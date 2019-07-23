@@ -1,5 +1,5 @@
 # Zio
-Zig library which abstracts out synchronous and asynchronous IO operations. The project is **currently a WIP** so expect updates. The motive being that there do not seem to be any IO multiplexing abstractions over the machine that:
+Zig library which abstracts out synchronous and asynchronous IO operations. The project is **currently a WIP** so expect updates. The motive being that there does not seem to be any IO multiplexing abstractions over the OS which:
 
 * Does not rely on language features such as closures or coroutines
 * Support Windows IOCP or completion based IO (eliminates libev & libevent)

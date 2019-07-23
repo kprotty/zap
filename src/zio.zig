@@ -1,4 +1,5 @@
-const builtin = @import("builtin");
+pub const std = @import("std");
+pub const builtin = @import("builtin");
 
 const Impl = switch (builtin.os) {
     .linux => @import("epoll.zig"),
@@ -26,25 +27,19 @@ pub const Token = packed struct {
     /// View the identity of a token as a Reader.
     /// Used for token equality when received from a `Selector.Event`.
     pub inline fn asReader(self: *const Token) *const Token {
-        return self.inner.asReader();
+        return @intToPtr(*const Token, self.inner.asReader());
     }
 
     /// View the identity of a token as a Writer.
     /// Used for token equality when received from a `Selector.Event`.
     pub inline fn asWriter(self: *const Token) *const Token {
-        return self.inner.asWriter();
+        return @intToPtr(*const Token, self.inner.asWriter());
     }
 
     /// Check if the identity of two tokens match.
     /// Both `self` and `other` should be the result of either `asReader()` or `asWriter()`
     pub inline fn is(self: *const Token, other: *const Token) bool {
-        return self.inner.is(other);
-    }
-
-    /// Get the `Token.Result` of a token retrieved from `Selector.Event.getToken()`.
-    /// If the token was not produced in that matter, the value of `getResult()` is undefined.
-    pub inline fn getResult(self: *Token) Result {
-        return self.inner.getResult();
+        return self.inner.is(&other.inner);
     }
 
     /// Represents the result of an IO operation.
@@ -58,15 +53,15 @@ pub const Token = packed struct {
         /// The `u32` represents the amount of bytes that were transferred.
         Transferred: u32,
 
-        /// If the result is from `Token.getResult()` (See above):
-        ///   the IO request was partially completed and
-        ///   the token should retry the operation where it left off to transfer fully.
+        /// If the result is from `Selector.Event.getResult()` (See above):
+        ///   the IO request was partially completed and the token should retry 
+        //    the operation (after being `.reset()`) where it left off to transfer fully.
         /// If the result is from an IO operation:
         ///   the buffers passed in are too large to be transffered.
         ///   Try performing the operation in batches of `std.math.maxInt(u32)` bytes.
         Retry,
 
-        /// If the result is from `Token.getResult()` (See above):
+        /// If the result is from `Selector.Event.getResult()` (See above):
         ///   this should be ignored as it shouldnt happen. Treat as error 
         /// If the result is from an IO operation:
         ///   the operation was partially completed with `u32` bytes transferred.
@@ -75,7 +70,7 @@ pub const Token = packed struct {
         ///     if `RegisterWrite`, the handle should be registered with `Selector.Event.Interest.Write`
         RegisterRead: u32,
         RegisterWrite: u32,
-    };
+    };  
 };
 
 /// A Selector is an implementation of the kernel's IO multiplexer which is used
@@ -102,13 +97,18 @@ pub const Selector = struct {
             ReadWrite,
         };
 
-        pub inline fn getToken(self: Event) ?*Token {
-            return inner.getToken();
+        pub inline fn getToken(self: Event) *Token {
+            return @fieldParentPtr(Token, "inner", self.inner.getToken());
         }
         
         pub inline fn getUserData(self: Event) usize {
-            return inner.getUserData();
-        }        
+            return self.inner.getUserData();
+        }
+
+        /// Get the `Token.Result` from an IO event. See `Token.Result` for more.
+        pub inline fn getResult(self: Event) Token.Result {
+            return self.inner.getResult();
+        } 
     };
 
     pub inline fn new(num_threads: usize) ?Selector {
@@ -176,6 +176,14 @@ pub const Socket = struct {
     /// Get the internal OS Handle
     pub inline fn getHandle(self: Selector) Handle {
         return self.inner.getHandle();
+    }
+
+    pub inline fn init() ?void {
+        return Impl.Socket.init();
+    }
+
+    pub inline fn deinit() void {
+        return Impl.Socket.deinit();
     }
 
     /// Socket address family

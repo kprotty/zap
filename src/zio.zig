@@ -120,6 +120,7 @@ pub const Selector = struct {
         self: *Selector,
         handle: Handle,
         interest: Event.Interest,
+        auto_rearm: bool,
         user_data: usize,
     ) ?void {
         return self.inner.register(handle, interest, user_data);
@@ -129,6 +130,7 @@ pub const Selector = struct {
         self: *Selector,
         handle: Handle,
         interest: Event.Interest,
+        auto_rearm: bool,
         user_data: usize,
     ) ?void {
         return self.inner.register(handle, interest, user_data);
@@ -296,23 +298,23 @@ pub const Socket = struct {
         return self.inner.close();
     }
 
-    pub inline fn timeout(self: *Socket, ms: ?u32) u32 {
+    pub inline fn timeout(self: *Socket, ms: ?u32) ?u32 {
         return self.inner.timeout(ms);
     }
 
-    pub inline fn keepAlive(self: *Socket, value: ?u32) u32 {
+    pub inline fn keepAlive(self: *Socket, value: ?u32) ?u32 {
         return self.inner.keepAlive(value);
     }
 
-    pub inline fn noDelay(self: *Socket, enabled: ?bool) bool {
+    pub inline fn noDelay(self: *Socket, enabled: ?bool) ?bool {
         return self.inner.noDelay(enabled);
     }
 
-    pub inline fn blocking(self: *Socket, enabled: ?bool) bool {
+    pub inline fn blocking(self: *Socket, enabled: ?bool) ?bool {
         return self.inner.blocking(enabled);
     }
 
-    pub inline fn option(self: *Socket, level: u32, name: u32, value: ?[]u8) u32 {
+    pub inline fn option(self: *Socket, level: u32, name: u32, value: ?[]u8) ?u32 {
         return self.inner.option(level, name, value);
     }
 

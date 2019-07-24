@@ -83,6 +83,11 @@ pub const Selector = struct {
         return self.inner.getHandle();
     }
 
+    /// Create a selector from an OS Handle
+    pub inline fn fromHandle(handle: Handle) Selector {
+        return self.inner.fromHandle(handle);
+    }
+
     pub const Event = packed struct {
         inner: Impl.Selector.Event,
 
@@ -120,7 +125,6 @@ pub const Selector = struct {
         self: *Selector,
         handle: Handle,
         interest: Event.Interest,
-        auto_rearm: bool,
         user_data: usize,
     ) ?void {
         return self.inner.register(handle, interest, user_data);
@@ -130,7 +134,6 @@ pub const Selector = struct {
         self: *Selector,
         handle: Handle,
         interest: Event.Interest,
-        auto_rearm: bool,
         user_data: usize,
     ) ?void {
         return self.inner.register(handle, interest, user_data);
@@ -149,6 +152,10 @@ pub const Selector = struct {
         timeout_ms: ?u32,
     ) ?[]Event {
         return self.inner.poll(events, timeout_ms);
+    }
+
+    pub inline fn close(self: *Selector) {
+        return self.inner.close();
     }
 };
 
@@ -176,8 +183,13 @@ pub const Socket = struct {
     inner: Impl.Socket,
 
     /// Get the internal OS Handle
-    pub inline fn getHandle(self: Selector) Handle {
+    pub inline fn getHandle(self: Socket) Handle {
         return self.inner.getHandle();
+    }
+
+    /// Create a socket from an OS Handle
+    pub inline fn fromHandle(handle: Handle) Socket {
+        return self.inner.fromHandle(handle);
     }
 
     pub inline fn init() ?void {
@@ -356,6 +368,13 @@ pub const Socket = struct {
         /// Parse an ipv6 string into its bitwise representation
         pub fn parseIpv6(input: []const u8) ?u128 {
             
+        }
+
+        /// Write the address into `output` as ASCII text.
+        ///   if `output` is null, return the amount of bytes it needs to write
+        /// returns the amount of bytes written into output
+        pub fn writeTo(self: Address, output: ?[]u8) usize {
+
         }
     };
 };

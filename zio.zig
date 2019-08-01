@@ -1,5 +1,9 @@
 const Scheduler = @import("src/scheduler.zig").Scheduler;
 
+pub const sync = struct {
+    pub const queue = @import("src/sync/queue.zig").SharedQueue;
+};
+
 pub const runtime = struct {
     pub const Task = Scheduler.Task;
     pub const Config = Scheduler.Config;

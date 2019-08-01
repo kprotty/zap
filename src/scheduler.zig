@@ -1,4 +1,5 @@
 
+// https://golang.org/s/go11sched
 pub const Scheduler = struct {
     pub var current: Scheduler = undefined;
 
@@ -10,9 +11,9 @@ pub const Scheduler = struct {
     };
 
     pub const Config = struct {
-        num_threads: u8,
-        allocator: *std.mem.Allocator,
-    }
+        max_threads: u8,
+        stack_size: usize,
+    };
 
     pub fn run(config: Config, comptime function: var, args: ...) !void {
 

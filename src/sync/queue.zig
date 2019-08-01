@@ -1,7 +1,15 @@
+const std = @import("std");
 const builtin = @import("builtin");
 
-pub const SharedQueue = struct {
-    pub fn SingleConsumer(comptime Node: type) type {
+const Xchg = builtin.AtomicRmwOp.Xchg;
+const Acquire = builtin.AtomicOrder.Acquire;
+const Release = builtin.AtomicOrder.Release;
+const Unordered = builtin.AtomicOrder.Unordered;
+const Monotonic = builtin.AtomicOrder.Monotonic;
+
+pub const Queue = struct {
+    pub fn Mpsc(comptime linkField: []const u8, comptime Node: type) type {
+        comptime std.debug.assert(isNode(Node));
         return struct {
             head: *Node,
             tail: *Node,
@@ -12,21 +20,23 @@ pub const SharedQueue = struct {
             }
 
             pub fn push(self: *@This(), node: *Node) void {
-                @fence(builtin.AtomicOrder.Release);
-                const prev = @atomicRmw(Node, &self.head, builtin.AtomicRmwOp.Xchg, node, builtin.AtomicOrder.Monotonic);
-                prev.next = node;
+                @fence(Release);
+                const previous = @atomicRmw(Node, &self.head, Xchg, node, Monotonic);
+                @field(previous, linkField).* = node;
             }
 
             pub fn pop(self: *@This()) ?*Node {
-                const next = @atomicLoad(?*Node, &self.tail.next, builtin.AtomicOrder.Unordered) orelse return null;
+                const node = @field(self.tail, linkField);
+                const next = @atomicLoad(?*Node, node, Unordered) orelse return null;
                 self.tail = next;
-                @fence(builtin.AtomicOrder.Acquire);
+                @fence(Acquire);
                 return next;
             }
         };
     }
 
-    pub fn MultiConsumer(comptime Node: type) type {
+    pub fn Mpmc(comptime linkField: []const u8, comptime Node: type) type {
+        comptime std.debug.assert(isNode(Node));
         return struct {
             head: *Node,
             tail: TailNode,
@@ -37,9 +47,9 @@ pub const SharedQueue = struct {
             }
 
             pub fn push(self: *@This(), node: *Node) void {
-                @fence(builtin.AtomicOrder.Release);
-                const prev = @atomicRmw(Node, &self.head, builtin.AtomicRmwOp.Xchg, node, builtin.AtomicOrder.Monotonic);
-                prev.next = node;
+                @fence(Release);
+                const previous = @atomicRmw(Node, &self.head, Xchg, node, Monotonic);
+                @field(previous, linkField).* = node;
             }
 
             pub fn pop(self: *@This()) ?*Node {
@@ -47,13 +57,14 @@ pub const SharedQueue = struct {
                 var xchg: TailNode = undefined;
 
                 while (true) {
-                    const next = @atomicLoad(?*Node, cmp.node.linkPtr(), builtin.AtomicOrder.Unordered) orelse return null;
+                    const node = @field(cmp.node, linkField);
+                    const next = @atomicLoad(?*Node, node, Unordered) orelse return null;
                     xchg.update(cmp, next);
-                    if (@cmpxchgWeak(TailNode, &self.tail, cmp, xchg, builtin.AtomicOrder.Monotonic, builtin.AtomicOrder.Monotonic)) |value| {
+                    if (@cmpxchgWeak(TailNode, &self.tail, cmp, xchg, Monotonic, Monotonic)) |value| {
                         cmp = value;
                         continue;
                     }
-                    @fence(builtin.AtomicOrder.Acquire);
+                    @fence(Acquire);
                     return next;                    
                 }
             }

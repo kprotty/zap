@@ -1,7 +1,7 @@
 const os = @import("os.zig");
 const zio = @import("../memory.zig");
 
-pub fn map(address: ?[*]align(zio.page_size) u8, bytes: usize, flags: u32) ?[]align(zio.page_size) u8 {
+pub fn map(address: ?[*]align(zio.page_size) u8, bytes: usize, flags: u32) zio.Error![]align(zio.page_size) u8 {
     const alloc_type = (if ((flags & zio.MEM_COMMIT) != 0) os.MEM_COMMIT else 0);
     const memory = os.VirtualAlloc(
         @ptrCast(?os.LPVOID, @alignCast(@alignOf(?os.LPVOID), address)),

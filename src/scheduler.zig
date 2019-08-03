@@ -14,7 +14,7 @@ pub const Scheduler = struct {
 
     pub const Config = struct {
         max_workers: usize,
-        allocator: *std.mem.Allocator,
+        task_allocator: *std.mem.Allocator,
 
         pub fn default() Config {
             

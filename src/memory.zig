@@ -15,6 +15,10 @@ pub const Error = error {
     OutOfMemory,
 };
 
+pub inline fn ptrCast(comptime ToPtr: type, fromPtr: var) ToPtr {
+    return @ptrCast(ToPtr, @alignCast(@alignOf(ToPtr), fromPtr));
+}
+
 pub inline fn map(address: ?[*]align(page_size) u8, bytes: usize, flags: u32) Error![]align(page_size) u8 {
     return Backend.map(address, bytes, flags);
 }

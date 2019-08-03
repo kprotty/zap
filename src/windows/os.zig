@@ -1,18 +1,54 @@
 // Basic data types
 
+pub const WORD = u16;
 pub const DWORD = u32;
 pub const LPDWORD = *DWORD;
 pub const SIZE_T = usize;
 pub const LPVOID = *c_void;
 
-pub const HANDLE = LPVOID;
-pub const INVALID_HANDLE = @intToPtr(HANDLE, ~usize(0));
-
 pub const TRUE: BOOL = 1;
 pub const FALSE: BOOL = 0;
 pub const BOOL = c_int;
 
+// System functions
+
+pub const LPSYSTEM_INFO = *SYSTEM_INFO;
+pub const SYSTEM_INFO = extern struct {
+    dwOemId: DWORD,
+    dwPageSize: DWORD,
+    lpMinimumApplicationAddress: LPVOID,
+    lpMaximumApplicationAddress: LPVOID,
+    dwActiveProcessorMask: LPDWORD,
+    dwNumberOfProcessors: DWORD,
+    dwProcessorType: DWORD,
+    dwAllocationGranularity: DWORD,
+    wProcessorLevel: WORD,
+    wProcessorRevision: WORD,
+};
+
 pub extern "kernel32" stdcallcc fn GetLastError() DWORD;
+
+pub extern "kernel32" stdcallcc fn GetSystemInfo(
+    lpSystemInfo: LPSYSTEM_INFO,
+) void;
+
+// Handles
+
+pub const WAIT_OBJECT_0: DWORD = 0x0000;
+pub const WAIT_TIMEOUT: DWORD = 0x0102;
+pub const INFINITE: DWORD = ~DWORD(0);
+
+pub const HANDLE = LPVOID;
+pub const INVALID_HANDLE = @intToPtr(HANDLE, ~usize(0));
+
+pub extern "kernel32" stdcallcc fn CloseHandle(
+    hObject: HANDLE,
+) BOOL;
+
+pub extern "kernel32" stdcallcc fn WaitForSingleObject(
+    hObject: HANDLE,
+    dwMilliseconds: DWORD,
+) DWORD;
 
 // Virtual Memory
 
@@ -58,11 +94,13 @@ pub const SECURITY_ATTRIBUTES = extern struct {
     bInheritHandle: BOOL,
 };
 
+pub extern "kernel32" stdcallcc fn GetCurrentThreadId() DWORD;
+
 pub extern "kernel32" stdcallcc fn CreateThread(
     lpThreadAttributes: ?LPSECURITY_ATTRIBUTES,
     dwStackSize: SIZE_T,
     lpStartAddress: LPTHREAD_START_ROUTINE,
     lpParameter: ?LPVOID,
     dwCreationFlags: DWORD,
-    lpThreadId: ?LPDOWRD,
+    lpThreadId: ?LPDWORD,
 ) ?HANDLE;

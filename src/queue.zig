@@ -1,12 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const Xchg = builtin.AtomicRmwOp.Xchg;
-const Acquire = builtin.AtomicOrder.Acquire;
-const Release = builtin.AtomicOrder.Release;
-const Unordered = builtin.AtomicOrder.Unordered;
-const Monotonic = builtin.AtomicOrder.Monotonic;
-
 fn isNode(comptime Node: type, comptime linkField: []const u8) bool {
     const field = if (@hasField(Node, linkField)) @typeOf(@field(Node(undefined), linkField)) else return false;
     const ftype = if (@typeId(field) == .Optional) @typeInfo(field).Optional.child else return false;
@@ -27,16 +21,16 @@ pub fn Mpsc(comptime Node: type, comptime linkField: []const u8) type {
         }
 
         pub fn push(self: *@This(), node: *Node) void {
-            @fence(Release);
-            const previous = @atomicRmw(*Node, &self.head, Xchg, node, Monotonic);
+            @fence(.Release);
+            const previous = @atomicRmw(*Node, &self.head, .Xchg, node, .Monotonic);
             @field(previous, linkField) = node;
         }
 
         pub fn pop(self: *@This()) ?*Node {
             const node = &@field(self.tail, linkField);
-            const next = @atomicLoad(?*Node, node, Unordered) orelse return null;
+            const next = @atomicLoad(?*Node, node, .Unordered) orelse return null;
             self.tail = next;
-            @fence(Acquire);
+            @fence(.Acquire);
             return next;
         }
     };
@@ -55,8 +49,8 @@ pub fn Mpmc(comptime Node: type, comptime linkField: []const u8) type {
         }
 
         pub fn push(self: *@This(), node: *Node) void {
-            @fence(Release);
-            const previous = @atomicRmw(*Node, &self.head, Xchg, node, Monotonic);
+            @fence(.Release);
+            const previous = @atomicRmw(*Node, &self.head, .Xchg, node, .Monotonic);
             @field(previous, linkField) = node;
         }
 
@@ -66,11 +60,11 @@ pub fn Mpmc(comptime Node: type, comptime linkField: []const u8) type {
 
             while (true) {
                 const node = &@field(cmp.data.node, linkField);
-                const next = @atomicLoad(?*Node, node, Unordered) orelse return null;
+                const next = @atomicLoad(?*Node, node, .Unordered) orelse return null;
                 xchg.update(cmp, next);
                 if (!self.tail.cas(&cmp, xchg))
                     continue;
-                @fence(Acquire);
+                @fence(.Acquire);
                 return next;                    
             }
         }
@@ -94,7 +88,8 @@ pub fn Mpmc(comptime Node: type, comptime linkField: []const u8) type {
             }
 
             pub inline fn cas(self: *TailNode, cmp: *TailNode, xchg: TailNode) bool {
-                if (@cmpxchgWeak(IntType, &self.raw, cmp.raw, xchg.raw, Monotonic, Monotonic)) |new_value| {
+                const aligned = @alignCast(@sizeOf(IntType), &self.raw);
+                if (@cmpxchgWeak(IntType, aligned, cmp.raw, xchg.raw, .Monotonic, .Monotonic)) |new_value| {
                     cmp.raw = new_value;
                     return false;
                 } else {

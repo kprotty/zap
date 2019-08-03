@@ -2,13 +2,13 @@ const os = @import("os.zig");
 const zio = @import("../memory.zig");
 
 pub fn map(address: ?[*]align(zio.page_size) u8, bytes: usize, flags: u32) zio.Error![]align(zio.page_size) u8 {
-    const alloc_type = (if ((flags & zio.MEM_COMMIT) != 0) os.MEM_COMMIT else 0);
+    const alloc_type = os.MEM_RESERVE | (if ((flags & zio.MEM_COMMIT) != 0) os.MEM_COMMIT else 0);
     const memory = os.VirtualAlloc(
         @ptrCast(?os.LPVOID, @alignCast(@alignOf(?os.LPVOID), address)),
         os.SIZE_T(bytes),
         os.DWORD(alloc_type),
         getProtectFlags(flags),
-    ) orelse return null;
+    ) orelse return zio.Error.OutOfMemory;
     return @ptrCast([*]align(zio.page_size) u8, @alignCast(zio.page_size, memory))[0..bytes];
 }
 
@@ -21,7 +21,7 @@ pub fn unmap(memory: []align(zio.page_size) u8) void {
 }
 
 pub fn protect(memory: []align(zio.page_size) u8, flags: u32) void {
-    var old_protect: DWORD = undefined;
+    var old_protect: os.DWORD = undefined;
     _ = os.VirtualProtect(
         @ptrCast(?os.LPVOID, @alignCast(@alignOf(?os.LPVOID), memory.ptr)),
         os.SIZE_T(memory.len),

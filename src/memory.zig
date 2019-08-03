@@ -23,10 +23,19 @@ pub inline fn unmap(memory: []align(page_size) u8) void {
     return Backend.unmap(memory);
 }
 
-pub fn protect(memory: []align(page_size) u8, flags: u32) void {
+pub inline fn protect(memory: []align(page_size) u8, flags: u32) void {
     return Backend.protect(memory, flags);
 }
 
-pub fn advise(memory: []align(page_size) u8, flags: u32) void {
+pub inline fn advise(memory: []align(page_size) u8, flags: u32) void {
     return Backend.advise(memory, flags);
+}
+
+test "virtual memory" {
+    var memory = try map(null, page_size * 64, 0);
+    defer unmap(memory);
+
+    protect(memory[0..page_size], MEM_READ | MEM_WRITE);
+    advise(memory[0..page_size], MEM_READ | MEM_WRITE | MEM_COMMIT);
+    memory[0] = 64;
 }

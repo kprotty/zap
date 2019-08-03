@@ -1,11 +1,20 @@
+// Basic data types
+
 pub const DWORD = u32;
-pub const PDWORD = *DWORD;
+pub const LPDWORD = *DWORD;
 pub const SIZE_T = usize;
 pub const LPVOID = *c_void;
+
+pub const HANDLE = LPVOID;
+pub const INVALID_HANDLE = @intToPtr(HANDLE, ~usize(0));
 
 pub const TRUE: BOOL = 1;
 pub const FALSE: BOOL = 0;
 pub const BOOL = c_int;
+
+pub extern "kernel32" stdcallcc fn GetLastError() DWORD;
+
+// Virtual Memory
 
 pub const MEM_COMMIT: DWORD = 0x1000;
 pub const MEM_RESERVE: DWORD = 0x2000;
@@ -29,13 +38,13 @@ pub extern "kernel32" stdcallcc fn VirtualAlloc(
 pub extern "kernel32" stdcallcc fn VirtualProtect(
     lpAddress: ?LPVOID,
     dwSize: SIZE_T,
-    flAllocationType: DWORD,
-    flProtect: DWORD,
+    flNewProtect: DWORD,
+    lpflOldProtect: LPDWORD,
 ) ?LPVOID;
 
 pub extern "kernel32" stdcallcc fn VirtualFree(
     lpAddress: ?LPVOID,
     dwSize: SIZE_T,
-    flNewProtect: DWORD,
-    lpflOldProtect: PDWORD,
+    flFreeType: DWORD,
 ) BOOL;
+

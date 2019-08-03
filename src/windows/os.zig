@@ -48,3 +48,21 @@ pub extern "kernel32" stdcallcc fn VirtualFree(
     flFreeType: DWORD,
 ) BOOL;
 
+// Thread functions
+
+pub const LPTHREAD_START_ROUTINE = extern fn(lpParameter: LPVOID) DWORD;
+pub const LPSECURITY_ATTRIBUTES = *SECURITY_ATTRIBUTES;
+pub const SECURITY_ATTRIBUTES = extern struct {
+    nLength: DWORD,
+    lpSecurityDescriptor: LPVOID,
+    bInheritHandle: BOOL,
+};
+
+pub extern "kernel32" stdcallcc fn CreateThread(
+    lpThreadAttributes: ?LPSECURITY_ATTRIBUTES,
+    dwStackSize: SIZE_T,
+    lpStartAddress: LPTHREAD_START_ROUTINE,
+    lpParameter: ?LPVOID,
+    dwCreationFlags: DWORD,
+    lpThreadId: ?LPDOWRD,
+) ?HANDLE;

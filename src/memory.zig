@@ -4,6 +4,10 @@ const Backend = switch (builtin.os) {
     else => @compileError("Platform not supported"),
 };
 
+pub inline fn ptrCast(comptime To: type, from: var) To {
+    return @ptrCast(To, @alignCast(@alignOf(To), from));
+}
+
 pub const page_size = 4 * 1024;
 
 pub const MEM_EXEC = 1 << 0;
@@ -14,10 +18,6 @@ pub const MEM_COMMIT = 1 << 3;
 pub const Error = error {
     OutOfMemory,
 };
-
-pub inline fn ptrCast(comptime ToPtr: type, fromPtr: var) ToPtr {
-    return @ptrCast(ToPtr, @alignCast(@alignOf(ToPtr), fromPtr));
-}
 
 pub inline fn map(address: ?[*]align(page_size) u8, bytes: usize, flags: u32) Error![]align(page_size) u8 {
     return Backend.map(address, bytes, flags);

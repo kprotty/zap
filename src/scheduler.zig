@@ -1,139 +1,75 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// sysmon ()
-pub const Scheduler = struct {
-    pub var current: Scheduler = undefined;
-    
-    active_tasks: usize,
-    allocator: *std.mem.Allocator,
+pub fn run(max_workers: usize, comptime function: var, args: ...) !void {
+    var main_task: Task = undefined;
+    var main_thread: Thread = undefined;
+    var main_worker: Worker = undefined;
 
-    workers: []Worker,
-    idle_workers: SharedQueue(Worker, "link"),
+    Worker.all.init();
+    Worker.all.push(&main_worker);
+    Worker.idle.init();
+    Worker.idle.push(&main_worker);
 
-    pub const Config = struct {
-        max_workers: usize,
-        allocator: *std.mem.Allocator,
+    main_worker.init()
+    main_worker.spawn(&main_task, function, args);
+    main_thread.run();
+}
 
-        pub fn default() Config {
-            return Config {
-                .allocator = std.debug.allocator,
-                .max_workers = std.Thread.cpuCount() catch 1,
-            };
-        }
-    };
+pub const Worker = struct {
+    pub var max: usize = undefined;
+    pub var all: SharedQueue(Worker, "next") = undefined;
+    pub var idle: SharedQueue(Worker, "link") = undefined;
 
-    pub fn run(config: Config, comptime function: var, args: ...) !void {
-        // initialize the scheduler
-        var self: Scheduler = undefined;
-        self.allocator = config.allocator;
+    status: Status,
+    next: ?*Worker,
+    link: ?*Worker,
 
-        // create the main task to run
-        const main_task = try self.spawn_task(function, args);
-        errdefer self.allocator.deinit(main_task);
-        self.active_tasks = 1;
+    pub fn init(self: *Worker) void {
 
-        // allocate workers, initialize them and add them to the idle_workers queue
-        self.workers = try self.allocator.alloc(Worker, std.math.max(config.max_workers, 1));
-        defer self.allocator.free(self.workers);
-        self.idle_workers.init();
-        for (self.workers[1..]) |*worker| {
-            worker.init();
-            self.idle_workers.push(worker);
-        }
-
-        // create the main thread and run the first worker using it
-        var thread: Thread = undefined;
-        self.workers[0].init();
-        thread.run(&self.workers[0], main_task);
-
-        // wait for all threads to complete
-        for (self.workers[1..]) |worker| {
-            if (worker.thread.inner) |std_thread| {
-                std_thread.wait();
-            }
-        }
     }
 
-    pub fn spawn(self: *Scheduler, comptime function: var, args: ...) !void {
-        // TODO
-    }
-
-    fn spawn_task(self: *Scheduler, comptime function: var, args: ...) !*Task {
-        const TaskWrapper = struct {
-            async fn func(sched: *Scheduler, task: *Task, fargs: ...) void {
-                suspend {
-                    task.handle = @handle();
-                    task.state = .Runnable;
-                }
-                _ = await (async function(fargs) catch unreachable);
-                task.state = .Completed;
-            }
-        };
-        const task = try self.allocator.init(Task);
-        try async<self.allocator> TaskWrapper.func(self, task, args);
-        return task;
-    }
-};
-
-pub const Task = struct {
-    data: usize,
-    link: ?*Task,
-    state: State,
-    handle: promise,
-    
-    pub const State = enum {
-        Runnable,
-        Completed,
+    pub const Status = enum {
+        Idle,
+        Running,
+        Syscall,
     };
 };
 
 pub const Thread = struct {
-    pub threadlocal var current: Thread = undefined;
-
-    task: *Task,
     worker: *Worker,
-    inner: ?*std.Thread,
-
-    pub fn submit(self: *Thread, task: *Task) void {
-        const scheduler = Scheduler.current;
-        _ = @atomicRmw(usize, &scheduler.active_tasks, .Add, 1, .SeqCst);
-
-        // try and add to run queue
-        // if it wasnt empty, try getting a free P
-        // if got free P, fetch/create new M to run P
-    }
-
-    pub fn run(self: *Thread, worker: *Worker, task: *Task, inner: ?*std.Thread) !void {
-        // if sysmon tick, iterate workers and steal syscalled Workers
-        self.task = task;
-        self.inner = inner;
-        self.worker = worker;
-        worker.thread = self;
-
-        // keep operating while theres still live tasks
-        const scheduler = Scheduler.current;
-        while (@atomicLoad(usize, &scheduler.active_tasks, .SeqCst) > 0) {
-            resume task.handle;
-            
-            // when task completed, decrement active_tasks and stop running 
-            if (task.state == .Completed) {
-                scheduler.allocator.deinit(task);
-                if (@atomicRmw(usize, &scheduler.active_tasks, .Sub, 1, .SeqCst) == 1)
-                    return;
-            }
-        }
-    }
+    handle: ?*std.Thread,
 };
 
-pub const Worker = struct {
-    link: ?*Worker,
+pub const Task = struct {
+    pub threadlocal var current: *Task = undefined;
 
-    task: *Task,
+    pub var active: usize = 0;
+    pub var global = SharedQueue(Task, "next").new();
+
+    next: ?*Task,
+    status: Status,
+    handle: promise,
     thread: *Thread,
 
-    pub fn init(self: *Worker) void {
-        
+    pub const Status = enum {
+        Runnable,
+        Running,
+        Completed,
+    };
+
+    pub fn spawn(task: *Task, allocator: *std.mem.Allocator, comptime function: var, args: ...) !void {
+        const TaskWrapper = struct {
+            async fn func(task_ref: *Task, func_args: ...) void {
+                suspend {
+                    task_ref.handle = @handle();
+                    task_ref.status = .Runnable;
+                }
+                _ = await (async function(func_args) catch unreachable);
+                task_ref.status = .Completed;
+            }
+        };
+        _ = try async<allocator> TaskWrapper.func(task, args);
     }
 };
 
@@ -179,3 +115,5 @@ fn SharedQueue(comptime Node: type, comptime Field: []const u8) type {
     comptime std.debug.assert(Queue.isValidNode());
     return Queue;
 }
+
+

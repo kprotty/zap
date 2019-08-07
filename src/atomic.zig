@@ -1,15 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// TODO: replace with atomicStore() https://github.com/ziglang/zig/issues/2995
+pub inline fn store(comptime T: type, ptr: *T, value: T, order: builtin.AtomicOrder) void {
+    @ptrCast(*volatile T, ptr).* = value;
+}
 
 fn isValidNode(comptime Node: type, comptime Field: []const u8) bool {
     const field = if (@hasField(Node, Field)) @typeOf(@field(Node(undefined), Field)) else return false;
     const ftype = if (@typeId(field) == .Optional) @typeInfo(field).Optional.child else return false;
     const ptype = if (@typeId(ftype) == .Pointer) @typeInfo(ftype).Pointer else return false;
     return ptype.size == .One and ptype.child == Node;
-}
-
-inline fn storeField(node: var, comptime Field: []const u8, value: ?*Node) void {
-    // TODO: replace with atomicStore() https://github.com/ziglang/zig/issues/2995
-    @ptrCast(*volatile ?@typeOf(node), &@field(node, Field)).* = value;
 }
 
 pub fn Stack(comptime Node: type, comptime Field: []const u8) type {
@@ -23,9 +24,9 @@ pub fn Stack(comptime Node: type, comptime Field: []const u8) type {
 
         pub fn push(self: *Queue, node: *Node) void {
             @fence(.Release);
-            storeField(node, Field, @atomicLoad(?*Node, &self.top, .Unordered));
+            store(?*Node, &@field(node, Field), @atomicLoad(?*Node, &self.top, .Unordered), .Monotonic);
             while (@cmpxchgWeak(?*Node, &self.top, @field(node, Field), node, .Monotonic, .Monotonic)) |new_top| {
-                storeField(node, Field, new_top);
+                store(?*Node, &@field(node, Field), new_top, .Monotonic);
             }
         }
 
@@ -54,13 +55,11 @@ pub fn Queue(comptime Node: type, comptime Field: []const u8) type {
             self.stub = null;
         }
 
-        
-
         pub fn push(self: *Queue, node: *Node) void {
             @fence(.Release);
-            storeField(node, Field, null);
+            store(?*Node, &@field(node, Field), null, .Monotonic);
             const previous = @atomicRmw(*Node, &self.head, .Xchg, node, .Monotonic);
-            storeField(previous, Field, node);
+            store(?*Node, &@field(previous, Field), node, .Monotonic);
         }
 
         pub fn pop(self: *Queue) ?*Node {

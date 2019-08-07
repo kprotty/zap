@@ -29,8 +29,13 @@ pub const System = struct {
         defer self.heap.allocator.free(Worker.all);
         for (Worker.all) |*worker| worker.init();
         defer { for (Worker.all) |*w| w.deinit(); }
-
+        
+        Worker.all[0].run_queue.spawn(function, args);
+        Thread.spawn();
         self.monitor();
+    }
+
+    fn monitor(self: *System) void {
         // wait for stop event
     }
 };

@@ -6,4 +6,8 @@ pub const Heap = struct {
     pub fn init(self: *Heap) void {
         self.allocator = std.debug.allocator.*; // TODO: mimalloc
     }
+
+    pub fn deinit(self: *Heap) void {
+        
+    }
 }

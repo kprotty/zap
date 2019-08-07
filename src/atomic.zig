@@ -24,14 +24,14 @@ pub fn Stack(comptime Node: type, comptime Field: []const u8) type {
 
         pub fn push(self: *Queue, node: *Node) void {
             @fence(.Release);
-            store(?*Node, &@field(node, Field), @atomicLoad(?*Node, &self.top, .Unordered), .Monotonic);
+            store(?*Node, &@field(node, Field), @atomicLoad(?*Node, &self.top, .Monotonic), .Monotonic);
             while (@cmpxchgWeak(?*Node, &self.top, @field(node, Field), node, .Monotonic, .Monotonic)) |new_top| {
                 store(?*Node, &@field(node, Field), new_top, .Monotonic);
             }
         }
 
         pub fn pop(self: *Queue) ?*Node {
-            var top = @atomicLoad(?*Node, &self.top, .Unordered);
+            var top = @atomicLoad(?*Node, &self.top, .Monotonic);
             while (top) |node| {
                 top = @cmpxchgWeak(?*Node, &self.top, top, @field(node, Field), .Monotonic, .Monotonic) 
                     orelse return node;
@@ -63,9 +63,9 @@ pub fn Queue(comptime Node: type, comptime Field: []const u8) type {
         }
 
         pub fn pop(self: *Queue) ?*Node {
-            var tail = @atomicLoad(*Node, &self.tail, .Unordered);
+            var tail = @atomicLoad(*Node, &self.tail, .Monotonic);
             while (true) {
-                const next = @atomicLoad(?*Node, &@field(tail, Field), .Unordered) orelse return null;
+                const next = @atomicLoad(?*Node, &@field(tail, Field), .Monotonic) orelse return null;
                 if (@cmpxchgWeak(*Node, &self.tail, tail, next, .Monotonic, .Monotonic)) |new_tail| {
                     tail = new_tail;
                     continue;

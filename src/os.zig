@@ -11,12 +11,22 @@ pub const FALSE: BOOL = 0;
 pub const INFINITE: DWORD = ~DWORD(0);
 pub const INVALID_HANDLE: HANDLE = @intToPtr(HANDLE, ~usize(0))
 
-pub const STATUS_PENDING: DWORD = 0x0103;
-pub const STATUS_SUCCESS: DWORD = 0x0000;
+pub const WSA_IO_PENDING: c_int = 997;
+
+pub const WSAOVERLAPPED_COMPLETION_ROUNTINE = extern fn(
+    dwErrorCode: DWORD,
+    dwNumberOfBytesTransferred: DWORD,
+    lpOverlapped: *OVERLAPPED,
+) void;
+
+pub const WSABUF = extern struct {
+    len: ULONG,
+    buf: [*]const u8,
+};
 
 pub const OVERLAPPED = extern struct {
-    Internal: *ULONG,
-    InternalHigh: *ULONG,
+    Internal: ?*ULONG,
+    InternalHigh: ?*ULONG,
     Offset: DWORD,
     OffsetHigh: DWORD,
     hEvent: HANDLE,
@@ -59,16 +69,30 @@ pub const WSADATA = extern struct {
     szSystemStatus: [129]u8,
 };
 
+pub extern "ws2_32" stdcallcc WSAGetLastError() c_int;
+
 pub extern "ws2_32" stdcallcc fn WSACleanup() c_int;
 pub extern "ws2_32" stdcallcc fn WSAStartup(
     wVersionRequired: WORD,
     lpWSAData: *WSADATA,
 ) c_int;
 
-pub extern "ws2_32" stdcallcc fn WSAGetOverlappedResult(
-    socket: SOCKET,
+pub extern "ws2_32" stdcallcc fn WSASend(
+    socket: HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: DWORD,
+    lpNumberOfBytesSent: *DWORD,
+    dwFlags: DWORD,
     lpOverlapped: *OVERLAPPED,
-    lpcbTransfer: *DWORD,
-    fWait: BOOL,
+    lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUNTINE,
+) c_int;
+
+pub extern "ws2_32" stdcallcc fn WSASend(
+    socket: HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: DWORD,
+    lpNumberOfBytesSent: *DWORD,
     lpdwFlags: *DWORD,
-) BOOL;
+    lpOverlapped: *OVERLAPPED,
+    lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUNTINE,
+) c_int;

@@ -2,6 +2,8 @@ pub const BOOL = c_int;
 pub const WORD = u16;
 pub const DWORD = u32;
 pub const ULONG = u32;
+pub const SIZE_T = usize;
+pub const PVOID = *c_void;
 pub const HANDLE = *c_void;
 pub const SOCKET = HANDLE;
 
@@ -13,6 +15,16 @@ pub const INVALID_HANDLE: HANDLE = @intToPtr(HANDLE, ~usize(0))
 
 pub const WSA_IO_PENDING: c_int = 997;
 
+pub const THREAD_START_ROUTINE = extern stdcallcc fn(
+    lpParameter: PVOID,
+) DWORD;
+
+pub const SECURITY_ATTRIBUTES = extern struct {
+    nLength: DWORD,
+    lpSecurityDescriptor: PVOID,
+    bInheritHandle: BOOL,
+};
+
 pub const WSAOVERLAPPED_COMPLETION_ROUNTINE = extern fn(
     dwErrorCode: DWORD,
     dwNumberOfBytesTransferred: DWORD,
@@ -22,6 +34,16 @@ pub const WSAOVERLAPPED_COMPLETION_ROUNTINE = extern fn(
 pub const WSABUF = extern struct {
     len: ULONG,
     buf: [*]const u8,
+};
+
+pub const WSADATA = extern struct {
+    wVersion: WORD,
+    wHighVersion: WORD,
+    iMaxSockets: c_ushort,
+    iMaxUdpDg: c_ushort,
+    lpVendorInfo: [*]const u8,
+    szDescription: [257]u8,
+    szSystemStatus: [129]u8,
 };
 
 pub const OVERLAPPED = extern struct {
@@ -59,15 +81,15 @@ pub extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
     fAlertable: BOOL,
 ) BOOL;
 
-pub const WSADATA = extern struct {
-    wVersion: WORD,
-    wHighVersion: WORD,
-    iMaxSockets: c_ushort,
-    iMaxUdpDg: c_ushort,
-    lpVendorInfo: [*]const u8,
-    szDescription: [257]u8,
-    szSystemStatus: [129]u8,
-};
+pub extern "kernel32" stdcallcc fn SwitchToThread() BOOL;
+pub extern "kernel32" stdcallcc fn CreateThread(
+    lpThreadAttributes: ?*SECURITY_ATTRIBUTES,
+    dwStackSize: SIZE_T,
+    lpStartAddress: THREAD_START_ROUTINE,
+    lpParameter: ?PVOID,
+    dwCreationFlags: DWORD,
+    lpThreadId: *DWORD,
+) ?HANDLE;
 
 pub extern "ws2_32" stdcallcc WSAGetLastError() c_int;
 
@@ -78,7 +100,7 @@ pub extern "ws2_32" stdcallcc fn WSAStartup(
 ) c_int;
 
 pub extern "ws2_32" stdcallcc fn WSASend(
-    socket: HANDLE,
+    socket: SOCKET,
     lpBuffers: [*]WSABUF,
     dwBufferCount: DWORD,
     lpNumberOfBytesSent: *DWORD,
@@ -88,7 +110,7 @@ pub extern "ws2_32" stdcallcc fn WSASend(
 ) c_int;
 
 pub extern "ws2_32" stdcallcc fn WSASend(
-    socket: HANDLE,
+    socket: SOCKET,
     lpBuffers: [*]WSABUF,
     dwBufferCount: DWORD,
     lpNumberOfBytesSent: *DWORD,

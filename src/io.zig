@@ -128,7 +128,7 @@ pub const Poller = struct {
 
 
 pub const Socket = struct {
-    handle: os.HANDLE,
+    handle: os.SOCKET,
     stream: Stream,
 
     pub async fn read(self: *Socket, buffer: []u8) !void {

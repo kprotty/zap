@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const sync = @import("sync.zig");
+const thread = @import("thread.zig");
 const atomic = @import("atomic.zig");
 const heap = @import("heap.zig").Heap;
 
@@ -23,7 +25,7 @@ pub const System = struct {
 
         Thread.init();
         Task.global.init();
-        try Worker.init();
+        try Worker.init(config);
         defer Worker.deinit();
         
         Worker.all[0].spawn(function, args);
@@ -39,9 +41,13 @@ pub const Worker = struct {
     pub var all: []Worker = undefined;
     pub var idle: atomic.Queue(Worker, "next") = undefined;
 
-    pub fn init(heap: *Heap, max_workers: usize) !void {
+    pub fn init(heap: *Heap, config: Config) !void {
+        all = try self.heap.allocator.alloc(switch (config.max_workers) {
+            0 => thread.cpuCount(),
+            else => max_workers,
+        });
+
         idle.init();
-        all = try self.heap.allocator.alloc(std.math.max(1, config.max_workers));
         for (all) |*worker| {
             worker.heap.init();
             worker.status = .Idle;
@@ -74,12 +80,15 @@ pub const Worker = struct {
             }
         };
 
-        // spawn the task and try and create a new Thread using an idle Worker
-        // if theres no idle workers, add to the local run queue.
+        // spawn a new task and increment the active count
         const task = try self.heap.allocator.init(Task);
         _ = try async<allocator> TaskWrapper.func(task, args);
+        _ = @atomicRmw(usize, &Task.active, .Add, 1, .Acquire);
+        
+        // try and place it onto an idle worker for concurrent
+        // if theres no idle workers, just add it to the local run queue
         if (idle.pop()) |idle_worker| {
-            try Thread.spawn(idle_worker, task);
+            try Thread.start(idle_worker, task);
         } else {
             self.run_queue.put(task, true);
         }
@@ -147,17 +156,50 @@ pub const Worker = struct {
 
 pub const Thread = struct {
     pub const max = 10 * 1000;
-    pub var num_spinning = usize(0);
 
+    pub var active: usize = undefined;
     pub var idle: atomic.Queue(Thread, "next") = undefined;
     pub var cache: atomic.Stack(Thread, "next") = undefined;
 
+    pub fn init() {
+        active = 0;
+        idle.init();
+        cache.init();
+    }
+
     next: ?*Thread,
-    worker: *Worker,
-    handle: ?*std.Thread,
+    task: *Task,
+    worker: ?*Worker,
+    handle: thread.Handle,
+    event: sync.Event,
 
-    pub fn run(self: *Thread) void {
+    pub fn start(worker: *Worker, task: *Task) !void {
+        // try and fetch from idle (running) threads if any
+        // try and fetch from cache to not allocate if any
+        // allocate a new Thread object to use
+        const this_thread =
+            if (idle.pop()) |idle_thread| idle_thread
+            else if (cache.pop()) |cached_thread| cached_thread
+            else value: {
+                const new_thread = try worker.heap.allocator.init(Thread);
+                new_thread.event.init();
+                break :value new_thread;
+            };
 
+        this_thread.next = null;
+        this_thread.task = task;
+        this_thread.worker = worker;
+
+        // signal a running os thread to wakeup or spawn a new os thread
+        if (this_thread.event.is_set()) {
+            this_thread.event.signal();
+        } else {
+            try thread.spawn(&this_thread.handle, run, this_thread);
+        }
+    }
+
+    fn run(self: *Thread) void {
+        // TODO
     }
 };
 

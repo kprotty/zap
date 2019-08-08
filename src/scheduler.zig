@@ -191,7 +191,7 @@ pub const Thread = struct {
         this_thread.worker = worker;
 
         // signal a running os thread to wakeup or spawn a new os thread
-        if (this_thread.event.is_set()) {
+        if (!this_thread.event.is_set()) {
             this_thread.event.signal();
         } else {
             try thread.spawn(&this_thread.handle, run, this_thread);

@@ -91,6 +91,14 @@ pub extern "kernel32" stdcallcc fn CreateThread(
     lpThreadId: *DWORD,
 ) ?HANDLE;
 
+pub extern "synchronization" stdcallcc fn WakeByAddressSingle(Address: PVOID) void;
+pub extern "synchronization" stdcallcc fn WaitOnAddress(
+    Address: PVOID,
+    CompareAddress: PVOID,
+    AddressSize: SIZE_T,
+    dwMilliseconds: DWORD,
+) BOOL;
+
 pub extern "ws2_32" stdcallcc WSAGetLastError() c_int;
 
 pub extern "ws2_32" stdcallcc fn WSACleanup() c_int;

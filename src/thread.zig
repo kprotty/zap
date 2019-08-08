@@ -20,5 +20,5 @@ pub fn yield() void {
 }
 
 pub fn cpuYield() void {
-    asm volatile("pause" ::: "memory");
+    _ = asm volatile("pause" ::: "memory");
 }

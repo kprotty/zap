@@ -25,6 +25,20 @@ pub const SECURITY_ATTRIBUTES = extern struct {
     bInheritHandle: BOOL,
 };
 
+pub const SYSTEM_INFO = extern struct {
+    wProcessorArchitecture: WORD,
+    wReserved: WORD,
+    dwPageSize: DWORD,
+    lpMinimumApplicationAddress: PVOID,
+    lpMaximumApplicationAddress: PVOID,
+    dwActiveProcessorMask: *const DWORD,
+    dwNumberOfProcessors: DWORD,
+    dwProcessorType: DWORD,
+    dwAllocationGranularity: DWORD,
+    wProcessorLevel: WORD,
+    wProcessorRevision: WORD,
+};
+
 pub const WSAOVERLAPPED_COMPLETION_ROUNTINE = extern fn(
     dwErrorCode: DWORD,
     dwNumberOfBytesTransferred: DWORD,
@@ -80,6 +94,10 @@ pub extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
     dwMilliseconds: DWORD,
     fAlertable: BOOL,
 ) BOOL;
+
+pub extern "kernel32" stdcallcc fn GetSystemInfo(
+    lpSystemInfo: *SYSTEM_INFO,
+) void;
 
 pub extern "kernel32" stdcallcc fn SwitchToThread() BOOL;
 pub extern "kernel32" stdcallcc fn CreateThread(

@@ -15,6 +15,12 @@ pub fn spawn(handle: *Handle, comptime function: var, context: var) !void {
         orelse return error.ThreadCreate;
 }
 
+pub fn cpuCount() usize {
+    var system_info: os.SYSTEM_INFO = undefined;
+    os.GetSystemInfo(&system_info);
+    return @intCast(usize, system_info.dwNumberOfProcessors);
+}
+
 pub fn yield() void {
     _ = SwitchToThread();
 }

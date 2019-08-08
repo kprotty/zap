@@ -21,17 +21,12 @@ pub const System = struct {
         self.heap.init();
         defer self.heap.deinit();
 
-        Worker.idle.init();
-        Thread.idle.init();
+        Thread.init();
         Task.global.init();
-
-        Worker.all = try self.heap.allocator.alloc(std.math.max(1, config.max_workers));
-        defer self.heap.allocator.free(Worker.all);
-        for (Worker.all) |*worker| worker.init();
-        defer { for (Worker.all) |*w| w.deinit(); }
+        try Worker.init();
+        defer Worker.deinit();
         
-        Worker.all[0].run_queue.spawn(function, args);
-        Thread.spawn();
+        Worker.all[0].spawn(function, args);
         self.monitor();
     }
 
@@ -44,23 +39,30 @@ pub const Worker = struct {
     pub var all: []Worker = undefined;
     pub var idle: atomic.Queue(Worker, "next") = undefined;
 
+    pub fn init(heap: *Heap, max_workers: usize) !void {
+        idle.init();
+        all = try self.heap.allocator.alloc(std.math.max(1, config.max_workers));
+        for (all) |*worker| {
+            worker.heap.init();
+            worker.status = .Idle;
+            idle.push(worker);
+        }
+    }
+
+    pub fn deinit(heap: *Heap) void {
+        for (all) |*worker|
+            worker.heap.deinit();
+        heap.allocator.free(all);
+        all = []Worker {};
+    }
+
     status: Status,
     next: ?*Worker,
     heap: Heap,
     thread: *Thread,
+    run_queue: TaskQueue,
 
-
-    pub fn init(self: *Worker) void {
-        self.heap.init();
-        self.status = .Idle;
-        idle.push(self);
-    }
-
-    pub fn deinit(self: *Worker) void {
-        self.heap.deinit();
-    }
-
-    pub fn spawn(comptime function: var, args: ...) !void {
+    pub fn spawn(self: *Worker, comptime function: var, args: ...) !void {
         const TaskWrapper = struct {
             async fn func(task_ref: *Task, func_args: ...) void {
                 suspend {
@@ -72,8 +74,15 @@ pub const Worker = struct {
             }
         };
 
+        // spawn the task and try and create a new Thread using an idle Worker
+        // if theres no idle workers, add to the local run queue.
         const task = try self.heap.allocator.init(Task);
         _ = try async<allocator> TaskWrapper.func(task, args);
+        if (idle.pop()) |idle_worker| {
+            try Thread.spawn(idle_worker, task);
+        } else {
+            self.run_queue.put(task, true);
+        }
     }
 
     pub const Status = enum {
@@ -81,6 +90,59 @@ pub const Worker = struct {
         Running,
         Syscall,
     };
+
+    pub const TaskQueue = struct {
+        head: u32,
+        tail: u32,
+        next: ?*Task,
+        tasks: [256]*Task,
+
+        pub fn init(self: *@This()) {
+            self.head = 0;
+            self.tail = 0;
+            self.next = null;
+        }
+
+        /// Try and put the new_task in the local run queue.
+        /// If as_next, put it in the self.next slot instead.
+        /// If the local run queue is full, move half of them to the global run queue.
+        pub fn put(self: *@This(), new_task: *Task, as_next: bool) void {
+            var task = new_task;
+
+            // if as_next, set to the self.next slot and push the old one to the tasks queue
+            if (as_next) {
+                var old_next = @atomicLoad(?*Task, &self.next, .Monotonic);
+                while (@cmpxchgWeak(?*Task, &self.next, old_next, task)) |current_next|
+                    old_next = current_next;
+                task = old_next orelse return;
+            }
+
+            while (true) {
+                // fast path, add one task to the queue
+                const head = @atomicLoad(u32, &self.head, .Acquire);
+                const tail = @atomicLoad(u32, &self.tail, .Monotonic);
+                if (head - tail < self.tasks.len) {
+                    self.tasks[tail % self.tasks.len] = task;
+                    atomic.store(u32, &self.tail, tail + 1, .Monotonic);
+                    return;
+                }
+
+                // slow path (run_queue is full), try and grab half of the runqueue
+                var task_batch: [self.batch.len / 2 + 1]*Task = undefined;
+                var batch = task_batch[0 .. (tail - head) / 2];
+                if (batch.len != self.tasks.len / 2)
+                    continue;
+                for (batch) |i, _| batch[i] = self.tasks[(head + i) % self.tasks.len];
+                if (@cmpxchgWeak(u32, &self.head, head, head + batch.len, .Release, .Monotonic) != null)
+                    continue;
+
+                // add the batch to the global run_queue
+                for (batch) |i, _| batch[i].next = batch[i + 1];
+                Task.global.push(batch[0]);
+                return;
+            }
+        }
+    }
 };
 
 pub const Thread = struct {
@@ -88,6 +150,7 @@ pub const Thread = struct {
     pub var num_spinning = usize(0);
 
     pub var idle: atomic.Queue(Thread, "next") = undefined;
+    pub var cache: atomic.Stack(Thread, "next") = undefined;
 
     next: ?*Thread,
     worker: *Worker,

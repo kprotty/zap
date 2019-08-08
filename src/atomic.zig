@@ -57,7 +57,6 @@ pub fn Queue(comptime Node: type, comptime Field: []const u8) type {
 
         pub fn push(self: *Queue, node: *Node) void {
             @fence(.Release);
-            store(?*Node, &@field(node, Field), null, .Monotonic);
             const previous = @atomicRmw(*Node, &self.head, .Xchg, node, .Monotonic);
             store(?*Node, &@field(previous, Field), node, .Monotonic);
         }

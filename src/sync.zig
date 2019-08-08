@@ -10,19 +10,23 @@ pub const Event = struct {
     value: u32,
 
     pub fn init(self: *Event) void {
-        self.value = 0;
+        self.reset();
     }
 
-    pub fn wait(self: *Event) void {
+    pub fn get(self: *Event) void {
         const wake_ptr = memory.ptrCast(os.PVOID, &wake);
         const value_ptr = memory.ptrCast(os.PVOID, &self.value);
         while (@atomicLoad(@typeOf(self.value), &self.value, .Monotonic) == 0)
             _ = os.WaitOnAddress(value_ptr, wake_ptr, @sizeOf(@typeOf(self.value)), os.INFINITE);
     }
 
-    pub fn signal(self: *Event) void {
-        atomic.store(@typeOf(self.value), &self.value, 1, .Acquire);
-        os.WakeByAddressSingle();
+    pub fn set(self: *Event) void {
+        if (@atomicRmw(@typeOf(self.value), &self.value, .Xchg, 1, .Acquire) == 0)
+            os.WakeByAddressSingle();
+    }
+
+    pub fn is_set(self: *Event) bool {
+        return @atomicLoad(@typeOf(self.value), &self.value, .Monotonic) == 1;
     }
 
     pub fn reset(self: *Event) void {

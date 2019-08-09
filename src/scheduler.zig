@@ -1,23 +1,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const sync = @import("sync.zig");
-const thread = @import("thread.zig");
-const atomic = @import("atomic.zig");
-const heap = @import("heap.zig").Heap;
+const os = struct {
+    pub const sync = @import("sync.zig");
+    pub const thread = @import("thread.zig");
+    pub const atomic = @import("atomic.zig");
+    pub const heap = @import("heap.zig").Heap;
+};
 
 pub const Config = struct {
     max_workers: usize,
 
     pub fn default() Config {
         return Config {
-            .max_workers = std.Thread.cpuCount() catch 1,
+            .max_workers = os.thread.cpuCount(),
         };
     }
 };  
 
 pub const System = struct {
-    heap: Heap,
+    heap: os.Heap,
 
     pub fn run(self: *System, config: Config, comptime function: var, args: ...) !void {
         self.heap.init();
@@ -39,23 +41,23 @@ pub const System = struct {
 
 pub const Worker = struct {
     pub var all: []Worker = undefined;
-    pub var idle: atomic.Queue(Worker, "next") = undefined;
+    pub var num_idle: usize = undefined;
+    pub var idle: os.atomic.Queue(Worker, "next") = undefined;
 
-    pub fn init(heap: *Heap, config: Config) !void {
-        all = try self.heap.allocator.alloc(switch (config.max_workers) {
-            0 => thread.cpuCount(),
-            else => max_workers,
-        });
-
+    pub fn init(heap: *os.Heap, config: Config) !void {
         idle.init();
+        num_idle = 0;
+        all = try heap.allocator.alloc(std.math.max(1, config.max_workers));
+
         for (all) |*worker| {
             worker.heap.init();
             worker.status = .Idle;
+            num_idle += 1;
             idle.push(worker);
         }
     }
 
-    pub fn deinit(heap: *Heap) void {
+    pub fn deinit(heap: *os.Heap) void {
         for (all) |*worker|
             worker.heap.deinit();
         heap.allocator.free(all);
@@ -64,7 +66,7 @@ pub const Worker = struct {
 
     status: Status,
     next: ?*Worker,
-    heap: Heap,
+    heap: os.Heap,
     thread: *Thread,
     run_queue: TaskQueue,
 
@@ -129,7 +131,7 @@ pub const Worker = struct {
             while (true) {
                 // fast path, add one task to the queue
                 const head = @atomicLoad(u32, &self.head, .Acquire);
-                const tail = @atomicLoad(u32, &self.tail, .Monotonic);
+                const tail = self.tail;
                 if (head - tail < self.tasks.len) {
                     self.tasks[tail % self.tasks.len] = task;
                     atomic.store(u32, &self.tail, tail + 1, .Monotonic);
@@ -158,8 +160,8 @@ pub const Thread = struct {
     pub const max = 10 * 1000;
 
     pub var active: usize = undefined;
-    pub var idle: atomic.Queue(Thread, "next") = undefined;
-    pub var cache: atomic.Stack(Thread, "next") = undefined;
+    pub var idle: os.atomic.Queue(Thread, "next") = undefined;
+    pub var cache: os.atomic.Stack(Thread, "next") = undefined;
 
     pub fn init() {
         active = 0;
@@ -170,13 +172,29 @@ pub const Thread = struct {
     next: ?*Thread,
     task: *Task,
     worker: ?*Worker,
-    handle: thread.Handle,
-    event: sync.Event,
+    handle: os.thread.Handle,
+    event: os.sync.Event,
 
     pub fn start(worker: *Worker, task: *Task) !void {
         // try and fetch from idle (running) threads if any
         // try and fetch from cache to not allocate if any
         // allocate a new Thread object to use
+        const new_thread = thread: {
+            if (idle.pop()) |idle_thread| {
+                break :thread idle_thread;
+            } else if (cache.pop()) |cached_thread| {
+                break :thread cached_thread;
+            } else {
+                const fresh_thread = try worker.heap.allocator.init(Thread);
+                fresh_thread.event.init();
+                break :thread fresh_thread;
+            }
+        };
+
+        new_thread.next = null;
+        new_thread.task = task;
+        new_thread.worker = worker;
+
         const this_thread =
             if (idle.pop()) |idle_thread| idle_thread
             else if (cache.pop()) |cached_thread| cached_thread
@@ -194,7 +212,7 @@ pub const Thread = struct {
         if (!this_thread.event.is_set()) {
             this_thread.event.signal();
         } else {
-            try thread.spawn(&this_thread.handle, run, this_thread);
+            try os.thread.spawn(&this_thread.handle, Thread.run, this_thread);
         }
     }
 
@@ -219,10 +237,6 @@ pub const Task = struct {
         Running,
         Completed,
     };
-
-    pub fn spawn(task: *Task, allocator: *std.mem.Allocator, comptime function: var, args: ...) !void {
-        
-    }
 };
 
 

@@ -8,8 +8,8 @@ pub inline fn store(comptime T: type, ptr: *T, value: T, order: builtin.AtomicOr
 
 fn isValidNode(comptime Node: type, comptime Field: []const u8) bool {
     const field = if (@hasField(Node, Field)) @typeOf(@field(Node(undefined), Field)) else return false;
-    const ftype = if (@typeId(field) == .Optional) @typeInfo(field).Optional.child else return false;
-    const ptype = if (@typeId(ftype) == .Pointer) @typeInfo(ftype).Pointer else return false;
+    const ftype = if (@typeId(field) == builtin.TypeId.Optional) @typeInfo(field).Optional.child else return false;
+    const ptype = if (@typeId(ftype) == builtin.TypeId.Pointer) @typeInfo(ftype).Pointer else return false;
     return ptype.size == .One and ptype.child == Node;
 }
 
@@ -22,7 +22,7 @@ pub fn Stack(comptime Node: type, comptime Field: []const u8) type {
             self.top = null;
         }
 
-        pub fn push(self: *Queue, node: *Node) void {
+        pub fn push(self: *@This(), node: *Node) void {
             @fence(.Release);
             store(?*Node, &@field(node, Field), @atomicLoad(?*Node, &self.top, .Monotonic), .Monotonic);
             while (@cmpxchgWeak(?*Node, &self.top, @field(node, Field), node, .Monotonic, .Monotonic)) |new_top| {
@@ -30,7 +30,7 @@ pub fn Stack(comptime Node: type, comptime Field: []const u8) type {
             }
         }
 
-        pub fn pop(self: *Queue) ?*Node {
+        pub fn pop(self: *@This()) ?*Node {
             var top = @atomicLoad(?*Node, &self.top, .Monotonic);
             while (top) |node| {
                 top = @cmpxchgWeak(?*Node, &self.top, top, @field(node, Field), .Monotonic, .Monotonic) 
@@ -49,19 +49,19 @@ pub fn Queue(comptime Node: type, comptime Field: []const u8) type {
         tail: *Node,
         stub: ?*Node,
 
-        pub fn init(self: *Queue) void {
+        pub fn init(self: *@This()) void {
             self.head = @fieldParentPtr(Node, Field, &self.stub);
             self.tail = self.head;
             self.stub = null;
         }
 
-        pub fn push(self: *Queue, node: *Node) void {
+        pub fn push(self: *@This(), node: *Node) void {
             @fence(.Release);
             const previous = @atomicRmw(*Node, &self.head, .Xchg, node, .Monotonic);
             store(?*Node, &@field(previous, Field), node, .Monotonic);
         }
 
-        pub fn pop(self: *Queue) ?*Node {
+        pub fn pop(self: *@This()) ?*Node {
             var tail = @atomicLoad(*Node, &self.tail, .Monotonic);
             while (true) {
                 const next = @atomicLoad(?*Node, &@field(tail, Field), .Monotonic) orelse return null;

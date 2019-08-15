@@ -13,7 +13,7 @@ pub fn build(b: *Builder) void {
         "hello_world",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
-        example.addPackagePath("zio", "zio.zig");
+        example.addPackagePath("ziggo", "ziggo.zig");
         example.setBuildMode(build_mode);
         example_step.dependOn(&example.step);
     }
@@ -28,7 +28,7 @@ pub fn build(b: *Builder) void {
             .ReleaseSmall => "release-small",
         };
 
-        const tests = b.addTest("zio.zig");
+        const tests = b.addTest("ziggo.zig");
         tests.setBuildMode(mode);
         tests.setNamePrefix(mode_str ++ " ");
 

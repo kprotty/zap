@@ -156,7 +156,7 @@ const Pthread = struct {
     const guard_page_size = std.mem.page_size;
 
     pub fn yield() void {
-
+        _ = std.c.pthread_yield();
     }
 
     pub fn sleep(ms: u32) void {
@@ -164,11 +164,20 @@ const Pthread = struct {
     }
 
     pub fn now() u64 {
-        
+        var tv: std.os.system.timeval = undefined;
+        std.debug.assert(std.c.gettimeofday(&tv, null) == 0);
+        return @intCast(usize, (tv.tv_sec / 1000) + (tv.tv_usec * 1000));
     }
 
     pub fn cpuCount() usize {
-        
+        var count: c_int = undefined;
+        var length: usize = @sizeOf(@typeOf(count));
+        const name = if (std.os.darwin.is_the_target) c"hw.logicalcpu" else c"hw.ncpu";
+        std.os.sysctlbynameC(name, &count, &length, null, 0) catch |err| switch (err) {
+            .NameTooLong => unreachable,
+            else => return 1,
+        };
+        return @intCast(usize, count);
     }
 
     pub fn stackSize(comptime function: var) usize {
@@ -214,6 +223,6 @@ const Pthread = struct {
         const thread_id = @typeInfo(@typeInfo(@typeOf(tid)).Pointer.child).Pointer.child;
         stack_offset.* = std.mem.alignForward(guard_page_size + @frameSize(function), std.mem.page_size);
         tid.* = @intToPtr(*thread_id, std.mem.alignForward(stack_offset.*, @alignOf(thread_id)));
-        try std.os.protect(memory[guard_page_size..], os.PROT_READ | os.PROT_WRITE);
+        try std.os.protect(memory[0..guard_page_size], os.PROT_NONE);
     }
 };

@@ -7,7 +7,7 @@ const Backend = switch (builtin.os) {
     else => Pthread,
 };
 
-/// Clock get current time
+/// Clock get current time in milliseconds
 pub const now = Backend.now;
 /// Yield the OS thread
 pub const yield = Backend.yield;
@@ -26,25 +26,30 @@ const Kernel32 = struct {
 };
 
 const LinuxClone = struct {
+    const linux = std.os.linux;
+
     pub fn now() usize {
-        
+        var ts: linux.timespec = undefined;
+        const err = linux.clock_gettime(linux.CLOCK_MONOTONIC, &ts);
+        std.debug.assert(err == 0);
+        return @intCast(usize, (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000));
     }
 
     pub fn yield() void {
-
+        _ = linux.syscall0(linux.SYS_sched_yield);
     }
 
     pub fn cpuCount() usize {
-        
+        return usize(std.os.CPU_COUNT(std.os.sched_getaffinity(0) catch return 1));
     }
 
     pub fn sleep(ms: u32) void {
-
+        return Pthread.sleep(ms);
     }
 
     pub fn stackSize(comptime function: var) usize {
         var stack_size = Pthread.setupStackSize(function, i32);
-        if (std.os.linux.tls.tls_image) |tls_image|
+        if (linux.tls.tls_image) |tls_image|
             stack_size = std.mem.alignForward(stack_size, @alignOf(usize)) + tls_image.alloc_size;
         return std.mem.alignForward(stack_size, std.mem.page_size);
     }
@@ -66,10 +71,10 @@ const LinuxClone = struct {
 
         const memory = stack orelse return error.StackRequired;
         try Pthread.setupStack(memory, function, &tid, &stack_offset);
-        if (std.os.linux.tls.tls_image) |tls_image| {
+        if (linux.tls.tls_image) |tls_image| {
             flags |= std.os.CLONE_TLS;
             const tls_start = memory.len - tls_image.alloc_size;
-            tls_offset = std.os.linux.tls.copyTLS(@ptrToInt(&memory[tls_start));
+            tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_start));
         }
 
         return switch (os.errno(os.linux.clone(Thread.main, stack_offset, flags, @ptrToInt(parameter), tid, tls_offset, tid))) {
@@ -98,7 +103,7 @@ const Pthread = struct {
     }
 
     pub fn sleep(ms: u32) void {
-
+        std.os.nanosleep(ms / 1000, (ms % 1000) * 1000000);
     }
 
     pub fn stackSize(comptime function: var) usize {

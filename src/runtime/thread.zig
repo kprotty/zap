@@ -22,29 +22,94 @@ pub const spawn = Backend.spawn;
 
 
 const Kernel32 = struct {
+    const windows = std.os.windows;
+    var module: ?windows.HANDLE = null;
+    var frequency: u64 = 0;
 
+    extern "kernel32" stdcallcc fn SwitchToThread() windows.BOOL;
+    extern "kernel32" stdcallcc fn GetModuleHandleA(lpModuleName: ?[*]u8) windows.HANDLE;
+    extern "kernel32" stdcallcc fn GetProcessAffinityMask(
+        hProcess: windows.HANDLE,
+        lpProcessAffinityMask: windows.DWORD_PTR,
+        lpSystemAffinityMask: windows.DWORD_PTR,
+    ) windows.BOOL;
+
+    pub fn yield() void {
+        _ = SwitchToThread();
+    }
+
+    pub fn sleep(ms: u32) void {
+        windows.kernel32.Sleep(ms);
+    }
+
+    pub fn now() u64 {
+        if (@atomicLoad(u64, &frequency, .Acquire) == 0) {
+            var frequency_counter: u64 = undefined;
+            if (windows.QueryPerformanceFrequency(&frequency_counter) != windows.TRUE)
+                _ = @atomicRmw(u64, &frequency, .Xchg, frequency_counter, .Release);
+        }
+
+        std.debug.assert(frequency > 0);
+        var performance_count: u64 = undefined;
+        std.debug.assert(windows.QueryPerformanceCounter(&performance_count) == windows.TRUE);
+        return ((performance_count * 1000000) / frequency) / 1000;
+    }
+
+    pub fn cpuCount() usize {
+        var system_mask: windows.DWORD = undefined;
+        var process_mask: windows.DWORD = undefined;
+        
+        if (@atomicLoad(?windows.HANDLE, &module, .Acquire) == null)
+            _ = @atomicRmw(?windows.HANDLE, &module, .Xchg, GetModuleHandleA(null), .Release);
+        if (GetProcessAffinityMask(module_handle.?, &process_mask, &system_mask) != windows.TRUE)
+            return 1;
+        if (process_mask != 0)
+            return usize(@popCount(windows.DWORD, process_mask));
+        
+        var system_info: windows.SYSTEM_INFO = undefined;
+        windows.GetSystemInfo(&system_info);
+        return @intCast(usize, system_info.dwNumberOfProcessors);
+        
+    }
+
+    pub fn stackSize(comptime function: var) usize {
+        return 0; // windows doesnt allow custom thread stacks
+    }
+
+    pub fn spawn(stack: ?[]align(std.mem.page_size) u8, comptime function: var, parameter: var) !void {
+        const Thread = struct {
+            extern fn main(argument: windows.LPVOID) windows.DWORD {
+                const Parameter = @typeOf(parameter);
+                _ = async function(@ptrCast(Parameter, @alignCast(@alignOf(Parameter), argument)));
+                return 0;
+            }
+        };
+
+        const handle = windows.kernel32.CreateThread(null, 64 * 1024, Thread.main, @ptrCast(*c_void, parameter), 0, null)
+            orelse return windows.unexpectedError(windows.kernel32.GetLastError());
+        _ = windows.CloseHandle(handle);
+    }
 };
 
 const LinuxClone = struct {
     const linux = std.os.linux;
 
-    pub fn now() usize {
-        var ts: linux.timespec = undefined;
-        const err = linux.clock_gettime(linux.CLOCK_MONOTONIC, &ts);
-        std.debug.assert(err == 0);
-        return @intCast(usize, (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000));
-    }
-
     pub fn yield() void {
         _ = linux.syscall0(linux.SYS_sched_yield);
     }
 
-    pub fn cpuCount() usize {
-        return usize(std.os.CPU_COUNT(std.os.sched_getaffinity(0) catch return 1));
-    }
-
     pub fn sleep(ms: u32) void {
         return Pthread.sleep(ms);
+    }
+    
+    pub fn now() u64 {
+        var ts: linux.timespec = undefined;
+        std.debug.assert(linux.clock_gettime(linux.CLOCK_MONOTONIC, &ts) == 0);
+        return @intCast(u64, (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000));
+    }
+
+    pub fn cpuCount() usize {
+        return usize(std.os.CPU_COUNT(std.os.sched_getaffinity(0) catch return 1));
     }
 
     pub fn stackSize(comptime function: var) usize {
@@ -90,20 +155,20 @@ const LinuxClone = struct {
 const Pthread = struct {
     const guard_page_size = std.mem.page_size;
 
-    pub fn now() usize {
-        
-    }
-
     pub fn yield() void {
 
     }
 
-    pub fn cpuCount() usize {
+    pub fn sleep(ms: u32) void {
+        std.os.nanosleep(ms / 1000, (ms % 1000) * 1000000);
+    }
+
+    pub fn now() u64 {
         
     }
 
-    pub fn sleep(ms: u32) void {
-        std.os.nanosleep(ms / 1000, (ms % 1000) * 1000000);
+    pub fn cpuCount() usize {
+        
     }
 
     pub fn stackSize(comptime function: var) usize {

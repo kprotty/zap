@@ -20,6 +20,13 @@ pub const stackSize = Backend.stackSize;
 /// Spawn a thread using a function and parameter with stack memory >= `stackSize()`
 pub const spawn = Backend.spawn;
 
+pub fn yieldCpu() void {
+    switch (builtin.arch) {
+        .i386, .x86_64 => asm volatile("pause" ::: "memory"),
+        .arm, .aarch64 => asm volatile("yield"),
+        else => {},
+    }
+}
 
 const Kernel32 = struct {
     const windows = std.os.windows;
@@ -30,8 +37,8 @@ const Kernel32 = struct {
     extern "kernel32" stdcallcc fn GetModuleHandleA(lpModuleName: ?[*]u8) windows.HANDLE;
     extern "kernel32" stdcallcc fn GetProcessAffinityMask(
         hProcess: windows.HANDLE,
-        lpProcessAffinityMask: windows.DWORD_PTR,
-        lpSystemAffinityMask: windows.DWORD_PTR,
+        lpProcessAffinityMask: *windows.DWORD,
+        lpSystemAffinityMask: *windows.DWORD,
     ) windows.BOOL;
 
     pub fn yield() void {
@@ -61,15 +68,14 @@ const Kernel32 = struct {
         
         if (@atomicLoad(?windows.HANDLE, &module, .Acquire) == null)
             _ = @atomicRmw(?windows.HANDLE, &module, .Xchg, GetModuleHandleA(null), .Release);
-        if (GetProcessAffinityMask(module_handle.?, &process_mask, &system_mask) != windows.TRUE)
+        if (GetProcessAffinityMask(module.?, &process_mask, &system_mask) != windows.TRUE)
             return 1;
         if (process_mask != 0)
             return usize(@popCount(windows.DWORD, process_mask));
         
         var system_info: windows.SYSTEM_INFO = undefined;
-        windows.GetSystemInfo(&system_info);
+        windows.kernel32.GetSystemInfo(&system_info);
         return @intCast(usize, system_info.dwNumberOfProcessors);
-        
     }
 
     pub fn stackSize(comptime function: var) usize {
@@ -80,7 +86,7 @@ const Kernel32 = struct {
         const Thread = struct {
             extern fn main(argument: windows.LPVOID) windows.DWORD {
                 const Parameter = @typeOf(parameter);
-                _ = async function(@ptrCast(Parameter, @alignCast(@alignOf(Parameter), argument)));
+                _ = function(@ptrCast(Parameter, @alignCast(@alignOf(Parameter), argument)));
                 return 0;
             }
         };
@@ -122,7 +128,7 @@ const LinuxClone = struct {
     pub fn spawn(stack: ?[]align(std.mem.page_size) u8, comptime function: var, parameter: var) !void {
         const Thread = struct {
             extern fn main(argument: usize) u8 {
-                _ = async function(@intToPtr(@typeOf(parameter), argument));
+                _ = function(@intToPtr(@typeOf(parameter), argument));
                 return 0;
             }
         };
@@ -139,7 +145,7 @@ const LinuxClone = struct {
         if (linux.tls.tls_image) |tls_image| {
             flags |= std.os.CLONE_TLS;
             const tls_start = memory.len - tls_image.alloc_size;
-            tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_start));
+            tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_start]));
         }
 
         return switch (os.errno(os.linux.clone(Thread.main, stack_offset, flags, @ptrToInt(parameter), tid, tls_offset, tid))) {
@@ -188,7 +194,7 @@ const Pthread = struct {
         const Thread = struct {
             extern fn main(argument: ?*c_void) ?*c_void {
                 const Parameter = @typeOf(parameter);
-                _ = async function(@ptrCast(Parameter, @alignCast(@alignOf(Parameter), argument)));
+                _ = function(@ptrCast(Parameter, @alignCast(@alignOf(Parameter), argument)));
                 return null;
             }
         };

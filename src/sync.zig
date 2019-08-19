@@ -15,11 +15,7 @@ pub fn AtomicStack(comptime Node: type, comptime Field: []const u8) type {
             self.count = 0;
             self.top = null;
         }
-
-        pub fn size(self: *@This()) usize {
-            return @atomicLoad(usize, &self.count, .Acquire);
-        }
-
+        
         pub fn put(self: *@This(), node: *Node) void {
             _ = @atomicRmw(usize, &self.count, .Add, 1, .Release);
             @field(node, Field) = @atomicLoad(?*Node, &self.top, .Monotonic);

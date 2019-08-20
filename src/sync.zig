@@ -91,7 +91,7 @@ pub const Futex = switch (builtin.os) {
 
 const WaitAddress = struct {
     const windows = std.os.windows;
-    const Value = usize;
+    pub const Value = usize;
 
     value: Value,
 
@@ -125,7 +125,28 @@ const WaitAddress = struct {
 };
 
 const LinuxFutex = struct {
+    const linux = std.os.linux;
+    pub const Value = i32;
 
+    value: Value,
+
+    pub fn init(self: *@This(), value: Value) void {
+        self.value = value;
+    }
+
+    pub fn wake(self: *@This(), everyone: bool) void {
+        const OP = linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG;
+        _ = linux.futex_wake(&self.value, OP, self.value);
+    }
+
+    pub fn wait(self: *@This(), expect: Value, timeout_ms: ?usize) void {
+        const OP = linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG;
+        var timeout = timespec {
+            .tv_sec = 0,
+            .tv_nsec = (timeout_ms orelse 0) * 1000000,
+        };
+        _ = linux.futex_wait(&self.value, OP, value, if (timeout_ms == null) null else &timeout);
+    }
 };
 
 const PthreadCond = struct {

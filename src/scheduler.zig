@@ -9,7 +9,7 @@ const os = struct {
 pub const Config = struct {
     max_workers: ?usize,
     max_threads: ?usize,
-    allocator: *std.mem.Allocator,
+    allocator: ?*std.mem.Allocator,
 
     pub fn default() Config {
         return Config {
@@ -22,146 +22,152 @@ pub const Config = struct {
 
 pub var system: System = undefined;
 pub const System = struct {
-    lock: os.sync.Mutex,
     allocator: *std.mem.Allocator,
-
-    workers: []Worker,
-    run_queue: Worker.GlobalQueue,
-    idle_workers: os.sync.AtomicStack(Worker, "link"),
+    workers: ?[]Worker,
+    main_worker: Worker,
+    run_queue: Worker.GlobalTaskQueue,
 
     max_threads: usize,
-    active_threads: usize,
-    spinning_threads: usize,
-    monitor_thread: ?Thread,
+    main_thread: Thread,
+    live_threads: os.sync.Futex,
     idle_threads: os.sync.AtomicStack(Thread, "link"),
 
-    pub inline fn isUniCore(self: *@This()) bool {
-        return builtin.single_threaded or self.workers.len == 1;
-    }
+    main_task: Task,
+    live_tasks: usize,
 
     pub fn run(self: *@This(), config: Config, comptime function: var, args: ...) !void {
-        // init thread info
+        // initialize thread data
         self.idle_threads.init();
-        self.active_threads = 0;
-        self.spinning_threads = 0;
-        self.monitor_thread = null;
-        self.max_threads = if (builtin.single_threaded) 1 else std.math.max(1, config.max_threads orelse (1 << 16));
+        self.live_threads.init(0);
+        self.max_threads = if (builtin.single_threaded) 1 else std.math.max(1, config.max_threads orelse 1 << 16);
         
-        // init worker info
-        self.lock.init();
+        // initialize worker data
         self.run_queue.init();
-        self.idle_workers.init();
-        self.allocator = config.allocator orelse std.heap.direct_allocator; // TODO: use better default
-
-        // allocate & initialize worker array using SmallVec-like optimization
-        var stack_workers: [1]Worker = undefined;
+        self.allocator = config.allocator orelse std.heap.direct_allocator; // TODO: find better default
         const num_workers = std.math.min(self.max_threads, std.math.max(1, config.max_workers orelse os.thread.cpuCount()));
-        self.workers = if (builtin.single_threaded or num_workers == 1) stack_workers[0..] else try self.allocator.alloc(Worker, num_workers); 
-        defer { if (self.workers.len > 1) self.allocator.free(self.workers); }
-        for (self.workers) |*worker| {
-            worker.init();
-            self.idle_workers.put(worker);
-        }
+        self.workers = if (num_workers > 1) try self.allocator.alloc(Worker, num_workers) else null;
+        defer if (self.workers) |workers| self.allocator.free(workers);
+        if (self.workers) |workers| for (workers) |*w| w.init();
+        self.main_worker.init();
 
-        // start the main_task on the main_thread
-        var main_thread: Thread = undefined;
-        var main_task = Task { .link = null, .frame = undefined };
-        main_thread.init(self.idle_workers.get().?, &main_task);
-        Thread.current = &main_thread;
-        main_task.frame = async function(args);
-        main_thread.run();
+        // register the current task on the main_thread
+        Thread.current = &self.main_thread;
+        defer Thread.current = null;
+        var task_memory: [Task.byteSize(function)]u8 align(Task.alignment(function)) = undefined;
+        const main_task = try Task.spawn(task_memory[0..], function, args);
+        self.main_thread.run(&self.main_worker, main_task);
+
+        // wait for all threads to finish
+        while (self.idle_threads.get()) |idle_thread| {
+            _ = @atomicRmw(usize, &self.live_threads.value, .Add, 1, .Release);
+            idle_thread.futex.wake(false);
+        }
+        while (@atomicLoad(usize, &self.live_threads.value, .Acquire) > 0)
+            self.live_threads.wait(self.live_threads.value, null);
     }
 };
 
 pub const Task = struct {
     link: ?*Task,
     frame: anyframe,
+    heap_allocated: bool,
+
+    pub fn alignment(comptime function: var) usize {
+        return @alignOf(@Frame(Spawn(function).func));
+    }
+
+    pub fn byteSize(comptime function: var) usize {
+        return std.mem.alignForward(@sizeOf(@This()), alignment(function)) + @frameSize(Spawn(function).func);
+    }
+
+    pub fn spawn(memory: ?[]align(alignment(function)) u8, comptime function: var, args: ...) !*Task {
+        var heap_allocated = false;
+        var task_memory: []align(alignment(function)) u8 = undefined;
+        if (memory) |user_memory| {
+            task_memory = user_memory;
+        } else {
+            task_memory = try system.allocator.alignedAlloc(u8, alignment(function), byteSize(function));
+            heap_allocated = true;
+        }
+
+        const frame_memory = task_memory[0..std.mem.alignForward(@sizeOf(@This()), alignment(function))];
+        const task = @ptrCast(*Task, @alignCast(@alignOf(*Task), task_memory.ptr));
+        if (task_memory.len < byteSize(function))
+            return std.mem.Allocator.Error.OutOfMemory;
+
+        task.frame = @asyncCall(frame_memory, {}, Spawn(function).func, task, args);
+        task.heap_allocated = heap_allocated;
+        task.link = null;
+        return task;
+    }
+
+    fn Spawn(comptime function: var) type {
+        return struct {
+            fn func(task: *Task, args: ...) void {
+                suspend;
+                _ = await function(args);
+                suspend {
+                    if (task.heap_allocated)
+                        system.allocator.free(@ptrCast([*]u8, task)[0..byteSize(function)]);
+                }
+            }
+        };
+    }
 };
 
 pub const Thread = struct {
-    pub threadlocal var current: ?*Thread = null;
+    pub threadlocal var current: ?*Thread = undefined;
 
-    link: ?*Thread,
-    task: *Task,
+    link: ?*@This(),
+    task: ?*Task,
     worker: *Worker,
+    futex: os.sync.Futex,
 
-    pub fn init(self: *@This(), worker: *Worker, task: *Task) void {
+    pub fn init(self: *@This(), worker: *Worker) void {
         self.link = null;
-        self.task = task;
+        self.task = null;
+        self.futex.init(0);
         self.worker = worker;
+        self.worker.thread = self;
+        _ = @atomicRmw(usize, &self.live_threads.value, .Add, 1, .Release);
     }
 
-    pub fn run(self: *@This()) void {
-        current = self;
-        var inherit_time: bool = undefined;
+    pub fn run(self: *@This(), worker: *Worker, task: *Task) void {
+        self.init(worker);
+        self.worker.run_queue.put(task);
+        
+        // TODO: run worker's tasks
 
-        while (self.findRunnable(&inherit_time)) |task| {
-            self.task = task;
-            resume task.frame;
-        }
+        if (@atomicRmw(usize, &system.live_threads.value, .Sub, 1, .Release) == 1)
+            system.live_threads.wake(false);
     }
-
-    fn findRunnable(self: *@This(), inherit_time: *bool) ?*Task {
-        while (true) {
-            // local run queue
-            if (self.worker.run_queue.get(inherit_time)) |task|
-                return task;
-            inherit_time.* = false;
-
-            // global run queue
-            if (system.run_queue.get()) |task|
-                return task;
-
-            // netpoll(non blocking)
-
-            // Prepare to steal from other workers.
-            // Returns null if either max_workers=1 or all other workers are idle.
-            // New tasks can be added from syscall stealing, network polling or timers.
-            // None submit tasks to the local run_queue of workers, so no point in stealing
-            const num_workers = system.workers.len;
-            if (@atomicLoad(usize, &system.idle_workers.count, .Acquire) == num_workers - 1)
-                return null;
-
-            // If number of spinning threads >= number of busy workers, block.
-            // This is to prevent excessive CPU consumptions on max_workers > 1 with low parallelism
-            const idle_workers = @atomicLoad(usize, &system.idle_workers.count, .Acquire);
-            const spinning_threads = @atomicLoad(usize, &system.spinning_threads, .Monotonic);
-            if (2 * spinning_threads >= num_workers - idle_workers)
-                return null;
-
-            // Start spinning and try to steal tasks from other Workers
-            _ = @atomicRmw(usize, &system.spinning_threads, .Add, 1, .AcqRel);
-            // for x in steal
-        }
 };
 
 pub const Worker = struct {
+    thread: ?*Thread,
+    run_queue: LocalTaskQueue,
 
-    link: ?*Worker,
-    run_queue: LocalQueue,
+    pub fn init(self: *@This()) void {
+        self.thread = null;
+        self.run_queue.init();
+    }
 
-    pub const LocalQueue = struct {
-        head: usize,
-        tail: usize,
-        next: ?*Task,
+    pub const LocalTaskQueue = struct {
+        head: u32,
+        tail: u32,
         tasks: [256]*Task,
 
         pub fn init(self: *@This()) void {
             self.head = 0;
             self.tail = 0;
-            self.next = null;
         }
 
-        pub fn isEmpty(self: *@This()) bool {
-            return false; // TODO
-        }
+        pub fn put(self: *@This(), task: *Task) void {
 
-        pub fn get(self: *@This(), inherit_time: *bool) ?*Task {
-            return null; // TODO
         }
     };
 
-    pub const GlobalQueue = struct {
+    pub const GlobalTaskQueue = struct {
         head: ?*Task,
         tail: ?*Task,
         count: usize,
@@ -172,13 +178,6 @@ pub const Worker = struct {
             self.head = null;
             self.tail = null;
             self.lock.init();
-        }
-
-        pub fn get(self: *@This()) ?*Task {
-            if (self.count == 0) return null;
-            self.lock.acquire();
-            defer self.lock.release();
-
         }
     };
 };

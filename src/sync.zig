@@ -4,7 +4,7 @@ const thread = @import("thread.zig");
 const scheduler = @import("scheduler.zig");
 
 pub fn AtomicStack(comptime Node: type, comptime Field: []const u8) type {
-    const field_type = @typeInfo(@typeInfo(@field(Node(undefined), Field)).Optional.child).Pointer;
+    const field_type = @typeInfo(@typeInfo(@typeOf(@field(Node(undefined), Field))).Optional.child).Pointer;
     comptime std.debug.assert(field_type.size == .One and field_type.child == Node);
 
     return struct {
@@ -14,6 +14,10 @@ pub fn AtomicStack(comptime Node: type, comptime Field: []const u8) type {
         pub fn init(self: *@This()) void {
             self.count = 0;
             self.top = null;
+        }
+
+        pub fn size(self: *@This()) usize {
+            return @atomicLoad(usize, &self.count, .Acquire);
         }
         
         pub fn put(self: *@This(), node: *Node) void {
@@ -79,7 +83,7 @@ pub const Mutex = struct {
     }
 };
 
-const Futex = switch (builtin.os) {
+pub const Futex = switch (builtin.os) {
     .windows => WaitAddress,
     .linux => if (builtin.link_libc) PthreadCond else LinuxFutex,
     else => PthreadCond,
@@ -87,7 +91,9 @@ const Futex = switch (builtin.os) {
 
 const WaitAddress = struct {
     const windows = std.os.windows;
-    value: u32,
+    const Value = usize;
+
+    value: Value,
 
     extern "Synchronization" stdcallcc fn WakeByAddressSingle(Address: windows.PVOID) void;
     extern "Synchronization" stdcallcc fn WakeByAddressAll(Address: windows.PVOID) void;
@@ -98,17 +104,16 @@ const WaitAddress = struct {
         dwMilliseconds: windows.DWORD,
     ) windows.BOOL;
 
-    pub fn init(self: *@This(), value: u32) void {
+    pub fn init(self: *@This(), value: Value) void {
         self.value = value;
     }
 
     pub fn wake(self: *@This(), everyone: bool) void {
         const address = @ptrCast(windows.PVOID, &self.value);
-        if (everyone) WakeByAddressAll(address)
-        else WakeByAddressSingle(address);
+        if (everyone) WakeByAddressAll(address) else WakeByAddressSingle(address);
     }
 
-    pub fn wait(self: *@This(), expect: u32, timeout_ms: ?usize) void {
+    pub fn wait(self: *@This(), expect: Value, timeout_ms: ?usize) void {
         var expected = expect;
         _ = WaitOnAddress(
             @ptrCast(windows.PVOID, &self.value),

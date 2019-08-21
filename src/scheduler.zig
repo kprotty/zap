@@ -29,11 +29,10 @@ pub const System = struct {
 
     max_threads: usize,
     main_thread: Thread,
-    live_threads: os.sync.Futex,
     idle_threads: os.sync.AtomicStack(Thread, "link"),
 
     main_task: Task,
-    live_tasks: usize,
+    live_tasks: os.sync.Futex,
 
     pub fn run(self: *@This(), config: Config, comptime function: var, args: ...) !void {
         // initialize thread data
@@ -53,66 +52,17 @@ pub const System = struct {
         // register the current task on the main_thread
         Thread.current = &self.main_thread;
         defer Thread.current = null;
-        var task_memory: [Task.byteSize(function)]u8 align(Task.alignment(function)) = undefined;
-        const main_task = try Task.spawn(task_memory[0..], function, args);
-        self.main_thread.run(&self.main_worker, main_task);
-
-        // wait for all threads to finish
-        while (self.idle_threads.get()) |idle_thread| {
-            _ = @atomicRmw(usize, &self.live_threads.value, .Add, 1, .Release);
-            idle_thread.futex.wake(false);
-        }
-        while (@atomicLoad(usize, &self.live_threads.value, .Acquire) > 0)
-            self.live_threads.wait(self.live_threads.value, null);
+        // TODO
     }
 };
 
 pub const Task = struct {
+    id: u32,
+    delay: u32,
     link: ?*Task,
+    next: ?*Task,
+    prev: ?*Task,
     frame: anyframe,
-    heap_allocated: bool,
-
-    pub fn alignment(comptime function: var) usize {
-        return @alignOf(@Frame(Spawn(function).func));
-    }
-
-    pub fn byteSize(comptime function: var) usize {
-        return std.mem.alignForward(@sizeOf(@This()), alignment(function)) + @frameSize(Spawn(function).func);
-    }
-
-    pub fn spawn(memory: ?[]align(alignment(function)) u8, comptime function: var, args: ...) !*Task {
-        var heap_allocated = false;
-        var task_memory: []align(alignment(function)) u8 = undefined;
-        if (memory) |user_memory| {
-            task_memory = user_memory;
-        } else {
-            task_memory = try system.allocator.alignedAlloc(u8, alignment(function), byteSize(function));
-            heap_allocated = true;
-        }
-
-        const frame_memory = task_memory[0..std.mem.alignForward(@sizeOf(@This()), alignment(function))];
-        const task = @ptrCast(*Task, @alignCast(@alignOf(*Task), task_memory.ptr));
-        if (task_memory.len < byteSize(function))
-            return std.mem.Allocator.Error.OutOfMemory;
-
-        task.frame = @asyncCall(frame_memory, {}, Spawn(function).func, task, args);
-        task.heap_allocated = heap_allocated;
-        task.link = null;
-        return task;
-    }
-
-    fn Spawn(comptime function: var) type {
-        return struct {
-            fn func(task: *Task, args: ...) void {
-                suspend;
-                _ = await function(args);
-                suspend {
-                    if (task.heap_allocated)
-                        system.allocator.free(@ptrCast([*]u8, task)[0..byteSize(function)]);
-                }
-            }
-        };
-    }
 };
 
 pub const Thread = struct {
@@ -129,7 +79,6 @@ pub const Thread = struct {
         self.futex.init(0);
         self.worker = worker;
         self.worker.thread = self;
-        _ = @atomicRmw(usize, &self.live_threads.value, .Add, 1, .Release);
     }
 
     pub fn run(self: *@This(), worker: *Worker, task: *Task) void {
@@ -137,15 +86,13 @@ pub const Thread = struct {
         self.worker.run_queue.put(task);
         
         // TODO: run worker's tasks
-
-        if (@atomicRmw(usize, &system.live_threads.value, .Sub, 1, .Release) == 1)
-            system.live_threads.wake(false);
     }
 };
 
 pub const Worker = struct {
     thread: ?*Thread,
     run_queue: LocalTaskQueue,
+    delayed_queue: DelayedQueue,
 
     pub fn init(self: *@This()) void {
         self.thread = null;
@@ -180,4 +127,69 @@ pub const Worker = struct {
             self.lock.init();
         }
     };
+
+    pub const DelayedQueue = struct {
+        top: ?*Task,
+
+        pub fn init(self: *@This()) void {
+            self.top = null;
+        }
+
+        pub fn peek(self: *@This()) ?*Task {
+            return self.top;
+        }
+
+        pub fn put(self: *@This(), task: *Task) void {
+            task.link = null;
+            task.next = null;
+            task.prev = null;
+            self.top = if (self.top) |top| merge(task, top) else task;
+        }
+
+        pub fn get(self: *@This()) ?*Task {
+            const top = self.top orelse return null;
+            if (top.link) |link| {
+                link.prev = null;
+                self.top = mergeLeft(mergeRight(link));
+            } else self.top = null;
+            return top;
+        }
+
+        fn mergeLeft(link: *Task) *Task {
+            var top = link.prev;
+            var task = link;
+            while (top) |top_task| {
+                task = merge(top_task, task);
+                top = task.prev;
+            }
+            return task;
+        }
+
+        fn mergeRight(link: *Task) *Task {
+            var top = link;
+            var task = link;
+            while (top) |top_task| {
+                task = merge(top_task, top_task.next orelse return top_task);
+                top = task.next;
+            }
+            return task;
+        }
+
+        fn merge(left: *Task, right: *Task) *Task {
+            var l = left;
+            var r = right;
+            if (l.state >= r.state) {
+                const temp = l;
+                l = r;
+                r = temp;
+            }
+            if (l.link) |link| link.prev = r;
+            if (r.link) |link| link.prev = l;
+            l.next = r.next;
+            r.next = l.link;
+            l.link = r;
+            r.prev = l;
+            return l;
+        }
+    }
 };

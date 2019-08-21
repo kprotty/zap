@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const os = struct {
+    pub const io = @import("io.zig");
     pub const sync = @import("sync.zig");
     pub const thread = @import("thread.zig");
 };
@@ -20,9 +21,14 @@ pub const Config = struct {
     }
 };
 
+// note: Store nodes on the task stack itself for submission
+// note: file per os rewrite. Fixed fs thread limit also
+// note: dont take in an allocator, use mmap/virtualmalloc it all 
 pub var system: System = undefined;
 pub const System = struct {
     allocator: *std.mem.Allocator,
+    selector: os.io.Selector,
+
     workers: ?[]Worker,
     main_worker: Worker,
     run_queue: Worker.GlobalTaskQueue,
@@ -128,6 +134,7 @@ pub const Worker = struct {
         }
     };
 
+    /// Pairing heap: https://github.com/sray256/pairing-heap/blob/master/heap.c
     pub const DelayedQueue = struct {
         top: ?*Task,
 

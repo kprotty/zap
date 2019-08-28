@@ -73,38 +73,50 @@ pub const Socket = switch (builtin.os) {
     },
     else => struct {
         fd: i32,
-        stream: Duplex,
+        events: Duplex,
 
         pub const Readable   = u32(0b001);
         pub const Writeable  = u32(0b010);
         pub const Disposable = u32(0b100);
 
         pub const Duplex = struct {
-            input: Channel,
-            output: Channel,
+            input: Event,
+            output: Event,
 
-            pub fn poll(self: *@This(), flags: u32, data: usize) !?*Task {
-                const read_task = if ((flags & Readable) != 0) try self.output.poll(flags, data) else null;
-                const write_task = if ((flags & Writable) != 0) try self.input.poll(flags, data) else null;
-                if (write_task) |task| task.link = read_task;
+            pub fn signal(self: *@This(), flags: u32, data: usize) !?*Task {
+                const write_task = if ((flags & Writeable) != 0) try self.input.signal(flags, data) else null;
+                const read_task = if ((flags & Readable) != 0) try self.output.signal(flags, data) else null;
                 return write_task orelse read_task;
             }
         };
 
-        pub const Channel = struct {
+        pub const Event = struct {
+            // init with 0
             state: usize,
-            
-            pub fn poll(self: *@This(), flags: u32, data: usize) !?*Task {
-                // swaps, uses .Release
+
+            pub async wait(self: *@This()) usize {
+                // if do_io: io() and retry:
+                //   v <- load(state, acquire)
+                //   if (v & 1) goto do_io(v >> 1);
+                //   if (v -> W) bad: panic(contended io)
+                //   cas(state, v, this, acquire):
+                //     & 1 -> goto do_io(^ >> 1);
+                //     W   -> goto bad (another worker called wait - contended)
+                //     0   -> unreachable (signal or wait doesnt set to 0)
+                //   suspend;
             }
 
-            pub fn recv(self: *@This()) usize {
-                // suspends, uses .Acquire
+            pub fn signal(self: *@This(), flags: u32, data: usize) !?*Task {
+                // v <- (data << 1) & 1
+                // swap(state, v, release):
+                //  & 1 -> panic(event not consumed)
+                //  0   -> nothing
+                //  W   -> return W
             }
         };
 
         pub fn init(self: *@This(), ) !void {
-
+            // register 
         }
     };
 };

@@ -46,9 +46,10 @@ pub const Poller = switch (builtin.os) {
                 if ((event.flags & (os.EV_EOF | os.EV_ERROR)) != 0)
                     flags |= Socket.Disposable;
 
+                // first bit set - duplex event
                 if (switch (event.udata & 1) {
-                    1 => try @intToPtr(*Socket.Duplex, event.udata & ~usize(1)).poll(flags, event.data),
-                    else => try @intToPtr(*Socket.Channel, event.udata).poll(flags, event.data),
+                    1 => try @intToPtr(*Socket.Duplex, event.udata & ~usize(1)).signal(flags, event.data),
+                    else => try @intToPtr(*Socket.Event, event.udata).signal(flags, event.data),
                 }) |task| {
                     task.link = task_list;
                     task_list = task;
@@ -99,19 +100,22 @@ pub const Socket = switch (builtin.os) {
                 //   v <- load(state, acquire)
                 //   if (v & 1) goto do_io(v >> 1);
                 //   if (v -> W) bad: panic(contended io)
+                //   if (v -> error) return error
                 //   cas(state, v, this, acquire):
                 //     & 1 -> goto do_io(^ >> 1);
+                //     error -> return error
                 //     W   -> goto bad (another worker called wait - contended)
                 //     0   -> unreachable (signal or wait doesnt set to 0)
                 //   suspend;
             }
 
             pub fn signal(self: *@This(), flags: u32, data: usize) !?*Task {
-                // v <- (data << 1) & 1
+                // v <- error | (data << 1) & 1
                 // swap(state, v, release):
                 //  & 1 -> panic(event not consumed)
                 //  0   -> nothing
                 //  W   -> return W
+                //  error -> unreachable (wait doesnt set error)
             }
         };
 

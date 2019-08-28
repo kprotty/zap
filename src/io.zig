@@ -9,41 +9,15 @@ pub const backend = switch (builtin.os) {
 };
 
 const Linux = struct {
-    pub const Handle = i32;
+    pub const Handle = Posix.Handle;
+    pub const Buffer = Posix.Buffer;
 
-    pub const Buffer = extern struct {
-        inner: system.iovec,
-
-        pub fn from(buffer: []const u8) ?@This() {
-            // arbitrary limit to return optional like Windows, 
-            /// but you probably shouldnt be doing io on terrabytes anyway ;-)
-            if (buffer.len == std.math.maxInt(usize))
-                return null;
-            const iovec = system.iovec { .iov_base = buffer.ptr, .iov_len = buffer.len };
-            return @This() { .inner = iovec };
-        }
-
-        pub fn to(self: @This()) []u8 {
-            return self.inner.iov_base[0..self.inner.iov_len];
-        }
-    };
-
-    pub const RequestToken = extern struct {
-        // need something here as its zeroed on start of IO operation
-        inner: u1,
-
-        // returns null to signify that the action should be retried to obtain the result since readiness based
-        pub fn getResult(self: @This()) ?usize {
-            return null;
-        }
-    };
-
-    const Selector = struct {
+    pub const Selector = struct {
         epoll_fd: Handle,
         event_fd: Handle,
 
         pub fn init(self: *@This()) !void {
-            self.event_fd = try system.eventfd(0, system.EFD_NONBLOCK);
+            self.event_fd = try system.eventfd(0, system.EFD_CLOEXEC | system.EFD_NONBLOCK);
             self.epoll_fd = try system.epoll_create1(system.EPOLL_CLOEXEC);
             try self.register(self.event_fd, self);
         }
@@ -68,7 +42,7 @@ const Linux = struct {
         }
 
         pub fn poll(self: *@This(), events: []Event, timeout_ms: ?u32) ![]Event {
-            // that in the system of the stdlib doesnt return error so have to do it manually
+            // epoll_wait in std.os doesnt return error so have to do it manually
             const num_events = @intCast(i32, events.len);
             const timeout = @bitCast(i32, timeout_ms orelse -1);
             while (true) {
@@ -91,6 +65,10 @@ const Linux = struct {
                 return self.inner.data.ptr;
             }
 
+            pub fn getTransffered(self: @This()) ?usize {
+                return null;
+            }
+
             pub fn isReadable(self: @This()) bool {
                 return (self.inner.events & system.EPOLLIN) != 0;
             }
@@ -101,6 +79,100 @@ const Linux = struct {
 
             pub fn isError(self: @This()) bool {
                 return (self.inner.events & (system.EPOLLERR | system.EPOLLHUP | system.EPOLLRDHUP)) != 0;
+            }
+        };
+    };
+};
+
+const Posix = struct {
+    pub const Handle = i32;
+
+    pub const Buffer = extern struct {
+        inner: system.iovec,
+
+        pub fn from(buffer: []const u8) ?@This() {
+            // arbitrary limit to return optional like Windows, 
+            /// but you probably shouldnt be doing io on terrabytes anyway ;-)
+            if (buffer.len == std.math.maxInt(usize))
+                return null;
+            const iovec = system.iovec { .iov_base = buffer.ptr, .iov_len = buffer.len };
+            return @This() { .inner = iovec };
+        }
+
+        pub fn to(self: @This()) []u8 {
+            return self.inner.iov_base[0..self.inner.iov_len];
+        }
+    };
+
+    pub const Selector = struct {
+        kqueue: Handle,
+
+        pub fn init(self: *@This()) !void {
+            self.kqueue = try system.kqueue();
+        }
+
+        pub fn deinit(self: *@This()) void {
+           system.close(self.kqueue);
+        }
+
+        pub fn register(self: *@This(), handle: Handle, token: usize) !void {
+            const empty_events = ([*]system.Kevent)(undefined)[0..0];
+            var events: [2]system.Kevent = undefined;
+            events[0].data = 0;
+            events[0].fflags = 0;
+            events[0].udata = token;
+            events[0].filter = system.EVFILT_READ;
+            events[0].flags = system.EV_ADD | system.EV_CLEAR;
+            events[1] = events[0];
+            events[1].filter = system.EVFILT_WRITE;
+            _ = try system.kevent(self.kqueue, events[0..], empty_events, null);
+        }
+
+        pub fn notify(self: *@This(), token: usize) !void {
+            const empty_events = ([*]system.Kevent)(undefined)[0..0];
+            var events: [1]system.Kevent = undefined;
+            events[0].data = 0;
+            events[0].fflags = 0;
+            events[0].udata = token;
+            events[0].filter = system.EVFILT_READ;
+            events[0].flags = system.EV_ONESHOT;
+            _ = try system.kevent(self.kqueue, events[0..], empty_events, null);
+        }
+
+        pub fn poll(self: *@This(), events: []Event, timeout_ms: ?u32) ![]Event {
+            var ts: system.timespec = undefined;
+            var timeout: ?*const system.timespec = null;
+            if (timeout_ms) |ms| {
+                timeout = &ts;
+                ts.tv_sec = @intCast(isize, ms / 1000);
+                ts.tv_nsec = @intCast(isize, (ms % 1000) * 1000000);
+            }
+            const empty_events = ([*]system.Kevent)(undefined)[0..0];
+            const num_events_found = try system.kevent(self.kqueue, empty_events, events, timeout);
+            return events[0..num_events_found];
+        }
+
+        pub const Event = packed struct {
+            inner: system.Kevent,
+            
+            pub fn getToken(self: @This()) usize {
+                return self.inner.udata;
+            }
+
+            pub fn getTransffered(self: @This()) ?usize {
+                return self.inner.data;
+            }
+
+            pub fn isReadable(self: @This()) bool {
+                return (self.inner.flags & system.EVFILT_READ) != 0;
+            }
+
+            pub fn isWriteable(self: @This()) bool {
+                return (self.inner.flags & system.EVFILT_WRITE) != 0;
+            }
+
+            pub fn isError(self: @This()) bool {
+                return (self.flags.events & (system.EV_EOF | system.EV_ERROR)) != 0;
             }
         };
     };
@@ -126,15 +198,6 @@ const Windows = {
 
         pub fn to(self: @This()) []u8 {
             return self.inner.buf[0..self.inner.len];
-        }
-    };
-
-    pub const RequestToken = extern struct {
-        inner: system.OVERLAPPED,
-
-        // should return the dwNumberOfBytesTransferred from the event
-        pub fn getResult(self: @This()) ?usize {
-            return @ptrToInt(self.inner.InternalHigh orelse return null);
         }
     };
 
@@ -170,20 +233,15 @@ const Windows = {
                 timeout_ms orelse system.INFINITE,
                 system.FALSE,
             )) {
-                // events were found. Store the bytes transferred in InternalHigh since the kernel wont be touching that soon
-                system.TRUE => found_events: {
-                    const new_events = events[0..num_events_found];
-                    for (new_events) |*event|
-                        event.lpOverlapped.InternalHigh = @intCast(system.ULONG_PTR, event.dwNumberOfBytesTransferred);
-                    break :found_events new_events;
-                },
+                system.TRUE => events[0..num_events_found],
                 // unknown error since it doesnt really say what to handle in the docs ;/
                 else => system.unexpectedError(system.kernel32.GetLastError()),
             };
         }
 
-        pub const Event = extern struct {
+        pub const Event = packed struct {
             // store the Readable/Writable propery in OVERLAPPED.hEvent and hope the kernel doesnt touch it
+            // TODO: replace with Token.data check for same lpOverlapped
             inner: OVERLAPPED_ENTRY,
             
             pub fn getToken(self: @This()) usize {
@@ -274,6 +332,16 @@ const Windows = {
 
         }
 
+        const AF_UNSPEC: system.DWORD = 0;
+        const AF_INET: system.DWORD = 2;
+        const AF_INET6: system.DWORD = 6;
+        const SOCK_STREAM: system.DWORD = 1;
+        const SOCK_DGRAM: system.DWORD = 2;
+        const SOCK_RAW: system.DWORD = 3;
+        const IPPROTO_RAW: system.DWORD = 0;
+        const IPPROTO_TCP: system.DWORD = 6;
+        const IPPROTO_UDP: system.DWORD = 17;
+
         const WSABUF = extern struct {
 
         };
@@ -302,6 +370,12 @@ const Windows = {
             lpdwBytesReceived: *system.DWORD,
             lpOverlapped: *system.OVERLAPPED,
         ) system.BOOL = undefined;
+
+        extern "ws2_32" stdcallcc fn socket(
+            dwAddressFamily: system.DWORD,
+            dwSocketType: system.DWORD,
+            dwProtocol: system.DWORD,
+        ) HANDLE;
 
         extern "ws2_32" stdcallcc fn WSACleanup() c_int;
         extern "ws2_32" stdcallcc fn WSAStartup(

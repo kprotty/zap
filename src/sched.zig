@@ -10,13 +10,13 @@ const Node = struct {
 
         pub fn reschedule(self: *@This()) void {
             if (Worker.current) |current_worker|
-                current_worker.run_queue.push(self);
+                current_worker.next_task = self;
         }
     };
 
     const Worker = struct {
         pub threadlocal var current: ?*Worker = null;
 
-        task: *Task,
+        next_task: ?*Task,
     };
 };

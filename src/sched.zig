@@ -8,8 +8,9 @@ const Node = struct {
         link: ?*Task,
         frame: anyframe,
 
-        pub inline fn getCurrent() ?*Task {
-            return (worker.current orelse return null).task;
+        pub fn reschedule(self: *@This()) void {
+            if (Worker.current) |current_worker|
+                current_worker.run_queue.push(self);
         }
     };
 

@@ -11,7 +11,7 @@ pub const Backend = switch (builtin.os) {
 };
 
 pub const Socket = struct {
-
+    
 };
 
 const IoStream = struct {
@@ -127,3 +127,139 @@ const IoStream = struct {
     };
 };
 
+const WinSock = struct {
+    pub const Handle = system.HANDLE;
+    
+    pub fn initAll() !void {
+        // initialize Winsock 2.2
+        var wsa_data: WSAData = undefined;
+        const wsa_version = system.WORD(0x0202);
+        if (WSAStartup(wsa_version, &wsa_data) != 0)
+            return error.WSAStartupFailed;
+        errdefer { _ = WSACleanup(); }
+        if (wsa_data.wVersion != wsa_version)
+            return error.WSAInvalidVersion;
+
+        // Fetch the AcceptEx and ConnectEx functions since theyre dynamically discovered
+        // The dummy socket is needed for WSAIoctl to fetch the addresses
+        const dummy = socket(AF_INET, SOCK_STREAM, 0);
+        if (dummy == system.INVALID_HANDLE_VALUE)
+            return error.InvalidIoctlSocket;
+        defer closesocket(dummy);
+
+        try findWSAFunc(dummy, WSAID_ACCEPTEX, &AcceptEx, error.WSAIoctlAcceptEx);
+        try findWSAFunc(dummy, WSAID_CONNECTEX, &ConnectEx, error.WSAIoctlConnectEx);
+    }
+
+    pub fn deinitAll() void {
+        _ = WSACleanup();
+    }
+
+    fn findWSAFunc(dummy_socket: HANDLE, func_guid: GUID, function: var, comptime err: anyerror) !void {
+        var guid: GUID = func_guid;
+        var dwBytes: system.DWORD = undefined;
+        if (WSAIoctl(
+            dummy_socket,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            @ptrCast(system.PVOID, &guid),
+            @sizeOf(@typeOf(guid)),
+            @ptrCAst(system.PVOID, function),
+            @sizeOf(@typeInfo(function)),
+            &dwBytes,
+            null,
+            null,
+        ) != 0)
+            return err;
+    }
+
+    const AF_UNSPEC: system.DWORD = 0;
+    const AF_INET: system.DWORD = 2;
+    const AF_INET6: system.DWORD = 6;
+    const SOCK_STREAM: system.DWORD = 1;
+    const SOCK_DGRAM: system.DWORD = 2;
+    const SOCK_RAW: system.DWORD = 3;
+    const IPPROTO_RAW: system.DWORD = 0;
+    const IPPROTO_TCP: system.DWORD = 6;
+    const IPPROTO_UDP: system.DWORD = 17;
+
+    const WSAID_ACCEPTEX: GUID = GUID {
+        .Data1 = 0xb5367df1,
+        .Data2 = 0xcbac,
+        .Data3 = 0x11cf,
+        .Data4 = [_]u8 { 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92 },
+    };
+
+    const WSAID_CONNECTEX: GUID = GUID {
+        .Data1 = 0x25a207b9,
+        .Data2 = 0xddf3,
+        .Data3 = 0x4660,
+        .Data4 = [_]u8 { 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e },
+    };
+
+    const GUID = extern struct {
+        Data1: c_ulong,
+        Data2: c_ushort,
+        Data3: c_ushort,
+        Data4: [8]u8,
+    };
+
+    const WSABUF = extern struct {
+        len: system.ULONG,
+        buf: [*]const u8,
+    };
+
+    const WSAData = extern struct {
+        wVersion: system.WORD,
+        wHighVersion: system.WORD,
+        iMaxSockets: c_ushort,
+        iMaxUdpDg: c_ushort,
+        lpVendorInfo: [*]u8,
+        szDescription: [257]u8,
+        szSystemStatus: [129]u8,
+    };
+
+    var ConnectEx: fn(
+        s: system.HANDLE,
+        name: *const sockaddr,
+        name_len: c_int,
+        lpSendBuffer: system.PVOID,
+        dwSendDataLength: system.DWORD,
+        lpdwBytesSent: *system.DWORD,
+        lpOverlapped: *system.OVERLAPPED,
+    ) system.BOOL = undefined;
+
+    var AcceptEx: fn(
+        sListenSocket: system.HANDLE,
+        sAcceptSocket: system.HANDLE,
+        lpOutputBuffer: ?system.PVOID,
+        dwReceiveDataLength: system.DWORD,
+        dwLocalAddressLength: system.DWORD,
+        dwRemoteAddressLength: system.DWORD,
+        lpdwBytesReceived: *system.DWORD,
+        lpOverlapped: *system.OVERLAPPED,
+    ) system.BOOL = undefined;
+
+    extern "ws2_32" stdcallcc fn socket(
+        dwAddressFamily: system.DWORD,
+        dwSocketType: system.DWORD,
+        dwProtocol: system.DWORD,
+    ) HANDLE;
+
+    extern "ws2_32" stdcallcc fn WSACleanup() c_int;
+    extern "ws2_32" stdcallcc fn WSAStartup(
+        wVersionRequested: system.WORD,
+        lpWSAData: *WSAData,
+    ) c_int;
+
+    extern "ws2_32" stdcallcc fn WSAIoctl(
+        s: system.HANDLE,
+        dwIoControlMode: system.DWORD,
+        lpvInBuffer: system.PVOID,
+        cbInBuffer: system.DWORD,
+        lpvOutBuffer: system.PVOID,
+        cbOutBuffer: system.DWORD,
+        lpcbBytesReturned: *system.DWORD,
+        lpOverlapped: ?*system.OVERLAPPED,
+        lpCompletionRoutine: ?fn(*system.OVERLAPPED) usize
+    ) c_int;
+};

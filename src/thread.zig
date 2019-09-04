@@ -9,6 +9,7 @@ const Backend = switch (builtin.os) {
     else => Posix,
 };
 
+pub const yield = Backend.yield;
 pub const spawn = Backend.spawn;
 pub const stackSize = Backend.stackSize;
 pub const nodeCount = Backend.nodeCount;
@@ -18,6 +19,10 @@ pub const nodeCommit = Backend.nodeCommit;
 pub const nodeSetAffinity = Backend.nodeSetAffinity;
 
 const Windows = struct {
+    pub fn yield() void {
+        _ = SwitchToThread();
+    }
+
     pub fn stackSize(comptime function: var) usize {
         return 0; // windows doesnt allow custom thread stacks
     }
@@ -105,7 +110,9 @@ const Windows = struct {
         Reserved: [3]system.USHORT,
     };
 
+    extern "kernel32" stdcallcc fn SwitchToThread() system.BOOL;
     extern "kernel32" stdcallcc fn GetCurrentProcess() system.HANDLE;
+
     extern "kernel32" stdcallcc fn SetProcessAffinityMask(
         hProcess: system.HANDLE,
         dwProcessAffinity: system.DWORD_PTR,

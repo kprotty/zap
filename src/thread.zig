@@ -11,6 +11,11 @@ const Backend = switch (builtin.os) {
 
 pub const spawn = Backend.spawn;
 pub const stackSize = Backend.stackSize;
+pub const nodeCount = Backend.nodeCount;
+pub const nodeFree = Backend.nodeFree;
+pub const nodeAlloc = Backend.nodeAlloc;
+pub const nodeCommit = Backend.nodeCommit;
+pub const nodeSetAffinity = Backend.nodeSetAffinity;
 
 const Windows = struct {
     pub fn stackSize(comptime function: var) usize {
@@ -34,6 +39,96 @@ const Windows = struct {
             orelse return system.unexpectedError(system.kernel32.GetLastError());
         system.CloseHandle(handle);
     }
+
+    pub fn nodeCount() usize {
+        var count: system.ULONG = undefined;
+        if (GetNumaHighestNodeNumber(&count) != system.TRUE)
+            return 1;
+        return @intCast(usize, count);
+    }
+
+    pub fn nodeSetAffinity(node: usize) !void {
+        var affinity: GROUP_AFFINITY = undefined;
+        if (GetNumaNodeProcessorMaskEx(@truncate(system.USHORT, node), &affinity) != system.TRUE)
+            return system.unexpectedError(system.kernel32.GetLastError());
+        if (SetProcessAffinityMask(GetCurrentProcess(), @ptrCast(system.DWORD_PTR, affinity.Mask)) != system.TRUE)
+            return system.unexpectedError(system.kernel32.GetLastError());
+    }
+
+    pub fn nodeAlloc(node: usize, bytes: usize) ![]align(std.mem.page_size) u8 {
+        const memory = VirtualAllocExNuma(
+            GetCurrentProcess(),
+            null,
+            bytes,
+            system.MEM_RESERVE,
+            system.PAGE_NOACCESS,
+            @truncate(system.DWORD, node),
+        ) orelse return error.OutOfMemory;
+        return memory[0..bytes];
+    }
+
+    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) !void {
+        if (VirtualFreeEx(
+            GetCurrentProcess(),
+            @ptrCast(?system.PVOID, memory.ptr),
+            0,
+            system.MEM_RELEASE,
+        ) != system.TRUE)
+            return error.InvalidMemory;
+    }
+
+    pub fn nodeCommit(node: usize, memory: []align(std.mem.page_size) u8, validate: bool) !void {
+        if (validate) {
+            _ = VirtualAllocExNuma(
+                GetCurrentProcess(),
+                @ptrCast(?system.PVOID, memory.ptr),
+                memory.len,
+                system.MEM_COMMIT,
+                system.PAGE_READWRITE,
+                @truncate(system.DWORD, node),
+            ) orelse return error.OutOfMemory;
+        } else {
+            if (VirtualFreeEx(
+                GetCurrentProcess(),
+                @ptrCast(?system.PVOID, memory.ptr),
+                memory.len,
+                system.MEM_DECOMMIT,
+            ) != system.TRUE)
+                return error.InvalidMemory;
+        }
+    }
+
+    const KAFFINITY = system.ULONG_PTR;
+    const GROUP_AFFINITY = extern struct {
+        Mask: KAFFINITY,
+        Group: system.USHORT,
+        Reserved: [3]system.USHORT,
+    };
+
+    extern "kernel32" stdcallcc fn GetCurrentProcess() system.HANDLE;
+    extern "kernel32" stdcallcc fn SetProcessAffinityMask(
+        hProcess: system.HANDLE,
+        dwProcessAffinity: system.DWORD_PTR,
+    ) system.BOOL;
+    extern "kernel32" stdcallcc fn GetNumaNodeProcessorMaskEx(
+        Node: system.USHORT,
+        ProcessAffinity: *GROUP_AFFINITY,
+    ) system.BOOL;
+
+    extern "kernel32" stdcallcc fn VirtualFreeEx(
+        hProcess: system.HANDLE,
+        lpAddress: ?system.PVOID,
+        dwSize: system.SIZE_T,
+        dwFreeType: system.DWORD,
+    ) system.BOOL;
+    extern "kernel32" stdcallcc fn VirtualAllocExNuma(
+        hProcess: system.HANDLE,
+        lpAddress: ?system.PVOID,
+        dwSize: system.SIZE_T,
+        flAllocationType: system.DWORD,
+        flProtect: system.DWORD,
+        numaNodePreferred: system.DWORD,
+    ) ?[*]align(std.mem.page_size) u8;
 };
 
 const Posix = struct {

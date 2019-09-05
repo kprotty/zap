@@ -213,4 +213,141 @@ const Linux = struct {
             else => |err| os.unexpectedErrno(err),
         };
     }
+
+    pub fn nodeCount() usize {
+        var dir_iter: DirIterator = undefined;
+        dir_iter.init("/sys/devices/system/node\x00") catch return 1;
+        defer dir_iter.close();
+        
+        var nodes = usize(0);
+        while (dir_iter.next()) |dir|
+            if (std.mem.startsWith(u8, dir, "node"))
+                nodes += 1;
+        return nodes;
+    }
+
+    pub fn nodeSetAffinity(node: usize) !void {
+        var dir_bytes: [64]u8 = undefined;
+        const dir_name = try std.fmt.bufPrint(dir_bytes[0..], "/sys/devices/system/node/node{}\x00", node);
+
+        var dir_iter: DirIterator = undefined;
+        try dir_iter.init(dir_name);
+        defer dir_iter.close();
+
+        var cpu_set: [512]u8 = undefined; // 512 * 8bits = 4096 max logical cpu cores
+        while (dir_iter.next()) |dir| {
+            if (std.mem.startsWith(u8, dir, "cpu")) {
+                const cpu = try std.fmt.parseInt(usize, dir[3..], 10);
+                cpu_set[cpu / 8] |= u8(1) << @truncate(u3, cpu % 8);
+            }
+        }
+
+        return switch (os.errno(system.syscall3(
+            system.SYS_sched_setaffinity,
+            0, // current pid
+            @sizeOf(cpu_set),
+            @ptrToInt(cpu_set[0..].ptr),
+        )) {
+            0 => {},
+            os.EINVAL => error.TooManyCpuCores,
+            os.EFAULT, os.EPERM, os.ESRCH => unreachable,
+            else => |err| os.unexpectedErrno(err),
+        };
+    }
+
+    pub fn nodeAlloc(node: usize, bytes: usize) ![]align(std.mem.page_size) u8 {
+        var node_mask: [64]c_ulong = undefined;
+        std.mem.secureZero(c_ulong, node_mask[0..]);
+        node_mask[node / @sizeOf(c_ulong)] = c_ulong(1) << @truncate(u5, node % @sizeOf(c_ulong));
+
+        const memory = try os.mmap(null, bytes, os.PROT_NONE, os.MAP_PRIVATE | os.MAP_ANONYMOUS, -1, 0);
+        return switch (os.errno(system.syscall6(
+            system.SYS_mbind,
+            @ptrToInt(memory.ptr),
+            memory.len,
+            MPOL_DEFAULT,
+            @ptrToInt(node_mask[0..].ptr),
+            node_mask.len + 1,
+            0,
+        ))) {
+            0 => {},
+            os.ENOMEM => error.OutOfMemory,
+            os.EIO, os.EPERM, os.EFAULT, os.EINVAL => unreachable,
+            else => |err| os.unexpectedErrno(err),
+        };
+    }
+
+    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) !void {
+        os.munmap(memory);
+    }
+
+    pub fn nodeCommit(node: usize, memory: []align(std.mem.page_size) u8, validate: bool) !void {
+        if (validate) {
+            try os.mprotect(memory, os.PROT_READ | os.PROT_WRITE);
+        } else {
+            return switch (os.errno(system.syscall3(
+                system.SYS_madvise,
+                @ptrToInt(memory.ptr),
+                memory.len,
+                MADV_FREE,
+            ))) {
+                0 => {},
+                os.EAGAIN, os.ENOMEM => error.OutOfMemory,
+                os.EACCES, os.EBADF, os.EINVAL, os.EPERM => unreachable,
+                else |err| => os.unexpectedErrno(err),
+            };
+        }
+    }
+
+    const MPOL_BIND = 2;
+    const MPOL_DEFAULT = 0;
+    const MPOL_PREFERRED = 1;
+    
+    const DirIterator = struct {
+        const linux_dirent = extern struct {
+            d_ino: c_ulong,
+            d_off: c_ulong,
+            d_reclen: c_ushort,
+            d_name: [0]u8,
+        };
+
+        fd: usize,
+        pos: usize,
+        read: usize,
+        buffer: [64 * 1024]u8,
+        
+        pub fn init(self: *@This(), dirname: []const u8) !void {
+            self.fd = system.syscall2(system.SYS_open, @ptrToInt(dirname.ptr), system.O_RDONLY | system.O_DIRECTORY);
+            var errno = system.getErrno(self.fd);
+            if (errno != 0)
+                return os.unexpectedErrno(errno);
+
+            self.pos = 0;
+            errno = self.readDir();
+            if (errno != 0)
+                return os.unexpectedErrno(errno);
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = system.syscall1(system.SYS_close, self.fd);
+        }
+
+        pub fn next(self: *@This()) ?[]const u8 {
+            while (true) {
+                if (self.pos >= self.read and self.readDir() != 0)
+                    return null;
+                const dirent = @ptrCast(*linux_dirent, &self.buffer[self.pos]);
+                self.pos += dirent.d_reclen;
+                if (dirent.d_ino != 0)
+                    return std.mem.toSliceConst(u8, dirent.d_name[0..]);
+            }
+        }
+
+        fn readDir(self: *@This()) isize {
+            self.read = system.syscall3(system.SYS_getdents, self.fd, @ptrToInt(buffer[0..].ptr), buffer.len);
+            if (self.read == 0)
+                return os.EAGAIN;
+            return system.getErrno(self.read);
+        }
+    };
 };

@@ -92,8 +92,8 @@ pub const EventPoller = struct {
         return self.inner.fromhandle(handle);
     }
 
-    pub const Error = error {
-        // TODO
+    pub const Error = std.os.UnexpectedError || error {
+        InvalidHandle,
     };
 
     /// Initialize the EventPoller
@@ -111,7 +111,7 @@ pub const EventPoller = struct {
     pub const ONE_SHOT:     u32 = 1 << 2;
     pub const EDGE_TRIGGER: u32 = 1 << 3;
 
-    pub const RegisterError = error {
+    pub const RegisterError = Error || error {
         // TODO
     };
 
@@ -159,14 +159,10 @@ pub const EventPoller = struct {
             return self.inner.getResult();
         }
 
-        /// Can be used to determine which pipe of the resource object was notified (in this case, the READ pipe)
-        pub inline fn isReadable(self: @This()) bool {
-            return self.inner.isReadable();
-        }
-
-        /// Can be used to determine which pipe of the resource object was notified (in this case, the WRITE pipe) 
-        pub inline fn isWriteable(self: @This()) bool {
-            return self.inner.isWriteable();
+        /// Get an identifier which can be used (e.g. by `Socket.isReadable()`) 
+        /// to know which pipe the event originated from in order to help event processing.
+        pub inline fn getIdentifier(self: @This()) usize {
+            return self.inner.getIdentifier();
         }
     };
 
@@ -223,6 +219,16 @@ pub const Socket = struct {
     /// Close this resource object
     pub inline fn close(self: *@This()) void {
         return self.inner.close();
+    }
+
+    /// Use the result of `EventPoller.Event.getIdenfier()` to discover if the event is from the READ pipe.
+    pub inline fn isReadable(self: *@This(), identifier: usize) bool {
+        return self.inner.isReadable(identifier);
+    }
+
+    /// Use the result of `EventPoller.Event.getIdenfier()` to discover if the event is from the WRITE pipe.
+    pub inline fn isWriteable(self: *@This(), identifier: usize) bool {
+        return self.inner.isWriteable(identifier);
     }
 
     pub const Option = union(enum) {

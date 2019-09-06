@@ -51,15 +51,15 @@ pub const EventPoller = struct {
         // TODO
     }
 
-    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
+    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         // TODO
     }
 
-    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
+    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         // TODO
     }
 
-    pub fn notify(self: *@This(), data: usize) NotifyError!void {
+    pub fn notify(self: *@This(), data: usize) zio.EventPoller.NotifyError!void {
         // TODO
     }
 
@@ -69,20 +69,16 @@ pub const EventPoller = struct {
             // TODO
         }
 
-        pub fn getResult(self: @This()) Result {
+        pub fn getResult(self: @This()) zio.Result {
             // TODO
         }
 
-        pub fn isReadable(self: @This()) bool {
-            // TODO
-        }
-
-        pub fn isWriteable(self: @This()) bool {
+        pub fn getIdentifier(self: @This()) usize {
             // TODO
         }
     };
 
-    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
+    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
         // TODO   
     }
 };
@@ -102,6 +98,14 @@ pub const Socket = struct {
     }
     
     pub fn close(self: *@This()) void {
+        // TODO
+    }
+
+    pub fn isReadable(self: *@This(), identifier: usize) bool {
+        // TODO
+    }
+
+    pub fn isWriteable(self: *@This(), identifier: usize) bool {
         // TODO
     }
 

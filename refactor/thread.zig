@@ -72,14 +72,13 @@ const Windows = struct {
         return memory[0..bytes];
     }
 
-    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) !void {
-        if (VirtualFreeEx(
+    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) void {
+        _ = VirtualFreeEx(
             GetCurrentProcess(),
             @ptrCast(?system.PVOID, memory.ptr),
             0,
             system.MEM_RELEASE,
-        ) != system.TRUE)
-            return error.InvalidMemory;
+        );
     }
 
     pub fn nodeCommit(node: usize, memory: []align(std.mem.page_size) u8, validate: bool) !void {
@@ -220,9 +219,10 @@ const Linux = struct {
         defer dir_iter.close();
         
         var nodes = usize(0);
-        while (dir_iter.next()) |dir|
+        while (dir_iter.next()) |dir| {
             if (std.mem.startsWith(u8, dir, "node"))
                 nodes += 1;
+        }
         return nodes;
     }
 
@@ -245,9 +245,9 @@ const Linux = struct {
         return switch (os.errno(system.syscall3(
             system.SYS_sched_setaffinity,
             0, // current pid
-            @sizeOf(cpu_set),
+            @sizeOf(@typeOf(cpu_set)),
             @ptrToInt(cpu_set[0..].ptr),
-        )) {
+        ))) {
             0 => {},
             os.EINVAL => error.TooManyCpuCores,
             os.EFAULT, os.EPERM, os.ESRCH => unreachable,
@@ -270,14 +270,14 @@ const Linux = struct {
             node_mask.len + 1,
             0,
         ))) {
-            0 => {},
+            0 => memory,
             os.ENOMEM => error.OutOfMemory,
             os.EIO, os.EPERM, os.EFAULT, os.EINVAL => unreachable,
             else => |err| os.unexpectedErrno(err),
         };
     }
 
-    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) !void {
+    pub fn nodeFree(node: usize, memory: []align(std.mem.page_size) u8) void {
         os.munmap(memory);
     }
 
@@ -294,11 +294,12 @@ const Linux = struct {
                 0 => {},
                 os.EAGAIN, os.ENOMEM => error.OutOfMemory,
                 os.EACCES, os.EBADF, os.EINVAL, os.EPERM => unreachable,
-                else |err| => os.unexpectedErrno(err),
+                else => |err| os.unexpectedErrno(err),
             };
         }
     }
 
+    const MADV_FREE = 8;
     const MPOL_BIND = 2;
     const MPOL_DEFAULT = 0;
     const MPOL_PREFERRED = 1;
@@ -336,15 +337,21 @@ const Linux = struct {
             while (true) {
                 if (self.pos >= self.read and self.readDir() != 0)
                     return null;
-                const dirent = @ptrCast(*linux_dirent, &self.buffer[self.pos]);
-                self.pos += dirent.d_reclen;
+                const dirent = @ptrCast(*linux_dirent, @alignCast(@alignOf(linux_dirent), &self.buffer[self.pos]));
+                self.pos += @sizeOf(linux_dirent) + dirent.d_reclen;
                 if (dirent.d_ino != 0)
-                    return std.mem.toSliceConst(u8, dirent.d_name[0..]);
+                    return std.mem.toSliceConst(u8, dirent.d_name[0..].ptr);
             }
         }
 
-        fn readDir(self: *@This()) isize {
-            self.read = system.syscall3(system.SYS_getdents, self.fd, @ptrToInt(buffer[0..].ptr), buffer.len);
+        fn readDir(self: *@This()) u12 {
+            self.read = system.syscall3(
+                system.SYS_getdents,
+                self.fd,
+                @ptrToInt(self.buffer[0..].ptr),
+                self.buffer.len - 1,
+            );
+            self.buffer[self.buffer.len - 1] = 0;
             if (self.read == 0)
                 return os.EAGAIN;
             return system.getErrno(self.read);

@@ -134,7 +134,7 @@ pub const EventPoller = struct {
         return self.inner.reregister(handle, flags, data);
     }
 
-    pub const NotifyError = error {
+    pub const NotifyError = Error || error {
         // TODO
     };
 
@@ -166,7 +166,7 @@ pub const EventPoller = struct {
         }
     };
 
-    pub const PollError = error {
+    pub const PollError = Error || error {
         // TODO
     };
 

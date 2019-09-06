@@ -47,14 +47,13 @@ pub fn Cleanup() void {
 }
 
 pub const Buffer = packed struct {
-    inner: WSABUF, 
+    inner: WSABUF,
 
     pub fn fromBytes(bytes: []const u8) @This() {
-        const limit = @intCast(usize, std.math.max(windows.DWORD));
         return @This() {
             .inner = WSABUF {
                 .buf = bytes.ptr,
-                .len = @intCast(windows.DWORD, std.math.min(limit, bytes.len)),
+                .len = @intCast(windows.DWORD, clamp(windows.DWORD, bytes.len)),
             }
         };
     }
@@ -65,67 +64,103 @@ pub const Buffer = packed struct {
 };
 
 pub const EventPoller = struct {
+    iocp: Handle,
 
     pub fn getHandle(self: @This()) Handle {
-        // TODO
+        return self.iocp;
     }
 
     pub fn fromHandle(handle: Handle) @This() {
-        // TODO
+        return @This() { .iocp = handle };
     }
 
     pub fn init(self: *@This()) zio.EventPoller.Error!void {
-        // TODO
+        self.iocp = windows.kernel32.CreateIoCompletionPort(windows.INVALID_HANDLE_VALUE, null, undefined, 0)
+            orelse return zio.EventPoller.Error.InvalidHandle;
     }
 
     pub fn close(self: *@This()) void {
-        // TODO
+        _ = windows.CloseHandle(self.iocp);
+        self.iocp = windows.INVALID_HANDLE_VALUE;
     }
 
-    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
-        // TODO
+    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+        if (handle == windows.INVALID_HANDLE_VALUE)
+            return zio.EventPoller.RegisterError.InvalidHandle;
+        _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, key, 0)
+            orelse return // TODO
     }
 
-    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
-        // TODO
+    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+        if (handle == windows.INVALID_HANDLE_VALUE)
+            return zio.EventPoller.RegisterError.InvalidHandle;
     }
 
-    pub fn notify(self: *@This(), data: usize) NotifyError!void {
-        // TODO
+    pub fn notify(self: *@This(), data: usize) zio.EventPoller.NotifyError!void {
+        if (self.iocp == windows.INVALID_HANDLE_VALUE)
+            return zio.EventPoller.PollError.InvalidHandle;
+        if (windows.kernel32.PostQueuedCompletionStatus(self.iocp, 0, @intToPtr(windows.ULONG_PTR, data), null) != windows.TRUE)
+            return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
     pub const Event = packed struct {
+        inner: OVERLAPPED_ENTRY,
 
         pub fn getData(self: @This()) usize {
-            // TODO
+            return @ptrToInt(self.inner.lpCompletionKey);
         }
 
-        pub fn getResult(self: @This()) Result {
-            // TODO
+        pub fn getResult(self: @This()) zio.Result {
+            const overlapped = self.inner.lpOverlapped orelse return zio.Result {
+                .transferred = 0,
+                .status = .Completed,
+            };
+            return zio.Result {
+                .transferred = self.inner.dwNumberOfBytesTransferred,
+                .status = if (overlapped.Internal == STATUS_COMPLETED) .Completed else .Error,
+            };
         }
 
-        pub fn isReadable(self: @This()) bool {
-            // TODO
-        }
-
-        pub fn isWriteable(self: @This()) bool {
-            // TODO
+        pub fn getIdentifier(self: @This()) usize {
+            const identifier = @ptrToInt(self.inner.lpOverlapped);
+            const alignment = std.math.max(zio.EventPoller.READ, zio.EventPoller.WRITE);
+            std.debug.assert(std.mem.isAligned(identifier, alignment));
+            return identifier;
         }
     };
 
-    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
-        // TODO   
+    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
+        var events_found: windows.ULONG = 0;
+        const result = GetQueuedCompletionStatusEx(
+            self.iocp,
+            events.ptr,
+            @intCast(windows.ULONG, clamp(windows.ULONG, events.len)),
+            &events_found,
+            if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,
+            windows.FALSE
+        );
+
+        if (self.iocp == windows.INVALID_HANDLE_VALUE)
+            return zio.EventPoller.PollError.InvalidHandle;
+        if (result == windows.TRUE or timeout == null)
+            return events[0..events_found];
+        return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 };
 
 pub const Socket = struct {
+    handle: Handle,
+    reader: windows.OVERLAPPED,
+    writer: windows.OVERLAPPED,
 
     pub fn getHandle(self: @This()) Handle {
-        // TODO
+        return self.handle;
     }
 
     pub fn fromHandle(handle: Handle) @This() {
-        // TODO
+        var self: @This() = undefined;
+        self.handle = handle;
+        return self;
     }
 
     pub fn init(self: *@This(), flags: u32) zio.Socket.Error!void {
@@ -134,6 +169,14 @@ pub const Socket = struct {
     
     pub fn close(self: *@This()) void {
         // TODO
+    }
+
+    pub fn isReadable(self: *@This(), identifier: usize) bool {
+        return @ptrToInt(&self.reader) == identifier;
+    }
+
+    pub fn isWriteable(self: *@This(), identifier: usize) bool {
+        return @ptrToInt(&self.writer) == identifier;
     }
 
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
@@ -183,3 +226,8 @@ pub const Socket = struct {
         // TODO
     }
 };
+
+fn clamp(comptime Int: type, number: var) @typeOf(number) {
+    const max_value = @intCast(@typeOf(number), std.math.maxInt(Int));
+    return std.math.min(max_value, number);
+}

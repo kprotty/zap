@@ -1,23 +1,66 @@
 const std = @import("std");
+const windows = std.os.windows;
 const zio = @import("../zio.zig");
 
-pub const Handle = ;
+pub const Handle = windows.HANDLE;
 
 pub fn Initialize() zio.InitError!void {
-    // TODO
+    // initialize winsock
+    var wsa_data: WSAData = undefined;
+    const wsa_version = windows.WORD(0x0202); // winsock 2.2
+    if (WSAStartup(wsa_version, &wsa_data) != 0 or wsa_data.wVersion != wsa_version)
+        return zio.InitError.InvalidSystemState;
+
+    // For loading WSA functions at runtime (required by winapi)
+    const WSA = struct {
+        pub fn findFunction(sock: Handle, id: GUID, function: var) zio.InitError!void {
+            var guid: GUID = id;
+            var dwBytes: windows.DWORD = undefined;
+            if (WSAIoctl(
+                sock,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                @ptrCast(windows.PVOID, &guid),
+                @sizeOf(@typeOf(guid)),
+                @ptrCast(windows.PVOID, function),
+                @sizeOf(@typeInfo(function).Pointer.child),
+                &dwBytes,
+                null,
+                null,
+            ) != 0)
+                return zio.InitError.InvalidIOFunction;
+        }
+    };
+
+    // Find AcceptEx and ConnectEx using WSAIoctl
+    if (AcceptEx == null or ConnectEx == null) {  
+        const dummy_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (dummy_socket == windows.INVALID_HANDLE_VALUE)
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        defer closesocket(dummy_socket);
+        try WSA.findFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx);
+        try WSA.findFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx);
+    }
 }
 
 pub fn Cleanup() void {
-    // TODO
+    _ = WSACleanup();
 }
 
 pub const Buffer = packed struct {
+    inner: WSABUF, 
+
     pub fn fromBytes(bytes: []const u8) @This() {
-        // TODO
+        const limit = @intCast(usize, std.math.max(windows.DWORD));
+        return @This() {
+            .inner = WSABUF {
+                .buf = bytes.ptr,
+                .len = @intCast(windows.DWORD, std.math.min(limit, bytes.len)),
+            }
+        };
     }
 
     pub fn getBytes(self: @This()) []u8 {
-       // TODO
+       return self.inner.buf[0..self.inner.len];
     }
 };
 

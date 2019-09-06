@@ -1,25 +1,20 @@
 const std = @import("std");
 const zio = @import("../zio.zig");
 
-pub const Handle = ;
+const linux = std.os.linux;
+const posix = @import("posix.zig");
+
+pub const Handle = posix.Handle;
 
 pub fn Initialize() zio.InitError!void {
-    // TODO
+    return posix.Initialize();
 }
 
 pub fn Cleanup() void {
-    // TODO
+    return posix.Cleanup();
 }
 
-pub const Buffer = packed struct {
-    pub fn fromBytes(bytes: []const u8) @This() {
-        // TODO
-    }
-
-    pub fn getBytes(self: @This()) []u8 {
-       // TODO
-    }
-};
+pub const Buffer = posix.Buffer;
 
 pub const EventPoller = struct {
 

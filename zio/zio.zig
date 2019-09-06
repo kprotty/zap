@@ -9,8 +9,11 @@ const backend = switch (builtin.os) {
     else => @compileError("Platform not supported"),
 };
 
-pub const InitError = error {
-    // TODO
+pub const InitError = std.os.UnexpectedError || error {
+    /// Failed to load an IO function
+    InvalidIOFunction,
+    /// An internal system invariant was incorrect
+    InvalidSystemState,
 };
 
 /// Allows the IO backend to initialize itself.
@@ -61,12 +64,13 @@ pub const Result = struct {
 pub const Buffer = packed struct {
     inner: backend.Buffer,
 
-    /// Convert a slice of bytes into a `Buffer`
+    /// Convert a slice of bytes into a `Buffer`.
+    /// Slices over std.math.maxInt(u32) may be truncated based on the platform
     pub inline fn fromBytes(bytes: []const u8) @This() {
         return self.inner.fromBytes(bytes);
     }
 
-    /// Convert a `Buffer` back into a slice of byets
+    /// Convert a `Buffer` back into a slice of bytes
     pub inline fn getBytes(self: @This()) []u8 {
         return self.inner.getBytes();
     }
@@ -127,7 +131,7 @@ pub const EventPoller = struct {
     /// if the handle was previously registerd with `ONE_SHOT`.
     /// This is most noteably called after a `Result.Status.Partial` operation registered with `ONE_SHOT`.
     pub inline fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
-        return self.inner.modify(handle, flags, data);
+        return self.inner.reregister(handle, flags, data);
     }
 
     pub const NotifyError = error {

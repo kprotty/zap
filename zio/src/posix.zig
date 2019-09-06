@@ -1,23 +1,35 @@
 const std = @import("std");
+const system = std.os.system;
 const zio = @import("../zio.zig");
 
-pub const Handle = ;
+pub const Handle = i32;
 
+// needs to throw some type of error for the compiler to not complain :/
+var dummy_var: usize = 0;
 pub fn Initialize() zio.InitError!void {
-    // TODO
+    if (@ptrCast(*volatile usize, &dummy_var).* != 0)
+        return zio.InitError.InvalidSystemState;
 }
 
 pub fn Cleanup() void {
-    // TODO
+    // nothing to do here, keep scrolling
 }
 
 pub const Buffer = packed struct {
+    inner: system.iovec_const,
+
     pub fn fromBytes(bytes: []const u8) @This() {
-        // TODO
+        return @This() {
+            .inner = system.iovec {
+                .iov_len = bytes.len,
+                .iov_base = bytes.ptr,
+            }
+        };
     }
 
     pub fn getBytes(self: @This()) []u8 {
-       // TODO
+        // rust would be screaming right now ;-)
+        @intToPtr([*]u8, @ptrToInt(self.inner.iov_base))[0..self.inner.iov_len];
     }
 };
 

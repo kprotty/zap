@@ -106,7 +106,7 @@ pub const EventPoller = struct {
     pub const Event = packed struct {
         inner: OVERLAPPED_ENTRY,
 
-        pub fn getData(self: @This()) usize {
+        pub fn getData(self: @This(), poller: *EventPoller) usize {
             return @ptrToInt(self.inner.lpCompletionKey);
         }
 
@@ -129,11 +129,11 @@ pub const EventPoller = struct {
         }
     };
 
-    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
+    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
         var events_found: windows.ULONG = 0;
         const result = GetQueuedCompletionStatusEx(
             self.iocp,
-            events.ptr,
+            @ptrCast([*]OVERLAPPED_ENTRY, events.ptr),
             @intCast(windows.ULONG, clamp(windows.ULONG, events.len)),
             &events_found,
             if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,

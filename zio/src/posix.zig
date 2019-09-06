@@ -65,7 +65,7 @@ pub const EventPoller = struct {
 
     pub const Event = packed struct {
 
-        pub fn getData(self: @This()) usize {
+        pub fn getData(self: @This(), poller: *EventPoller) usize {
             // TODO
         }
 
@@ -78,7 +78,7 @@ pub const EventPoller = struct {
         }
     };
 
-    pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
+    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
         // TODO   
     }
 };

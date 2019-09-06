@@ -94,6 +94,7 @@ pub const EventPoller = struct {
 
     pub const Error = std.os.UnexpectedError || error {
         InvalidHandle,
+        OutOfResources,
     };
 
     /// Initialize the EventPoller
@@ -112,12 +113,14 @@ pub const EventPoller = struct {
     pub const EDGE_TRIGGER: u32 = 1 << 3;
 
     pub const RegisterError = Error || error {
-        // TODO
+        InvalidValue,
+        AlreadyExists,
     };
 
     /// In order for the `EventPoller` to receive IO events,
     /// one should register the IO resource object under the event poller.
     /// `data`: arbitrary user data which can be retrieved when polling for events.
+    ///     `data` of `@ptrToInt(self)` may return `RegisterError.InvalidValue`
     /// `flags`: it a bitmask of IO events to listen for and how:
     ///     - READ: an event will be generated once the resource object is readable.
     ///     - WRITE: an event will be generated onec the resource object is writeable.
@@ -134,9 +137,7 @@ pub const EventPoller = struct {
         return self.inner.reregister(handle, flags, data);
     }
 
-    pub const NotifyError = Error || error {
-        // TODO
-    };
+    pub const NotifyError = RegisterError;
 
     /// Generate a user-based event with the `data` being arbitrary user data.
     /// Most noteably used for communicating with an `EventPoller` which is blocked polling.
@@ -149,9 +150,10 @@ pub const EventPoller = struct {
     pub const Event = packed struct {
         inner: backend.EventPoller.Event,
 
-        /// Get the arbitrary user data tagged to the event when registering
-        pub inline fn getData(self: @This()) usize {
-            return self.inner.getData();
+        /// Get the arbitrary user data tagged to the event when registering under the `poller`.
+        /// Should be called only once as it consumes the event data and is UB if called again.
+        pub inline fn getData(self: @This(), poller: *EventPoller) usize {
+            return self.inner.getData(&poller.inner);
         }
 
         /// Get the result of the corresponding IO operation to continue processing
@@ -167,7 +169,7 @@ pub const EventPoller = struct {
     };
 
     pub const PollError = Error || error {
-        // TODO
+        InavlidEvents,
     };
 
     /// Poll for `Event` objects that have been ready'd by the kernel.

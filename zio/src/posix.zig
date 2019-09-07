@@ -112,7 +112,7 @@ pub const EventPoller = struct {
 
         pub fn getResult(self: @This()) zio.Result {
             return zio.Result {
-                .transferred = @intCast(usize, self.inner.data),
+                .data = @intCast(usize, self.inner.data),
                 .status = switch (self.inner.flags & (system.EV_EOF | system.EV_ERROR)) {
                     0 => .Retry,
                     else => .Error,
@@ -163,7 +163,7 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: Handle, flags: u32) @This() {
         // TODO
     }
 
@@ -191,14 +191,6 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
-        // TODO
-    }
-
-    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
-        // TODO
-    }
-
     pub const Ipv4 = packed struct {
 
         pub fn from(address: u32, port: u16) @This() {
@@ -212,6 +204,22 @@ pub const Socket = struct {
             // TODO
         }
     };
+
+    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn readFrom(self: *@This(), address: *zio.Socket.Address, buffers: []zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn writeTo(self: *@This(), address: *const zio.Socket.Address, buffers: []const zio.Buffer) zio.Result {
+        // TODO
+    }
 
     pub fn bind(self: *@This(), address: *zio.Socket.Address) zio.Socket.BindError!void {
         // TODO

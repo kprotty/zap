@@ -112,12 +112,12 @@ pub const EventPoller = struct {
 
         pub fn getResult(self: @This()) zio.Result {
             const overlapped = self.inner.lpOverlapped orelse return zio.Result {
-                .transferred = 0,
-                .status = .Completed,
+                .data = 0,
+                .status = .Completed, // notify() result
             };
             return zio.Result {
-                .transferred = self.inner.dwNumberOfBytesTransferred,
-                .status = if (overlapped.Internal == STATUS_COMPLETED) .Completed else .Error,
+                .data = self.inner.dwNumberOfBytesTransferred,
+                .status = if (@ptrToInt(overlapped.Internal) == STATUS_COMPLETED) .Completed else .Error,
             };
         }
 
@@ -150,6 +150,8 @@ pub const EventPoller = struct {
 
 pub const Socket = struct {
     handle: Handle,
+    is_overlapped: bool,
+    recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
 
@@ -157,18 +159,42 @@ pub const Socket = struct {
         return self.handle;
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: Handle, flags: u32) @This() {
         var self: @This() = undefined;
+        self.is_overlapped = (flags & zio.Socket.Nonblock) != 0;
         self.handle = handle;
         return self;
     }
 
     pub fn init(self: *@This(), flags: u32) zio.Socket.Error!void {
-        // TODO
+        const dwFlags = if ((flags & zio.Socket.Nonblock) != 0) WSA_FLAG_OVERLAPPED else 0;
+        const family = switch (flags & (zio.Socket.Ipv4 | zio.Socket.Ipv6)) {
+            zio.Socket.Ipv4 => AF_INET,
+            zio.Socket.Ipv6 => AF_INET6,
+            else => AF_UNSPEC,
+        };
+        const protocol = switch (flags & (zio.Socket.Tcp | zio.Socket.Udp | zio.Socket.Raw)) {
+            zio.Socket.Raw => 0,
+            zio.Socket.Udp => IPPROTO_UDP,
+            zio.Socket.Tcp => IPPROTO_TCP,
+            else => return zio.SOcket.Error.InvalidValue,
+        };
+        const sock_type = switch (flags & (zio.Socket.Tcp | zio.Socket.Udp | zio.Socket.Raw)) {
+            zio.Socket.Raw => SOCK_RAW,
+            zio.Socket.Udp => SOCK_DGRAM,
+            zio.Socket.Tcp => SOCK_STREAM,
+            else => return zio.Socket.Error.InvalidValue,
+        };
+
+        self.is_overlapped = dwFlags != 0;
+        self.handle = WSASocketA(family, protocol, sock_type, null, 0, dwFlags);
+        if (self.handle == windows.INVALID_HANDLE_VALUE)
+            return zio.Socket.Error.InvalidHandle;
     }
     
     pub fn close(self: *@This()) void {
-        // TODO
+        _ = closesocket(self.handle);
+        self.handle = windows.INVALID_HANDLE_VALUE;
     }
 
     pub fn isReadable(self: *@This(), identifier: usize) bool {
@@ -187,33 +213,94 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
-        // TODO
-    }
-
-    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
-        // TODO
-    }
-
     pub const Ipv4 = packed struct {
+        inner: SOCKADDR_IN,
 
         pub fn from(address: u32, port: u16) @This() {
-            // TODO
+            return @This() {
+                .inner = SOCKADDR_IN {
+                    .sin_family = AF_INET,
+                    .sin_addr = IN_ADDR { .s_addr = address },
+                    .sin_port = std.mem.nativeToBig(u16, port),
+                    .sin_zero = [_]u8{0} ** @sizeOf(@typeOf(SOCKADDR_IN(undefined).sin_zero)),
+                }
+            };
         }
     };
 
     pub const Ipv6 = packed struct {
+        inner: SOCKADDR_IN6,
 
         pub fn from(address: u128, port: u16) @This() {
-            // TODO
+            return @This() {
+                .inner = SOCKADDR_IN6 {
+                    .sin6_flowinfo = 0,
+                    .sin6_scope_id = 0,
+                    .sin6_family = AF_INET6,
+                    .sin6_port = std.mem.nativeToBig(u16, port),
+                    .sin6_addr = IN6_ADDR { .Word = @bitCast(@typeOf(IN6_ADDR(undefined).Word), address) },
+                }
+            };
         }
     };
+
+    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
+        return self.performIO(&self.reader, null, buffers);
+    }
+
+    pub fn readFrom(self: *@This(), address: *zio.Socket.Address, buffers: []zio.Buffer) zio.Result {
+        return self.performIO(&self.reader, address, buffers);
+    }
+
+    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
+        return self.performIO(&self.writer, null, buffers);
+    }
+
+    pub fn writeFrom(self: *@This(), address: *const zio.Socket.Address, buffers: []const zio.Buffer) zio.Result {
+        return self.performIO(&self.writer, address, buffers);
+    }
+
+    inline fn performIO(
+        self: *@This(),
+        overlapped: *windows.OVERLAPPED,
+        address: ?*const zio.Socket.Address,
+        buffers: []const zio.Buffer
+    ) zio.Result {
+        if (self.is_overlapped)
+            @memset(@ptrCast([*]u8, overlapped), 0, @sizeOf(windows.OVERLAPPED));
+        
+        const ptr = if (self.is_overlapped) overlapped else null;
+        const buf_ptr = @intToPtr([*]WSABUF, @ptrToInt(buffers.ptr));
+        const buf_len = @intCast(windows.DWORD, clamp(windows.DWORD, buffers.len));
+        const addr_ptr = @intToPtr(?*SOCKADDR, @ptrToInt(if (address) |addr| &addr.address else null));
+
+        var result: c_int = undefined;
+        switch (overlapped) {
+            &self.writer => {
+                const addr_len = if (address) |addr| addr.length else 0; 
+                result = WSASendTo(self.handle, buf_ptr, buf_len, null, 0, addr_ptr, addr_len, ptr, null);
+            },
+            &self.reader => {
+                self.recv_flags = 0;
+                const addr_len = if (address) |addr| &addr.length else null; 
+                result = WSARecvFrom(self.handle, buf_ptr, buf_len, null, &self.recv_flags, addr_ptr, addr_len, ptr, null);
+            },
+            else => unreachable,
+        }
+
+        return zio.Result {
+            .data = @ptrToInt(self.reader.InternalHigh),
+            .status = 
+                if (result == 0) .Completed
+                else if (WSAGetLastError() == WSA_IO_PENDING) .Retry
+                else .Error,
+        };
+    }
 
     pub fn bind(self: *@This(), address: *zio.Socket.Address) zio.Socket.BindError!void {
         // TODO
     }
 
-   
     pub fn listen(self: *@This(), backlog: u16) zio.Socket.ListenError!void {
         // TODO
     }
@@ -244,6 +331,12 @@ const SOCK_DGRAM: windows.DWORD = 2;
 const SOCK_RAW: windows.DWORD = 3;
 const IPPROTO_TCP: windows.DWORD = 6;
 const IPPROTO_UDP: windows.DWORD = 17;
+
+const STATUS_COMPLETED = 0;
+const WSAEMSGSIZE: windows.DWORD = 10040;
+const WSA_IO_PENDING: windows.DWORD = 997;
+const WSA_INVALID_HANDLE: windows.DWORD = 6;
+const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
 
 const SOCKADDR = extern struct {
     sa_family: c_ushort,
@@ -347,12 +440,6 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
 ) system.BOOL;
 
 extern "ws2_32" stdcallcc fn closesocket(s: windows.HANDLE) c_int;
-extern "ws2_32" stdcallcc fn socket(
-    dwAddressFamily: windows.DWORD,
-    dwSocketType: windows.DWORD,
-    dwProtocol: windows.DWORD,
-) HANDLE;
-
 extern "ws2_32" stdcallcc fn listen(
     s: windows.HANDLE,
     backlog: c_int,
@@ -363,6 +450,7 @@ extern "ws2_32" stdcallcc fn bind(
     addr_len: c_int,
 ) c_int;
 
+extern "Ws2_32" stdcallcc fn WSAGetLastError() c_int;
 extern "ws2_32" stdcallcc fn WSACleanup() c_int;
 extern "ws2_32" stdcallcc fn WSAStartup(
     wVersionRequested: windows.WORD,
@@ -381,34 +469,23 @@ extern "ws2_32" stdcallcc fn WSAIoctl(
     lpCompletionRoutine: ?fn(*windows.OVERLAPPED) usize,
 ) c_int;
 
-extern "ws2_32" stdcallcc fn WSASend(
-    s: windows.HANDLE,
-    lpBuffers: [*]WSABUF,
-    dwBufferCount: windows.DWORD,
-    lpNumberOfBytesSent: *windows.DWORD,
+extern "ws2_32" stdcallcc fn WSASocketA(
+    family: windows.DWORD,
+    sock_type: windows.DWORD,
+    protocol: windows.DWORD,
+    lpProtocolInfo: usize,,
+    group: usize,
     dwFlags: windows.DWORD,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRouting: ?OverlappedCompletionRoutine,
-) c_int;
+) windows.HANDLE;
 
 extern "ws2_32" stdcallcc fn WSASendTo(
     s: windows.HANDLE,
     lpBuffers: [*]WSABUF,
     dwBufferCount: windows.DWORD,
-    lpNumberOfBytesSent: *windows.DWORD,
+    lpNumberOfBytesSent: ?*windows.DWORD,
     dwFlags: windows.DWORD,
-    lpTo: *const SOCKADDR,
+    lpTo: ?*const SOCKADDR,
     iToLen: c_int,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRouting: ?OverlappedCompletionRoutine,
-) c_int;
-
-extern "ws2_32" stdcallcc fn WSARecv(
-    s: windows.HANDLE,
-    lpBuffers: [*]WSABUF,
-    dwBufferCount: windows.DWORD,
-    lpNumberOfBytesRecv: *windows.DWORD,
-    lpFlags: *windows.DWORD,
     lpOverlapped: ?*windows.OVERLAPPED,
     lpCompletionRouting: ?OverlappedCompletionRoutine,
 ) c_int;
@@ -417,9 +494,9 @@ extern "ws2_32" stdcallcc fn WSARecvFrom(
     s: windows.HANDLE,
     lpBuffers: [*]WSABUF,
     dwBufferCount: windows.DWORD,
-    lpNumberOfBytesRecv: *windows.DWORD,
+    lpNumberOfBytesRecv: ?*windows.DWORD,
     lpFlags: *windows.DWORD,
-    lpFrom: *SOCKADDR,
+    lpFrom: ?*SOCKADDR,
     lpFromLen: *c_int,
     lpOverlapped: ?*windows.OVERLAPPED,
     lpCompletionRouting: ?OverlappedCompletionRoutine,

@@ -47,7 +47,10 @@ pub const Result = struct {
         Retry,
         /// The operation was fully completed and `data` holds the result.
         Completed,
-    }
+        /// Memory passed into the io operation was too small.
+        /// One should reperform the io operation with a larger memory region.
+        MoreMemory,
+    };
 };
 
 /// A Buffer represents a slice of bytes encoded in a form
@@ -237,25 +240,40 @@ pub const Socket = struct {
         return self.inner.getOption(option);
     }
 
-    pub const Address = union(enum) {
-        v4: backend.Socket.Ipv4,
-        v6: backend.Socket.Ipv6,
+    pub const Address = struct {
+        length: c_int,
+        address: IpAddress,
+
+        const IpAddress = packed union {
+            v4: backend.Socket.Ipv4,
+            v6: backend.Socket.Ipv6,
+        };
 
         pub fn parseIpv4(address: []const u8, port: u16) ?@This() {
             // var addr: u32 = // TODO: ipv4 parsing
-            return @This() { .v4 = backend.Socket.Ipv4.from(addr, port) };
+            return @This() {
+                .length = @sizeOf(backend.Socket.Ipv4),
+                .address = IpAddress {
+                    .v4 = backend.Socket.Ipv4.from(addr, port),
+                },
+            };
         }
 
         pub fn parseIpv6(address: []const u8, port: u16) ?@This() {
             // var addr: u128 = // TODO: ipv6 parsing
-            return @This() { .v6 = backend.Socket.Ipv6.from(addr, port) };
+            return @This() {
+                .length = @sizeOf(backend.Socket.Ipv6),
+                .address = IpAddress {
+                    .v6 = backend.Socket.Ipv6.from(addr, port),
+                },
+            };
         }
 
         pub fn writeTo(self: @This(), buffer: []u8) ?void {
             // TODO: ipv4 & ipv6 serialization
             return null;
         }
-    };
+    }
 
     /// IO:[LOCKS READ PIPE] Read data from the underlying socket into the buffers.
     /// `Result.transferred` represents the amount of bytes read from the socket.

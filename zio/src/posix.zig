@@ -112,7 +112,7 @@ pub const EventPoller = struct {
 
         pub fn getResult(self: @This()) zio.Result {
             return zio.Result {
-                .transferred = @intCast(usize, self.inner.data),
+                .data = @intCast(usize, self.inner.data),
                 .status = switch (self.inner.flags & (system.EV_EOF | system.EV_ERROR)) {
                     0 => .Retry,
                     else => .Error,

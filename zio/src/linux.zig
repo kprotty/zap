@@ -121,7 +121,7 @@ pub const EventPoller = struct {
 
         pub fn getResult(self: @This()) zio.Result {
             return zio.Result {
-                .transferred = 0,
+                .data = 0,
                 .status = switch (self.inner.events & (linux.EPOLLERR | linux.EPOLLHUP | linux.EPOLLRDHUP)) {
                     0 => .Retry,
                     else => .Error,

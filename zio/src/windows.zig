@@ -177,7 +177,7 @@ pub const Socket = struct {
             zio.Socket.Raw => 0,
             zio.Socket.Udp => IPPROTO_UDP,
             zio.Socket.Tcp => IPPROTO_TCP,
-            else => return zio.SOcket.Error.InvalidValue,
+            else => return zio.Socket.Error.InvalidValue,
         };
         const sock_type = switch (flags & (zio.Socket.Tcp | zio.Socket.Udp | zio.Socket.Raw)) {
             zio.Socket.Raw => SOCK_RAW,

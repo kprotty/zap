@@ -198,8 +198,9 @@ pub const Socket = struct {
         return self.inner.fromhandle(handle);
     }
 
-    pub const Error = error {
-        // TODO
+    pub const Error = std.os.UnexpectedError || error {
+        InvalidValue,
+        InvalidHandle,
     };
 
     /// Initialize a socket using the given flags.
@@ -301,7 +302,8 @@ pub const Socket = struct {
     }
 
     pub const BindError = ListenError || error {
-        // TODO
+        AddressInUse,
+        InvalidAddress,
     };
 
     /// [LOCKS READ & WRITE PIPE] Bind and set the source address for the underlying socket object.
@@ -312,7 +314,9 @@ pub const Socket = struct {
     }
 
     pub const ListenError = error {
-        // TODO
+        InvalidState,
+        InvalidHandle,
+        OutOfResources,
     };
 
     /// [LOCKS READ & WRITE PIPE] Marks the socket as passive to be used for `accept()`ing connections.

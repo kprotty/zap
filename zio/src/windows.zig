@@ -36,7 +36,7 @@ pub fn Initialize() zio.InitError!void {
         const dummy_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (dummy_socket == windows.INVALID_HANDLE_VALUE)
             return windows.unexpectedError(windows.kernel32.GetLastError());
-        defer closesocket(dummy_socket);
+        defer Mswsock.closesocket(dummy_socket);
         try WSA.findFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx);
         try WSA.findFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx);
     }
@@ -193,7 +193,7 @@ pub const Socket = struct {
     }
     
     pub fn close(self: *@This()) void {
-        _ = closesocket(self.handle);
+        _ = Mswsock.closesocket(self.handle);
         self.handle = windows.INVALID_HANDLE_VALUE;
     }
 
@@ -297,12 +297,28 @@ pub const Socket = struct {
         };
     }
 
-    pub fn bind(self: *@This(), address: *zio.Socket.Address) zio.Socket.BindError!void {
-        // TODO
+    pub fn bind(self: *@This(), address: *const zio.Socket.Address) zio.Socket.BindError!void {
+        if (Mswsock.bind(self.handle, @ptrCast(*const SOCKADDR, address.address), address.length) == 0)
+            return;
+        return switch (WSAGetLastError()) {
+            WSANOTINITIALIZED, WSAENETDOWN => zio.Socket.BindError.InvalidState,
+            WSAEADDRNOTAVAIL, WSAEFAULT => zio.Socket.BindError.InvalidAddress,
+            WSAEADDRINUSE => zio.Socket.BindError.AddressInUse,
+            WSAENOTSOCK => zio.Socket.BindError.InvalidHandle,
+            WSAENOBUFS => zio.Socket.BindError.OutOfResources,
+            else => unreachable,
+        };
     }
 
     pub fn listen(self: *@This(), backlog: u16) zio.Socket.ListenError!void {
-        // TODO
+        if (Mswsock.listen(self.handle, backlog) == 0)
+            return;
+        return switch (WSAGetLastError()) {
+            WSANOTINITIALIZED, WSAENETDOWN, WSAEADDRINUSE, WSAEINPROGRESS, WSAEINVAL => zio.Socket.ListenError.InvalidState,
+            WSAEISCONN, WSAEMFILE, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.ListenError.InvalidHandle,
+            WSAENOBUFS => zio.Socket.ListenError.OutOfResources,
+            else => unreachable,
+        };
     }
 
     pub fn accept(self: *@This(), address: *zio.Socket.Address) zio.Result {
@@ -333,10 +349,22 @@ const IPPROTO_TCP: windows.DWORD = 6;
 const IPPROTO_UDP: windows.DWORD = 17;
 
 const STATUS_COMPLETED = 0;
-const WSAEMSGSIZE: windows.DWORD = 10040;
 const WSA_IO_PENDING: windows.DWORD = 997;
 const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
+const WSAEMSGSIZE: windows.DWORD = 10040;
+const WSANOTINITIALIZED: windows.DWORD = 10093;
+const WSAEADDRINUSE: windows.DWORD = 10048;
+const WSAEADDRNOTAVAIL: windows.DWORD = 10049;
+const WSAEINPROGRESS: windows.DWORD = 10036;
+const WSAEMFILE: windows.DWORD = 10024;
+const WSAEISCONN: windows.DWORD = 10056;
+const WSAENETDOWN: windows.DWORD = 10050;
+const WSAEINVAL: windows.DWORD = 10022;
+const WSAEFAULT: windows.DWORD = 10014;
+const WSAENOBUFS: windows.DWORD = 10055;
+const WSAENOTSOCK: windows.DWORD = 10038;
+const WSAEOPNOTSUPP: windows.DWORD = 10045;
 
 const SOCKADDR = extern struct {
     sa_family: c_ushort,
@@ -439,16 +467,18 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
     fAlertable: system.BOOL,
 ) system.BOOL;
 
-extern "ws2_32" stdcallcc fn closesocket(s: windows.HANDLE) c_int;
-extern "ws2_32" stdcallcc fn listen(
-    s: windows.HANDLE,
-    backlog: c_int,
-) c_int;
-extern "ws2_32" stdcallcc fn bind(
-    s: windows.HANDLE,
-    addr: *const SOCKADDR,
-    addr_len: c_int,
-) c_int;
+const Mswsock = {
+    pub extern "ws2_32" stdcallcc fn closesocket(s: windows.HANDLE) c_int;
+    pub extern "ws2_32" stdcallcc fn listen(
+        s: windows.HANDLE,
+        backlog: c_int,
+    ) c_int;
+    pub extern "ws2_32" stdcallcc fn bind(
+        s: windows.HANDLE,
+        addr: *const SOCKADDR,
+        addr_len: c_int,
+    ) c_int;
+};
 
 extern "Ws2_32" stdcallcc fn WSAGetLastError() c_int;
 extern "ws2_32" stdcallcc fn WSACleanup() c_int;

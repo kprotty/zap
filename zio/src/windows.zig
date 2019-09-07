@@ -330,6 +330,22 @@ var AcceptEx: fn(
     lpOverlapped: *windows.OVERLAPPED,
 ) windows.BOOL = undefined;
 
+const OVERLAPPED_ENTRY = extern struct {
+    lpCompletionKey: system.ULONG_PTR,
+    lpOverlapped: ?*system.OVERLAPPED,
+    Internal: system.ULONG_PTR,
+    dwNumberOfBytesTransferred: system.DWORD,
+};
+
+extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
+    CompletionPort: system.HANDLE,
+    lpCompletionPortEntries: [*]OVERLAPPED_ENTRY,
+    ulCount: system.ULONG,
+    ulNumEntriesRemoved: system.PULONG,
+    dwMilliseconds: system.DWORD,
+    fAlertable: system.BOOL,
+) system.BOOL;
+
 extern "ws2_32" stdcallcc fn closesocket(s: windows.HANDLE) c_int;
 extern "ws2_32" stdcallcc fn socket(
     dwAddressFamily: windows.DWORD,

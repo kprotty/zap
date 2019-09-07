@@ -13,8 +13,8 @@ pub fn Initialize() zio.InitError!void {
 
     // For loading WSA functions at runtime (required by winapi)
     const WSA = struct {
-        pub fn findFunction(sock: Handle, id: GUID, function: var) zio.InitError!void {
-            var guid: GUID = id;
+        pub fn findFunction(sock: Handle, id: windows.GUID, function: var) zio.InitError!void {
+            var guid = id;
             var dwBytes: windows.DWORD = undefined;
             if (WSAIoctl(
                 sock,
@@ -87,8 +87,8 @@ pub const EventPoller = struct {
     pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         if (handle == windows.INVALID_HANDLE_VALUE)
             return zio.EventPoller.RegisterError.InvalidHandle;
-        _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, key, 0)
-            orelse return // TODO
+        _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, @ptrCast(windows.ULONG_PTR, data), 0)
+            orelse return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
     pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
@@ -231,3 +231,180 @@ fn clamp(comptime Int: type, number: var) @typeOf(number) {
     const max_value = @intCast(@typeOf(number), std.math.maxInt(Int));
     return std.math.min(max_value, number);
 }
+
+///-----------------------------------------------------------------------------///
+///                                API Definitions                              ///
+///-----------------------------------------------------------------------------///
+
+const AF_UNSPEC: windows.DWORD = 0;
+const AF_INET: windows.DWORD = 2;
+const AF_INET6: windows.DWORD = 6;
+const SOCK_STREAM: windows.DWORD = 1;
+const SOCK_DGRAM: windows.DWORD = 2;
+const SOCK_RAW: windows.DWORD = 3;
+const IPPROTO_TCP: windows.DWORD = 6;
+const IPPROTO_UDP: windows.DWORD = 17;
+
+const SOCKADDR = extern struct {
+    sa_family: c_ushort,
+    sa_data: [14]windows.CHAR,
+};
+
+const IN_ADDR = extern struct {
+    s_addr: windows.ULONG,
+};
+
+const IN6_ADDR = extern union {
+    Byte: [16]windows.CHAR,
+    Word: [8]windows.WORD,
+};
+
+const SOCKADDR_IN = extern struct {
+    sin_family: windows.SHORT,
+    sin_port: c_ushort,
+    sin_addr: IN_ADDR,
+    sin_zero: [8]windows.CHAR,
+};
+
+const SOCKADDR_IN6 = extern struct {
+    sin6_family: windows.SHORT,
+    sin6_port: c_ushort,
+    sin6_flowinfo: windows.ULONG,
+    sin6_addr: IN6_ADDR,
+    sin6_scope_id: windows.ULONG,
+};
+
+const WSAID_ACCEPTEX = windows.GUID {
+    .Data1 = 0xb5367df1,
+    .Data2 = 0xcbac,
+    .Data3 = 0x11cf,
+    .Data4 = [_]u8 { 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92 },
+};
+
+const WSAID_CONNECTEX = windows.GUID {
+    .Data1 = 0x25a207b9,
+    .Data2 = 0xddf3,
+    .Data3 = 0x4660,
+    .Data4 = [_]u8 { 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e },
+};
+
+const WSABUF = extern struct {
+    len: windows.ULONG,
+    buf: [*]const u8,
+};
+
+const WSAData = extern struct {
+    wVersion: windows.WORD,
+    wHighVersion: windows.WORD,
+    iMaxSockets: c_ushort,
+    iMaxUdpDg: c_ushort,
+    lpVendorInfo: [*]u8,
+    szDescription: [257]u8,
+    szSystemStatus: [129]u8,
+};
+
+const OverlappedCompletionRoutine = fn(
+    dwErrorCode: windows.DWORD,
+    dwNumberOfBytesTransferred: windows.DWORD,
+    lpOverlapped: *windows.OVERLAPPED,
+) void;
+
+var ConnectEx: fn(
+    s: windows.HANDLE,
+    name: *const sockaddr,
+    name_len: c_int,
+    lpSendBuffer: windows.PVOID,
+    dwSendDataLength: windows.DWORD,
+    lpdwBytesSent: *windows.DWORD,
+    lpOverlapped: *windows.OVERLAPPED,
+) windows.BOOL = undefined;
+
+var AcceptEx: fn(
+    sListenSocket: windows.HANDLE,
+    sAcceptSocket: windows.HANDLE,
+    lpOutputBuffer: ?windows.PVOID,
+    dwReceiveDataLength: windows.DWORD,
+    dwLocalAddressLength: windows.DWORD,
+    dwRemoteAddressLength: windows.DWORD,
+    lpdwBytesReceived: *windows.DWORD,
+    lpOverlapped: *windows.OVERLAPPED,
+) windows.BOOL = undefined;
+
+extern "ws2_32" stdcallcc fn closesocket(s: windows.HANDLE) c_int;
+extern "ws2_32" stdcallcc fn socket(
+    dwAddressFamily: windows.DWORD,
+    dwSocketType: windows.DWORD,
+    dwProtocol: windows.DWORD,
+) HANDLE;
+
+extern "ws2_32" stdcallcc fn listen(
+    s: windows.HANDLE,
+    backlog: c_int,
+) c_int;
+extern "ws2_32" stdcallcc fn bind(
+    s: windows.HANDLE,
+    addr: *const SOCKADDR,
+    addr_len: c_int,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSACleanup() c_int;
+extern "ws2_32" stdcallcc fn WSAStartup(
+    wVersionRequested: windows.WORD,
+    lpWSAData: *WSAData,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSAIoctl(
+    s: windows.HANDLE,
+    dwIoControlMode: windows.DWORD,
+    lpvInBuffer: windows.PVOID,
+    cbInBuffer: windows.DWORD,
+    lpvOutBuffer: windows.PVOID,
+    cbOutBuffer: windows.DWORD,
+    lpcbBytesReturned: *windows.DWORD,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    lpCompletionRoutine: ?fn(*windows.OVERLAPPED) usize,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSASend(
+    s: windows.HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: windows.DWORD,
+    lpNumberOfBytesSent: *windows.DWORD,
+    dwFlags: windows.DWORD,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    lpCompletionRouting: ?OverlappedCompletionRoutine,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSASendTo(
+    s: windows.HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: windows.DWORD,
+    lpNumberOfBytesSent: *windows.DWORD,
+    dwFlags: windows.DWORD,
+    lpTo: *const SOCKADDR,
+    iToLen: c_int,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    lpCompletionRouting: ?OverlappedCompletionRoutine,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSARecv(
+    s: windows.HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: windows.DWORD,
+    lpNumberOfBytesRecv: *windows.DWORD,
+    lpFlags: *windows.DWORD,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    lpCompletionRouting: ?OverlappedCompletionRoutine,
+) c_int;
+
+extern "ws2_32" stdcallcc fn WSARecvFrom(
+    s: windows.HANDLE,
+    lpBuffers: [*]WSABUF,
+    dwBufferCount: windows.DWORD,
+    lpNumberOfBytesRecv: *windows.DWORD,
+    lpFlags: *windows.DWORD,
+    lpFrom: *SOCKADDR,
+    lpFromLen: *c_int,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    lpCompletionRouting: ?OverlappedCompletionRoutine,
+) c_int;

@@ -32,8 +32,8 @@ pub fn Initialize() zio.InitError!void {
     };
 
     // Find AcceptEx and ConnectEx using WSAIoctl
-    if (AcceptEx == null or ConnectEx == null) {  
-        const dummy_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (AcceptEx == null or ConnectEx == null) {
+        const dummy_socket = WSASocketA(AF_INET, SOCK_STREAM, 0, null, 0, 0);
         if (dummy_socket == windows.INVALID_HANDLE_VALUE)
             return windows.unexpectedError(windows.kernel32.GetLastError());
         defer Mswsock.closesocket(dummy_socket);

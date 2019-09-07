@@ -16,6 +16,17 @@ pub fn nextPowerOfTwo(value: var) @typeOf(value) {
     return T(1) << @truncate(ShrType, Bits - @clz(T, value - 1));
 }
 
+pub fn cpuYield(spin_count: usize) void {
+    var spin = spin_count;
+    while (spin > 0) : (spin -= 1) {
+        switch (builtin.arch) {
+            .i386, .x86_64 => asm volatile("pause" ::: "memory"),
+            .arm, .aarch64 => asm volatile("yield"),
+            else => // TODO
+        }
+    }
+}
+
 pub const AtomicOrder = enum {
     Relaxed,
     Consume,
@@ -35,6 +46,10 @@ pub const AtomicOrder = enum {
         };
     }
 };
+
+pub inline fn Fence(comptime order: AtomicOrder) void {
+    @fence(comptime order.toBuiltin());
+}
 
 pub fn Atomic(comptime T: type) type {
     std.debug.assert(@sizeOf(T) > 0);

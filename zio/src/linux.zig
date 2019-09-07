@@ -165,7 +165,7 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: Handle, flags: u32) @This() {
         // TODO
     }
 

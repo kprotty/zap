@@ -150,6 +150,8 @@ pub const EventPoller = struct {
 
 pub const Socket = struct {
     handle: Handle,
+    is_overlapped: bool,
+    recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
 
@@ -157,7 +159,7 @@ pub const Socket = struct {
         return self.handle;
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: Handle, flags: u32) @This() {
         var self: @This() = undefined;
         self.handle = handle;
         return self;

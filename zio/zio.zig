@@ -32,30 +32,22 @@ pub inline fn Cleanup() void {
 pub const Handle = backend.Handle;
 
 /// The result of an IO operation which denotes:
-/// - the noted side-effects
-/// - what action to take next.
+/// - the side effects of the operation
+/// - the actions to perform next in order to complete it
 pub const Result = struct {
+    data: u32,
     status: Status,
-    transferred: usize,
 
     pub const Status = enum {
-        /// The operation was fully completed successfully.
-        /// The result of the operation lies in `transferred`. 
-        Completed,
-        /// There was an error performing the IO operation.
-        /// One should `.close()` the resource object in question
-        /// and no longer interact with it as that is then undefined.
-        /// `transferred` represents the bytes transferred nonetheless 
+        /// There was an error performing the operation.
+        /// `data` refers to whatever work was completed nonetheless.
         Error,
-        /// The operation which produced this result should be retried.
-        /// `transferred` instead refers to a hint which can be used for
-        /// retrying the IO operation (e.g. bytes ready after a `.read()`)
+        /// The operation was partially completed and would normally block.
+        /// `data` refers to whatever work was partially completed.
         Retry,
-        /// The operation completed partially, as in there is still more work to do.
-        /// One should register/have registered the resource object under an `EventPoller`
-        /// or use some other mechanism to wait for the kernel to allow the IO operation to progress.
-        Partial,
-    };
+        /// The operation was fully completed and `data` holds the result.
+        Completed,
+    }
 };
 
 /// A Buffer represents a slice of bytes encoded in a form
@@ -161,8 +153,8 @@ pub const EventPoller = struct {
             return self.inner.getResult();
         }
 
-        /// Get an identifier which can be used (e.g. by `Socket.isReadable()`) 
-        /// to know which pipe the event originated from in order to help event processing.
+        /// Get an identifier which can be used with `.isReadable()` or `.isWriteable()`
+        /// in order to help identify which pipe this event originated from.
         pub inline fn getIdentifier(self: @This()) usize {
             return self.inner.getIdentifier();
         }
@@ -188,23 +180,23 @@ pub const EventPoller = struct {
 pub const Socket = struct {
     inner: backend.Socket,
 
-    /// Get the underlying Handle for this resource object
-    pub inline fn getHandle(self: @This()) Handle {
-        return self.inner.getHandle();
-    }
-
-    /// Create a `Socket` from a Handle.
-    /// There should not exist more than one EventPoller active at a given point.
-    pub inline fn fromHandle(handle: Handle) @This() {
-        return self.inner.fromhandle(handle);
-    }
-
     pub const Raw:      u32 = 1 << 0;
     pub const Tcp:      u32 = 1 << 1;
     pub const Udp:      u32 = 1 << 2;
     pub const Ipv4:     u32 = 1 << 3;
     pub const Ipv6:     u32 = 1 << 4;
     pub const Nonblock: u32 = 1 << 5;
+
+    /// Get the underlying Handle for this resource object
+    pub inline fn getHandle(self: @This()) Handle {
+        return self.inner.getHandle();
+    }
+
+    /// Create a `Socket` from a Handle using `flags` as the context.
+    /// There should not exist more than one EventPoller active at a given point.
+    pub inline fn fromHandle(handle: Handle, flags: u32) @This() {
+        return self.inner.fromhandle(handle);
+    }
 
     pub const Error = error {
         // TODO
@@ -221,16 +213,6 @@ pub const Socket = struct {
     /// Close this resource object
     pub inline fn close(self: *@This()) void {
         return self.inner.close();
-    }
-
-    /// Use the result of `EventPoller.Event.getIdenfier()` to discover if the event is from the READ pipe.
-    pub inline fn isReadable(self: *@This(), identifier: usize) bool {
-        return self.inner.isReadable(identifier);
-    }
-
-    /// Use the result of `EventPoller.Event.getIdenfier()` to discover if the event is from the WRITE pipe.
-    pub inline fn isWriteable(self: *@This(), identifier: usize) bool {
-        return self.inner.isWriteable(identifier);
     }
 
     pub const Option = union(enum) {
@@ -310,19 +292,20 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    /// IO:[LOCKS READ PIPE] Accept an incoming connection from the socket.
-    /// The peer address of the client is stored in the given `address` pointer.
-    /// The client Handle can be @intCast()'ed from `Result.transffered` if `Result.Status.Completed`.
-    /// The client Handle can then be used to create a client socket using `Socket.fromHandle()`.
-    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.READ`.
-    pub inline fn accept(self: *@This(), address: *Address) Result {
-        return self.inner.accept(address, client);
-    }
-
     /// IO:[LOCKS WRITE PIPE] Starts a (TCP) connection with a remote address using the socket.
+    /// The `address` pointer needs to be live until `Result.Stats.Completed` is returned.
     /// if `Result.Status.Completed`, then the connection was completed and it is safe to call `read()` and `write()`
     /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.WRITE`.
     pub inline fn connect(self: *@This(), address: *Address) Result {
         return self.inner.connect(address);
+    }
+
+    /// IO:[LOCKS READ PIPE] Accept an incoming connection from the socket.
+    /// The client's handle is stored in the given 'client' pointer.
+    /// The peer address of the client is stored in the given `address` pointer.
+    /// If `Nonblock`, both the `address` and the `client` pointers need to be live until `Result.Status.Completed`
+    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.READ`.
+    pub inline fn accept(self: *@This(), client: *Handle, address: *Address) Result {
+        return self.inner.accept(address, client);
     }
 };

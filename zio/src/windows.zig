@@ -290,10 +290,10 @@ pub const Socket = struct {
 
         return zio.Result {
             .data = @ptrToInt(self.reader.InternalHigh),
-            .status = 
-                if (result == 0) .Completed
-                else if (WSAGetLastError() == WSA_IO_PENDING) .Retry
-                else .Error,
+            .status = if (result == 0) .Completed else switch (WSAGetLastError()) {
+                WSA_IO_PENDING => .Retry,
+                else => .Error,
+            },
         };
     }
 

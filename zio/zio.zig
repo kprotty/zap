@@ -47,9 +47,6 @@ pub const Result = struct {
         Retry,
         /// The operation was fully completed and `data` holds the result.
         Completed,
-        /// Memory passed into the io operation was too small.
-        /// One should reperform the io operation with a larger memory region.
-        MoreMemory,
     };
 };
 

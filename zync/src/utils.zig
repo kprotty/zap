@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 pub fn CachePadded(comptime T: type) type {
     return packed struct {
         value: T,
-        padding: [64 - @sizeOf(T)]u8,
+        padding: [@sizeOf(T) % 64]u8,
     };
 }
 
@@ -145,10 +145,14 @@ pub fn Atomic(comptime T: type) type {
         }
 
         inline fn transmute(comptime To: type, from: var) To {
-            var input = from;
-            var value: To = undefined;
-            @memcpy(@ptrCast([*]u8, &value), @ptrCast([*]const u8, &input), @sizeOf(To));
-            return value;
+            return (
+                extern union {
+                    output: To,
+                    input: @typeOf(from),
+                } {
+                    .input = from,
+                }
+            ).output;
         }
     };
 }

@@ -213,14 +213,6 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
-        // TODO
-    }
-
-    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
-        // TODO
-    }
-
     pub const Ipv4 = packed struct {
         inner: SOCKADDR_IN,
 
@@ -251,6 +243,22 @@ pub const Socket = struct {
             };
         }
     };
+
+    pub fn read(self: *@This(), buffers: []zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn write(self: *@This(), buffers: []const zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn readFrom(self: *@This(), address: *zio.Socket.Address, buffers: []zio.Buffer) zio.Result {
+        // TODO
+    }
+
+    pub fn writeTo(self: *@This(), address: *const zio.Socket.Address, buffers: []const zio.Buffer) zio.Result {
+        // TODO
+    }
 
     pub fn bind(self: *@This(), address: *zio.Socket.Address) zio.Socket.BindError!void {
         // TODO

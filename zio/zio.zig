@@ -237,20 +237,6 @@ pub const Socket = struct {
         return self.inner.getOption(option);
     }
 
-    /// IO:[LOCKS READ PIPE] Read data from the underlying socket into the buffers.
-    /// `Result.transferred` represents the amount of bytes read from the socket.
-    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.READ`.
-    pub inline fn read(self: *@This(), buffers: []Buffer) Result {
-        return self.inner.read(buffers);
-    }
-
-    /// IO:[LOCKS READ PIPE] Write data to the underlying socket using the buffers.
-    /// `Result.transferred` represents the amount of bytes written to the socket.
-    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.WRITE`.
-    pub inline fn write(self: *@This(), buffers: []const Buffer) Result {
-        return self.inner.write(buffers);
-    }
-
     pub const Address = union(enum) {
         v4: backend.Socket.Ipv4,
         v6: backend.Socket.Ipv6,
@@ -270,6 +256,34 @@ pub const Socket = struct {
             return null;
         }
     };
+
+    /// IO:[LOCKS READ PIPE] Read data from the underlying socket into the buffers.
+    /// `Result.transferred` represents the amount of bytes read from the socket.
+    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.READ`.
+    pub inline fn read(self: *@This(), buffers: []Buffer) Result {
+        return self.inner.read(buffers);
+    }
+
+    /// Similar to `read()` but works with message based protocols (Udp).
+    /// Receives the address of the peer sender into 'address'.
+    /// 'address' pointer must be live until it returns `Result.Status.Completed`.
+    pub inline fn readFrom(self: *@This(), address: *Address, buffers: []Buffer) Result {
+        return self.inner.readFrom(address, buffers);
+    }
+
+    /// IO:[LOCKS READ PIPE] Write data to the underlying socket using the buffers.
+    /// `Result.transferred` represents the amount of bytes written to the socket.
+    /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.WRITE`.
+    pub inline fn write(self: *@This(), buffers: []const Buffer) Result {
+        return self.inner.write(buffers);
+    }
+
+    /// Similar to `write()` but works with message based protocols (Udp).
+    /// Send the data using the peer address of the 'address' pointer.
+    /// 'address' pointer must be live until it returns `Result.Status.Completed.`
+    pub inline fn writeTo(self: *@This(), address: *const Address, buffers: []const Buffer) Result {
+        return self.inner.writeTo(address, buffers);
+    }
 
     pub const BindError = ListenError || error {
         // TODO

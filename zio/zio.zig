@@ -198,9 +198,10 @@ pub const Socket = struct {
         return self.inner.fromhandle(handle);
     }
 
-    pub const Error = std.os.UnexpectedError || error {
+    pub const Error = error {
+        InvalidState,
         InvalidValue,
-        InvalidHandle,
+        OutOfResources,
     };
 
     /// Initialize a socket using the given flags.

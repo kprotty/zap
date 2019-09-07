@@ -188,8 +188,14 @@ pub const Socket = struct {
 
         self.is_overlapped = dwFlags != 0;
         self.handle = WSASocketA(family, protocol, sock_type, null, 0, dwFlags);
-        if (self.handle == windows.INVALID_HANDLE_VALUE)
-            return zio.Socket.Error.InvalidHandle;
+        if (self.handle == windows.INVALID_HANDLE_VALUE) {
+            return switch (WSAGetLastError()) {
+                WSANOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS, WSAEINVALIDPROVIDER, WSAEINVALIDPROCTABLE, WSAEPROVIDERFAILEDINIT => zio.Socket.Error.InvalidState,
+                WSAEAFNOTSUPPORT, WSAEFAULT, WSAEINVAL, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT => zio.Socket.Error.InvalidValue,
+                WSAEMFILE, WSAENOBUFS => zio.Socket.Error.OutOfResources,
+                else => unreachable,
+            };
+        }
     }
     
     pub fn close(self: *@This()) void {
@@ -362,9 +368,16 @@ const WSAEISCONN: windows.DWORD = 10056;
 const WSAENETDOWN: windows.DWORD = 10050;
 const WSAEINVAL: windows.DWORD = 10022;
 const WSAEFAULT: windows.DWORD = 10014;
+const WSAEPROTOTYPE: windows.DWORD = 10041;
 const WSAENOBUFS: windows.DWORD = 10055;
 const WSAENOTSOCK: windows.DWORD = 10038;
 const WSAEOPNOTSUPP: windows.DWORD = 10045;
+const WSAEAFNOTSUPPORT: windows.DWORD = 10047;
+const WSAEPROTONOSUPPORT: windows.DWORD = 10043;
+const WSAESOCKTNOSUPPORT: windows.DWORD = 10044;
+const WSAEINVALIDPROVIDER: windows.DWORD = 10105;
+const WSAEINVALIDPROCTABLE: windows.DWORD = 10104;
+const WSAEPROVIDERFAILEDINIT: windows.DWORD = 10106;
 
 const SOCKADDR = extern struct {
     sa_family: c_ushort,

@@ -1,3 +1,6 @@
+const std = @import("std");
+const builtin = @import("builtin");
+
 pub fn yield(spin_count: usize) void {
     var spin = spin_count;
     while (spin > 0) : (spin -= 1) {

@@ -272,7 +272,7 @@ pub const Socket = struct {
             // TODO: ipv4 & ipv6 serialization
             return null;
         }
-    }
+    };
 
     /// IO:[LOCKS READ PIPE] Read data from the underlying socket into the buffers.
     /// `Result.transferred` represents the amount of bytes read from the socket.

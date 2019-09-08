@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const utils = @import("utils.zig");
 
 pub fn yield(spin_count: usize) void {
     var spin = spin_count;
@@ -32,7 +33,7 @@ pub const AtomicOrder = enum {
     }
 };
 
-pub inline fn Fence(comptime order: AtomicOrder) void {
+pub inline fn fence(comptime order: AtomicOrder) void {
     @fence(comptime order.toBuiltin());
 }
 
@@ -46,13 +47,15 @@ pub fn Atomic(comptime T: type) type {
         pub const Type = baseType(T);
         pub const Order = AtomicOrder;
 
+        /// Used for resolved int/float types with weird bit sizes (e.g. u7)
+        /// and store them in an atomic-type compatible backing with conversions in and out.
         fn baseType(comptime B: type) type {
             return switch (@typeInfo(B)) {
-                .Int => |int| @IntType(int.is_signed, comptime nextPowerOfTwo(int.bits)),
-                .Float => |float| @IntType(false, comptime nextPowerOfTwo(float.bits)),
+                .Int => |int| @IntType(int.is_signed, std.math.max(8, comptime utils.nextPowerOfTwo(int.bits))),
+                .Float => |float| @IntType(false, std.math.max(8, comptime utils.nextPowerOfTwo(float.bits))),
                 .Enum => baseType(@TagType(B)),
                 .Bool => u8,
-                else => @IntType(false, comptime nextPowerOfTwo(@sizeOf(B) * 8)),
+                else => @IntType(false, comptime utils.nextPowerOfTwo(@sizeOf(B) * 8)),
             };
         }
         
@@ -61,7 +64,7 @@ pub fn Atomic(comptime T: type) type {
         }
 
         pub inline fn get(self: @This()) T {
-            return transmute(Type, self.value);
+            return transmute(T, self.value);
         }
 
         pub inline fn set(self: *@This(), value: T) void {
@@ -70,7 +73,7 @@ pub fn Atomic(comptime T: type) type {
 
         pub inline fn store(self: *@This(), value: T, comptime order: Order) void {
             // TODO: https://github.com/ziglang/zig/issues/2995
-            return self.swap(value, order);
+            _ = self.swap(value, order);
         }
 
         pub fn load(self: *@This(), comptime order: Order) T {
@@ -113,7 +116,7 @@ pub fn Atomic(comptime T: type) type {
             return self.atomicRmw(value, .Min, order);
         }
 
-        pub fn casWeak(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
+        pub fn compareSwap(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
             return transmute(?T, @cmpxchgWeak(
                 Type,
                 &self.value,
@@ -124,7 +127,7 @@ pub fn Atomic(comptime T: type) type {
             ));
         }
 
-        pub fn casStrong(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
+        pub fn compareSwapStrong(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
             return transmute(?T, @cmpxchgStrong(
                 Type,
                 &self.value,
@@ -157,3 +160,45 @@ pub fn Atomic(comptime T: type) type {
         }
     };
 }
+
+const expect = std.testing.expect;
+
+test "yield, fence" {
+    fence(.Release);
+    _ = yield(69);
+    fence(.Acquire);
+}
+
+test "size rounding" {
+    expect(Atomic(struct { x: usize }).Type == @IntType(false, @typeInfo(usize).Int.bits));
+    expect(Atomic(enum(u2) { X, Y }).Type == u8);
+    expect(Atomic(u42).Type == u64);
+    expect(Atomic(u64).Type == u64);
+}
+
+test "get, set, load, store, swap, compareSwap" {
+    var f = Atomic(f32).new(3.14);
+    expect(f.get() == 3.14);
+
+    var e = Atomic(enum { A, B, C, D, E }).new(.A);
+    expect(e.get() == .A);
+    e.set(.B);
+    expect(e.load(.Relaxed) == .B);
+    e.store(.C, .Relaxed);
+    expect(e.swap(.D, .Relaxed) == .C);
+    expect(e.compareSwap(.D, .E, .Relaxed, .Relaxed) == null);
+    expect(e.get() == .E);
+}
+
+test "add, sub, and, nand, or, xor, min, max" {
+    var n = Atomic(u8).new(0);
+    expect(n.fetchAdd(4, .Relaxed) == 0);           // n = 0 ADD 4 = 4
+    expect(n.fetchSub(1, .Relaxed) == 4);           // n = 4 SUB 1 = 3
+    expect(n.fetchAnd(2, .Relaxed) == 3);           // n = 3(0b11) AND 2(0b10) = 2(0b10)
+    expect(n.fetchNand(2, .Relaxed) == 2);          // n = 2(0b00000010) NAND 2 = 0b11111101
+    expect(n.fetchOr(2, .Relaxed) == ~u8(2));       // n = 0b11111101 OR 0b00000010 = 0b11111111
+    expect(n.fetchXor(~u8(0), .Relaxed) == ~u8(0)); // n = 0b11111111 XOR 0b11111111 = 0
+    expect(n.min(1, .Relaxed) == 0);                // n = (0 < 1) ? 0 : 1 = 0
+    expect(n.max(1, .Relaxed) == 0);                // n = (1 > 0) ? 1 : 0 = 1
+    expect(n.load(.Relaxed) == 1);
+} 

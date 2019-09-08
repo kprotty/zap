@@ -12,7 +12,7 @@ pub fn build(b: *std.build.Builder) void {
         // "zell",
     }) |module| {
         const tests = b.addTest(module ++ "/" ++ module ++ ".zig");
-        tests.setNamePrefix(module ++ " ");
+        // tests.setNamePrefix(module ++ " ");
         tests.setBuildMode(mode);
 
         const test_step = b.step("test-" ++ module, "Run all tests for " ++ module);

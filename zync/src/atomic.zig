@@ -7,7 +7,7 @@ pub fn yield(spin_count: usize) void {
         switch (builtin.arch) {
             .i386, .x86_64 => asm volatile("pause" ::: "memory"),
             .arm, .aarch64 => asm volatile("yield"),
-            else => // TODO
+            else => _ = @ptrCast(*volatile usize, &spin).*,
         }
     }
 }

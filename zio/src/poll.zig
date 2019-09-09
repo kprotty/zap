@@ -1,3 +1,4 @@
+const std = @import("std");
 const zio = @import("../zio.zig");
 
 /// An EventPoller is used to listen to & generate IO events for non-blocking resource objects.
@@ -10,6 +11,8 @@ pub const EventPoller = struct {
     }
 
     /// Create an `EventPoller` from a Handle.
+    // There should not exist more than one EventPoller active at a given point.
+    /// It is also undefined behavior to call this method after previously calling `notify()`
     pub inline fn fromHandle(handle: zio.Handle) @This() {
         return self.inner.fromhandle(handle);
     }
@@ -27,6 +30,15 @@ pub const EventPoller = struct {
     /// Close this resource object
     pub inline fn close(self: *@This()) void {
         return self.inner.close();
+    }
+
+    pub const NotifyError = RegisterError;
+
+    /// Generate a user-based event with the `data` being arbitrary user data.
+    /// Most noteably used for communicating with an `EventPoller` which is blocked polling.
+    /// `Event`s originating from a `notify()` call are always Readable and never Writeable.
+    pub inline fn notify(self: *@This(), data: usize) NotifyError!void {
+        return self.inner.notify(data);
     }
 
     pub const READ:         u32 = 1 << 0;
@@ -94,30 +106,24 @@ pub const EventPoller = struct {
     }
 };
 
-pub const EventNotifier = struct {
-    inner: zio.backend.EventNotifier,
+const expect = std.testing.expect;
+test "EventPoller" {
+    var events: [1]EventPoller.Event = undefined;
+    var poller: EventPoller = undefined;
+    try poller.init();
+    defer poller.close();
 
-    pub const Error = error {
-        InvalidHandle,
-        OutOfResources,
-    };
+    // TODO: Implement pipes in order to test out register/reregister
+    // TODO: Implement zuma.now() in order to test poll() blocking timing.
 
-    /// Initialize the EventNotifier using the EventPoller
-    pub inline fn init(self: *@This(), poller: *EventPoller, id: usize) Error!void {
-        return self.inner.init(&poller.inner);
-    }
-
-    /// Close the EventNotifier if required
-    pub inline fn close(self: *@This()) void {
-        return self.inner.close();
-    }
-
-    pub const NotifyError = EventPoller.RegisterError;
-
-    /// Generate a user-based event with the 'data' being arbitrary user data.
-    /// This signals the associated EventPoller with the data usually used for notification.
-    /// `EventPoller.Event`s originating from a `notify()` are always Readable and never Writeable.
-    pub inline fn notify(self: *@This(), data: usize) NotifyError!void {
-        return self.inner.notify(data);
-    }
-};
+    var events_found = try poller.poll(events[0..], 0);
+    expect(events_found.len == 0);
+    
+    try poller.notify(1234);
+    events_found = try poller.poll(events[0..], 0);
+    expect(events_found.len == 1);
+    const data = events_found[0].getData();
+    const identifier = events_found[0].getIdentifier();
+    expect(data == 1234);
+    expect(identifier == EventPoller.READ or identifier == 0);
+}

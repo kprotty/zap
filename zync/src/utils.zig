@@ -1,11 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub fn CachePadded(comptime T: type) type {
+pub const cache_line = 64;
+pub fn CachePadded(comptime T: type) type { 
     return packed struct {
         value: T,
-        padding: [@sizeOf(T) % 64]u8,
+        padding: [std.mem.alignForward(@sizeOf(T), cache_line) - @sizeOf(T)]u8,
     };
+}
+
+const expect = std.testing.expect;
+test "cache padding" {
+    expect(@sizeOf(CachePadded(u9)) == cache_line);
+    expect(@sizeOf(CachePadded(u64)) == cache_line);
+    expect(@sizeOf(CachePadded([cache_line]u8)) == cache_line);
 }
 
 pub fn popCount(value: var) @typeOf(value) {
@@ -27,6 +35,12 @@ pub fn popCount(value: var) @typeOf(value) {
     }
 }
 
+test "popCount" {
+    expect(popCount(0b11011) == 4);
+    expect(popCount(usize(0b111)) == usize(3));
+    expect(popCount(~u64(0)) == @typeInfo(u64).Int.bits);
+}
+
 pub fn nextPowerOfTwo(value: var) @typeOf(value) {
     const T = @typeOf(value);
     switch (@typeInfo(T)) {
@@ -43,3 +57,8 @@ pub fn nextPowerOfTwo(value: var) @typeOf(value) {
     }
 }
 
+test "nextPowerOfTwo" {
+    expect(nextPowerOfTwo(9) == 16);
+    expect(nextPowerOfTwo(usize(32)) == 32);
+    expect(nextPowerOfTwo(u8(127)) == u8(128));
+}

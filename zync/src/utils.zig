@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const atomic = @import("atomic.zig");
 
 pub const cache_line = 64;
 pub fn CachePadded(comptime T: type) type { 
@@ -61,4 +62,61 @@ test "nextPowerOfTwo" {
     expect(nextPowerOfTwo(9) == 16);
     expect(nextPowerOfTwo(usize(32)) == 32);
     expect(nextPowerOfTwo(u8(127)) == u8(128));
+}
+
+pub fn Lazy(initializer: var) type {    
+    return struct {
+        pub const Type = @typeOf(initializer).ReturnType;
+        pub const State = enum {
+            Uninitialized,
+            Initializing,
+            Initialized,
+        };
+
+        value: Type,
+        state: atomic.Atomic(State),
+
+        pub fn new() @This() {
+            return @This() {
+                .value = undefined,
+                .state = atomic.Atomic(State).new(.Uninitialized),
+            };
+        }
+
+        pub inline fn get(self: *@This()) Type {
+            return self.getPtr().*;
+        }
+
+        pub fn getPtr(self: *@This()) *Type {
+            if (self.state.load(.Relaxed) == .Initialized)
+                return &self.value;
+
+            if (self.state.compareSwap(.Uninitialized, .Initializing, .Relaxed, .Relaxed)) |_| {
+                while (self.state.load(.Relaxed) == .Initializing)
+                    atomic.yield(1);
+                return &self.value;
+            }
+
+            self.value = initializer();
+            atomic.fence(.AcqRel);
+            self.state.store(.Initialized, .Release);
+            return &self.value;
+        }
+    };
+}
+
+test "lazy init" {
+    const Pi = struct {
+        threadlocal var current: Lazy(new) = undefined;
+        fn new() f32 {
+            expect(current.state.get() == .Initializing);
+            return f32(3.14);
+        }
+    };
+
+    Pi.current = @typeOf(Pi.current).new();
+    expect(Pi.current.state.get() == .Uninitialized);
+    expect(Pi.current.get() == 3.14);
+    expect(Pi.current.state.get() == .Initialized);
+    expect(Pi.current.get() == 3.14);
 }

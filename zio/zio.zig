@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const poll = @import("src/poll.zig");
+const socket = @import("src/socket.zig");
 pub const backend = switch (builtin.os) {
     .linux => @import("src/backend/linux.zig"),
     .windows => @import("src/backend/windows.zig"),
@@ -8,6 +10,18 @@ pub const backend = switch (builtin.os) {
     .macosx, .freebsd, .netbsd, .openbsd, .dragonfly => @import("src/backend/posix.zig"),
     else => @compileError("Platform not supported"),
 };
+
+test "zio" {
+    _ = poll;
+    _ = socket;
+}
+
+/// A bi-directional network stream
+pub const Socket = socket.Socket;
+/// An ipv4 or ipv6 network address
+pub const Address = socket.Address;
+/// A selector to poll for IO + user events
+pub const EventPoller = poll.EventPoller;
 
 pub const InitError = std.os.UnexpectedError || error {
     /// Failed to load an IO function
@@ -67,11 +81,3 @@ pub const Buffer = packed struct {
         return self.inner.getBytes();
     }
 };
-
-
-/// A bi-directional network stream
-pub const Socket = @import("src/socket.zig").Socket;
-/// A ipv4 or ipv6 network address
-pub const Address = @import("src/address.zig").Address;
-/// A selector to poll for IO events
-pub const EventPoller = @import("src/poll.zig").EventPoller;

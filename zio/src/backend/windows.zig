@@ -1,6 +1,6 @@
 const std = @import("std");
 const windows = std.os.windows;
-const zio = @import("../zio.zig");
+const zio = @import("../../zio.zig");
 
 pub const Handle = windows.HANDLE;
 
@@ -327,7 +327,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn accept(self: *@This(), address: *zio.Socket.Address) zio.Result {
+    pub fn accept(self: *@This(), client: *zio.Handle, address: *zio.Socket.Address) zio.Result {
         // TODO
     }
 

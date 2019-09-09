@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("../zio.zig");
+const zio = @import("../../zio.zig");
 
 const os = std.os;
 const system = os.system;

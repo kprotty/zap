@@ -215,15 +215,15 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn readFrom(self: *@This(), address: *zio.Socket.Address, buffers: []zio.Buffer) zio.Result {
+    pub fn readFrom(self: *@This(), address: *zio.Address, buffers: []zio.Buffer) zio.Result {
         // TODO
     }
 
-    pub fn writeTo(self: *@This(), address: *const zio.Socket.Address, buffers: []const zio.Buffer) zio.Result {
+    pub fn writeTo(self: *@This(), address: *const zio.Address, buffers: []const zio.Buffer) zio.Result {
         // TODO
     }
 
-    pub fn bind(self: *@This(), address: *zio.Socket.Address) zio.Socket.BindError!void {
+    pub fn bind(self: *@This(), address: *zio.Address) zio.Socket.BindError!void {
         // TODO
     }
 
@@ -232,11 +232,11 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn accept(self: *@This(), address: *zio.Socket.Address) zio.Result {
+    pub fn accept(self: *@This(), address: *zio.Address) zio.Result {
         // TODO
     }
 
-    pub fn connect(self: *@This(), address: *zio.Socket.Address) zio.Result {
+    pub fn connect(self: *@This(), address: *zio.Address) zio.Result {
         // TODO
     }
 };

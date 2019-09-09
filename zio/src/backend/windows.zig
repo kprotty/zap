@@ -254,7 +254,7 @@ pub const Socket = struct {
         return self.performIO(&self.reader, null, buffers);
     }
 
-    pub fn readFrom(self: *@This(), address: *zio.Socket.Address, buffers: []zio.Buffer) zio.Result {
+    pub fn readFrom(self: *@This(), address: *zio.Address, buffers: []zio.Buffer) zio.Result {
         return self.performIO(&self.reader, address, buffers);
     }
 
@@ -262,14 +262,14 @@ pub const Socket = struct {
         return self.performIO(&self.writer, null, buffers);
     }
 
-    pub fn writeFrom(self: *@This(), address: *const zio.Socket.Address, buffers: []const zio.Buffer) zio.Result {
+    pub fn writeFrom(self: *@This(), address: *const zio.Address, buffers: []const zio.Buffer) zio.Result {
         return self.performIO(&self.writer, address, buffers);
     }
 
     inline fn performIO(
         self: *@This(),
         overlapped: *windows.OVERLAPPED,
-        address: ?*const zio.Socket.Address,
+        address: ?*const zio.Address,
         buffers: []const zio.Buffer
     ) zio.Result {
         if (self.is_overlapped)
@@ -303,7 +303,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn bind(self: *@This(), address: *const zio.Socket.Address) zio.Socket.BindError!void {
+    pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
         if (Mswsock.bind(self.handle, @ptrCast(*const SOCKADDR, address.address), address.length) == 0)
             return;
         return switch (WSAGetLastError()) {
@@ -327,11 +327,11 @@ pub const Socket = struct {
         };
     }
 
-    pub fn accept(self: *@This(), client: *zio.Handle, address: *zio.Socket.Address) zio.Result {
+    pub fn accept(self: *@This(), client: *zio.Handle, address: *zio.Address) zio.Result {
         // TODO
     }
 
-    pub fn connect(self: *@This(), address: *zio.Socket.Address) zio.Result {
+    pub fn connect(self: *@This(), address: *zio.Address) zio.Result {
         // TODO
     }
 };

@@ -21,7 +21,7 @@ pub const Socket = struct {
 
     /// Create a `Socket` from a Handle using `flags` as the context.
     /// There should not exist more than one EventPoller active at a given point.
-    pub inline fn fromHandle(handle: Handle, flags: u32) @This() {
+    pub inline fn fromHandle(handle: zio.Handle, flags: u32) @This() {
         return self.inner.fromhandle(handle);
     }
 
@@ -122,7 +122,7 @@ pub const Socket = struct {
     /// The `address` pointer needs to be live until `Result.Stats.Completed` is returned.
     /// if `Result.Status.Completed`, then the connection was completed and it is safe to call `read()` and `write()`
     /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.WRITE`.
-    pub inline fn connect(self: *@This(), address: *Address) zio.Result {
+    pub inline fn connect(self: *@This(), address: *zio.Address) zio.Result {
         return self.inner.connect(address);
     }
 
@@ -131,7 +131,7 @@ pub const Socket = struct {
     /// The peer address of the client is stored in the given `address` pointer.
     /// If `Nonblock`, both the `address` and the `client` pointers need to be live until `Result.Status.Completed`
     /// if `Result.Status.Partial` and `EventPoller.ONE_SHOT`, re-register using `EventPoller.READ`.
-    pub inline fn accept(self: *@This(), client: *Handle, address: *Address) zio.Result {
+    pub inline fn accept(self: *@This(), client: *zio.Handle, address: *Address) zio.Result {
         return self.inner.accept(client, address);
     }
 };

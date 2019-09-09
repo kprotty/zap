@@ -2,17 +2,15 @@ const zio = @import("../zio.zig");
 
 /// An EventPoller is used to listen to & generate IO events for non-blocking resource objects.
 pub const EventPoller = struct {
-    inner: backend.EventPoller,
+    inner: zio.backend.EventPoller,
 
     /// Get the underlying Handle for this resource object
-    pub inline fn getHandle(self: @This()) Handle {
+    pub inline fn getHandle(self: @This()) zio.Handle {
         return self.inner.getHandle();
     }
 
     /// Create an `EventPoller` from a Handle.
-    /// There should not exist more than one EventPoller active at a given point.
-    /// It is also undefined behavior to call this method after previously calling `notify()` 
-    pub inline fn fromHandle(handle: Handle) @This() {
+    pub inline fn fromHandle(handle: zio.Handle) @This() {
         return self.inner.fromhandle(handle);
     }
 
@@ -61,15 +59,6 @@ pub const EventPoller = struct {
         return self.inner.reregister(handle, flags, data);
     }
 
-    pub const NotifyError = RegisterError;
-
-    /// Generate a user-based event with the `data` being arbitrary user data.
-    /// Most noteably used for communicating with an `EventPoller` which is blocked polling.
-    /// `Event`s originating from a `notify()` call are always Readable and never Writeable.
-    pub inline fn notify(self: *@This(), data: usize) NotifyError!void {
-        return self.inner.notify(data);
-    }
-
     /// A notification of an IO operation status - a.k.a. an IO event.
     pub const Event = packed struct {
         inner: backend.EventPoller.Event,
@@ -102,5 +91,33 @@ pub const EventPoller = struct {
     ///     - if `timeout` is 0, then poll() will return with any events that were immediately ready'd (can be empty)
     pub inline fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
         return self.inner.poll(events, timeout);
+    }
+};
+
+pub const EventNotifier = struct {
+    inner: zio.backend.EventNotifier,
+
+    pub const Error = error {
+        InvalidHandle,
+        OutOfResources,
+    };
+
+    /// Initialize the EventNotifier using the EventPoller
+    pub inline fn init(self: *@This(), poller: *EventPoller, id: usize) Error!void {
+        return self.inner.init(&poller.inner);
+    }
+
+    /// Close the EventNotifier if required
+    pub inline fn close(self: *@This()) void {
+        return self.inner.close();
+    }
+
+    pub const NotifyError = EventPoller.RegisterError;
+
+    /// Generate a user-based event with the 'data' being arbitrary user data.
+    /// This signals the associated EventPoller with the data usually used for notification.
+    /// `EventPoller.Event`s originating from a `notify()` are always Readable and never Writeable.
+    pub inline fn notify(self: *@This(), data: usize) NotifyError!void {
+        return self.inner.notify(data);
     }
 };

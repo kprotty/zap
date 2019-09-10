@@ -14,7 +14,7 @@ pub const EventPoller = struct {
     // There should not exist more than one EventPoller active at a given point.
     /// It is also undefined behavior to call this method after previously calling `notify()`
     pub inline fn fromHandle(handle: zio.Handle) @This() {
-        return self.inner.fromhandle(handle);
+        return @This() { .inner = zio.backend.EventPoller.fromHandle(handle) };
     }
 
     pub const Error = std.os.UnexpectedError || error {
@@ -60,20 +60,20 @@ pub const EventPoller = struct {
     ///     - WRITE: an event will be generated onec the resource object is writeable.
     ///     - ONE_SHOT: once an event is consumed, it will no longer be generated and can be re-registered.
     ///     - EDGE_TRIGGER(defualt): once an event is consumed, it can be regenerated after the corresponding operation completes
-    pub inline fn register(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
+    pub inline fn register(self: *@This(), handle: zio.Handle, flags: u32, data: usize) RegisterError!void {
         return self.inner.register(handle, flags, data);
     }
 
     /// Similar to `register()` but should be called to re-register an event 
     /// if the handle was previously registerd with `ONE_SHOT`.
     /// This is most noteably called after a `Result.Status.Partial` operation registered with `ONE_SHOT`.
-    pub inline fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) RegisterError!void {
+    pub inline fn reregister(self: *@This(), handle: zio.Handle, flags: u32, data: usize) RegisterError!void {
         return self.inner.reregister(handle, flags, data);
     }
 
     /// A notification of an IO operation status - a.k.a. an IO event.
-    pub const Event = packed struct {
-        inner: backend.EventPoller.Event,
+    pub const Event = struct {
+        inner: zio.backend.EventPoller.Event,
 
         /// Get the arbitrary user data tagged to the event when registering under the `poller`.
         /// Should be called only once as it consumes the event data and is UB if called again.
@@ -94,7 +94,7 @@ pub const EventPoller = struct {
     };
 
     pub const PollError = Error || error {
-        InavlidEvents,
+        InvalidEvents,
     };
 
     /// Poll for `Event` objects that have been ready'd by the kernel.
@@ -107,23 +107,34 @@ pub const EventPoller = struct {
 };
 
 const expect = std.testing.expect;
-test "EventPoller" {
-    var events: [1]EventPoller.Event = undefined;
+// TODO: Implement pipes in order to test out register/reregister
+// TODO: Implement zuma.now() in order to test poll() blocking timing.
+
+test "EventPoller - poll - nonblock" {
     var poller: EventPoller = undefined;
     try poller.init();
     defer poller.close();
 
-    // TODO: Implement pipes in order to test out register/reregister
-    // TODO: Implement zuma.now() in order to test poll() blocking timing.
-
-    var events_found = try poller.poll(events[0..], 0);
+    var events: [1]EventPoller.Event = undefined;
+    const events_found = try poller.poll(events[0..], 0);
     expect(events_found.len == 0);
-    
-    try poller.notify(1234);
-    events_found = try poller.poll(events[0..], 0);
+}
+
+test "EventPoller - notify" {
+    var poller: EventPoller = undefined;
+    try poller.init();
+    defer poller.close();
+
+    const value = usize(1234);
+    try poller.notify(value);
+
+    var events: [1]EventPoller.Event = undefined;
+    const events_found = try poller.poll(events[0..], 0);
     expect(events_found.len == 1);
-    const data = events_found[0].getData();
+
+    const data = events_found[0].getData(&poller);
+    expect(data == value);
     const identifier = events_found[0].getIdentifier();
-    expect(data == 1234);
     expect(identifier == EventPoller.READ or identifier == 0);
 }
+

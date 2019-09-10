@@ -17,7 +17,7 @@ pub fn Cleanup() void {
     // nothing to do here, keep scrolling
 }
 
-pub const Buffer = packed struct {
+pub const Buffer = struct {
     inner: system.iovec_const,
 
     pub fn fromBytes(bytes: []const u8) @This() {
@@ -36,13 +36,13 @@ pub const Buffer = packed struct {
 };
 
 pub const EventPoller = struct {
-    kqueue: Handle,
+    kqueue: zio.Handle,
 
     pub fn getHandle(self: @This()) Handle {
         return self.kqueue;
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: zio.Handle) @This() {
         return @This() { .kqueue = handle };
     }
 
@@ -59,7 +59,7 @@ pub const EventPoller = struct {
         _ = system.close(self.kqueue);
     }
 
-    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+    pub fn register(self: *@This(), handle: zio.Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         var num_events: usize = 0;
         var events: [2]system.Kevent = undefined;
 
@@ -82,7 +82,7 @@ pub const EventPoller = struct {
         return self.kevent(events[0..num_events], ([*]system.Kevent)(undefined)[0..0], null);
     }
 
-    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+    pub fn reregister(self: *@This(), handle: zio.Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         return self.register(handle, flags, data);
     }
 
@@ -103,7 +103,7 @@ pub const EventPoller = struct {
         };
     }
 
-    pub const Event = packed struct {
+    pub const Event = struct {
         inner: system.Kevent,
 
         pub fn getData(self: @This(), poller: *EventPoller) usize {
@@ -129,20 +129,21 @@ pub const EventPoller = struct {
         }
     };
 
-    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
-        return self.kevent(([*]system.Kevent)(undefined)[0..0], @bytesToSlice(system.Kevent, @sliceToBytes(events)), timeout);  
+    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]zio.EventPoller.Event {
+        const empty_set = ([*]system.Kevent)(undefined)[0..0];
+        const event_set = @ptrCast([*]system.Kevent, events.ptr)[0..events.len];
+        return self.kevent(empty_set, event_set, timeout);  
     }
 
     fn kevent(self: *@This(), change_set: []system.Kevent, event_set: []system.Kevent, timeout: ?u32) zio.EventPoller.PollError!usize {
         var ts: system.timespec = undefined;
-        const ts_ptr = value: if (timeout) |timeout_ms| {
+        var ts_ptr: ?*system.timespec = null;
+        if (timeout) |timeout_ms| {
             ts.tv_nsec = (timeout_ms % 1000) * 1000000;
             ts.tv_sec = timeout_ms / 1000;
-            break :value &ts;
-        } else {
-            break :value null;
-        };
-        
+            ts_ptr = &ts;
+        }
+
         while (true) {
             const events_found = system.kevent(self.kqueue, change_set.ptr, change_set.len, event_set.ptr, event_set.len, ts_ptr);
             switch (system.getErrno(events_found)) {
@@ -163,7 +164,7 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub fn fromHandle(handle: Handle, flags: u32) @This() {
+    pub fn fromHandle(handle: zio.Handle, flags: u32) @This() {
         // TODO
     }
 
@@ -191,14 +192,14 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub const Ipv4 = packed struct {
+    pub const Ipv4 = struct {
 
         pub fn from(address: u32, port: u16) @This() {
             // TODO
         }
     };
 
-    pub const Ipv6 = packed struct {
+    pub const Ipv6 = struct {
 
         pub fn from(address: u128, port: u16) @This() {
             // TODO

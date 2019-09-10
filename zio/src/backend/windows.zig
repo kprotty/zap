@@ -13,7 +13,7 @@ pub fn Initialize() zio.InitError!void {
 
     // For loading WSA functions at runtime (required by winapi)
     const WSA = struct {
-        pub fn findFunction(sock: Handle, id: windows.GUID, function: var) zio.InitError!void {
+        pub fn findFunction(sock: zio.Handle, id: windows.GUID, function: var) zio.InitError!void {
             var guid = id;
             var dwBytes: windows.DWORD = undefined;
             if (WSAIoctl(
@@ -46,7 +46,7 @@ pub fn Cleanup() void {
     _ = WSACleanup();
 }
 
-pub const Buffer = packed struct {
+pub const Buffer = struct {
     inner: WSABUF,
 
     pub fn fromBytes(bytes: []const u8) @This() {
@@ -64,13 +64,13 @@ pub const Buffer = packed struct {
 };
 
 pub const EventPoller = struct {
-    iocp: Handle,
+    iocp: zio.Handle,
 
     pub fn getHandle(self: @This()) Handle {
         return self.iocp;
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    pub fn fromHandle(handle: zio.Handle) @This() {
         return @This() { .iocp = handle };
     }
 
@@ -84,14 +84,14 @@ pub const EventPoller = struct {
         self.iocp = windows.INVALID_HANDLE_VALUE;
     }
 
-    pub fn register(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+    pub fn register(self: *@This(), handle: zio.Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         if (handle == windows.INVALID_HANDLE_VALUE)
             return zio.EventPoller.RegisterError.InvalidHandle;
         _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, @ptrCast(windows.ULONG_PTR, data), 0)
             orelse return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
-    pub fn reregister(self: *@This(), handle: Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
+    pub fn reregister(self: *@This(), handle: zio.Handle, flags: u32, data: usize) zio.EventPoller.RegisterError!void {
         if (handle == windows.INVALID_HANDLE_VALUE)
             return zio.EventPoller.RegisterError.InvalidHandle;
     }
@@ -103,7 +103,7 @@ pub const EventPoller = struct {
             return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
-    pub const Event = packed struct {
+    pub const Event = struct {
         inner: OVERLAPPED_ENTRY,
 
         pub fn getData(self: @This(), poller: *EventPoller) usize {
@@ -129,7 +129,7 @@ pub const EventPoller = struct {
         }
     };
 
-    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]Event {
+    pub fn poll(self: *@This(), events: []zio.EventPoller.Event, timeout: ?u32) zio.EventPoller.PollError![]zio.EventPoller.Event {
         var events_found: windows.ULONG = 0;
         const result = GetQueuedCompletionStatusEx(
             self.iocp,
@@ -149,7 +149,7 @@ pub const EventPoller = struct {
 };
 
 pub const Socket = struct {
-    handle: Handle,
+    handle: zio.Handle,
     is_overlapped: bool,
     recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
@@ -159,7 +159,7 @@ pub const Socket = struct {
         return self.handle;
     }
 
-    pub fn fromHandle(handle: Handle, flags: u32) @This() {
+    pub fn fromHandle(handle: zio.Handle, flags: u32) @This() {
         var self: @This() = undefined;
         self.is_overlapped = (flags & zio.Socket.Nonblock) != 0;
         self.handle = handle;
@@ -219,7 +219,7 @@ pub const Socket = struct {
         // TODO
     }
 
-    pub const Ipv4 = packed struct {
+    pub const Ipv4 = struct {
         inner: SOCKADDR_IN,
 
         pub fn from(address: u32, port: u16) @This() {
@@ -234,7 +234,7 @@ pub const Socket = struct {
         }
     };
 
-    pub const Ipv6 = packed struct {
+    pub const Ipv6 = struct {
         inner: SOCKADDR_IN6,
 
         pub fn from(address: u128, port: u16) @This() {

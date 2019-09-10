@@ -16,7 +16,7 @@ pub const Poller = switch (builtin.os) {
 };
 
 const Iocp = struct {
-    iocp: Handle,
+    iocp: zio.Handle,
 
     pub fn init(self: *@This()) !void {
         try Net.Backend.initAll();
@@ -32,7 +32,7 @@ const Iocp = struct {
         _ = try system.PostQueueCompletionStatus(self.iocp, undefined, @ptrToInt(task), null);
     }
 
-    pub fn register(self: *@This(), handle: Handle, stream: *IoStream) !void {
+    pub fn register(self: *@This(), handle: zio.Handle, stream: *IoStream) !void {
         _ = try system.CreateIoCompletionPort(handle, self.iocp, @ptrCast(system.ULONG_PTR, stream), 1);
     }
 
@@ -86,7 +86,7 @@ const Iocp = struct {
 
 const Kqueue = struct {
     const empty_events = ([*]os.Kevent)(undefined)[0..0];
-    kqueue: Handle,
+    kqueue: zio.Handle,
 
     pub fn init(self: *@This()) !void {
         self.kqueue = try std.os.kqueue();
@@ -111,7 +111,7 @@ const Kqueue = struct {
         _ = try std.os.kevent(self.kqueue, events[0..], empty_events, null);
     }
 
-    pub fn register(self: *@This(), handle: Handle, stream: *IoStream) !void {
+    pub fn register(self: *@This(), handle: zio.Handle, stream: *IoStream) !void {
         var events: [2]os.Kevent = undefined;
         @memset(@ptrCast([*]u8, events.ptr), 0, @sizeOf(os.Kevent));
         events[0].filter = os.EVFILT_READ;
@@ -146,8 +146,8 @@ const Kqueue = struct {
 };
 
 const Epoll = struct {
-    epoll_fd: Handle,
-    event_fd: Handle,
+    epoll_fd: zio.Handle,
+    event_fd: zio.Handle,
 
     pub fn init(self: *@This()) !void {
         self.epoll_fd = try os.epoll_create1(os.EPOLL_CLOEXEC);
@@ -165,7 +165,7 @@ const Epoll = struct {
         try os.write(self.event_fd, @ptrCast([*]u8, &value)[0..@sizeOf(u64)]);
     }
 
-    pub fn register(self: *@This(), handle: Handle, stream: *IoStream) !void {
+    pub fn register(self: *@This(), handle: zio.Handle, stream: *IoStream) !void {
         // event_fd doesnt need to listen to writable events (it should always be writeable)
         const EPOLLOUT = if (handle == self.event_fd) 0 else os.EPOLLOUT;
         var event = os.epoll_event {

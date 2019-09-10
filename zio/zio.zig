@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-
 const poll = @import("src/poll.zig");
 const socket = @import("src/socket.zig");
+
 pub const backend = switch (builtin.os) {
     .linux => @import("src/backend/linux.zig"),
     .windows => @import("src/backend/windows.zig"),
@@ -12,8 +12,11 @@ pub const backend = switch (builtin.os) {
 };
 
 test "zio" {
+    try Initialize();
+    defer Cleanup();
+
     _ = poll;
-    _ = socket;
+    // _ = socket;
 }
 
 /// A bi-directional network stream
@@ -67,7 +70,7 @@ pub const Result = struct {
 /// A Buffer represents a slice of bytes encoded in a form
 /// which can be passed into IO operations for resource objects.
 /// NOTE: At the moment, @sizeOf(Buffer) == @sizeOf([]u8) just the fields may be rearraged.
-pub const Buffer = packed struct {
+pub const Buffer = struct {
     inner: backend.Buffer,
 
     /// Convert a slice of bytes into a `Buffer`.

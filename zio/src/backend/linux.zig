@@ -1,150 +1,135 @@
+const std = @import("std");
+const posix = @import("posix.zig");
 const zio = @import("../../zio.zig");
 
-pub fn initialize() zio.InitError!void {
-    
-}
+const os = std.os;
+const linux = os.linux;
 
-pub fn cleanup() void {
-    
-}
-
-pub const Handle = ;
-
-pub const Buffer = struct {
-    inner: ,
-
-    pub fn fromBytes(bytes: []const u8) @This() {
-        return @This() {
-            .inner = 
-        };
-    }
-
-    pub fn getBytes(self: @This()) []u8 {
-        
-    }
-};
-
-pub const Ipv4 = struct {
-    inner: ,
-
-    pub fn from(address: u32, port: u16) @This() {
-        return @This() {
-            .inner = 
-        };
-    }
-};
-
-pub const Ipv6 = struct {
-    inner: ,
-
-    pub fn from(address: u128, port: u16, flow: u32, scope: u32) @This() {
-        return @This() {
-            .inner = 
-        };
-    }
-};
+pub const initialize = posix.initialize;
+pub const clenaup = posix.clenaup;
+pub const Handle = posix.Handle;
+pub const Buffer = posix.Buffer;
+pub const Socket = posix.Socket;
+pub const Ipv4 = posix.Ipv4;
+pub const Ipv6 = posix.Ipv6;
 
 pub const Event = struct {
-    inner: ,
+    inner: linux.epoll_event,
 
-    pub fn getData(self: @This(), poller: *Poller) usize {
-        
+    pub fn getData(self: *@This(), poller: *Poller) usize {
+        if (self.inner.data.ptr != ~usize(0))
+            return self.inner.data.ptr;
+        var value: u64 = undefined;
+        const bytes = linux.read(poller.event_fd, @ptrCast([*]u8, &value), @sizeOf(@typeOf(value)));
+        return if (bytes == @sizeOf(@typeOf(value))) @truncate(usize, value) else 0;
     }
 
-    pub fn getResult(self: @This()) zio.Result {
-        
+    pub fn getResult(self: *@This()) zio.Result {
+        return zio.Result {
+            .data = 0,
+            .status = switch (self.inner.events & (linux.EPOLLERR | linux.EPOLLHUP | linux.EPOLLRDHUP)) {
+                0 => .Retry,
+                else => .Error,
+            },
+        };
     }
 
     pub const Poller = struct {
+        epoll_fd: Handle,
+        event_fd: Handle,
+
         pub fn init(self: *@This()) zio.Event.Poller.InitError!void {
-            
+            const epoll_fd = linux.epoll_create1(linux.EPOLL_CLOEXEC);
+            return switch (linux.getErrno(epoll_fd)) {
+                0 => fromHandle(@intCast(Handle, epoll_fd)),
+                os.EMFILE, os.ENOMEM => zio.Event.Poller.InitError.OutOfResources,
+                os.EINVAL => unreachable,
+                else => unreachable,
+            };
         }
 
         pub fn close(self: *@This()) void {
-            
+            _ = linux.close(self.epoll_fd);
+            if (self.event_fd != 0)
+                _ = linux.close(self.event_fd);    
         }
 
         pub fn getHandle(self: @This()) zio.Handle {
-            
+            return self.epoll_fd;
         }
 
         pub fn fromHandle(handle: zio.Handle) @This() {
-            
+            return @This() {
+                .epoll_fd = handle,
+                .event_fd = 0,
+            };
         }
 
         pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
-            
+            if (data == ~usize(0))
+                return zio.Event.Poller.RegisterError.InvalidValue;
+            return self.epoll_ctl(handle, linux.EPOLL_CTL_ADD, flags, data);
         }
 
         pub fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
-            
+            if (data == ~usize(0))
+                return zio.Event.Poller.RegisterError.InvalidValue;
+            return self.epoll_ctl(handle, linux.EPOLL_CTL_MOD, flags, data);
         }
 
         pub fn send(self: *@This(), data: usize) zio.Event.Poller.SendError!void {
-            
+            if (self.event_fd == 0) {
+                const event_fd = linux.eventfd(0, linux.EFD_NONBLOCK | linux.EFD_CLOEXEC);
+                switch (linux.getErrno(event_fd)) {
+                    0 => self.event_fd = @intCast(Handle, event_fd),
+                    os.EMFILE, os.ENFILE, os.ENODEV, os.ENOMEM => return zio.Event.Poller.SendError.OutOfResources,
+                    os.EINVAL => unreachable,
+                    else => unreachable,
+                }
+                try self.epoll_ctl(self.event_fd, linux.EPOLL_CTL_ADD, zio.Event.Readable | zio.Event.EdgeTrigger, ~usize(0));
+            }
+
+            var value = @intCast(u64, data);
+            const errno = linux.getErrno(linux.write(self.event_fd, @ptrCast([*]u8, &value), @sizeOf(@typeOf(value))));
+            if (errno != 0)
+                return os.unexpectedErrno(errno);
         }
 
         pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
-            
+            const timeout_ms = if (timeout) |t| @intCast(i32, t) else -1;
+            while (true) {
+                const events_found = linux.epoll_wait(self.epoll_fd, events.ptr, @intCast(i32, events.len), timeout_ms);
+                switch (linux.getErrno(events_found)) {
+                    0 => return events[0..events_found],
+                    os.EBADF, os.EINVAL => return zio.Event.Poller.PollError.InvalidHandle,
+                    os.EFAULT => return zio.Event.Poller.PollError.InvalidEvents,
+                    os.EINTR => continue,
+                    else => unreachable,
+                }
+            }
+        }
+
+        fn epoll_ctl(self: @This(), handle: Handle, op: u32, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            var event = linux.epoll_event {
+                .events = linux.EPOLLEXCLUSIVE,
+                .data = linux.epoll_data { .ptr = data },
+            };
+
+            if ((flags & zio.Event.Writeable) != 0)
+                event.events |= linux.EPOLLOUT; 
+            if ((flags & zio.Event.Readable) != 0)
+                event.events |= linux.EPOLLIN | linux.EPOLLRDHUP;
+            if ((flags & zio.Event.EdgeTrigger) != 0)
+                event.events |= linux.EPOLLET;
+            else
+                event.events |= linux.EPOLLONESHOT;
+
+            return switch (linux.getErrno(linux.epoll_ctl(self.epoll_fd, op, handle, &event))) {
+                0 => {},
+                os.EBADF, os.EINVAL, os.ELOOP, os.ENOENT, os.EPERM => zio.Event.Poller.RegisterError.InvalidValue,
+                os.ENOMEM, os.ENOSPC => zio.Event.Poller.RegisterError.OutOfResources,
+                else => unreachable,
+            };
         }
     };
-};
-
-pub const Socket = struct {
-
-    pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
-        
-    }
-
-    pub fn close(self: *@This()) void {
-        
-    }
-
-    pub fn getHandle(self: @This()) zio.Handle {
-        
-    }
-
-    pub fn fromHandle(handle: zio.Handle) @This() {
-        
-    }
-
-    pub fn isReadable(self: *const @This(), event: Event) bool {
-        
-    }
-
-    pub fn isWriteable(self: *const @This(), event: Event) bool {
-        
-    }
-
-    pub fn setOption(option: Option) zio.Socket.OptionError!void {
-       
-    }
-
-    pub fn getOption(option: *Option) zio.Socket.OptionError!void {
-        
-    }
-
-    pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        
-    }
-
-    pub fn listen(self: *@This(), backlog: u16) zio.Socket.ListenError!void {
-        
-    }
-
-    pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {
-        
-    }
-
-    pub fn accept(self: *@This(), client: *zio.Handle, address: *zio.Address) zio.Result {
-        
-    }
-
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
-        
-    }
-
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
-        
-    }
 };

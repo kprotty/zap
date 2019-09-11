@@ -12,7 +12,6 @@ const zio = @import("../zio.zig");
 /// IO operations, such as those listed above, return a `zio.Result`:
 ///     - `zio.Result.Status.Error`:
 ///         The operation was unable to complete.
-///         One can use `zio.errno(zio.Result.data)` for platform-specific info.
 ///     - `zio.Result.Status.Retry`:
 ///         The operation would normally block.
 ///         This is only returned if the socket is non-blocking.

@@ -47,11 +47,11 @@ pub const Ipv6 = struct {
 pub const Event = struct {
     inner: ,
 
-    pub fn getData(self: @This(), poller: *Poller) usize {
+    pub fn getData(self: *@This(), poller: *Poller) usize {
         
     }
 
-    pub fn getResult(self: @This()) zio.Result {
+    pub fn getResult(self: *@This()) zio.Result {
         
     }
 

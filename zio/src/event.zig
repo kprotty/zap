@@ -5,9 +5,14 @@ const zio = @import("../zio.zig");
 pub const Event = struct {
     inner: zio.backend.Event,
 
+    pub const OneShot = 1 << 0;
+    pub const Readable = 1 << 1;
+    pub const Writeable = 1 << 2;
+    pub const EdgeTrigger = 1 << 3;
+
     /// Get whatever user data was attached to the IO object handle
     /// or that was requested when generating a user-based event.
-    pub inline fn getData(self: @This(), poller: *Poller) usize {
+    pub inline fn getData(self: *@This(), poller: *Poller) usize {
         return self.inner.getData(&poller.inner);
     }
 
@@ -26,7 +31,7 @@ pub const Event = struct {
     ///     - `zio.Result.Status.Completed`:
     ///         The operation completed fully and successfully.
     ///     
-    pub inline fn getResult(self: @This()) zio.Result {
+    pub inline fn getResult(self: *@This()) zio.Result {
         return self.inner.getResult();
     }
 
@@ -35,7 +40,7 @@ pub const Event = struct {
         inner: zio.backend.Event.Poller,
 
         pub const InitError = error {
-            // TODO
+            OutOfResources,
         };
 
         /// Initialize the event poller IO object.
@@ -60,13 +65,9 @@ pub const Event = struct {
         }
 
         pub const RegisterError = error {
-            // TODO
+            InvalidValue,
+            OutOfResources,
         };
-
-        pub const OneShot = 1 << 0;
-        pub const Readable = 1 << 1;
-        pub const Writeable = 1 << 2;
-        pub const EdgeTrigger = 1 << 3;
         
         /// Register a kernel object handle to listen for IO event.
         /// `data` is arbitrary user data which can be retrieved from `Event.getData()`:
@@ -85,8 +86,9 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, data);
         }
 
-        pub const SendError = error {
-            // TODO
+        pub const SendError = std.os.UnexpectedError || error {
+            InvalidValue,
+            OutOfResources,
         };
 
         /// Send a user event with arbitrary `data` that can be retrieved from `Event.getData()`
@@ -95,7 +97,8 @@ pub const Event = struct {
         }
 
         pub const PollError = error {
-            // TODO
+            InvalidHandle,
+            InvalidEvents,
         };
 
         /// Poll for IO events using the event poller.
@@ -104,6 +107,8 @@ pub const Event = struct {
         ///     - `timeout` value of `std.math.maxInt(u32)` or `~u32(0)` is reserved.
         ///     - if `timeout` is `null`, then it will block until an IO event gets triggered.
         pub inline fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
+            if (events.len == 0)
+                return events[0..0];
             const events = try self.inner.poll(@ptrCast([*]zio.backend.Event, events.ptr)[0..events.len], timeout);
             return @ptrCast([*]Event, events.ptr)[0..events.len];
         }

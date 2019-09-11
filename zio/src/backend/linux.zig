@@ -39,9 +39,10 @@ pub const Event = struct {
         event_fd: Handle,
 
         pub fn init(self: *@This()) zio.Event.Poller.InitError!void {
+            self.event_fd = 0;
             const epoll_fd = linux.epoll_create1(linux.EPOLL_CLOEXEC);
             return switch (linux.getErrno(epoll_fd)) {
-                0 => fromHandle(@intCast(Handle, epoll_fd)),
+                0 => self.epoll_fd = @intCast(Handle, epoll_fd),
                 os.EMFILE, os.ENOMEM => zio.Event.Poller.InitError.OutOfResources,
                 os.EINVAL => unreachable,
                 else => unreachable,
@@ -97,8 +98,9 @@ pub const Event = struct {
 
         pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
             const timeout_ms = if (timeout) |t| @intCast(i32, t) else -1;
+            const events_ptr = @ptrCast([*]linux.epoll_event, events.ptr);
             while (true) {
-                const events_found = linux.epoll_wait(self.epoll_fd, events.ptr, @intCast(i32, events.len), timeout_ms);
+                const events_found = linux.epoll_wait(self.epoll_fd, events_ptr, @intCast(u32, events.len), timeout_ms);
                 switch (linux.getErrno(events_found)) {
                     0 => return events[0..events_found],
                     os.EBADF, os.EINVAL => return zio.Event.Poller.PollError.InvalidHandle,
@@ -111,8 +113,8 @@ pub const Event = struct {
 
         fn epoll_ctl(self: @This(), handle: Handle, op: u32, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
             var event = linux.epoll_event {
-                .events = linux.EPOLLEXCLUSIVE,
                 .data = linux.epoll_data { .ptr = data },
+                .events = 0,
             };
 
             if ((flags & zio.Event.Writeable) != 0)

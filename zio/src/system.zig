@@ -1,7 +1,8 @@
 const zio = @import("../zio.zig");
 
 pub const InitError = error {
-    
+    InvalidState,
+    InvalidIOFunction,
 };
 
 /// Initialize all things related to IO for the platform.

@@ -71,12 +71,16 @@ pub const Socket = struct {
 
     /// Check if an `Event` produced by an IO operation
     /// on this socket originated from the Reader channel.
+    /// This (or isWriteable) should be called on an event 
+    /// before calling `zio.Event.getResult()`.
     pub inline fn isReadable(self: *const @This(), event: zio.Event) bool {
         return self.inner.isReadable(event.inner);
     }
 
     /// Check if an `Event` produced by an IO operation
     /// on this socket originated from the Writeable channel.
+    /// This (or isReadable) should be called on an event
+    /// before calling `zio.Event.getResult()`.
     pub inline fn isWriteable(self: *const @This(), event: zio.Event) bool {
         return self.inner.isWriteable(event.inner);
     }

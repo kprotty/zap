@@ -6,7 +6,7 @@ const os = std.os;
 const linux = os.linux;
 
 pub const initialize = posix.initialize;
-pub const clenaup = posix.clenaup;
+pub const cleanup = posix.cleanup;
 pub const Handle = posix.Handle;
 pub const Buffer = posix.Buffer;
 pub const Socket = posix.Socket;
@@ -119,10 +119,11 @@ pub const Event = struct {
                 event.events |= linux.EPOLLOUT; 
             if ((flags & zio.Event.Readable) != 0)
                 event.events |= linux.EPOLLIN | linux.EPOLLRDHUP;
-            if ((flags & zio.Event.EdgeTrigger) != 0)
+            if ((flags & zio.Event.EdgeTrigger) != 0) {
                 event.events |= linux.EPOLLET;
-            else
+            } else {
                 event.events |= linux.EPOLLONESHOT;
+            }
 
             return switch (linux.getErrno(linux.epoll_ctl(self.epoll_fd, op, handle, &event))) {
                 0 => {},

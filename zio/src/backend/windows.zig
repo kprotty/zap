@@ -10,60 +10,111 @@ pub fn initialize() zio.InitError!void {
     if (wsa_data.wVersion != wsa_version)
         return zio.InitError.InvalidState;
 
-    const dummy_socket = 
+    const dummy_socket = WSASocketA(AF_INET, SOCK_STREAM, 0, null, 0, 0);
+    if (dummy_socket == INVALID_SOCKET)
+        return zio.InitError.InvalidState;
+    defer { _ = Mswsock.closesocket(dummy_socket); }
+
+    try findWSAFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx);
+    try findWSAFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx);
 }
 
 pub fn cleanup() void {
     _ = WSACleanup();    
 }
 
+fn findWSAFunction(socket: SOCKET, function_guid: GUID, function: var) zio.InitError!void {
+    var guid = function_guid;
+    var dwBytes: windows.DWORD = undefined;
+    if (WSAIoctl(
+        socket,
+        SIO_GET_EXTENSION_FUNCTION_POINTER,
+        @ptrCast(windows.PVOID, &guid),
+        @sizeOf(@typeOf(guid)),
+        @ptrCast(windows.PVOID, function),
+        @sizeOf(@typeInfo(function).Pointer.child),
+        &dwBytes,
+        null,
+        null,
+    ) != 0)
+        return zio.InitError.InvalidIOFunction;
+}
+
 pub const Handle = windows.HANDLE;
 
 pub const Buffer = struct {
-    inner: ,
+    inner: WSABUF,
 
     pub fn fromBytes(bytes: []const u8) @This() {
         return @This() {
-            .inner = 
+            .inner = WSABUF {
+                .ptr = bytes.ptr,
+                .len = @intCast(windows.DWORD, bytes.len),
+            } 
         };
     }
 
     pub fn getBytes(self: @This()) []u8 {
-        
+        return self.ptr[0..self.len];
     }
 };
 
-pub const IncomingPadding = ;
+/// AcceptEx requires a 16 byte padding on the buffer
+/// used for receiving an incoming remote address for
+/// some odd reason :/
+pub const IncomingPadding = 16;
 
 pub const Ipv4 = packed struct {
-    inner: ,
+    inner: SOCKADDR_IN,
 
     pub fn from(address: u32, port: u16) @This() {
         return @This() {
-            .inner = 
+            .inner = SOCKADDR_IN {
+                .sin_family = AF_INET,
+                .sin_port = std.mem.nativeToBig(@typeOf(port), port),
+                .sin_zero = [_]u8{0} * @sizeOf(@typeOf(SOCKADDR_IN(undefined).sin_zero)),
+                .sin_addr = IN_ADDR { .s_addr = std.mem.nativeToBig(@typeOf(address), address) },
+            }
         };
     }
 };
 
 pub const Ipv6 = packed struct {
-    inner: ,
+    inner: SOCKADDR_IN6,
 
     pub fn from(address: u128, port: u16, flow: u32, scope: u32) @This() {
         return @This() {
-            .inner = 
+            .inner = SOCKADDR_IN6 {
+                .sin6_family = AF_INET6,
+                .sin6_port = std.mem.nativeToBig(@typeOf(port), port),
+                .sin6_flowinfo = std.mem.nativeToBig(@typeOf(flow), flow),
+                .sin6_scope_id = std.mem.nativeToBig(@typeOf(scope), scope),
+                .sin6_addr = IN_ADDR6 { .Qword = std.mem.nativeToBig(@typeOf(address), address) },
+            }
         };
     }
 };
 
 pub const Event = struct {
-    inner: ,
+    inner: OVERLAPPED_ENTRY,
 
     pub fn getData(self: *@This(), poller: *Poller) usize {
-        
+        return @ptrToInt(self.inner.lpCompletionKey);
     }
 
     pub fn getResult(self: *@This()) zio.Result {
-        
+        /// After verifying the event through `zio.Socket.(isReadable|isWriteable)`
+        /// the lpOverlapped.hEvent should be ~usize(0) if MSG_PARTIAL was set.
+        return zio.Result {
+            .data = self.inner.dwNumberOfBytesTransferred,
+            .status = status: {
+                if (self.inner.lpOverlapped.Internal != 0)
+                    break :status zio.Result.Status.Error;
+                if (@ptrToInt(self.inner.lpOverlapped.hEvent) == ~usize(0))
+                    break :status zio.Result.Status.Partial;
+                break :status zio.Result.Status.Completed;
+            },
+        };
     }
 
     pub const Poller = struct {
@@ -198,6 +249,8 @@ const WSAEINVALIDPROVIDER: windows.DWORD = 10105;
 const WSAEINVALIDPROCTABLE: windows.DWORD = 10104;
 const WSAEPROVIDERFAILEDINIT: windows.DWORD = 10106;
 
+const SOCKET = windows.HANDLE;
+const INVALID_SOCKET = windows.INVALID_HANDLE_VALUE;
 const SOCKADDR = extern struct {
     sa_family: c_ushort,
     sa_data: [14]windows.CHAR,
@@ -210,6 +263,7 @@ const IN_ADDR = extern struct {
 const IN6_ADDR = extern union {
     Byte: [16]windows.CHAR,
     Word: [8]windows.WORD,
+    Qword: u128,
 };
 
 const SOCKADDR_IN = extern struct {
@@ -338,7 +392,7 @@ extern "ws2_32" stdcallcc fn WSASocketA(
     lpProtocolInfo: usize,,
     group: usize,
     dwFlags: windows.DWORD,
-) windows.HANDLE;
+) SOCKET;
 
 extern "ws2_32" stdcallcc fn WSASendTo(
     socket: SOCKET,

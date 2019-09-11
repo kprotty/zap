@@ -106,7 +106,7 @@ pub const Socket = struct {
 
     /// Bind the source address of the socket to the given `zio.Address`.
     /// Addresses bound can serve as servers for their instantiated protocol.
-    pub inline fn bind(self: *@This(), address: *const zio.Address) BindError!void {
+    pub inline fn bind(self: *@This(), address: usize, len: usize) BindError!void {
         return self.inner.bind(address);
     }
 
@@ -121,17 +121,17 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
+    /// Accept an incoming client from the current server.
+    /// If it returns `zio.Result.Status.Retry` and is non-blocking
+    /// One should ensure that the pointer to `incoming` remain live
+    /// and untouched until the operation completes (usually via `zio.Event`).
+    pub inline fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
+        return self.inner.accept(incoming);
+    }
+
     /// Connect to an address under the instantiated protocol.
     pub inline fn connect(self: *@This(), address: *const zio.Address) zio.Result {
         return self.inner.connect(address);
-    }
-
-    /// Accept an incoming client from the current server.
-    /// If it returns `zio.Result.Status.Retry` and is non-blocking
-    /// One should ensure that the pointers for `client` and `address`
-    /// remain live and untouched until the operation completes (usually via `zio.Event`).
-    pub inline fn accept(self: *@This(), client: *zio.Handle, address: *zio.Address) zio.Result {
-        return self.inner.accept(client, address);
     }
 
     /// Receive incoming data from the socket into the given `zio.Buffers`.

@@ -5,11 +5,20 @@ const zio = @import("../zio.zig");
 /// arguments for socket functions which store the len.
 pub const Address = struct {
     len: u32,
-    data: SockAddr,
+    ip: SockAddr,
 
-    const SockAddr = packed union {
+    /// Union for easier type access
+    const SockAddr = extern union {
         v4: zio.backend.Ipv4,
         v6: zio.backend.Ipv6,
+    };
+
+    /// Data structure used for accepting 
+    /// incoming IO handles with an ip address.
+    pub const Incoming = packed struct {
+        handle: zio.Handle,
+        address: Address,
+        padding: [@sizeOf(Address) + @sizeOf(zio.Handle) - zio.backend.IncomingPadding]u8,
     };
 
     /// Returns where the internal variant is an ipv4

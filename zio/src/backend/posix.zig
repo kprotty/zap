@@ -24,7 +24,9 @@ pub const Buffer = struct {
     }
 };
 
-pub const Ipv4 = struct {
+pub const IncomingPadding = ;
+
+pub const Ipv4 = packed struct {
     inner: ,
 
     pub fn from(address: u32, port: u16) @This() {
@@ -34,7 +36,7 @@ pub const Ipv4 = struct {
     }
 };
 
-pub const Ipv6 = struct {
+pub const Ipv6 = packed struct {
     inner: ,
 
     pub fn from(address: u128, port: u16, flow: u32, scope: u32) @This() {
@@ -136,7 +138,7 @@ pub const Socket = struct {
         
     }
 
-    pub fn accept(self: *@This(), client: *zio.Handle, address: *zio.Address) zio.Result {
+    pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
         
     }
 

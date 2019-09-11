@@ -25,6 +25,7 @@ pub const Event = struct {
     ///     - `zio.Result.Status.Retry`:
     ///         There is data ready on the corresponding handle.
     ///         Retry the IO operation in order to get the "true" `zio.Result`
+    ///         `zio.Result.data` may contain hints for retrying the operation.
     ///     - `zio.Result.Status.Partial`:
     ///         The operation completed, but only partially.
     ///         `zio.Result.data` contains the data transferred regardless.
@@ -67,6 +68,7 @@ pub const Event = struct {
 
         pub const RegisterError = error {
             InvalidValue,
+            InvalidHandle,
             OutOfResources,
         };
         
@@ -87,7 +89,7 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, data);
         }
 
-        pub const SendError = std.os.UnexpectedError || error {
+        pub const SendError = std.os.UnexpectedError || RegisterError || error {
             InvalidValue,
             OutOfResources,
         };

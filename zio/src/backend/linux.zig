@@ -54,40 +54,40 @@ pub const Event = struct {
     pub fn getData(self: @This(), poller: *Poller) usize {
         
     }
-};
 
-pub const Poller = struct {
-    pub inline fn init(self: *@This()) InitError!void {
-        
-    }
+    pub const Poller = struct {
+        pub inline fn init(self: *@This()) zio.Event.Poller.InitError!void {
+            
+        }
 
-    pub inline fn close(self: *@This()) void {
-        
-    }
+        pub inline fn close(self: *@This()) void {
+            
+        }
 
-    pub inline fn getHandle(self: @This()) zio.Handle {
-        
-    }
+        pub inline fn getHandle(self: @This()) zio.Handle {
+            
+        }
 
-    pub inline fn fromHandle(handle: zio.Handle) @This() {
-        
-    }
+        pub inline fn fromHandle(handle: zio.Handle) @This() {
+            
+        }
 
-    pub inline fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Poller.RegisterError!void {
-        
-    }
+        pub inline fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            
+        }
 
-    pub inline fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Poller.RegisterError!void {
-        
-    }
+        pub inline fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            
+        }
 
-    pub inline fn send(self: *@This(), data: usize) zio.Poller.SendError!void {
-        
-    }
+        pub inline fn send(self: *@This(), data: usize) zio.Event.Poller.SendError!void {
+            
+        }
 
-    pub inline fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Poller.PollError![]Event {
-        
-    }
+        pub inline fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
+            
+        }
+    };
 };
 
 pub const Socket = struct {

@@ -28,17 +28,9 @@ pub const Result = struct {
     status: Status,
 
     pub const Status = enum {
-        /// There was an error processing the IO operation.
-        /// At this point, one should normally `.close()` the IO object.
         Error,
-        /// The operation should be retried (possibly later) as either:
-        /// - the kernel has no more resources to provide and it would block.
-        /// - the action needs to be re-performed in order to get the true `Result`. 
         Retry,
-        /// The IO operation was completed, but only partially.
-        /// There's still some remaining data that needs to be consumed.
         Partial,
-        /// The IO operation was completed fully and successfully.
         Completed,
     };
 };

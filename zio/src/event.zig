@@ -5,16 +5,29 @@ const zio = @import("../zio.zig");
 pub const Event = struct {
     inner: zio.backend.Event,
 
-    /// Get the result of the IO operation which triggered this event.
-    /// This is used to decide how to finish and process the IO operation.
-    pub inline fn getResult(self: @This()) zio.Result {
-        return self.inner.getResult();
-    }
-
     /// Get whatever user data was attached to the IO object handle
     /// or that was requested when generating a user-based event.
     pub inline fn getData(self: @This(), poller: *Poller) usize {
         return self.inner.getData(&poller.inner);
+    }
+
+    /// Get the result of the IO operation which triggered this event.
+    /// This is used to decide how to finish and process the IO operation.
+    ///     - `zio.Result.Status.Error`:
+    ///         The operation resulted in an error.
+    ///         One should `.close()` any handles related.
+    ///     - `zio.Result.Status.Retry`:
+    ///         There is data ready on the corresponding handle.
+    ///         Retry the IO operation in order to get the "true" `zio.Result`
+    ///     - `zio.Result.Status.Partial`:
+    ///         The operation completed, but only partially.
+    ///         `zio.Result.data` contains the data transferred regardless.
+    ///         Reperform the IO operation in order to consume the remaining data.
+    ///     - `zio.Result.Status.Completed`:
+    ///         The operation completed fully and successfully.
+    ///     
+    pub inline fn getResult(self: @This()) zio.Result {
+        return self.inner.getResult();
     }
 
     /// An IO object used for polling events from other non-blocking IO objects.

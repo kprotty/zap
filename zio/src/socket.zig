@@ -18,12 +18,6 @@ const zio = @import("../zio.zig");
 ///         For sockets registered using `zio.Event.Poller.OneShot`,
 ///         this is when one should reregister the socket in order to listen for completion.
 ///         `zio.Result.data` contains bytes transferred if any.
-///     - `zio.Result.Status.Partial`:
-///         The operation completed, but only partially.
-///         One should perform the operation again to consume more data.
-///         At the moment, this is only returned on `.recv()` for
-///         fragmented UDP packets but that may change in the future.
-///         One can use `zio.errno(zio.Result.data)` for platform-specific info.
 ///     - `zio.Result.Status.Completed`:
 ///         The operation completed fully and successfully.
 ///         `zio.Result.data` contains bytes transferred if any.
@@ -142,17 +136,17 @@ pub const Socket = struct {
 
     /// Receive incoming data from the socket into the given `zio.Buffers`.
     /// If `address` is not null, then it acts as a call to `recvfrom()` in C.
-    /// This operation can complete partially but the `zio.Result.Status` reflects differently:
-    ///     - `zio.Result.Status.Partial`: fragmented protocol packet. Call again to consume remaining data.
-    ///     - `zio.Result.Status.Completed`: read some (may not be all) bytes into the `buffers` array.
-    ///         The amount of bytes received can be retrieved from `zio.Result.data`.
+    /// This operation can complete partially, returning `zio.Result.Status.Complete`
+    /// but only reading part of the buffer specified. This should be handled by the user.
+    /// The amount of bytes sent on `zio.Result.Status.Completed` can be retrieved from `zio.Result.data`.
     pub inline fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
         return self.inner.recv(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len]);
     }
 
     /// Send outgoing data from the socket using the given `zio.Buffers`.
     /// If `address` is not null, then it acts as a call to `sendto()` in C.
-    /// Ths operation does not return `zio.Result.Status.Partial` like `recv()` but may not send all data.
+    /// This operation can complete partially, returning `zio.Result.Status.Complete`
+    /// but only reading part of the buffer specified. This should be handled by the user.
     /// The amount of bytes sent on `zio.Result.Status.Completed` can be retrieved from `zio.Result.data`.
     pub inline fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
         return self.inner.send(address, @ptrCast([*]const zio.backend.Buffer, buffers.ptr)[0..buffers.len]);

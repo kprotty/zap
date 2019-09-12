@@ -31,7 +31,6 @@ pub const Result = struct {
     pub const Status = enum {
         Error,
         Retry,
-        Partial,
         Completed,
     };
 };

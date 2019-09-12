@@ -103,17 +103,10 @@ pub const Event = struct {
     }
 
     pub fn getResult(self: *@This()) zio.Result {
-        /// After verifying the event through `zio.Socket.(isReadable|isWriteable)`
-        /// the lpOverlapped.hEvent should be ~usize(0) if MSG_PARTIAL was set.
+        const status = @ptrToInt(self.inner.lpOverlapped.Internal);
         return zio.Result {
             .data = self.inner.dwNumberOfBytesTransferred,
-            .status = status: {
-                if (self.inner.lpOverlapped.Internal != 0)
-                    break :status zio.Result.Status.Error;
-                if (@ptrToInt(self.inner.lpOverlapped.hEvent) == ~usize(0))
-                    break :status zio.Result.Status.Partial;
-                break :status zio.Result.Status.Completed;
-            },
+            .status = if (status == STATUS_SUCCESS) .Completed else .Retry,
         };
     }
 
@@ -224,7 +217,7 @@ const SOCK_RAW: windows.DWORD = 3;
 const IPPROTO_TCP: windows.DWORD = 6;
 const IPPROTO_UDP: windows.DWORD = 17;
 
-const STATUS_COMPLETED = 0;
+const STATUS_SUCCESS = 0;
 const WSA_IO_PENDING: windows.DWORD = 997;
 const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;

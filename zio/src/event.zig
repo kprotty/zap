@@ -26,10 +26,6 @@ pub const Event = struct {
     ///         There is data ready on the corresponding handle.
     ///         Retry the IO operation in order to get the "true" `zio.Result`
     ///         `zio.Result.data` may contain hints for retrying the operation.
-    ///     - `zio.Result.Status.Partial`:
-    ///         The operation completed, but only partially.
-    ///         `zio.Result.data` contains the data transferred regardless.
-    ///         Reperform the IO operation in order to consume the remaining data.
     ///     - `zio.Result.Status.Completed`:
     ///         The operation completed fully and successfully.
     ///     

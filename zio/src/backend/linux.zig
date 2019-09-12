@@ -10,6 +10,7 @@ pub const cleanup = posix.cleanup;
 
 pub const Handle = posix.Handle;
 pub const Buffer = posix.Buffer;
+pub const Socket = posix.Socket;
 
 pub const Ipv4 = posix.Ipv4;
 pub const Ipv6 = posix.Ipv6;
@@ -136,16 +137,4 @@ pub const Event = struct {
             };
         }
     };
-};
-
-pub const Socket = struct {
-    pub usingnamespace posix.BsdSocket;
-
-    pub fn isReadable(self: *const @This(), event: Event) bool {
-        return (event.inner.events & linux.EPOLLIN) != 0;
-    }
-
-    pub fn isWriteable(self: *const @This(), event: Event) bool {
-        return (event.inner.events & linux.EPOLLOUT) != 0;
-    }
 };

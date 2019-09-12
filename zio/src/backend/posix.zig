@@ -185,18 +185,6 @@ pub const Event = struct {
 };
 
 pub const Socket = struct {
-    pub usingnamespace BsdSocket;
-
-    pub fn isReadable(self: *const @This(), event: Event) bool {
-        return event.inner.filter == os.EVFILT_READ;
-    }
-
-    pub fn isWriteable(self: *const @This(), event: Event) bool {
-        return event.inner.filter == os.EVFILT_WRITE;
-    }
-};
-
-pub const BsdSocket = struct {
     handle: Handle,
     
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
@@ -242,6 +230,18 @@ pub const BsdSocket = struct {
         return @This() { .handle = handle };
     }
 
+    pub fn isReadable(self: *const @This(), event: Event) bool {
+        if (builtin.os == .linux)
+            return (event.inner.events & os.EPOLLIN) != 0;
+        return event.inner.filter == os.EVFILT_READ;
+    }
+
+    pub fn isWriteable(self: *const @This(), event: Event) bool {
+        if (builtin.os == .linux)
+            return (event.inner.events & os.EPOLLOUT) != 0;
+        return event.inner.filter == os.EVFILT_WRITE;
+    }
+
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
        
     }
@@ -281,10 +281,70 @@ pub const BsdSocket = struct {
     }
 
     pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
-        
+        return self.performIO(address, buffers, recvmsg);
     }
 
     pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
-        
+        return self.performIO(address, buffers, recvmsg);
+    }
+
+    inline fn performIO(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer, io: var) zio.Result {
+        if (buffer.len == 0) {
+            return zio.Result {
+                .status = .Completed,
+                .data = 0,
+            };
+        }
+            
+        var message_header = msghdr {
+            .msg_name = @ptrToInt(address),
+            .msg_namelen = if (address) |addr| @intCast(c_uint, addr.len) else 0,
+            .msg_iov = @ptrCast(*const os.iovec_const, buffers.ptr),
+            .msg_iovlen = @intCast(c_uint, buffers.len),
+            .msg_control = 0,
+            .msg_controllen = 0,
+            .msg_flags = 0,
+        };
+
+        const bytes = io(self.handle, &message_header, MSG_DONTWAIT);
+        return switch (os.errno(bytes)) {
+            0 => @intCast(usize, bytes),
+
+        }
+    }
+
+    const MSG_DONTWAIT = ;
+    const msghdr = extern struct {
+        msg_name: usize,
+        msg_namelen: c_uint,
+        msg_iov: *const os.iovec_const,
+        msg_iovlen: c_uint,
+        msg_control: usize,
+        msg_controllen: c_uint,
+        msg_flags: c_uint,
+    };
+
+    extern "c" fn recvmsg(socket: i32, message: *msghdr, flags: c_int) isize;
+    fn Recvmsg(socket: Handle, message: *msghdr, flags: c_int) isize {
+        if (builtin.os == .linux)
+            return @intCast(isize, system.syscall3(
+                system.SYS_recvmsg,
+                @intCast(usize, self.handle),
+                @ptrToInt(message),
+                @intCast(c_int, flags),
+            ));
+        return recvmsg(socket, message, flags);
+    }
+
+    extern "c" fn sendmsg(socket: i32, message: *const msghdr, flags: c_int) isize;
+    fn Sendmsg(socket: Handle, message: *const msghdr, flags: c_int) isize {
+        if (builtin.os == .linux)
+            return @intCast(isize, system.syscall3(
+                system.SYS_sendmsg,
+                @intCast(usize, self.handle),
+                @ptrToInt(message),
+                @intCast(c_int, flags),
+            ));
+        return sendmsg(socket, message, flags);
     }
 };

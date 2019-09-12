@@ -189,10 +189,13 @@ pub const Socket = struct {
     
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
         var domain: u32 = 0;
-        if ((flags & zio.Socket.Ipv4) != 0)
+        if ((flags & zio.Socket.Ipv4) != 0) {
             domain |= system.AF_INET;
-        if ((flags & zio.Socket.Ipv6) != 0)
+        } else if ((flags & zio.Socket.Ipv6) != 0) {
             domain |= system.AF_INET6;
+        } else if (builtin.os == .linux) {
+            domain |= system.AF_PACKET;
+        }
         
         var protocol: u32 = 0;
         var sock_type: u32 = 0;
@@ -295,24 +298,47 @@ pub const Socket = struct {
                 .data = 0,
             };
         }
-            
-        var message_header = msghdr {
-            .msg_name = @ptrToInt(address),
-            .msg_namelen = if (address) |addr| @intCast(c_uint, addr.len) else 0,
-            .msg_iov = @ptrCast(*const os.iovec_const, buffers.ptr),
-            .msg_iovlen = @intCast(c_uint, buffers.len),
-            .msg_control = 0,
-            .msg_controllen = 0,
-            .msg_flags = 0,
-        };
 
-        const bytes = io(self.handle, &message_header, MSG_DONTWAIT);
-        return switch (os.errno(bytes)) {
-            0 => @intCast(usize, bytes),
+        while (true) { 
+            var message_header = msghdr {
+                .msg_name = @ptrToInt(address),
+                .msg_namelen = if (address) |addr| @intCast(c_uint, addr.len) else 0,
+                .msg_iov = @ptrCast(*const os.iovec_const, buffers.ptr),
+                .msg_iovlen = @intCast(c_uint, buffers.len),
+                .msg_control = 0,
+                .msg_controllen = 0,
+                .msg_flags = 0,
+            };
 
+            // TODO
+            const bytes = io(self.handle, &message_header, MSG_DONTWAIT);
+            if (bytes > 0 and (message_header.msg_flags & MSG_ERRQUEUE) == 0) {
+                return zio.Result
+
+            if (bytes == 0 or (message_header.msg_flags & MSG_ERRQUEUE) != 0)
+                return zio.Result { .status = .Error, .data = 0 };
+
+            const errno = os.errno(bytes);
+            if (errno == 0)
+                return zio.Result { .status = .Completed, .data = @intCast(u32, bytes) };
+            return zio.Result {
+                .status = 
+            }
+
+            return switch () {
+                0 => zio.Result {
+                    .data = @intCast(u32, bytes),
+                    .status = .Completed,
+                },
+                os.EAGAIN, os.EWOULDBLOCK => zio.Result {
+                    .data = 0,
+                    .status = .Retry,
+                },
+            };
         }
     }
 
+    const MSG_ERRQUEUE = ;
     const MSG_DONTWAIT = ;
     const msghdr = extern struct {
         msg_name: usize,

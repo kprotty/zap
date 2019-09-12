@@ -10,7 +10,7 @@ pub fn initialize() zio.InitError!void {
     if (wsa_data.wVersion != wsa_version)
         return zio.InitError.InvalidState;
 
-    const dummy_socket = WSASocketA(AF_INET, SOCK_STREAM, 0, null, 0, 0);
+    const dummy_socket = WSASocketA(AF_INET, SOCK_STREAM, 0, 0, 0, 0);
     if (dummy_socket == INVALID_SOCKET)
         return zio.InitError.InvalidState;
     defer { _ = Mswsock.closesocket(dummy_socket); }
@@ -23,7 +23,7 @@ pub fn cleanup() void {
     _ = WSACleanup();    
 }
 
-fn findWSAFunction(socket: SOCKET, function_guid: GUID, function: var) zio.InitError!void {
+fn findWSAFunction(socket: SOCKET, function_guid: windows.GUID, function: var) zio.InitError!void {
     var guid = function_guid;
     var dwBytes: windows.DWORD = undefined;
     if (WSAIoctl(
@@ -32,7 +32,7 @@ fn findWSAFunction(socket: SOCKET, function_guid: GUID, function: var) zio.InitE
         @ptrCast(windows.PVOID, &guid),
         @sizeOf(@typeOf(guid)),
         @ptrCast(windows.PVOID, function),
-        @sizeOf(@typeInfo(function).Pointer.child),
+        @sizeOf(@typeInfo(@typeOf(function)).Pointer.child),
         &dwBytes,
         null,
         null,
@@ -99,7 +99,7 @@ pub const Event = struct {
     inner: OVERLAPPED_ENTRY,
 
     pub fn getData(self: *@This(), poller: *Poller) usize {
-        return @ptrToInt(self.inner.lpCompletionKey);
+        return self.inner.lpCompletionKey;
     }
 
     pub fn getResult(self: *@This()) zio.Result {
@@ -111,36 +111,61 @@ pub const Event = struct {
     }
 
     pub const Poller = struct {
+        iocp: Handle,
+
         pub fn init(self: *@This()) zio.Event.Poller.InitError!void {
-            
+            self.iocp = windows.kernel32.CreateIoCompletionPort(windows.INVALID_HANDLE_VALUE, null, undefined, 0)
+                orelse return zio.Event.Poller.InitError.InvalidHandle;
         }
 
         pub fn close(self: *@This()) void {
-            
+            _ = windows.CloseHandle(self.iocp);
         }
 
         pub fn getHandle(self: @This()) zio.Handle {
-            
+            return self.iocp;
         }
 
         pub fn fromHandle(handle: zio.Handle) @This() {
-            
+            return @This() { .iocp = handle };
         }
 
         pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
-            
+            if (handle == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.RegisterError.InvalidHandle;
+            _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, data, 0)
+                orelse return windows.unexpectedError(windows.kernel32.GetLastError());
         }
 
         pub fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
-            
+            if (handle == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.RegisterError.InvalidHandle;
         }
 
         pub fn send(self: *@This(), data: usize) zio.Event.Poller.SendError!void {
-            
+            if (self.iocp == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.SendError.InvalidHandle;
+            if (windows.kernel32.PostQueuedCompletionStatus(self.iocp, 0, data, null) != windows.TRUE)
+                return windows.unexpectedError(windows.kernel32.GetLastError());
         }
 
         pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
-            
+            var events_found: windows.ULONG = 0;
+            const result = GetQueuedCompletionStatusEx(
+                self.iocp,
+                @ptrCast([*]OVERLAPPED_ENTRY, events.ptr),
+                @intCast(windows.ULONG, events.len),
+                &events_found,
+                if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,
+                windows.FALSE,
+            );
+
+            const err_code = windows.kernel32.GetLastError();
+            if (self.iocp == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.PollError.InvalidHandle;
+            if (result == windows.TRUE or timeout == null or err_code == WAIT_TIMEOUT)
+                return events[0..events_found];
+            return windows.unexpectedError(windows.kernel32.GetLastError());
         }
     };
 };
@@ -218,6 +243,9 @@ const IPPROTO_TCP: windows.DWORD = 6;
 const IPPROTO_UDP: windows.DWORD = 17;
 
 const STATUS_SUCCESS = 0;
+const WAIT_TIMEOUT: windows.DWORD = 258;
+const SIO_GET_EXTENSION_FUNCTION_POINTER: windows.DWORD = 0xc8000006;
+
 const WSA_IO_PENDING: windows.DWORD = 997;
 const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
@@ -309,9 +337,9 @@ const OverlappedCompletionRoutine = fn(
     lpOverlapped: *windows.OVERLAPPED,
 ) void;
 
-var ConnectEx: fn(
+var ConnectEx: extern fn(
     socket: SOCKET,
-    name: *const sockaddr,
+    name: *const SOCKADDR,
     name_len: c_int,
     lpSendBuffer: windows.PVOID,
     dwSendDataLength: windows.DWORD,
@@ -319,7 +347,7 @@ var ConnectEx: fn(
     lpOverlapped: *windows.OVERLAPPED,
 ) windows.BOOL = undefined;
 
-var AcceptEx: fn(
+var AcceptEx: extern fn(
     sListenSocket: SOCKET,
     sAcceptSocket: SOCKET,
     lpOutputBuffer: ?windows.PVOID,
@@ -331,22 +359,22 @@ var AcceptEx: fn(
 ) windows.BOOL = undefined;
 
 const OVERLAPPED_ENTRY = extern struct {
-    lpCompletionKey: system.ULONG_PTR,
-    lpOverlapped: ?*system.OVERLAPPED,
-    Internal: system.ULONG_PTR,
-    dwNumberOfBytesTransferred: system.DWORD,
+    lpCompletionKey: windows.ULONG_PTR,
+    lpOverlapped: ?*windows.OVERLAPPED,
+    Internal: windows.ULONG_PTR,
+    dwNumberOfBytesTransferred: windows.DWORD,
 };
 
 extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
-    CompletionPort: system.HANDLE,
+    CompletionPort: windows.HANDLE,
     lpCompletionPortEntries: [*]OVERLAPPED_ENTRY,
-    ulCount: system.ULONG,
-    ulNumEntriesRemoved: system.PULONG,
-    dwMilliseconds: system.DWORD,
-    fAlertable: system.BOOL,
-) system.BOOL;
+    ulCount: windows.ULONG,
+    ulNumEntriesRemoved: *windows.ULONG,
+    dwMilliseconds: windows.DWORD,
+    fAlertable: windows.BOOL,
+) windows.BOOL;
 
-const Mswsock = {
+const Mswsock = struct {
     pub extern "ws2_32" stdcallcc fn closesocket(socket: SOCKET) c_int;
     pub extern "ws2_32" stdcallcc fn listen(
         socket: SOCKET,
@@ -375,14 +403,14 @@ extern "ws2_32" stdcallcc fn WSAIoctl(
     cbOutBuffer: windows.DWORD,
     lpcbBytesReturned: *windows.DWORD,
     lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRoutine: ?fn(*windows.OVERLAPPED) usize,
+    lpCompletionRoutine: ?extern fn(*windows.OVERLAPPED) usize,
 ) c_int;
 
 extern "ws2_32" stdcallcc fn WSASocketA(
     family: windows.DWORD,
     sock_type: windows.DWORD,
     protocol: windows.DWORD,
-    lpProtocolInfo: usize,,
+    lpProtocolInfo: usize,
     group: usize,
     dwFlags: windows.DWORD,
 ) SOCKET;

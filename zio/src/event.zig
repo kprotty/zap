@@ -38,6 +38,7 @@ pub const Event = struct {
         inner: zio.backend.Event.Poller,
 
         pub const InitError = error {
+            InvalidHandle,
             OutOfResources,
         };
 
@@ -62,7 +63,7 @@ pub const Event = struct {
             return @This() { .inner = zio.backend.Poller.fromHandle(handle) };
         }
 
-        pub const RegisterError = error {
+        pub const RegisterError = std.os.UnexpectedError || error {
             InvalidValue,
             InvalidHandle,
             OutOfResources,
@@ -85,17 +86,14 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, data);
         }
 
-        pub const SendError = std.os.UnexpectedError || RegisterError || error {
-            InvalidValue,
-            OutOfResources,
-        };
+        pub const SendError = RegisterError;
 
         /// Send a user event with arbitrary `data` that can be retrieved from `Event.getData()`
         pub inline fn send(self: *@This(), data: usize) SendError!void {
             return self.inner.send(data);
         }
 
-        pub const PollError = error {
+        pub const PollError = std.os.UnexpectedError || error {
             InvalidHandle,
             InvalidEvents,
         };

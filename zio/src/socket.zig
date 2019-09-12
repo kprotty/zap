@@ -31,7 +31,9 @@ pub const Socket = struct {
     inner: zio.backend.Socket,
 
     pub const InitError = error {
-        // TODO
+        InvalidState,
+        InvalidValue,
+        OutOfResources,
     };
 
     pub const Raw = 1 << 0;
@@ -105,7 +107,9 @@ pub const Socket = struct {
     }
 
     pub const BindError = error {
-        // TODO
+        InvalidState,
+        InvalidValue,
+        AddressInUse,
     };
 
     /// Bind the source address of the socket to the given `zio.Address`.
@@ -114,9 +118,7 @@ pub const Socket = struct {
         return self.inner.bind(address);
     }
 
-    pub const ListenError = error {
-        // TODO
-    };
+    pub const ListenError = BindError;
 
     /// Convert the socket into passive mode in which it can
     /// receive connections (asynchronously) using `accept()`.

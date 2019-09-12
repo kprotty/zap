@@ -185,29 +185,61 @@ pub const Event = struct {
 };
 
 pub const Socket = struct {
-
-    pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
-        
-    }
-
-    pub fn close(self: *@This()) void {
-        
-    }
-
-    pub fn getHandle(self: @This()) zio.Handle {
-        
-    }
-
-    pub fn fromHandle(handle: zio.Handle) @This() {
-        
-    }
+    pub usingnamespace BsdSocket;
 
     pub fn isReadable(self: *const @This(), event: Event) bool {
-        
+        return event.inner.filter == os.EVFILT_READ;
     }
 
     pub fn isWriteable(self: *const @This(), event: Event) bool {
+        return event.inner.filter == os.EVFILT_WRITE;
+    }
+};
+
+pub const BsdSocket = struct {
+    handle: Handle,
+    
+    pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
+        var domain: u32 = 0;
+        if ((flags & zio.Socket.Ipv4) != 0)
+            domain |= system.AF_INET;
+        if ((flags & zio.Socket.Ipv6) != 0)
+            domain |= system.AF_INET6;
         
+        var protocol: u32 = 0;
+        var sock_type: u32 = 0;
+        if ((flags & zio.Socket.Nonblock))
+            sock_type |= system.SOCK_NONBLOCK;
+        if ((flags & zio.Socket.Tcp) != 0) {
+            protocol |= system.IPPROTO_TCP;
+            sock_type |= system.SOCK_STREAM;
+        } else if ((flags & zio.Socket.Udp) != 0) {
+            protocol |= system.IPPROTO_UDP;
+            sock_type |= system.SOCK_DGRAM;
+        } else if ((flags & zio.Socket.Raw) != 0) {
+            sock_type |= system.SOCK_RAW;
+        }
+        
+        const handle = os.socket(domain, sock_type, protocol);
+        return switch (os.errno(handle)) {
+            0 => self.handle = @intCast(Handle, handle),
+            os.ENFILE, os.EMFILE, os.ENOBUFS, os.ENOMEM => zio.Socket.InitError.OutOfResources,
+            os.EINVAL, os.EAFNOSUPPORT, os.EPROTONOSUPPORT => zio.Socket.InitError.InvalidValue,
+            os.EACCES => zio.Socket.InitError.InvalidState,
+            else => unreachable,
+        };
+    }
+
+    pub fn close(self: *@This()) void {
+        _ = os.close(self.handle);
+    }
+
+    pub fn getHandle(self: @This()) zio.Handle {
+        return self.handle;
+    }
+
+    pub fn fromHandle(handle: zio.Handle) @This() {
+        return @This() { .handle = handle };
     }
 
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
@@ -219,11 +251,25 @@ pub const Socket = struct {
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        
+        const address_len = @intCast(c_int, address.len);
+        const address_ptr = @ptrCast(*const os.sockaddr, &address.ip);
+        return switch (os.errno(system.bind(self.handle, address_ptr, address_len))) {
+            0 => {},
+            os.ELOOP, os.EBADF, os.EFAULT, os.ENAMETOOLONG, os.ENOENT, os.ENOTDIR => zio.Socket.BindError.InvalidValue,
+            os.EACCES, os.ENOMEM, o.EROFS => zio.Socket.BindError.InvalidState,
+            os.EADDRINUSE, os.EINVAL => zio.Socket.BindError.AddressInUse,
+            else => unreachable,
+        };
     }
 
     pub fn listen(self: *@This(), backlog: u16) zio.Socket.ListenError!void {
-        
+        return switch (os.errno(system.listen(self.handle, backlog))) {
+            0 => {},
+            os.EOPNOTSUPP => zio.Socket.ListenError.InvalidState,
+            os.EADDRINUSE => zio.Socket.ListenError.AddressInUse,
+            os.EBADF => zio.Socket.ListenError.InvalidValue,
+            else => unreachable,
+        };
     }
 
     pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {

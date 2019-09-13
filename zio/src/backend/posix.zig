@@ -262,11 +262,16 @@ pub const Socket = struct {
     }
 
     pub fn setOption(self: *@This(), option: zio.Option) zio.Socket.OptionError!void {
-       
+        var option_val = option;
+        return switch os.errno(socketOption(true, self.handle, &option_val, Setsockopt, os)) {
+
+        };
     }
 
     pub fn getOption(self: *@This(), option: *zio.Option) zio.Socket.OptionError!void {
-        
+        return switch os.errno(socketOption(false, self.handle, &option_val, Getsockopt, os)) {
+
+        };
     }
 
     pub const Linger = extern struct {
@@ -514,5 +519,33 @@ pub const Socket = struct {
                 if ((flags & zio.Socket.Nonblock) != 0) os.SOCK_NONBLOCK else 0,
             ));
         return accept(socket, address, length);
+    }
+
+    extern "c" fn setsockopt(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) c_int;
+    fn Setsockopt(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) c_int {
+        if (builtin.os == .linux)
+            return @intCast(c_int, system.syscall5(
+                system.SYS_setsockopt,
+                @intCast(usize, socket),
+                @intCast(usize, level),
+                @intCast(usize, optname),
+                optval,
+                @intCast(usize, optlen),
+            ));
+        return setsockopt(socket, level, optname, optval, optlen);
+    }
+
+    extern "c" fn getsockopt(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) c_int;
+    fn Getsockopt(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) c_int {
+        if (builtin.os == .linux)
+            return @intCast(c_int, system.syscall5(
+                system.SYS_getsockopt,
+                @intCast(usize, socket),
+                @intCast(usize, level),
+                @intCast(usize, optname),
+                optval,
+                @ptrToInt(optlen),
+            ));
+        return getsockopt(socket, level, optname, optval, optlen);
     }
 };

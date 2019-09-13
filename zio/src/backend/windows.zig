@@ -295,48 +295,52 @@ pub const Socket = struct {
         };
     }
 
-    inline fn getResultFrom(result: windows.BOOL) zio.Result {
-        if (result == windows.TRUE)
-            return zio.Result { .status = .Completed, .data = 0 };
-        if (WSAGetLastError() == ERROR_IO_PENDING)
-            return zio.Result { .status = .Retry, .data = 0 };
-        return zio.Result { .status = .Error, .data = 0 };
-    }
-
     pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {
         const connectEx = ConnectEx orelse return zio.Result { .status = .Error, .data = 0 };
-        @memset(@ptrCast([*]u8, &self.writer), 0, @sizeOf(@typeOf(self.writer)));
         return getResultFrom(connectEx(
             self.handle,
             @ptrCast(*const SOCKADDR, &address.ip),
             address.len,
-            null,
-            0,
-            null,
-            &self.writer,
+            null,   // no buffer to send after connecting
+            0,      // sizeof buffer to send doesnt exist
+            null,   // not sending data so no recv len ptr
+            self.getOverlapped(&self.writer),
         ));
     }
 
     pub fn accept(self: *@This(), incoming: *Incoming) zio.Result {
-        //nNeed to create the socket before hand.
+        // need to create the socket before hand.
         var listen_socket: @This() = undefined;
-        _ = listen_socket.init(self.sock_flags) 
-            catch return zio.Result { .status = .Error, .data = 0 };
+        _ = listen_socket.init(self.sock_flags) catch return zio.Result { .status = .Error, .data = 0 };
         incoming.flags = self.sock_flags;
         incoming.handle = listen_socket.getHandle();
 
         const acceptEx = AcceptEx orelse return zio.Result { .status = .Error, .data = 0 };
-        @memset(@ptrCast([*]u8, &self.reader), 0, @sizeOf(@typeOf(self.reader)));
         return getResultFrom(acceptEx(
             incoming.handle,
             self.handle,
             @ptrCast(windows.PVOID, &incoming.address),
             0, // dont receive any data
             0, // dont retrive local address
-            @intCast(windos.DWORD, incoming.address.len),
+            @intCast(windos.DWORD, incoming.address.value.len),
             &self.recv_flags,
-            &self.reader,
+            self.getOverlapped(&self.reader),
         ));
+    }
+
+    fn getOverlapped(self: *const @This(), overlapped: *windows.OVERLAPPED) ?*windows.OVERLAPPED {
+        if ((self.sock_flags & zio.Socket.Nonblock) == 0)
+            return null;
+        @memset(@ptrCast([*]u8, overlapped), 0, @sizeOf(windows.OVERLAPPED));
+        return overlapped;
+    }
+
+    fn getResultFrom(result: windows.BOOL) zio.Result {
+        if (result == windows.TRUE)
+            return zio.Result { .status = .Completed, .data = 0 };
+        if (WSAGetLastError() == ERROR_IO_PENDING)
+            return zio.Result { .status = .Retry, .data = 0 };
+        return zio.Result { .status = .Error, .data = 0 };
     }
 
     pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {

@@ -205,29 +205,29 @@ pub const Socket = struct {
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
         var domain: u32 = 0;
         if ((flags & zio.Socket.Ipv4) != 0) {
-            domain |= system.AF_INET;
+            domain = os.AF_INET;
         } else if ((flags & zio.Socket.Ipv6) != 0) {
-            domain |= system.AF_INET6;
+            domain = os.AF_INET6;
         } else if (builtin.os == .linux) {
-            domain |= system.AF_PACKET;
+            domain = os.AF_PACKET;
         }
         
         var protocol: u32 = 0;
         var sock_type: u32 = 0;
         if ((flags & zio.Socket.Nonblock))
-            sock_type |= system.SOCK_NONBLOCK;
+            sock_type = os.SOCK_NONBLOCK;
         if ((flags & zio.Socket.Tcp) != 0) {
-            protocol |= system.IPPROTO_TCP;
-            sock_type |= system.SOCK_STREAM;
+            protocol = os.IPPROTO_TCP;
+            sock_type = os.SOCK_STREAM;
         } else if ((flags & zio.Socket.Udp) != 0) {
-            protocol |= system.IPPROTO_UDP;
-            sock_type |= system.SOCK_DGRAM;
+            protocol = os.IPPROTO_UDP;
+            sock_type = os.SOCK_DGRAM;
         } else if ((flags & zio.Socket.Raw) != 0) {
-            sock_type |= system.SOCK_RAW;
+            sock_type = os.SOCK_RAW;
         }
         
         self.flags = flags;
-        const handle = os.socket(domain, sock_type, protocol);
+        const handle = os.socket(domain, sock_type | os.SOCK_CLOEXEC, protocol);
         return switch (os.errno(handle)) {
             0 => self.handle = @intCast(Handle, handle),
             os.ENFILE, os.EMFILE, os.ENOBUFS, os.ENOMEM => zio.Socket.InitError.OutOfResources,
@@ -383,22 +383,48 @@ pub const Socket = struct {
     }
 
     pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {
-        
+        while (true) {
+            const result = Connect(self.handle, @ptrCast(*const os.sockaddr, &address.ip), @intCast(c_int, address.len));
+            switch (os.errno(result)) {
+                os.EINTR => continue,
+                0 => return zio.Result { .status = .Completed, .data = 0 },
+                os.EAGAIN, os.EWOULDBLOCK, os.EINPROGRESS => 
+                    return zio.Result { .status = .Retry, .data = 0 },
+                os.EACCES, os.EPERM, os.EADDRINUSE, os.EADDRNOTAVAIL, os.EAFNOSUPPORT, os.EALREADY, os.EBADF,
+                os.ECONNREFUSED, os.EFAULT, os.ISCONN, os.ENETUNREACH, os.ENOTSOCK, os.EPROTOTYPE, os.ETIMEDOUT =>
+                    return zio.Result { .status = .Error, .data = 0 },
+                else => unreachable,
+            }
+        }
     }
 
     pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
-        
+        while (true) {
+            const fd = Accept(self.handle, @ptrCast(*os.sockaddr, &incoming.address), @intCast(c_int, incoming.address.len), self.flags);
+            incoming.handle = @intCast(zio.Handle, fd);
+            switch (os.errno(fd)) {
+                os.EINTR => continue,
+                0 => return zio.Result { .status = .Completed, .data = 0 },
+                os.EAGAIN, os.EWOULDBLOCK =>
+                    return zio.Result { .status = .Retry, .data = 0 },
+                os.EBADF, os.ECONNABORTED, os.EFAULT, os.EINVAL, os.EMFILE,
+                os.ENOBUFS, os.ENOMEM, os.ENOTSOCK, os.EOPNOTSUPP, os.EPROTO, os.EPERM,
+                os.ENOSR, os.ESOCKTNOSUPPORT, os.EPROTONOSUPPORT, os.ETIMEDOUT, os.ERESTARTSYS =>
+                    return zio.Result { .status = .Error, .data = 0 },
+                else => unreachable,
+            }
+        }
     }
 
     pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
-        return self.performIO(address, buffers, recvmsg);
+        return self.performIO(address, buffers, Recvmsg);
     }
 
     pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
-        return self.performIO(address, buffers, sendmsg);
+        return self.performIO(address, buffers, Sendmsg);
     }
 
-    inline fn performIO(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer, perform: var) zio.Result {
+    fn performIO(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer, perform: var) zio.Result {
         if (buffer.len == 0)
             return zio.Result { .status = .Completed, .data = 0 }; 
 
@@ -422,7 +448,7 @@ pub const Socket = struct {
                 0 => unreachable,
                 os.EINTR => continue,
                 os.EAGAIN, os.EWOULDBLOCK => return zio.Result { .status = .Retry, .data = 0 },
-                // TODO
+                os.EBADF, os.EINVAL, os.ENOMEM, os.ENOTCONN, os.ENOTSOCK => return zio.Result { .status = .Error, .data = 0 },
                 else => unreachable,
             }
         }
@@ -441,27 +467,52 @@ pub const Socket = struct {
         msg_flags: c_uint,
     };
 
-    extern "c" fn recvmsg(socket: i32, message: *msghdr, flags: c_int) isize;
+    extern "c" fn recvmsg(socket: Handle, message: *msghdr, flags: c_int) isize;
     fn Recvmsg(socket: Handle, message: *msghdr, flags: c_int) isize {
         if (builtin.os == .linux)
             return @intCast(isize, system.syscall3(
                 system.SYS_recvmsg,
-                @intCast(usize, self.handle),
+                @intCast(usize, socket),
                 @ptrToInt(message),
                 @intCast(c_int, flags),
             ));
         return recvmsg(socket, message, flags);
     }
 
-    extern "c" fn sendmsg(socket: i32, message: *const msghdr, flags: c_int) isize;
+    extern "c" fn sendmsg(socket: Handle, message: *const msghdr, flags: c_int) isize;
     fn Sendmsg(socket: Handle, message: *const msghdr, flags: c_int) isize {
         if (builtin.os == .linux)
             return @intCast(isize, system.syscall3(
                 system.SYS_sendmsg,
-                @intCast(usize, self.handle),
+                @intCast(usize, socket),
                 @ptrToInt(message),
                 @intCast(c_int, flags),
             ));
         return sendmsg(socket, message, flags);
+    }
+
+    extern "c" fn connect(socket: Handle, address: *const os.sockaddr, len: c_int) isize;
+    fn Connect(socket: Handle, address: *const os.sockaddr, length: c_int) isize {
+        if (builtin.os == .linux)
+            return @intCast(isize, system.syscall3(
+                system.SYS_connect,
+                @intCast(usize, socket),
+                @ptrToInt(address),
+                @intCast(usize, length),
+            ));
+        return connect(socket, address, length);
+    }
+
+    extern "c" fn accept(socket: Handle, address: *os.sockaddr, len: c_int) isize;
+    fn Accept(socket: Handle, address: *os.sockaddr, length: c_int, flags: u8) isize {
+        if (builtin.os == .linux)
+            return @intCast(isize, system.syscall4(
+                system.SYS_accept4,
+                @intCast(usize, socket),
+                @ptrToInt(address),
+                @intCast(usize, length),
+                if ((flags & zio.Socket.Nonblock) != 0) os.SOCK_NONBLOCK else 0,
+            ));
+        return accept(socket, address, length);
     }
 };

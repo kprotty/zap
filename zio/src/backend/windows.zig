@@ -15,8 +15,10 @@ pub fn initialize() zio.InitError!void {
         return zio.InitError.InvalidState;
     defer { _ = Mswsock.closesocket(dummy_socket); }
 
-    try findWSAFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx);
-    try findWSAFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx);
+    if (AcceptEx == null)
+        try findWSAFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx);
+    if (ConnectEx == null)
+        try findWSAFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx);
 }
 
 pub fn cleanup() void {
@@ -159,65 +161,160 @@ pub const Event = struct {
                 if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,
                 windows.FALSE,
             );
+            if (result == windows.TRUE)
+                return events[0..events_found];
 
             const err_code = windows.kernel32.GetLastError();
             if (self.iocp == windows.INVALID_HANDLE_VALUE)
                 return zio.Event.Poller.PollError.InvalidHandle;
-            if (result == windows.TRUE or timeout == null or err_code == WAIT_TIMEOUT)
-                return events[0..events_found];
+            if (timeout == null or err_code == WAIT_TIMEOUT)
+                return events[0..0];
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
     };
 };
 
 pub const Socket = struct {
+    handle: Handle,
+    sock_flags: windows.DWORD,
+    recv_flags: windows.DWORD,
+    reader: windows.OVERLAPPED,
+    writer: windows.OVERLAPPED,
 
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
-        
+        var family: windows.DWORD = 0;
+        if ((flags & zio.Socket.Raw) != 0) {
+            family = AF_UNSPEC;
+        } else if ((flags & zio.Socket.Ipv4) != 0) {
+            family = AF_INET;
+        } else if ((flags & zio.Socket.Ipv6) != 0) {
+            family = AF_INET6;
+        }
+
+        var protocol: windows.DWORD = 0;
+        var sock_type: windows.DWORD = 0;
+        if ((flags & zio.Socket.Raw) != 0) {
+            sock_type = SOCK_RAW;
+        } else if ((flags & zio.Socket.Tcp) != 0) {
+            protocol = IPPROTO_TCP;
+            sock_type = SOCK_STREAM;
+        } else if ((flags & zio.Socket.Udp) != 0) {
+            protocol = IPPROTO_UDP;
+            sock_type = SOCK_DGRAM;
+        }
+
+        var wsa_flags: windows.DWORD = 0;
+        if ((flags & zio.Socket.Nonblock) != 0)
+            wsa_flags = WSA_FLAG_OVERLAPPED;
+
+        self.sock_flags = flags;
+        self.handle = WSASocketA(family, sock_type, protocol, 0, 0, wsa_flags);
+        if (self.handle == INVALID_SOCKET) {
+            return switch (WSAGetLastError()) {
+                WSANOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS, WSAEINVALIDPROVIDER, WSAEINVALIDPROCTABLE, WSAEPROVIDERFAILEDINIT => zio.Socket.InitError.InvalidState,
+                WSAEAFNOTSUPPORT, WSAEFAULT, WSAEINVAL, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT => zio.Socket.InitError.InvalidValue,
+                WSAEMFILE, WSAENOBUFS => zio.Socket.InitError.OutOfResources,
+                else => unreachable,
+            };
+        }
     }
 
     pub fn close(self: *@This()) void {
-        
+        _ = Mswsock.closesocket(self.handle);
     }
 
     pub fn getHandle(self: @This()) zio.Handle {
-        
+        return self.handle;
     }
 
     pub fn fromHandle(handle: zio.Handle) @This() {
-        
+        var self: @This() = undefined;
+        self.handle = handle;
+        return self;
     }
 
     pub fn isReadable(self: *const @This(), event: Event) bool {
-        
+        return event.lpOverlapped == &self.reader;
     }
 
     pub fn isWriteable(self: *const @This(), event: Event) bool {
-        
+        return event.lpOverlapped == &self.writer;
     }
 
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
-       
+       // TODO
     }
 
     pub fn getOption(option: *Option) zio.Socket.OptionError!void {
-        
+        // TODO
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        
+        if (Mswsock.bind(self.handle, @ptrCast(*const SOCKADDR, address.ip), address.len) == 0)
+            return;
+        return switch (WSAGetLastError()) {
+            WSANOTINITIALIZED, WSAENETDOWN => zio.Socket.BindError.InvalidState,
+            WSAEADDRNOTAVAIL, WSAEFAULT => zio.Socket.BindError.InvalidAddress,
+            WSAEADDRINUSE => zio.Socket.BindError.AddressInUse,
+            WSAENOTSOCK => zio.Socket.BindError.InvalidHandle,
+            WSAENOBUFS => zio.Socket.BindError.OutOfResources,
+            else => unreachable,
+        };
     }
 
     pub fn listen(self: *@This(), backlog: u16) zio.Socket.ListenError!void {
-        
+        if (Mswsock.listen(self.handle, backlog) == 0)
+            return;
+        return switch (WSAGetLastError()) {
+            WSANOTINITIALIZED, WSAENETDOWN, WSAEADDRINUSE, WSAEINPROGRESS, WSAEINVAL => zio.Socket.ListenError.InvalidState,
+            WSAEISCONN, WSAEMFILE, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.ListenError.InvalidHandle,
+            WSAENOBUFS => zio.Socket.ListenError.OutOfResources,
+            else => unreachable,
+        };
+    }
+
+    inline fn getResultFrom(result: windows.BOOL) zio.Result {
+        if (result == windows.TRUE)
+            return zio.Result { .status = .Completed, .data = 0 };
+        if (WSAGetLastError() == ERROR_IO_PENDING)
+            return zio.Result { .status = .Retry, .data = 0 };
+        return zio.Result { .status = .Error, .data = 0 };
     }
 
     pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {
-        
+        const connectEx = ConnectEx orelse return zio.Result { .status = .Error, .data = 0 };
+        @memset(@ptrCast([*]u8, &self.writer), 0, @sizeOf(@typeOf(self.writer)));
+        return getResultFrom(connectEx(
+            self.handle,
+            @ptrCast(*const SOCKADDR, &address.ip),
+            address.len,
+            null,
+            0,
+            null,
+            &self.writer,
+        ));
     }
 
     pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
-        
+        //nNeed to create the socket before hand.
+        var listen_socket: @This() = undefined;
+        _ = listen_socket.init(self.sock_flags) 
+            catch return zio.Result { .status = .Error, .data = 0 };
+        incoming.handle = listen_socket.getHandle();
+        incoming.flags = @intCast(zio.Handle, self.sock_flags);
+
+        const acceptEx = AcceptEx orelse return zio.Result { .status = .Error, .data = 0 };
+        @memset(@ptrCast([*]u8, &self.reader), 0, @sizeOf(@typeOf(self.reader)));
+        return getResultFrom(acceptEx(
+            incoming.handle,
+            self.handle,
+            @ptrCast(windows.PVOID, &incoming.address),
+            0, // dont receive any data
+            0, // dont retrive local address
+            @intCast(windos.DWORD, incoming.address.len),
+            &self.recv_flags,
+            &self.reader,
+        ));
     }
 
     pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
@@ -244,6 +341,7 @@ const IPPROTO_UDP: windows.DWORD = 17;
 
 const STATUS_SUCCESS = 0;
 const WAIT_TIMEOUT: windows.DWORD = 258;
+const ERROR_IO_PENDING: windows.DWORD = 997;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: windows.DWORD = 0xc8000006;
 
 const WSA_IO_PENDING: windows.DWORD = 997;
@@ -337,17 +435,17 @@ const OverlappedCompletionRoutine = fn(
     lpOverlapped: *windows.OVERLAPPED,
 ) void;
 
-var ConnectEx: extern fn(
+var ConnectEx: ?extern fn(
     socket: SOCKET,
     name: *const SOCKADDR,
     name_len: c_int,
-    lpSendBuffer: windows.PVOID,
+    lpSendBuffer: ?windows.PVOID,
     dwSendDataLength: windows.DWORD,
-    lpdwBytesSent: *windows.DWORD,
+    lpdwBytesSent: ?*windows.DWORD,
     lpOverlapped: *windows.OVERLAPPED,
 ) windows.BOOL = undefined;
 
-var AcceptEx: extern fn(
+var AcceptEx: ?extern fn(
     sListenSocket: SOCKET,
     sAcceptSocket: SOCKET,
     lpOutputBuffer: ?windows.PVOID,

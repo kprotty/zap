@@ -101,9 +101,12 @@ pub const Socket = struct {
     }
 
     pub const BindError = error {
+        AddressInUse,
         InvalidState,
         InvalidValue,
-        AddressInUse,
+        InvalidHandle,
+        InvalidAddress,
+        OutOfResources,
     };
 
     /// Bind the source address of the socket to the given `zio.Address`.

@@ -88,12 +88,12 @@ pub const Socket = struct {
     const Linger = zio.backend.Socket.Linger;
     pub const Option = union(enum) {
         Debug: bool,        // SO_DEBUG
-        Nodelay: bool,      // TCP_NODELAY
         Linger: Linger,     // SO_LINGER
         Broadcast: bool,    // SO_BROADCAST
         Reuseaddr: bool,    // SO_REUSEADDR
         Keepalive: bool,    // SO_KEEPALIVE
         Oobinline: bool,    // SO_OOBINLINE
+        Tcpnodelay: bool,   // TCP_NODELAY
         RecvBufMax: c_int,  // SO_RCVBUF
         RecvBufMin: c_int,  // SO_RCVLOWAT
         RecvTimeout: c_int, // SO_RCVTIMEO
@@ -103,12 +103,12 @@ pub const Socket = struct {
     };
 
     /// Given an option variant, set the desired option on the socket.
-    pub inline fn setOption(option: Option) OptionError!void {
+    pub inline fn setOption(self: *@This(), option: Option) OptionError!void {
         return self.inner.setOption(option);
     }
 
     /// Get the option variant, storing the result in the argument if success.
-    pub inline fn getOption(option: *Option) OptionError!void {
+    pub inline fn getOption(self: *@This(), option: *Option) OptionError!void {
         return self.inner.getOption(option);
     }
 

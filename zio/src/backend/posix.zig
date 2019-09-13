@@ -259,17 +259,103 @@ pub const Socket = struct {
         return event.inner.filter == os.EVFILT_WRITE;
     }
 
+    pub fn setOption(self: *@This(), option: zio.Option) zio.Socket.OptionError!void {
+       
+    }
+
+    pub fn getOption(self: *@This(), option: *zio.Option) zio.Socket.OptionError!void {
+        
+    }
+
     pub const Linger = extern struct {
         l_onoff: c_int,
         l_linger: c_int,
     };
 
-    pub fn setOption(option: Option) zio.Socket.OptionError!void {
-       
-    }
+    pub fn socketOption(comptime set: bool, handle: zio.Handle, option: *zio.Option, comptime apply: var, comptime options: var) c_int {
+        var number: c_int = undefined;
+        var level: c_int = options.SOL_SOCKET;
+        var opt_name: c_int = undefined;
+        var opt_val: usize = @ptrToInt(number);
+        var opt_len: c_int = @sizeOf(@typeOf(number));
 
-    pub fn getOption(option: *Option) zio.Socket.OptionError!void {
-        
+        switch (option.*) {
+            .Debug => |value| {
+                if (set) number = if (value) 1 else 0;
+                opt_name = options.SO_DEBUG;
+            },
+            .Tcpnodelay => |value| {
+                if (set) number = if (value) 1 else 0;
+                level = options.IPPROTO_TCP,
+                opt_name = options.TCP_NODELAY;
+            },
+            .Linger => |value| {
+                opt_name = options.SO_LINGER,
+                opt_val = @ptrToInt(&option.Linger);
+                opt_len = @sizeOf(@typeOf(value));
+            },
+            .Broadcast => |value| {
+                if (set) number = if (value) 1 else 0;
+                opt_name = options.SO_BROADCAST;
+            },
+            .Reuseaddr => |value| {
+                if (set) number = if (value) 1 else 0;
+                opt_name = options.SO_REUSEADDR;
+            },
+            .Keepalive => |value| {
+                if (set) number = if (value) 1 else 0;
+                opt_name = options.SO_KEEPALIVE;
+            },
+            .Oobinline => |value| {
+                if (set) number = if (value) 1 else 0;
+                opt_name = options.SO_OOBLINE;
+            },
+            .RecvBufMax => |value| {
+                if (set) number = value;
+                opt_name = options.SO_RCVBUF;
+            },
+            .RecvBufMin => |value| {
+                if (set) number = value;
+                opt_name = options.SO_RCVLOWAT;
+            },
+            .RecvTimeout => |value| {
+                if (set) number = value;
+                opt_name = options.SO_RCVTIMEO;
+            },
+            .SendBufMax => |value| {
+                if (set) number = value;
+                opt_name = options.SO_SNDBUF;
+            },
+            .SendBufMin => |value| {
+                if (set) number = value;
+                opt_name = options.SO_SNDLOWAT;
+            },
+            .SendTimeout => |value| {
+                if (set) number = value;
+                opt_name = options.SO_SNDTIMEO;
+            },
+        }
+
+        if (set) return apply(self.handle, level, opt_name, opt_val, opt_len);
+        const result = apply(self.handle, level, opt_name, opt_val, &opt_len);
+        if (result == 0) {
+            switch (option.*) {
+                .Linger => {},
+                .Debug => option.* = zio.Option { .Debug = number != 0 },
+                .Broadcast => option.* = zio.Option { .Debug = number != 0 },
+                .Reuseaddr => option.* = zio.Option { .Reuseaddr = number != 0 },
+                .Keepalive => option.* = zio.Option { .Keepalive = number != 0 },
+                .Oobinline => option.* = zio.Option { .Oobinline = number != 0 },
+                .Tcpnodelay => option.* = zio.Option { .Tcpnodelay = number != 0 },
+                .RecvBufMax => option.* = zio.Option { .RecvBufMax = number },
+                .RecvBufMin => option.* = zio.Option { .RecvBufMin = number },
+                .RecvTimeout => option.* = zio.Option { .RecvTimeout = number },
+                .SendBufMax => option.* = zio.Option { .SendBufMax = number },
+                .SendBufMin => option.* = zio.Option { .SendBufMin = number },
+                .SendTimeout => option.* = zio.Option { .SendTimeout = number },
+            }
+        }
+        return result;
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {

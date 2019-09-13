@@ -61,11 +61,6 @@ pub const Buffer = struct {
     }
 };
 
-/// AcceptEx requires a 16 byte padding on the buffer
-/// used for receiving an incoming remote address for
-/// some odd reason :/
-pub const IncomingPadding = 16;
-
 pub const Ipv4 = packed struct {
     inner: SOCKADDR_IN,
 
@@ -94,6 +89,34 @@ pub const Ipv6 = packed struct {
                 .sin6_addr = IN_ADDR6 { .Qword = std.mem.nativeToBig(@typeOf(address), address) },
             }
         };
+    }
+};
+
+pub const Incoming = struct {
+    handle: zio.Handle,
+    flags: windows.DWORD,
+    address: PaddedAddress,
+
+    const PaddedAddress = extern struct {
+        value: zio.Address,
+        padding: [16]u8, // AcceptEx in the docs requires this for some reason :/
+    };
+    
+    pub fn from(address: zio.Address) @This() {
+        var self: @This() = undefined;
+        self.address.value = address;
+        return self;
+    }
+
+    pub fn getSocket(self: @This()) Socket {
+        // remove the IsPassive flag if any
+        var socket = Socket.fromHandle(self.handle);
+        socket.sock_flags = self.flags & ~Socket.IsPassive;
+        return socket;
+    }
+
+    pub fn getAddress(self: @This()) zio.Address {
+        return self.address.value;
     }
 };
 
@@ -180,6 +203,9 @@ pub const Socket = struct {
     recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
+
+    // value is arbitrary. Just cant collide with zio.Socket bit flags
+    pub const IsPassive: windows.DWORD = 1 << 20;
 
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
         var family: windows.DWORD = 0;

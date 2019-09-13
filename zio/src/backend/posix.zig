@@ -35,9 +35,6 @@ pub const Buffer = struct {
     }
 };
 
-/// Linux doesnt need any dumb padding or Incoming buffer at all
-pub const IncomingPadding = 0;
-
 pub const Ipv4 = packed struct {
     inner: os.sockaddr_in,
 
@@ -66,6 +63,23 @@ pub const Ipv6 = packed struct {
                 .sin6_addr = os.in_addr6 { .Qword = std.mem.nativeToBig(@typeOf(address), address) },
             }
         };
+    }
+};
+
+pub const Incoming = struct {
+    handle: zio.Handle,
+    address: zio.Address,
+
+    pub fn from(address: zio.Address) @This() {
+        return @This() { .handle = undefined, .address = address };    
+    }
+
+    pub fn getSocket(self: @This()) Socket {
+        return Socket.fromHandle(self.handle);
+    }
+
+    pub fn getAddress(self: @This()) zio.Address {
+        return self.addres;
     }
 };
 

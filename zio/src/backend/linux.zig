@@ -12,6 +12,7 @@ pub const Handle = posix.Handle;
 pub const Buffer = posix.Buffer;
 pub const Socket = posix.Socket;
 
+pub const Incoming = posix.Incoming;
 pub const Ipv4 = posix.Ipv4;
 pub const Ipv6 = posix.Ipv6;
 

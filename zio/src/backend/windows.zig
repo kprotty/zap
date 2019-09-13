@@ -316,7 +316,7 @@ pub const Socket = struct {
         incoming.handle = listen_socket.getHandle();
 
         const acceptEx = AcceptEx orelse return zio.Result { .status = .Error, .data = 0 };
-        return getResultFrom(acceptEx(
+        return getResultFrom(0, acceptEx(
             incoming.handle,
             self.handle,
             @ptrCast(windows.PVOID, &incoming.address),
@@ -328,6 +328,14 @@ pub const Socket = struct {
         ));
     }
 
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
+        return self.performIO(&self.reader, address, buffers, performRead);
+    }
+
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
+        return self.performIO(&self.writer, address, buffers, performWrite);
+    }
+
     fn getOverlapped(self: *const @This(), overlapped: *windows.OVERLAPPED) ?*windows.OVERLAPPED {
         if ((self.sock_flags & zio.Socket.Nonblock) == 0)
             return null;
@@ -335,20 +343,62 @@ pub const Socket = struct {
         return overlapped;
     }
 
-    fn getResultFrom(result: windows.BOOL) zio.Result {
+    fn getResultFrom(data: u32, result: windows.BOOL) zio.Result {
         if (result == windows.TRUE)
-            return zio.Result { .status = .Completed, .data = 0 };
-        if (WSAGetLastError() == ERROR_IO_PENDING)
+            return zio.Result { .status = .Completed, .data = data };
+        const wsa_error = WSAGetLastError();
+        if (wsa_error == ERROR_IO_PENDING or wsa_error == WSA_IO_PENDING)
             return zio.Result { .status = .Retry, .data = 0 };
         return zio.Result { .status = .Error, .data = 0 };
     }
 
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
-        
+    fn performRead(self: *@This(), overlapped: ?*windows.OVERLAPPED, address: ?*zio.Address, buffers: []zio.Buffer, transferred: *windows.DWORD) c_int {
+        self.recv_flags = 0;
+        return WSARecvFrom(
+            self.handle,
+            @intCast([*]WSABUF, @ptrToInt(buffers.ptr)),
+            @intCast(windows.DWORD, buffers.len),
+            transferred,
+            &self.recv_flags,
+            if (address) |addr| &addr.ip else null,
+            if (address) |addr| addr.len else 0,
+            overlapped,
+            null,
+        );
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
-        
+    fn performWrite(self: *@This(), overlapped: ?*windows.OVERLAPPED, address: ?*const zio.Address, buffers: []const zio.Buffer, transferred: *windows.DWORD) c_int {
+        return WSASendTo(
+            self.handle,
+            @ptrCast([*]const WSABUF, buffers.ptr),
+            @intCast(windows.DWORD, buffers.len),
+            &bytes_sent,
+            0, // no receive flags
+            if (address) |addr| &addr.ip else null,
+            if (address) |addr| addr.len else 0,
+            overlapped,
+            null,
+        );
+    }
+
+    fn performIO(self: *@This(), overlapped: *windows.OVERLAPPED, var, buffers: var, perform: var) zio.Result {
+        // return early for no buffers
+        if (buffers.len == 0)
+            return zio.Result { .status = .Completed, .data = 0 };
+
+        // prepare the overlapped pointer if necessary (by checking if the socket is non-blocking)
+        var overlapped_ptr: ?*windows.OVERLAPPED = null;
+        const is_non_blocking = (self.sock_flags & zio.Socket.Nonblock) != 0;
+        if (is_non_blocking) {
+            overlapped_ptr = overlapped;
+            @memset(@ptrCast([*]u8, overlapped_ptr), 0, @sizeOf(windows.OVERLAPPED));
+        }
+
+        // perform the actual io & use the `bytes_transferred` if socket isnt non-blocking
+        var bytes_transferred: windows.DWORD = undefined;
+        const io_result = perform(self, overlapped_ptr, address, buffers, &bytes_transferred);
+        const result = if (io_result == SOCKET_ERROR) windows.TRUE else windows.FALSE;
+        return getResult(if (is_non_blocking) bytes_transferred else 0, io_result);
     }
 };
 

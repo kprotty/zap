@@ -58,11 +58,12 @@ pub const Socket = struct {
         return self.inner.getHandle();
     }
 
-    /// Create a socket from a given `Handle`.
+    /// Create a socket from a given `Handle`
+    /// with the specified socket flags.
     /// This should not be called from a `Socket` handle
     /// in the middle of a non-blocking IO operation.
-    pub inline fn fromHandle(handle: zio.Handle) @This() {
-        return @This() { .inner = zio.backend.Socket.fromHandle(handle) };
+    pub inline fn fromHandle(handle: zio.Handle, flags: u8) @This() {
+        return @This() { .inner = zio.backend.Socket.fromHandle(handle, flags) };
     }
 
     /// Check if an `Event` produced by an IO operation

@@ -200,6 +200,7 @@ pub const Event = struct {
 
 pub const Socket = struct {
     handle: Handle,
+    flags: u8,
     
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
         var domain: u32 = 0;
@@ -225,6 +226,7 @@ pub const Socket = struct {
             sock_type |= system.SOCK_RAW;
         }
         
+        self.flags = flags;
         const handle = os.socket(domain, sock_type, protocol);
         return switch (os.errno(handle)) {
             0 => self.handle = @intCast(Handle, handle),
@@ -243,8 +245,8 @@ pub const Socket = struct {
         return self.handle;
     }
 
-    pub fn fromHandle(handle: zio.Handle) @This() {
-        return @This() { .handle = handle };
+    pub fn fromHandle(handle: zio.Handle, flags: u8) @This() {
+        return @This() { .handle = handle, .flags = flags };
     }
 
     pub fn isReadable(self: *const @This(), event: Event) bool {
@@ -286,11 +288,11 @@ pub const Socket = struct {
             },
             .Tcpnodelay => |value| {
                 if (set) number = if (value) 1 else 0;
-                level = options.IPPROTO_TCP,
+                level = options.IPPROTO_TCP;
                 opt_name = options.TCP_NODELAY;
             },
             .Linger => |value| {
-                opt_name = options.SO_LINGER,
+                opt_name = options.SO_LINGER;
                 opt_val = @ptrToInt(&option.Linger);
                 opt_len = @sizeOf(@typeOf(value));
             },
@@ -393,16 +395,12 @@ pub const Socket = struct {
     }
 
     pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
-        return self.performIO(address, buffers, recvmsg);
+        return self.performIO(address, buffers, sendmsg);
     }
 
-    inline fn performIO(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer, io: var) zio.Result {
-        if (buffer.len == 0) {
-            return zio.Result {
-                .status = .Completed,
-                .data = 0,
-            };
-        }
+    inline fn performIO(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer, perform: var) zio.Result {
+        if (buffer.len == 0)
+            return zio.Result { .status = .Completed, .data = 0 }; 
 
         while (true) { 
             var message_header = msghdr {
@@ -415,36 +413,24 @@ pub const Socket = struct {
                 .msg_flags = 0,
             };
 
-            // TODO
-            const bytes = io(self.handle, &message_header, MSG_DONTWAIT);
-            if (bytes > 0 and (message_header.msg_flags & MSG_ERRQUEUE) == 0) {
-                return zio.Result
-
-            if (bytes == 0 or (message_header.msg_flags & MSG_ERRQUEUE) != 0)
-                return zio.Result { .status = .Error, .data = 0 };
-
-            const errno = os.errno(bytes);
-            if (errno == 0)
+            const flags = if ((self.flags & zio.Socket.Nonblock) != 0) MSG_DONTWAIT else MSG_WAITALL;
+            const bytes = perform(self.handle, &message_header, flags);
+            if (bytes > 0 and (message_header.msg_flags & MSG_ERRQUEUE) == 0)
                 return zio.Result { .status = .Completed, .data = @intCast(u32, bytes) };
-            return zio.Result {
-                .status = 
-            }
 
-            return switch () {
-                0 => zio.Result {
-                    .data = @intCast(u32, bytes),
-                    .status = .Completed,
-                },
-                os.EAGAIN, os.EWOULDBLOCK => zio.Result {
-                    .data = 0,
-                    .status = .Retry,
-                },
-            };
+            switch (os.errno(bytes)) {
+                0 => unreachable,
+                os.EINTR => continue,
+                os.EAGAIN, os.EWOULDBLOCK => return zio.Result { .status = .Retry, .data = 0 },
+                // TODO
+                else => unreachable,
+            }
         }
     }
 
-    const MSG_ERRQUEUE = ;
-    const MSG_DONTWAIT = ;
+    const MSG_WAITALL = 0x0100;
+    const MSG_DONTWAIT = 0x0040;
+    const MSG_ERRQUEUE = 0x2000;
     const msghdr = extern struct {
         msg_name: usize,
         msg_namelen: c_uint,

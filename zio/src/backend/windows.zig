@@ -110,9 +110,7 @@ pub const Incoming = struct {
     }
 
     pub fn getSocket(self: @This()) Socket {
-        var socket = Socket.fromHandle(self.handle);
-        socket.sock_flags = self.flags;
-        return socket;
+        return Socket.fromHandle(self.handle, self.flags);
     }
 
     pub fn getAddress(self: @This()) zio.Address {
@@ -250,8 +248,9 @@ pub const Socket = struct {
         return self.handle;
     }
 
-    pub fn fromHandle(handle: zio.Handle) @This() {
+    pub fn fromHandle(handle: zio.Handle, flags: u8) @This() {
         var self: @This() = undefined;
+        self.sock_flags = flags;
         self.handle = handle;
         return self;
     }

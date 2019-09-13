@@ -86,7 +86,11 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, data);
         }
 
-        pub const SendError = RegisterError;
+        pub const SendError = std.os.UnexpectedError || error {
+            InvalidValue,
+            InvalidHandle,
+            OutOfResources,
+        };
 
         /// Send a user event with arbitrary `data` that can be retrieved from `Event.getData()`
         pub inline fn send(self: *@This(), data: usize) SendError!void {

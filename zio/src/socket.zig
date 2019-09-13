@@ -83,7 +83,9 @@ pub const Socket = struct {
     }
 
     pub const OptionError = error {
-        // TODO
+        InvalidState,
+        InvalidValue,
+        InvalidHandle,
     };
 
     const Linger = zio.backend.Socket.Linger;

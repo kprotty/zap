@@ -259,6 +259,11 @@ pub const Socket = struct {
         return event.inner.filter == os.EVFILT_WRITE;
     }
 
+    pub const Linger = extern struct {
+        l_onoff: c_int,
+        l_linger: c_int,
+    };
+
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
        
     }

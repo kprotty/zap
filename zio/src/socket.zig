@@ -85,9 +85,21 @@ pub const Socket = struct {
         // TODO
     };
 
+    const Linger = zio.backend.Socket.Linger;
     pub const Option = union(enum) {
-        ReuseAddr: bool,
-        // TODO
+        Debug: bool,        // SO_DEBUG
+        Nodelay: bool,      // TCP_NODELAY
+        Linger: Linger,     // SO_LINGER
+        Broadcast: bool,    // SO_BROADCAST
+        Reuseaddr: bool,    // SO_REUSEADDR
+        Keepalive: bool,    // SO_KEEPALIVE
+        Oobinline: bool,    // SO_OOBINLINE
+        RecvBufMax: c_int,  // SO_RCVBUF
+        RecvBufMin: c_int,  // SO_RCVLOWAT
+        RecvTimeout: c_int, // SO_RCVTIMEO
+        SendBufMax: c_int,  // SO_SNDBUF
+        SendBufMin: c_int,  // SO_SNDLOWAT
+        SendTimeout: c_int, // SO_SNDTIMEO
     };
 
     /// Given an option variant, set the desired option on the socket.

@@ -198,7 +198,7 @@ pub const Event = struct {
 
 pub const Socket = struct {
     handle: Handle,
-    sock_flags: windows.DWORD,
+    sock_flags: u8,
     recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
@@ -263,8 +263,13 @@ pub const Socket = struct {
         return event.lpOverlapped == &self.writer;
     }
 
+    pub const Linger = extern struct {
+        l_onoff: c_ushort,
+        l_linger: c_ushort,
+    };
+
     pub fn setOption(option: Option) zio.Socket.OptionError!void {
-       // TODO
+        // TODO
     }
 
     pub fn getOption(option: *Option) zio.Socket.OptionError!void {
@@ -549,19 +554,39 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
 ) windows.BOOL;
 
 const Mswsock = struct {
-    pub extern "ws2_32" stdcallcc fn closesocket(socket: SOCKET) c_int;
+    pub extern "ws2_32" stdcallcc fn closesocket(
+        socket: SOCKET,
+    ) c_int;
+
     pub extern "ws2_32" stdcallcc fn listen(
         socket: SOCKET,
         backlog: c_int,
     ) c_int;
+
     pub extern "ws2_32" stdcallcc fn bind(
         socket: SOCKET,
         addr: *const SOCKADDR,
         addr_len: c_int,
     ) c_int;
+
+    pub extern "ws2_32" stdcallcc fn setsockopt(
+        socket: SOCKET,
+        level: c_int,
+        optname: c_int,
+        optval: usize,
+        optlen: c_int,
+    ) c_int;
+
+    pub extern "ws2_32" stdcallcc fn getsockopt(
+        socket: SOCKET,
+        level: c_int,
+        optname: c_int,
+        optval: usize,
+        optlen: *c_int,
+    ) c_int;
 };
 
-extern "Ws2_32" stdcallcc fn WSAGetLastError() c_int;
+extern "ws2_32" stdcallcc fn WSAGetLastError() c_int;
 extern "ws2_32" stdcallcc fn WSACleanup() c_int;
 extern "ws2_32" stdcallcc fn WSAStartup(
     wVersionRequested: windows.WORD,

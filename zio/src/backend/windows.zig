@@ -109,9 +109,8 @@ pub const Incoming = struct {
     }
 
     pub fn getSocket(self: @This()) Socket {
-        // remove the IsPassive flag if any
         var socket = Socket.fromHandle(self.handle);
-        socket.sock_flags = self.flags & ~Socket.IsPassive;
+        socket.sock_flags = self.flags;
         return socket;
     }
 
@@ -203,9 +202,6 @@ pub const Socket = struct {
     recv_flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
-
-    // value is arbitrary. Just cant collide with zio.Socket bit flags
-    pub const IsPassive: windows.DWORD = 1 << 20;
 
     pub fn init(self: *@This(), flags: u8) zio.Socket.InitError!void {
         var family: windows.DWORD = 0;
@@ -321,13 +317,13 @@ pub const Socket = struct {
         ));
     }
 
-    pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
+    pub fn accept(self: *@This(), incoming: *Incoming) zio.Result {
         //nNeed to create the socket before hand.
         var listen_socket: @This() = undefined;
         _ = listen_socket.init(self.sock_flags) 
             catch return zio.Result { .status = .Error, .data = 0 };
+        incoming.flags = self.sock_flags;
         incoming.handle = listen_socket.getHandle();
-        incoming.flags = @intCast(zio.Handle, self.sock_flags);
 
         const acceptEx = AcceptEx orelse return zio.Result { .status = .Error, .data = 0 };
         @memset(@ptrCast([*]u8, &self.reader), 0, @sizeOf(@typeOf(self.reader)));

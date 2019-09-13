@@ -103,7 +103,7 @@ pub const Event = struct {
         /// `timeout` is the number of milliseconds to block for events until giving up:
         ///     - `timeout` value of `std.math.maxInt(u32)` or `~u32(0)` is reserved.
         ///     - if `timeout` is `null`, then it will block until an IO event gets triggered.
-        pub inline fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
+        pub fn poll(self: *@This(), events: []Event, timeout: ?u32) PollError![]Event {
             if (events.len == 0)
                 return events[0..0];
             const events_found = try self.inner.poll(@ptrCast([*]zio.backend.Event, events.ptr)[0..events.len], timeout);

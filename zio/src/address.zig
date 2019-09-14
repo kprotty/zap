@@ -5,7 +5,7 @@ const zio = @import("../zio.zig");
 /// arguments for socket functions which store the len.
 pub const Address = struct {
     len: u32,
-    ip: SockAddr,
+    ip: SockAddr align(@alignOf(usize)),
 
     /// Union for easier type access
     pub const SockAddr = extern union {
@@ -19,34 +19,34 @@ pub const Address = struct {
         inner: zio.backend.Incoming,
 
         /// Create an incoming address using the ip address provided
-        pub inline fn from(address: Address) @This() {
+        pub fn from(address: Address) @This() {
             return @This() { .inner = zio.backend.Incoming.from(address) };
         }
 
         /// Once filled by the backend, get the client socket from the Incoming
-        pub inline fn getSocket(self: @This()) zio.Socket {
+        pub fn getSocket(self: @This()) zio.Socket {
             return zio.Socket { .inner = self.inner.getSocket() };
         }
 
         /// Once filled by the backend, get the remote address from the Incoming
         /// This should be of the same type passed into `from()`.
-        pub inline fn getAddress(self: @This()) Address {
+        pub fn getAddress(self: @This()) Address {
             return self.inner.getAddress();
         }
     };
 
     /// Returns where the internal variant is an ipv4
-    pub inline fn isIpv4(self: @This()) bool {
+    pub fn isIpv4(self: @This()) bool {
         return self.len == @sizeOf(zio.backend.Ipv4);
     }
 
     /// Returns where the internal variant is an ipv6
-    pub inline fn isIpv6(self: @This()) bool {
+    pub fn isIpv6(self: @This()) bool {
         return self.len == @sizeOf(zio.backend.Ipv6);
     }
 
     /// Create an Ipv4 Address using the given parameters
-    pub inline fn fromIpv4(address: u32, port: u16) @This() {
+    pub fn fromIpv4(address: u32, port: u16) @This() {
         return @This() {
             .len = @sizeOf(zio.backend.Ipv4),
             .ip = SockAddr { .v4 = zio.backend.Ipv4.from(address, port), }
@@ -54,7 +54,7 @@ pub const Address = struct {
     }
 
     /// Create an Ipv6 Address using the given parameters
-    pub inline fn fromIpv6(address: u128, port: u16, flow: u32, scope: u32) @This() {
+    pub fn fromIpv6(address: u128, port: u16, flow: u32, scope: u32) @This() {
         return @This() {
             .len = @sizeOf(zio.backend.Ipv6),
             .ip = SockAddr { .v6 = zio.backend.Ipv6.from(address, port, flow, scope), }

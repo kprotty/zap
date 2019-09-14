@@ -13,7 +13,7 @@ pub const Event = struct {
 
     /// Get whatever user data was attached to the IO object handle
     /// or that was requested when generating a user-based event.
-    pub inline fn getData(self: *@This(), poller: *Poller) usize {
+    pub fn getData(self: *@This(), poller: *Poller) usize {
         return self.inner.getData(&poller.inner);
     }
 
@@ -29,7 +29,7 @@ pub const Event = struct {
     ///     - `zio.Result.Status.Completed`:
     ///         The operation completed fully and successfully.
     ///     
-    pub inline fn getResult(self: *@This()) zio.Result {
+    pub fn getResult(self: *@This()) zio.Result {
         return self.inner.getResult();
     }
 
@@ -43,23 +43,23 @@ pub const Event = struct {
         };
 
         /// Initialize the event poller IO object.
-        pub inline fn init(self: *@This()) InitError!void {
+        pub fn init(self: *@This()) InitError!void {
             return self.inner.init();
         }
 
         /// Close the event poller & unregister any IO Objects previously registered.
-        pub inline fn close(self: *@This()) void {
+        pub fn close(self: *@This()) void {
             return self.inner.close();
         }
 
         /// Get the internal `Handle` for the event poller
-        pub inline fn getHandle(self: @This()) zio.Handle {
+        pub fn getHandle(self: @This()) zio.Handle {
             return self.inner.getHandle();
         }
 
         /// Create an event poller from a given `Handle`.
         /// This should not be called from a `Poller` handle which has previously invoked `send()`
-        pub inline fn fromHandle(handle: zio.Handle) @This() {
+        pub fn fromHandle(handle: zio.Handle) @This() {
             return @This() { .inner = zio.backend.Poller.fromHandle(handle) };
         }
 
@@ -77,12 +77,12 @@ pub const Event = struct {
         ///     - `Writeable`: trigger an event when the handle receives data in the WRITE pipe.
         ///     - `EdgeTrigger`: once an event has been triggered, it will be retriggered after the IO is consumed.
         ///     - `OneShot`(default): once an event has been triggered, it will no longer trigger unless `reregister()`ed
-        pub inline fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) RegisterError!void {
+        pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) RegisterError!void {
             return self.inner.register(handle, flags, data);
         }
 
         /// Similar to `register()` but fo modifying an existing event registration.
-        pub inline fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) RegisterError!void {
+        pub fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) RegisterError!void {
             return self.inner.reregister(handle, flags, data);
         }
 
@@ -93,7 +93,7 @@ pub const Event = struct {
         };
 
         /// Send a user event with arbitrary `data` that can be retrieved from `Event.getData()`
-        pub inline fn send(self: *@This(), data: usize) SendError!void {
+        pub fn send(self: *@This(), data: usize) SendError!void {
             return self.inner.send(data);
         }
 

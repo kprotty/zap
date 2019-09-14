@@ -51,7 +51,7 @@ pub const Incoming = struct {
     }
 
     pub fn getAddress(self: @This()) zio.Address {
-        return self.addres;
+        return self.address;
     }
 };
 
@@ -422,7 +422,7 @@ pub const Socket = struct {
             sock_flags |= os.SOCK_NONBLOCK;
 
         while (true) {
-            const fd = ACCEPT(self.handle, incoming, sock_flags);
+            const fd = ACCEPT(self.handle, &incoming.address, 0);
             incoming.handle = @intCast(zio.Handle, fd);
             incoming.flags = self.flags;
             switch (os.errno(fd)) {
@@ -512,12 +512,12 @@ inline fn CONNECT(socket: Handle, address: *const zio.Address) usize {
     );
 }
 
-inline fn ACCEPT(socket: Handle, incoming: *Incoming, flags: usize) usize {
+inline fn ACCEPT(socket: Handle, address: *zio.Address, flags: usize) usize {
     return system.syscall4(
         system.SYS_accept4,
         @intCast(usize, socket),
-        @ptrToInt(&incoming.address.ip),
-        @intCast(usize, incoming.address.len),
+        @ptrToInt(&address.ip),
+        @ptrToInt(&address.len),
         flags,
     );
 }

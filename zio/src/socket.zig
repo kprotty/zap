@@ -43,19 +43,19 @@ pub const Socket = struct {
     /// Only one of Raw, Tcp and Udp may be set unless InvalidValue is raised.
     /// If `Nonblock` is set, IO operations will return `zio.Result.Retry`
     /// to indicate that the operation would normally block.
-    pub inline fn init(self: *@This(), flags: u8) InitError!void {
+    pub fn init(self: *@This(), flags: u8) InitError!void {
         return self.inner.init(flags);
     }
 
     /// Close the socket, freeing its internal resources as well as:
     /// - cancel any pending non-blocking IO operations on all channels.
     /// - unregister it from any `zio.Event.Poller` instances if registered.
-    pub inline fn close(self: *@This()) void {
+    pub fn close(self: *@This()) void {
         return self.inner.close();
     }
 
     /// Get the internal `Handle` for the socket
-    pub inline fn getHandle(self: @This()) zio.Handle {
+    pub fn getHandle(self: @This()) zio.Handle {
         return self.inner.getHandle();
     }
 
@@ -63,7 +63,7 @@ pub const Socket = struct {
     /// with the specified socket flags.
     /// This should not be called from a `Socket` handle
     /// in the middle of a non-blocking IO operation.
-    pub inline fn fromHandle(handle: zio.Handle, flags: u8) @This() {
+    pub fn fromHandle(handle: zio.Handle, flags: u8) @This() {
         return @This() { .inner = zio.backend.Socket.fromHandle(handle, flags) };
     }
 
@@ -71,7 +71,7 @@ pub const Socket = struct {
     /// on this socket originated from the Reader channel.
     /// This (or isWriteable) should be called on an event 
     /// before calling `zio.Event.getResult()`.
-    pub inline fn isReadable(self: *const @This(), event: zio.Event) bool {
+    pub fn isReadable(self: *const @This(), event: zio.Event) bool {
         return self.inner.isReadable(event.inner);
     }
 
@@ -79,7 +79,7 @@ pub const Socket = struct {
     /// on this socket originated from the Writeable channel.
     /// This (or isReadable) should be called on an event
     /// before calling `zio.Event.getResult()`.
-    pub inline fn isWriteable(self: *const @This(), event: zio.Event) bool {
+    pub fn isWriteable(self: *const @This(), event: zio.Event) bool {
         return self.inner.isWriteable(event.inner);
     }
 
@@ -107,12 +107,12 @@ pub const Socket = struct {
     };
 
     /// Given an option variant, set the desired option on the socket.
-    pub inline fn setOption(self: *@This(), option: Option) OptionError!void {
+    pub fn setOption(self: *@This(), option: Option) OptionError!void {
         return self.inner.setOption(option);
     }
 
     /// Get the option variant, storing the result in the argument if success.
-    pub inline fn getOption(self: *@This(), option: *Option) OptionError!void {
+    pub fn getOption(self: *@This(), option: *Option) OptionError!void {
         return self.inner.getOption(option);
     }
 
@@ -127,7 +127,7 @@ pub const Socket = struct {
 
     /// Bind the source address of the socket to the given `zio.Address`.
     /// Addresses bound can serve as servers for their instantiated protocol.
-    pub inline fn bind(self: *@This(), address: *const zio.Address) BindError!void {
+    pub fn bind(self: *@This(), address: *const zio.Address) BindError!void {
         return self.inner.bind(address);
     }
 
@@ -136,7 +136,7 @@ pub const Socket = struct {
     /// Convert the socket into passive mode in which it can
     /// receive connections (asynchronously) using `accept()`.
     /// `backlog` refers to the maximum depth of the accepted connection queue.
-    pub inline fn listen(self: *@This(), backlog: u16) ListenError!void {
+    pub fn listen(self: *@This(), backlog: u16) ListenError!void {
         return self.inner.listen(backlog);
     }
 
@@ -144,12 +144,12 @@ pub const Socket = struct {
     /// If it returns `zio.Result.Status.Retry` and is non-blocking
     /// One should ensure that the pointer to `incoming` remain live
     /// and untouched until the operation completes (usually via `zio.Event`).
-    pub inline fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
+    pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
         return self.inner.accept(&incoming.inner);
     }
 
     /// Connect to an address under the instantiated protocol.
-    pub inline fn connect(self: *@This(), address: *const zio.Address) zio.Result {
+    pub fn connect(self: *@This(), address: *const zio.Address) zio.Result {
         return self.inner.connect(address);
     }
 
@@ -158,7 +158,7 @@ pub const Socket = struct {
     /// This operation can complete partially, returning `zio.Result.Status.Complete`
     /// but only reading part of the buffer specified. This should be handled by the user.
     /// The amount of bytes sent on `zio.Result.Status.Completed` can be retrieved from `zio.Result.data`.
-    pub inline fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
         return self.inner.recv(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len]);
     }
 
@@ -167,7 +167,7 @@ pub const Socket = struct {
     /// This operation can complete partially, returning `zio.Result.Status.Complete`
     /// but only reading part of the buffer specified. This should be handled by the user.
     /// The amount of bytes sent on `zio.Result.Status.Completed` can be retrieved from `zio.Result.data`.
-    pub inline fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
         return self.inner.send(address, @ptrCast([*]const zio.backend.Buffer, buffers.ptr)[0..buffers.len]);
     }
 };
@@ -192,12 +192,13 @@ test "Socket - Tcp" {
     /// create client socket & connect to server
     var client: Socket = undefined;
     try client.init(Socket.Ipv4 | Socket.Tcp);
-    defer server.close();
+    defer client.close();
     address = zio.Address.fromIpv4(0, port);
     expect(client.connect(&address).status == .Completed);
 
     /// accept the client from the server
     var incoming = zio.Address.Incoming.from(zio.Address.fromIpv4(0, 0));
+    expect(incoming.getAddress().isIpv4());
     expect(server.accept(&incoming).status == .Completed);
     var server_client = incoming.getSocket();
 

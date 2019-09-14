@@ -1,3 +1,4 @@
+const std = @import("std");
 const zio = @import("../zio.zig");
 
 /// A bi-directional stream of network data.
@@ -126,7 +127,7 @@ pub const Socket = struct {
 
     /// Bind the source address of the socket to the given `zio.Address`.
     /// Addresses bound can serve as servers for their instantiated protocol.
-    pub inline fn bind(self: *@This(), address: usize, len: usize) BindError!void {
+    pub inline fn bind(self: *@This(), address: *const zio.Address) BindError!void {
         return self.inner.bind(address);
     }
 
@@ -144,7 +145,7 @@ pub const Socket = struct {
     /// One should ensure that the pointer to `incoming` remain live
     /// and untouched until the operation completes (usually via `zio.Event`).
     pub inline fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Result {
-        return self.inner.accept(incoming);
+        return self.inner.accept(&incoming.inner);
     }
 
     /// Connect to an address under the instantiated protocol.
@@ -170,3 +171,36 @@ pub const Socket = struct {
         return self.inner.send(address, @ptrCast([*]const zio.backend.Buffer, buffers.ptr)[0..buffers.len]);
     }
 };
+
+const expect = std.testing.expect;
+
+test "Socket - Tcp" {
+    /// Generate a server ip address
+    var rng = std.rand.DefaultPrng.init(0);
+    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
+    var address = zio.Address.fromIpv4(0, port);
+    expect(address.isIpv4());
+
+    /// Create server socket & bind to the address
+    var server: Socket = undefined;
+    try server.init(Socket.Ipv4 | Socket.Tcp);
+    defer server.close();
+    try server.setOption(Socket.Option { .Reuseaddr = true });
+    try server.bind(&address);
+    try server.listen(1);
+
+    /// create client socket & connect to server
+    var client: Socket = undefined;
+    try client.init(Socket.Ipv4 | Socket.Tcp);
+    defer server.close();
+    address = zio.Address.fromIpv4(0, port);
+    expect(client.connect(&address).status == .Completed);
+
+    /// accept the client from the server
+    var incoming = zio.Address.Incoming.from(zio.Address.fromIpv4(0, 0));
+    expect(server.accept(&incoming).status == .Completed);
+    var server_client = incoming.getSocket();
+
+    /// test if echoing works
+
+}

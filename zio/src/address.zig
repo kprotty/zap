@@ -8,7 +8,7 @@ pub const Address = struct {
     ip: SockAddr,
 
     /// Union for easier type access
-    const SockAddr = extern union {
+    pub const SockAddr = extern union {
         v4: zio.backend.Ipv4,
         v6: zio.backend.Ipv6,
     };
@@ -49,7 +49,7 @@ pub const Address = struct {
     pub inline fn fromIpv4(address: u32, port: u16) @This() {
         return @This() {
             .len = @sizeOf(zio.backend.Ipv4),
-            .data = SockAddr { .v4 = zio.backend.Ipv4.from(address, port), }
+            .ip = SockAddr { .v4 = zio.backend.Ipv4.from(address, port), }
         };
     }
 
@@ -57,7 +57,7 @@ pub const Address = struct {
     pub inline fn fromIpv6(address: u128, port: u16, flow: u32, scope: u32) @This() {
         return @This() {
             .len = @sizeOf(zio.backend.Ipv6),
-            .data = SockAddr { .v6 = zio.backend.Ipv6.from(address, port, flow, scope), }
+            .ip = SockAddr { .v6 = zio.backend.Ipv6.from(address, port, flow, scope), }
         };
     }
 

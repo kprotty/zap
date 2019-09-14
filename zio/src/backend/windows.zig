@@ -62,7 +62,7 @@ pub const Buffer = struct {
     }
 };
 
-pub const Ipv4 = packed struct {
+pub const Ipv4 = struct {
     inner: SOCKADDR_IN,
 
     pub fn from(address: u32, port: u16) @This() {
@@ -77,7 +77,7 @@ pub const Ipv4 = packed struct {
     }
 };
 
-pub const Ipv6 = packed struct {
+pub const Ipv6 = struct {
     inner: SOCKADDR_IN6,
 
     pub fn from(address: u128, port: u16, flow: u32, scope: u32) @This() {
@@ -268,7 +268,7 @@ pub const Socket = struct {
         l_linger: c_ushort,
     };
 
-    pub fn setOption(self: *@This(), option: zio.Option) zio.Socket.OptionError!void {
+    pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         var option_val = option;
         if (posix.Socket.socketOption(true, self.handle, &option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
             return;
@@ -281,7 +281,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn getOption(option: *Option) zio.Socket.OptionError!void {
+    pub fn getOption(option: *zio.Socket.Option) zio.Socket.OptionError!void {
         if (posix.Socket.socketOption(false, self.handle, option, Mswsock.getsockopt, Mswsock.Options) == 0)
             return;
         return switch (WSAGetLastError()) {

@@ -438,19 +438,33 @@ pub const Socket = struct {
         }
     }
 
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) zio.Result {
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer) zio.Result {
         return self.performIO(address, buffers, READV);
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.Buffer) zio.Result {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer) zio.Result {
         return self.performIO(address, buffers, WRITEV);
     }
 
     fn performIO(self: *@This(), address: var, buffers: var, perform: var) zio.Result {
-        if (buffer.len == 0)
+        if (buffers.len == 0)
             return zio.Result { .status = .Completed, .data = 0 }; 
 
-        // TODO
+        while (true) {
+            const bytes = perform(self.handle, buffers);
+            switch (os.errno(bytes)) {
+                0 => {
+                    if (bytes > 0)
+                        return zio.Result { .status = .Completed, .data = @intCast(u32, bytes) };
+                    return zio.Result { .status = .Error, .data = 0 };
+                },
+                os.EINTR => continue,
+                os.EAGAIN => return zio.Result { .status = .Retry, .data = 0 },
+                os.EBADF, os.EFAULT, os.EINVAL, os.EIO, os.EISDIR => 
+                    return zio.Result { .status = .Error, .data = 0 },
+                else => unreachable,
+            }
+        }
     }
 };
 
@@ -477,7 +491,7 @@ const Options = struct {
     pub const SO_SNDTIMEO: c_int = os.SO_SNDTIMEO;
 };
 
-inline fn SOCKET(domain: u32, sock_type: u32, protocol: u32) usize {
+fn SOCKET(domain: u32, sock_type: u32, protocol: u32) usize {
     return system.syscall3(
         system.SYS_socket,
         @intCast(usize, domain),
@@ -486,7 +500,7 @@ inline fn SOCKET(domain: u32, sock_type: u32, protocol: u32) usize {
     );
 }
 
-inline fn LISTEN(socket: Handle, backlog: u16) usize {
+fn LISTEN(socket: Handle, backlog: u16) usize {
     return system.syscall2(
         system.SYS_listen,
         @intCast(usize, socket),
@@ -494,7 +508,7 @@ inline fn LISTEN(socket: Handle, backlog: u16) usize {
     );
 }
 
-inline fn BIND(socket: Handle, address: *const zio.Address) usize {
+fn BIND(socket: Handle, address: *const zio.Address) usize {
     return system.syscall3(
         system.SYS_bind,
         @intCast(usize, socket),
@@ -503,7 +517,7 @@ inline fn BIND(socket: Handle, address: *const zio.Address) usize {
     );
 }
 
-inline fn CONNECT(socket: Handle, address: *const zio.Address) usize {
+fn CONNECT(socket: Handle, address: *const zio.Address) usize {
     return system.syscall3(
         system.SYS_connect,
         @intCast(usize, socket),
@@ -512,7 +526,7 @@ inline fn CONNECT(socket: Handle, address: *const zio.Address) usize {
     );
 }
 
-inline fn ACCEPT(socket: Handle, address: *zio.Address, flags: usize) usize {
+fn ACCEPT(socket: Handle, address: *zio.Address, flags: usize) usize {
     return system.syscall4(
         system.SYS_accept4,
         @intCast(usize, socket),
@@ -522,7 +536,7 @@ inline fn ACCEPT(socket: Handle, address: *zio.Address, flags: usize) usize {
     );
 }
 
-inline fn READV(socket: Handle, buffers: []zio.Buffer) usize {
+fn READV(socket: Handle, buffers: []Buffer) usize {
     return system.syscall3(
         system.SYS_readv,
         @intCast(usize, socket),
@@ -531,7 +545,7 @@ inline fn READV(socket: Handle, buffers: []zio.Buffer) usize {
     );
 }
 
-inline fn WRITEV(socket: Handle, buffers: []const zio.Buffer) usize {
+fn WRITEV(socket: Handle, buffers: []const Buffer) usize {
     return system.syscall3(
         system.SYS_writev,
         @intCast(usize, socket),
@@ -540,7 +554,7 @@ inline fn WRITEV(socket: Handle, buffers: []const zio.Buffer) usize {
     );
 }
 
-inline fn SETSOCKOPT(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize {
+fn SETSOCKOPT(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize {
     return system.syscall5(
         system.SYS_setsockopt,
         @intCast(usize, socket),
@@ -551,7 +565,7 @@ inline fn SETSOCKOPT(socket: Handle, level: c_int, optname: c_int, optval: usize
     );
 }
 
-inline fn GETSOCKOPT(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize {
+fn GETSOCKOPT(socket: Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize {
     return system.syscall5(
         system.SYS_getsockopt,
         @intCast(usize, socket),

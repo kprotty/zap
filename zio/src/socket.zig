@@ -201,7 +201,20 @@ test "Socket - Tcp" {
     expect(incoming.getAddress().isIpv4());
     expect(server.accept(&incoming).status == .Completed);
     var server_client = incoming.getSocket();
+    defer server_client.close();
 
-    /// test if echoing works
+    /// send data from the client to the server
+    const data = "Hello world";
+    var buffer = [1]zio.Buffer { zio.Buffer.fromBytes(data) };
+    var client_result = client.send(null, buffer[0..]);
+    expect(client_result.status == .Completed);
+    expect(client_result.data == data.len);
 
+    /// read back that data from the server
+    var read_buffer: [data.len]u8 = undefined;
+    buffer[0] = zio.Buffer.fromBytes(read_buffer[0..]);
+    var server_client_result = server_client.recv(null, buffer[0..]);
+    expect(server_client_result.status == .Completed);
+    expect(server_client_result.data == data.len);
+    expect(std.mem.eql(u8, data, read_buffer[0..]));
 }

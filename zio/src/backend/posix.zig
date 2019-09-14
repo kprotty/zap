@@ -75,12 +75,12 @@ pub const Ipv6 = struct {
 
     pub fn from(address: u128, port: u16, flow: u32, scope: u32) @This() {
         return @This() {
-            .inner = sockaddr_in6 {
-                .sin6_family = AF_INET6,
-                .sin6_port = std.mem.nativeToBig(@typeOf(port), port),
-                .sin6_flowinfo = std.mem.nativeToBig(@typeOf(flow), flow),
-                .sin6_scope_id = std.mem.nativeToBig(@typeOf(scope), scope),
-                .sin6_addr = in_addr6 { .Qword = std.mem.nativeToBig(@typeOf(address), address) },
+            .inner = os.sockaddr_in6 {
+                .flowinfo = flow,
+                .scope_id = scope,
+                .family = os.AF_INET6,
+                .addr = @bitCast([16]u8, address),
+                .port = std.mem.nativeToBig(@typeOf(port), port),
             }
         };
     }

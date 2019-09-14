@@ -174,16 +174,44 @@ pub const Socket = struct {
 
 const expect = std.testing.expect;
 
-test "Socket - Tcp" {
+test "Socket - Tcp - Ipv4" {
+    try testTcpSocketBlocking(struct {
+        pub const flags = Socket.Ipv4;
+
+        pub fn create(port: u16) zio.Address {
+            return zio.Address.fromIpv4(0, port);
+        }
+
+        pub fn validate(address: zio.Address) bool {
+            return address.isIpv4();
+        }
+    });
+}
+
+test "Socket - Tcp - Ipv6" {
+    try testTcpSocketBlocking(struct {
+        pub const flags = Socket.Ipv6;
+
+        pub fn create(port: u16) zio.Address {
+            return zio.Address.fromIpv6(0, port, 0, 0);
+        }
+
+        pub fn validate(address: zio.Address) bool {
+            return address.isIpv6();
+        }
+    });
+}
+
+fn testTcpSocketBlocking(comptime AddressType: var) !void {
     /// Generate a server ip address
     var rng = std.rand.DefaultPrng.init(0);
     const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
-    var address = zio.Address.fromIpv4(0, port);
-    expect(address.isIpv4());
+    var address = AddressType.create(port);
+    expect(AddressType.validate(address));
 
     /// Create server socket & bind to the address
     var server: Socket = undefined;
-    try server.init(Socket.Ipv4 | Socket.Tcp);
+    try server.init(Socket.Tcp | AddressType.flags);
     defer server.close();
     try server.setOption(Socket.Option { .Reuseaddr = true });
     try server.bind(&address);
@@ -191,14 +219,14 @@ test "Socket - Tcp" {
 
     /// create client socket & connect to server
     var client: Socket = undefined;
-    try client.init(Socket.Ipv4 | Socket.Tcp);
+    try client.init(Socket.Tcp | AddressType.flags);
     defer client.close();
-    address = zio.Address.fromIpv4(0, port);
+    address = AddressType.create(port);
     expect(client.connect(&address).status == .Completed);
 
     /// accept the client from the server
-    var incoming = zio.Address.Incoming.from(zio.Address.fromIpv4(0, 0));
-    expect(incoming.getAddress().isIpv4());
+    var incoming = zio.Address.Incoming.from(AddressType.create(0));
+    expect(AddressType.validate(incoming.getAddress()));
     expect(server.accept(&incoming).status == .Completed);
     var server_client = incoming.getSocket();
     defer server_client.close();

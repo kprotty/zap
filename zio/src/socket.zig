@@ -172,34 +172,35 @@ pub const Socket = struct {
     }
 };
 
+const Ipv4AddressType = struct {
+    pub const flags = Socket.Ipv4;
+
+    pub fn create(port: u16) zio.Address {
+        return zio.Address.fromIpv4(0, port);
+    }
+
+    pub fn validate(address: zio.Address) bool {
+        return address.isIpv4();
+    }
+};
+
+const Ipv6AddressType = struct {
+    pub const flags = Socket.Ipv6;
+
+    pub fn create(port: u16) zio.Address {
+        return zio.Address.fromIpv6(0, port, 0, 0);
+    }
+
+    pub fn validate(address: zio.Address) bool {
+        return address.isIpv6();
+    }
+};
+
 const expect = std.testing.expect;
 
-test "Socket - Tcp - Ipv4" {
-    try testTcpSocketBlocking(struct {
-        pub const flags = Socket.Ipv4;
-
-        pub fn create(port: u16) zio.Address {
-            return zio.Address.fromIpv4(0, port);
-        }
-
-        pub fn validate(address: zio.Address) bool {
-            return address.isIpv4();
-        }
-    });
-}
-
-test "Socket - Tcp - Ipv6" {
-    try testTcpSocketBlocking(struct {
-        pub const flags = Socket.Ipv6;
-
-        pub fn create(port: u16) zio.Address {
-            return zio.Address.fromIpv6(0, port, 0, 0);
-        }
-
-        pub fn validate(address: zio.Address) bool {
-            return address.isIpv6();
-        }
-    });
+test "Socket - Tcp - blocking (Ipv4 + Ipv6)" {
+    try testTcpSocketBlocking(Ipv4AddressType);
+    try testTcpSocketBlocking(Ipv6AddressType);
 }
 
 fn testTcpSocketBlocking(comptime AddressType: var) !void {
@@ -214,6 +215,9 @@ fn testTcpSocketBlocking(comptime AddressType: var) !void {
     try server.init(Socket.Tcp | AddressType.flags);
     defer server.close();
     try server.setOption(Socket.Option { .Reuseaddr = true });
+    var reuse_addr = Socket.Option { .Reuseaddr = undefined };
+    try server.getOption(&reuse_addr);
+    expect(reuse_addr.Reuseaddr == true);
     try server.bind(&address);
     try server.listen(1);
 

@@ -281,7 +281,7 @@ pub const Socket = struct {
     }
 
     pub fn getOption(self: *@This(), option: *zio.Socket.Option) zio.Socket.OptionError!void {
-        return switch (os.errno(socketOption(false, self.handle, &option_val, GETSOCKOPT, Options))) {
+        return switch (os.errno(socketOption(false, self.handle, option, GETSOCKOPT, Options))) {
             0 => {},
             os.ENOPROTOOPT, os.EFAULT, os.EINVAL => zio.Socket.OptionError.InvalidValue,
             os.EBADF, os.ENOTSOCK => zio.Socket.OptionError.InvalidHandle,
@@ -365,18 +365,18 @@ pub const Socket = struct {
         if (result == 0) {
             switch (option.*) {
                 .Linger => {},
-                .Debug => option.* = zio.Option { .Debug = number != 0 },
-                .Broadcast => option.* = zio.Option { .Debug = number != 0 },
-                .Reuseaddr => option.* = zio.Option { .Reuseaddr = number != 0 },
-                .Keepalive => option.* = zio.Option { .Keepalive = number != 0 },
-                .Oobinline => option.* = zio.Option { .Oobinline = number != 0 },
-                .Tcpnodelay => option.* = zio.Option { .Tcpnodelay = number != 0 },
-                .RecvBufMax => option.* = zio.Option { .RecvBufMax = number },
-                .RecvBufMin => option.* = zio.Option { .RecvBufMin = number },
-                .RecvTimeout => option.* = zio.Option { .RecvTimeout = number },
-                .SendBufMax => option.* = zio.Option { .SendBufMax = number },
-                .SendBufMin => option.* = zio.Option { .SendBufMin = number },
-                .SendTimeout => option.* = zio.Option { .SendTimeout = number },
+                .Debug => option.* = zio.Socket.Option { .Debug = number != 0 },
+                .Broadcast => option.* = zio.Socket.Option { .Debug = number != 0 },
+                .Reuseaddr => option.* = zio.Socket.Option { .Reuseaddr = number != 0 },
+                .Keepalive => option.* = zio.Socket.Option { .Keepalive = number != 0 },
+                .Oobinline => option.* = zio.Socket.Option { .Oobinline = number != 0 },
+                .Tcpnodelay => option.* = zio.Socket.Option { .Tcpnodelay = number != 0 },
+                .RecvBufMax => option.* = zio.Socket.Option { .RecvBufMax = number },
+                .RecvBufMin => option.* = zio.Socket.Option { .RecvBufMin = number },
+                .RecvTimeout => option.* = zio.Socket.Option { .RecvTimeout = number },
+                .SendBufMax => option.* = zio.Socket.Option { .SendBufMax = number },
+                .SendBufMin => option.* = zio.Socket.Option { .SendBufMin = number },
+                .SendTimeout => option.* = zio.Socket.Option { .SendTimeout = number },
             }
         }
         return result;

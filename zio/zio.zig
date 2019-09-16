@@ -8,22 +8,6 @@ pub const backend = switch (builtin.os) {
     else => @compileError("Only supports linux, windows and some *BSD variants"),
 };
 
-const address = @import("src/address.zig");
-const system = @import("src/system.zig");
-const socket = @import("src/socket.zig");
-const event = @import("src/event.zig");
-
-pub usingnamespace address;
-pub usingnamespace system;
-pub usingnamespace socket;
-pub usingnamespace event;
-
 test "zio" {
-    try system.initialize();
-    defer system.cleanup();
-
-    _ = address;
-    _ = event;
-    _ = socket;
+    
 }
-

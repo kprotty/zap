@@ -4,7 +4,7 @@ const zio = @import("../zio.zig");
 /// The length is stored in order to not require extra
 /// arguments for socket functions which store the len.
 pub const Address = struct {
-    len: u32,
+    len: c_int,
     ip: SockAddr align(@alignOf(usize)),
 
     /// Union for easier type access
@@ -24,13 +24,13 @@ pub const Address = struct {
         }
 
         /// Once filled by the backend, get the client socket from the Incoming
-        pub fn getSocket(self: @This()) zio.Socket {
+        pub fn getSocket(self: *@This()) zio.Socket {
             return zio.Socket { .inner = self.inner.getSocket() };
         }
 
         /// Once filled by the backend, get the remote address from the Incoming
         /// This should be of the same type passed into `from()`.
-        pub fn getAddress(self: @This()) Address {
+        pub fn getAddress(self: *@This()) Address {
             return self.inner.getAddress();
         }
     };

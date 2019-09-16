@@ -199,6 +199,8 @@ const Ipv6AddressType = struct {
 const expect = std.testing.expect;
 
 test "Socket - Tcp - blocking (Ipv4 + Ipv6)" {
+    try zio.initialize();
+    defer zio.cleanup();
     try testTcpSocketBlocking(Ipv4AddressType);
     try testTcpSocketBlocking(Ipv6AddressType);
 }

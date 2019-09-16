@@ -46,11 +46,11 @@ pub const Incoming = struct {
         return self;  
     }
 
-    pub fn getSocket(self: @This()) Socket {
+    pub fn getSocket(self: *@This()) Socket {
         return Socket.fromHandle(self.handle, self.flags);
     }
 
-    pub fn getAddress(self: @This()) zio.Address {
+    pub fn getAddress(self: *@This()) zio.Address {
         return self.address;
     }
 };

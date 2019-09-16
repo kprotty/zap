@@ -19,10 +19,11 @@ pub usingnamespace socket;
 pub usingnamespace event;
 
 test "zio" {
-    try initialize();
-    defer cleanup();
+    try system.initialize();
+    defer system.cleanup();
+
     _ = address;
-    _ = socket;
     _ = event;
+    _ = socket;
 }
 

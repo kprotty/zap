@@ -65,7 +65,10 @@ pub const Socket = struct {
     }
 
     pub const BindError = error {
-        // TODO
+        AddressInUse,
+        InvalidState,
+        InvalidHandle,
+        InvalidAddress,
     };
 
     pub fn bind(self: *@This(), address: *const zio.Address) BindError!void {
@@ -73,42 +76,51 @@ pub const Socket = struct {
     }
 
     pub const ListenError = error {
-        // TODO
+        AddressInUse,
+        InvalidHandle,
     };
 
-    pub fn listen(self: *@This(), backlog: c_int) ListenError!void {
+    pub fn listen(self: *@This(), backlog: c_uint) ListenError!void {
         return self.inner.listen(backlog);
     }
 
     pub const ConnectError = zio.ErrorPending || error {
-        // TODO
+        Refused,
+        TimedOut,
+        InvalidState,
+        InvalidHandle,
+        InvalidAddress,
+        AlreadyConnected,
     };
 
-    pub fn connect(self: *@This(), address: *const zio.Address) ConnectError!void {
-        return self.inner.connect(address);
+    pub fn connect(self: *@This(), address: *const zio.Address, token: usize) ConnectError!void {
+        return self.inner.connect(address, token);
     }
 
     pub const AcceptError = zio.ErrorPending || error {
-        // TODO
+        Refused,
+        InvalidHandle,
+        InvalidAddress,
+        OutOfResources,
     };
 
-    pub fn accept(self: *@This(), flags: Flags, incoming: *zio.Address.Incoming) AcceptError!void {
-        return self.inner.accept(flags, incoming);
+    pub fn accept(self: *@This(), flags: Flags, incoming: *zio.Address.Incoming, token: usize) AcceptError!void {
+        return self.inner.accept(flags, incoming, token);
     }
 
     pub const DataError = zio.ErrorPending || error {
         // TODO
     };
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer) DataError!usize {
+    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer, token: usize) DataError!usize {
         if (buffers.len == 0)
             return 0;
-        return self.inner.read(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len]);
+        return self.inner.read(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len], token);
     }
 
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const zio.ConstBuffer) DataError!usize {
+    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const zio.ConstBuffer, token: usize) DataError!usize {
         if (buffers.len == 0)
             return 0;
-        return self.inner.write(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len]);
+        return self.inner.write(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len], token);
     }
 };

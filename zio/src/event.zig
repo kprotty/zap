@@ -10,12 +10,12 @@ pub const Event = struct {
     pub const Writeable: Flags = 1 << 2;
     pub const EdgeTrigger: Flags = 1 << 3;
 
-    pub fn readData(self: *@This(), poller: *Poller) usize {
-        return self.inner.readData(&poller.inner);
+    pub fn getToken(self: @This()) usize {
+        return self.inner.getToken();
     }
 
-    pub fn readFlags(self: *@This(), duplex_type: zio.DuplexType) Flags {
-        return self.inner.readFlags(duplex_type);
+    pub fn readData(self: *@This(), poller: *Poller) usize {
+        return self.inner.readData(&poller.inner);
     }
 
     pub const Poller = struct {

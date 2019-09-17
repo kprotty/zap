@@ -55,14 +55,7 @@ pub const Socket = struct {
         
     }
 
-    pub fn getStreamRef(self: *const @This()) zio.StreamRef {
-        
-    }
-
-    const Linger = switch (builtin.os) {
-        .linux => // TODO,
-        else => // TODO
-    };
+    const Linger = //
 
     pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         
@@ -72,27 +65,27 @@ pub const Socket = struct {
         
     }
 
-    pub fn bind(self: *@This(), address: *const zio.Address) zio.BindError!void {
+    pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
         
     }
 
-    pub fn listen(self: *@This(), backlog: c_int) zio.Socket.ListenError!void {
+    pub fn listen(self: *@This(), backlog: c_uint) zio.Socket.ListenError!void {
         
     }
 
-    pub fn connect(self: *@This(), address: *const zio.Address) zio.Socket.ConnectError!void {
+    pub fn connect(self: *@This(), address: *const zio.Address, event: ?zio.backend.Event) zio.Socket.ConnectError!void {
         
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, event: ?zio.backend.Event) zio.Socket.AcceptError!void {
         
     }
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer) zio.Socket.DataError!usize {
+    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, event: ?zio.backend.Event) zio.Socket.DataError!usize {
         
     }
 
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []ConstBuffer) zio.Socket.DataError!usize {
+    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, event: ?zio.backend.Event) zio.Socket.DataError!usize {
         
     }
 };

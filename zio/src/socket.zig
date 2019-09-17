@@ -92,8 +92,8 @@ pub const Socket = struct {
         // TODO
     };
 
-    pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) AcceptError!void {
-        return self.inner.accept(incoming);
+    pub fn accept(self: *@This(), flags: Flags, incoming: *zio.Address.Incoming) AcceptError!void {
+        return self.inner.accept(flags, incoming);
     }
 
     pub const DataError = zio.ErrorPending || error {

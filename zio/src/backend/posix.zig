@@ -44,7 +44,7 @@ pub const ConstBuffer = struct {
 pub const Socket = struct {
     handle: Handle,
 
-    pub fn new(self: *@This(), flags: Flags) zio.Socket.Error!@This() {
+    pub fn new(self: *@This(), flags: zio.Socket.Flags) zio.Socket.Error!@This() {
         
     }
 
@@ -190,7 +190,7 @@ pub const Socket = struct {
         
     }
 
-    pub fn accept(self: *@This(), incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
         
     }
 

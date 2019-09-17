@@ -52,7 +52,8 @@ pub const Socket = struct {
     };
 
     pub const OptionError = error {
-        // TODO
+        InvalidValue,
+        InvalidHandle,
     };
 
     pub fn setOption(self: *@This(), option: Option) OptionError!void {

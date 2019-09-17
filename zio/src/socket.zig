@@ -28,10 +28,10 @@ pub const Socket = struct {
         return self.inner.getHandle();
     }
 
-    pub fn getDuplexType(self: *const @This()) zio.DuplexType {
-        const duplex_type = self.inner.getDuplexType();
-        std.debug.assert(duplex_type.isFull());
-        return duplex_type;
+    pub fn getStreamRef(self: *const @This()) zio.StreamRef {
+        const stream_ref = self.inner.getStreamRef();
+        std.debug.assert(stream_ref.getType() == .Duplex);
+        return stream_ref;
     }
 
     const Linger = zio.backend.Socket.Linger;
@@ -79,7 +79,7 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = error {
+    pub const ConnectError = zio.ErrorPending || error {
         // TODO
     };
 
@@ -87,7 +87,7 @@ pub const Socket = struct {
         return self.inner.connect(address);
     }
 
-    pub const AcceptError = error {
+    pub const AcceptError = zio.ErrorPending || error {
         // TODO
     };
 
@@ -95,7 +95,7 @@ pub const Socket = struct {
         return self.inner.accept(incoming);
     }
 
-    pub const DataError = error {
+    pub const DataError = zio.ErrorPending || error {
         // TODO
     };
 

@@ -58,5 +58,5 @@ pub const Event = struct {
             const events_found = try self.inner.poll(@ptrCast([*]zio.backend.Event, events.ptr)[0..events.len], timeout_ms);
             return @ptrCast([*]Event, events_found.ptr)[0..events_found.len];
         }
-    }
+    };
 };

@@ -84,7 +84,7 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = zio.ErrorPending || error {
+    pub const ConnectError = zio.ErrorPending || zio.ErrorClosed || error {
         Refused,
         TimedOut,
         InvalidState,
@@ -97,7 +97,7 @@ pub const Socket = struct {
         return self.inner.connect(address, token);
     }
 
-    pub const AcceptError = zio.ErrorPending || error {
+    pub const AcceptError = zio.ErrorPending || zio.ErrorClosed || error {
         Refused,
         InvalidHandle,
         InvalidAddress,
@@ -108,8 +108,10 @@ pub const Socket = struct {
         return self.inner.accept(flags, incoming, token);
     }
 
-    pub const DataError = zio.ErrorPending || error {
-        // TODO
+    pub const DataError = zio.ErrorPending || zio.ErrorClosed || error {
+        InvalidValue,
+        InvalidHandle,
+        OutOfResources,
     };
 
     pub fn read(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer, token: usize) DataError!usize {

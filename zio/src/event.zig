@@ -8,7 +8,8 @@ pub const Event = struct {
     pub const OneShot: Flags = 1 << 0;
     pub const Readable: Flags = 1 << 1;
     pub const Writeable: Flags = 1 << 2;
-    pub const EdgeTrigger: Flags = 1 << 3;
+    pub const Disposable: Flags = 1 << 3;
+    pub const EdgeTrigger: Flags = 1 << 4;
 
     pub fn getToken(self: @This()) usize {
         return self.inner.getToken();

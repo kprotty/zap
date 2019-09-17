@@ -4,6 +4,7 @@ const expect = std.testing.expect;
 
 pub const Handle = zio.backend.Handle;
 
+pub const ErrorClosed = error.Closed;
 pub const ErrorPending = error.Pending;
 
 pub const Buffer = struct {
@@ -32,15 +33,15 @@ pub const ConstBuffer = struct {
 
 test "ConstBuffer" {
     const hello_world = "Hello world";
-    const cbuf = ConstBuffer.fromBytes(hello_world);
-    expect(std.mem.eql(u8, cbuf.getBytes(), hello_world));
+    const buffer = ConstBuffer.fromBytes(hello_world);
+    expect(std.mem.eql(u8, buffer.getBytes(), hello_world));
 }
 
 test "Buffer" {
     const hello_world = "Hello world";
     var data: [hello_world.len]u8 = undefined;
     std.mem.copy(u8, data[0..], hello_world);
-    const buf = Buffer.fromBytes(data[0..]);
+    const buffer = Buffer.fromBytes(data[0..]);
     expect(std.mem.eql(u8, data[0..], hello_world));
-    expect(std.mem.eql(u8, buf.getBytes(), hello_world));
+    expect(std.mem.eql(u8, buffer.getBytes(), hello_world));
 }

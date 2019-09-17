@@ -194,6 +194,9 @@ pub const Socket = struct {
     }
 
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
+        std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
+        if ((token & zio.Event.Disposable) != 0)
+                return zio.ErrorClosed;
         if ((token & zio.Event.Writeable) != 0) {
             var errno_len: c_int = undefined;
             var errno_value: c_int = undefined;
@@ -223,6 +226,10 @@ pub const Socket = struct {
     }
 
     pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
+        std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
+        if ((token & zio.Event.Disposable) != 0)
+            return zio.ErrorClosed;
+
         while (true) {
             const fd = Accept(self.handle, flags, &incoming.address);
             switch (errno(fd)) {
@@ -241,11 +248,44 @@ pub const Socket = struct {
     }
 
     pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
-        
+        std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
+        if ((token & zio.Event.Disposable) != 0)
+            return zio.ErrorClosed;
+        return transfer(sel.fhandle, address, buffers, Recvmsg);
     }
 
     pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
-        
+        std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
+        if ((token & zio.Event.Disposable) != 0)
+            return zio.ErrorClosed;
+        return transfer(self.handle, address, buffers, Sendmsg);
+    }
+
+    fn transfer(handle: zio.Handle, address: var, buffers: var, comptime Transfer: var) zio.Socket.DataError!usize {
+        var message_header = msghdr {
+            .msg_name = if (address) |addr| @ptrToInt(&addr.sockaddr) else 0,
+            .msg_namelen = if (address) |addr| addr.length else 0,
+            .msg_iov = @ptrToInt(buffers.ptr),
+            .msg_iovlen = buffers.len,
+            .msg_control = 0,
+            .msg_controllen = 0,
+            .msg_flags = 0,
+        };
+
+        while (true) {
+            const transferred = Transfer(handle, &message_header, MSG_NOSIGNAL);
+            switch (errno(transferred)) {
+                0 => return transferred,
+                os.EOPNOTSUPP, os.EINVAL, os.EFAULT, os.EISCONN, os.ENOTCONN => return zio.Socket.DataError.InvalidValue,
+                os.EACCES, os.EBADF, os.EDESTADDRREQ, os.ENOTSOCK => return zio.Socket.DataError.InvalidHandle,
+                os.ENOMEM, os.ENOBUFS => return zio.Socket.DataError.OutOfResources,
+                os.EPIPE, os.ECONNRESET => return zio.ErrorClosed,
+                os.EAGAIN => return zio.ErrorPending,
+                os.EMSGSIZE => unreachable,
+                os.EINTR => continue,
+                else => unreachable,
+            }
+        }
     }
 };
 
@@ -269,12 +309,25 @@ const Options = struct {
     pub const SO_SNDTIMEO = os.SO_SNDTIMEO;
 };
 
+const MSG_NOSIGNAL = 0x4000;
+const msghdr = extern struct {
+    msg_name: usize,
+    msg_namelen: c_uint,
+    msg_iov: usize,
+    msg_iovlen: usize,
+    msg_control: usize,
+    msg_controllen: usize,
+    msg_flags: c_int,
+};
+
 const C = struct {
     pub extern "c" fn getsockopt(fd: i32, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize;
     pub extern "c" fn setsockopt(fd: i32, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize;
     pub extern "c" fn accept4(fd: i32, addr: *os.sockaddr, len: c_uint, flags: c_uint) usize;
     pub extern "c" fn connect(fd: i32, addr: *const os.sockaddr, len: c_int) usize;
     pub extern "c" fn bind(fd: i32, addr: *const os.sockaddr, len: c_uint) usize;
+    pub extern "c" fn sendmsg(fd: i32, msg: *const msghdr, flags: c_int) usize;
+    pub extern "c" fn recvmsg(fd: i32, msg: *msghdr, flags: c_int) usize;
     pub extern "c" fn listen(fd: i32, backlog: c_uint) usize;
 };
 
@@ -334,6 +387,28 @@ inline fn Connect(fd: zio.Handle, address: *const zio.Address) usize {
         @intCast(usize, fd),
         @ptrToInt(&address.sockaddr),
         @intCast(usize, address.length),
+    );
+}
+
+inline fn Sendmsg(fd: zio.Handle, message_header: *const msghdr, flags: c_int) usize {
+    if (builtin.os != .linux)
+        return C.recvmsg(fd, message_header, flags);
+    return system.syscall3(
+        system.SYS_sendmsg,
+        @intCast(usize, fd),
+        @ptrToInt(message_header),
+        @intCast(usize, flags),
+    );
+}
+
+inline fn Recvmsg(fd: zio.Handle, message_header: *msghdr, flags: c_int) usize {
+    if (builtin.os != .linux)
+        return C.recvmsg(fd, message_header, flags);
+    return system.syscall3(
+        system.SYS_recvmsg,
+        @intCast(usize, fd),
+        @ptrToInt(message_header),
+        @intCast(usize, flags),
     );
 }
 

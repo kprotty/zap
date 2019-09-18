@@ -46,7 +46,7 @@ pub const Socket = struct {
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
 
-    pub fn new(self: *@This(), flags: zio.Socket.Flags) zio.Socket.Error!@This() {
+    pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
         if (init_error.get()) |err|
             return err;
     }

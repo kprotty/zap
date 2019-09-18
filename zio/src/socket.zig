@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("../zio.zig");
+const expect = std.testing.expect;
 
 pub const Socket = struct {
     inner: zio.backend.Socket,
@@ -15,7 +16,7 @@ pub const Socket = struct {
         // TODO
     };
 
-    pub fn new(self: *@This(), flags: Flags) Error!@This() {
+    pub fn new(flags: Flags) Error!@This() {
         const socket = try zio.backend.Socket.new(flags);
         return @This() { .inner = socket };
     }
@@ -30,12 +31,6 @@ pub const Socket = struct {
 
     pub inline fn getHandle(self: @This()) zio.Handle {
         return self.inner.getHandle();
-    }
-
-    pub fn getStreamRef(self: *const @This()) zio.StreamRef {
-        const stream_ref = self.inner.getStreamRef();
-        std.debug.assert(stream_ref.getType() == .Duplex);
-        return stream_ref;
     }
 
     const Linger = zio.backend.Socket.Linger;
@@ -132,3 +127,80 @@ pub const Socket = struct {
         return self.inner.write(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len], token);
     }
 };
+
+test "Socket(Tcp) Ipv4 + Ipv6" {
+    var rng = std.rand.DefaultPrng.init(0);
+    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
+    try testBlockingTcp(Ipv4Address, port);
+    try testBlockingTcp(Ipv6Address, port);
+}
+
+const Ipv4Address = struct {
+    pub const Flag = Socket.Ipv4;
+    pub fn new(port: u16) zio.Address {
+        const host = zio.Address.parseIpv4("127.0.0.1").?;
+        return zio.Address.fromIpv4(host, port);
+    }
+
+    pub fn validate(address: zio.Address) bool {
+        return address.isIpv4();
+    }
+};
+
+const Ipv6Address = struct {
+    pub const Flag = Socket.Ipv6;
+    pub fn new(port: u16) zio.Address {
+        const host = zio.Address.parseIpv4("::1").?;
+        return zio.Address.fromIpv4(host, port);
+    }
+
+    pub fn validate(address: zio.Address) bool {
+        return address.isIpv6();
+    }
+};
+
+fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
+    // Create the server socket
+    var server = try Socket.new(AddressType.Flag | Socket.Tcp);
+    defer server.close();
+
+    // Allow the server socket to accept incoming connections
+    try server.setOption(Socket.Option { .SendTimeout = 1000 });
+    try server.setOption(Socket.Option { .RecvTimeout = 1000 });
+    try server.setOption(Socket.Option { .Reuseaddr = true });
+    var option = Socket.Option { .Reuseaddr = undefined };
+    try server.getOption(&option);
+    expect(option.Reuseaddr == true);
+    try server.bind(&AddressType.new(port));
+    try server.listen(1);
+
+    // Create the client socket
+    const client = try Socket.new(AddressType.Flag | Socket.Tcp);
+    defer client.close();
+
+    // Connect the client socket to the server socket
+    try client.setOption(Socket.Option { .SendTimeout = 1000 });
+    try client.setOption(Socket.Option { .RecvTimeout = 1000 });
+    try client.setOption(Socket.Option { .Tcpnodelay = true });
+    try client.connect(&AddressType.new(port), 0);
+    
+    // Accept the incoming client from the server
+    var incoming = zio.Address.Incoming(AddressType.new(undefined));
+    try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
+    expect(AddressType.validate(incoming.getAddress()));
+    var server_client = incoming.getSocket();
+    defer server_client.close();
+
+    // send data from the servers client to the connected client
+    const data = "Hello world"[0..];
+    var output_buffer = [_]zio.ConstBuffer { .fromBytes(data) };
+    var transferred = try server_client.send(null, output_buffer[0..], 0);
+    expect(transferred == data.len);
+
+    // receive the data from the connected client which was sent by the server client
+    var input_data: [data.len]u8 = undefined;
+    var data_buffer = [_]zio.Buffer { .fromBytes(input_data[0..]) };
+    transferred = try client.recv(null, data_buffer[0..], 0);
+    expect(transferred == data.len);
+    expect(std.mem.eql(u8, data, input_data[0..]));
+}

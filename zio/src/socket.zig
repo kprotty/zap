@@ -20,6 +20,10 @@ pub const Socket = struct {
         return @This() { .inner = socket };
     }
 
+    pub fn close(self: *@This()) void {
+        return self.inner.close();
+    }
+
     pub inline fn fromHandle(handle: zio.Handle) @This() {
         return @This() { .inner = zio.backend.Socket.fromHandle(handle) };
     }
@@ -52,6 +56,7 @@ pub const Socket = struct {
     };
 
     pub const OptionError = error {
+        InvalidState,
         InvalidValue,
         InvalidHandle,
     };
@@ -77,6 +82,7 @@ pub const Socket = struct {
 
     pub const ListenError = error {
         AddressInUse,
+        InvalidState,
         InvalidHandle,
     };
 

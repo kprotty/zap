@@ -48,6 +48,10 @@ pub const Socket = struct {
         
     }
 
+    pub fn close(self: *@This()) void {
+        
+    }
+
     pub fn fromHandle(handle: zio.Handle) @This() {
         return @This() { .handle = handle };
     }

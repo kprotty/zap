@@ -62,7 +62,28 @@ pub const Socket = struct {
     }
 
     pub fn getHandle(self: @This()) zio.Handle {
-        return self.handle;
+        return @intToPtr(zio.Handle, @ptrToInt(self.handle) & ~is_overlapped);
+    }
+
+    const is_overlapped = usize(1);
+    const OverlappedResult = union(enum) {
+        Error: c_int,
+        Completed: usize,
+        Retry: ?*windows.OVERLAPPED,
+    };
+
+    fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) OverlappedResult {
+        std.debug.assert(token == 0 or token == @ptrToInt(overlapped));
+        if (token == @ptrToInt(overlapped)) {
+            if (overlapped.Internal == STATUS_SUCCESS)
+                return OverlappedResult { .Completed = overlapped.InternalHigh };
+            return OverlappedResult { .Error = @intCast(c_int, overlapped.Internal) };
+        }
+
+        const use_overlapped = (@ptrToInt(self.handle) & is_overlapped) != 0;
+        if (use_overlapped) 
+            @memset(@ptrCast([*]u8, overlapped), 0, @sizeOf(windows.OVERLAPPED));
+        return OverlappedResult { .Retry = if (use_overlapped) overlapped else null };
     }
 
     var init_error = zync.Lazy(WSAInitialize);
@@ -89,7 +110,7 @@ pub const Socket = struct {
     fn findWSAFunction(socket: SOCKET, function_guid: windows.GUID, function: var) zio.Socket.Error!void {
         var guid = function_guid;
         var dwBytes: windows.DWORD = undefined;
-        if (WSAIoctl(
+        const result = WSAIoctl(
             socket,
             SIO_GET_EXTENSION_FUNCTION_POINTER,
             @ptrCast(windows.PVOID, &guid),
@@ -99,7 +120,8 @@ pub const Socket = struct {
             &dwBytes,
             null,
             null,
-        ) != 0)
+        );
+        if (result != 0)
             return zio.Socket.Error.InvalidInitialize;
     }
 
@@ -110,7 +132,7 @@ pub const Socket = struct {
 
     pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         var option_val = option;
-        if (posix.socketOption(self.handle, option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
+        if (posix.socketOption(self.getHandle(), option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
@@ -122,7 +144,7 @@ pub const Socket = struct {
     }
 
     pub fn getOption(self: @This(), option: *zio.Socket.Option) zio.Socket.OptionError!void {
-        if (posix.socketOption(self.handle, option_val, Mswsock.getsockopt, Mswsock.Options) == 0)
+        if (posix.socketOption(self.getHandle(), option_val, Mswsock.getsockopt, Mswsock.Options) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
@@ -134,7 +156,7 @@ pub const Socket = struct {
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        if (Mswsock.bind(self.handle, @ptrCast(*const SOCKADDR, &address.ip), address.len) == 0)
+        if (Mswsock.bind(self.getHandle(), @ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS => zio.Socket.BindError.InvalidState,
@@ -146,7 +168,7 @@ pub const Socket = struct {
     }
 
     pub fn listen(self: *@This(), backlog: c_uint) zio.Socket.ListenError!void {
-        if (Mswsock.listen(self.handle, backlog) == 0)
+        if (Mswsock.listen(self.getHandle(), backlog) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS, WSAEINPROGRESS, WSAEINVAL => zio.Socket.ListenError.InvalidState,
@@ -156,19 +178,37 @@ pub const Socket = struct {
         };
     }
 
-    pub fn connect(self: *@This(), address: *const zio.Address, event: ?zio.backend.Event) zio.Socket.ConnectError!void {
+    pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
+        return switch (error_code: {
+            switch (self.getOverlappedResult(&self.writer, token)) {
+                .Completed => |_| return,
+                .Error => |code| break :error_code code,
+                .Retry => |overlapped| {
+                    const handle = self.getHandle();
+                    const addr = @ptrCast(*const SOCKADDR, address);
+                    if (switch (overlapped) {
+                        null => Mswsock.connect(handle, addr, address.length) == 0,
+                        else => (ConnectEx.?)(handle, addr, address.length, null, 0, null, overlapped) == windows.TRUE,
+                    }) return;
+                    break :error_code WSAGetLastError();
+                },
+            }
+        }) {
+            0 => unreachable,
+            // TODO
+            else => unreachable,
+        };
+    }
+
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, event: ?zio.backend.Event) zio.Socket.AcceptError!void {
+    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         
     }
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, event: ?zio.backend.Event) zio.Socket.DataError!usize {
-        
-    }
-
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, event: ?zio.backend.Event) zio.Socket.DataError!usize {
+    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
         
     }
 };
@@ -343,7 +383,7 @@ const Mswsock = struct {
 
     pub extern "ws2_32" stdcallcc fn listen(
         socket: SOCKET,
-        backlog: c_int,
+        backlog: c_uint,
     ) c_int;
 
     pub extern "ws2_32" stdcallcc fn bind(

@@ -22,8 +22,8 @@ pub const Event = struct {
     pub const Poller = struct {
         inner: zio.backend.Event.Poller,
 
-        pub const Error = error {
-            // TODO
+        pub const Error = std.os.UnexpectedError || error {
+            OutOfResources,
         };
 
         pub fn new() Error!@This() {
@@ -31,8 +31,9 @@ pub const Event = struct {
             return @This() { .inner = poller };
         }
 
-        pub const RegisterError = error {
-            // TODO
+        pub const RegisterError = std.os.UnexpectedError || error {
+            InvalidValue,
+            OutOfResources,
         };
 
         pub fn register(self: *@This(), handle: zio.Handle, flags: Event.Flags, user_data: usize) RegisterError!void {
@@ -43,16 +44,17 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, user_data);
         }
 
-        pub const NotifyError = error {
-            // TODO
+        pub const NotifyError = std.os.UnexpectedError || error {
+            OutOfResources,
         };
 
         pub fn notify(self: *@This(), user_data: usize) NotifyError!void {
             return self.inner.notify(user_data);
         }
 
-        pub const PollError = error {
-            // TODO
+        pub const PollError = std.os.UnexpectedError || error {
+            InvalidHandle,
+            InvalidEvents,
         };
 
         pub fn poll(self: *@This(), events: []Event, timeout_ms: ?usize) PollError![]Event {

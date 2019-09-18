@@ -6,6 +6,7 @@ pub const Handle = zio.backend.Handle;
 
 pub const ErrorClosed = error.Closed;
 pub const ErrorPending = error.Pending;
+pub const Error = error { Closed, Pending };
 
 pub const Buffer = struct {
     inner: zio.backend.Buffer,

@@ -200,15 +200,15 @@ pub const Socket = struct {
         };
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *Incoming, token: usize) zio.Socket.AcceptError!void {
         
     }
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         
     }
 
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
         
     }
 };

@@ -41,11 +41,94 @@ pub const ConstBuffer = struct {
     }
 };
 
+pub const SockAddr = os.sockaddr;
+
+pub const Ipv4 = struct {
+    inner: os.sockaddr_in,
+
+    pub fn from(address: u32, port: u16) @This() {
+        return @This() {
+            .inner = os.sockaddr_in {
+                .addr = address,
+                .family = os.AF_INET,
+                .zero = [_]u8{0} ** 8,
+                .port = std.mem.nativeToBig(u16, port),
+            }
+        };
+    }
+};
+
+pub const Ipv6 = struct {
+    inner: os.sockaddr_in6,
+
+    pub fn from(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
+        return @This() {
+            .inner = os.sockaddr_in6 {
+                .scope_id = scope,
+                .flowinfo = flowinfo,
+                .family = os.AF_INET6,
+                .addr = @bitCast([16]u8, address),
+                .port = std.mem.nativeToBig(@typeOf(port), port),
+            }
+        };
+    }
+};
+
+pub const Incoming = struct {
+    handle: zio.Handle,
+    address: zio.Address,
+
+    pub fn new(address: zio.Address) @This() {
+        return @This() {
+            .handle = undefined,
+            .address = address,
+        };
+    }
+
+    pub fn getSocket(self: @This()) Socket {
+        return Socket.fromHandle(self.handle);
+    }
+
+    pub fn getAddressPtr(self: *const @This()) *const zio.Address {
+        return &self.address;
+    }
+};
+
 pub const Socket = struct {
     handle: Handle,
 
     pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
+        var domain: u32 = 0;
+        if ((flags & zio.Socket.Ipv4) != 0) {
+            domain = os.AF_INET;
+        } else if ((flags & zio.Socket.Ipv6) != 0) {
+            domain = os.AF_INET6;
+        } else if (builtin.os == .linux) {
+            domain = os.AF_PACKET;
+        }
         
+        var protocol: u32 = 0;
+        var sock_type: u32 = 0;
+        if ((flags & zio.Socket.Nonblock) != 0)
+            sock_type = os.SOCK_NONBLOCK;
+        if ((flags & zio.Socket.Tcp) != 0) {
+            protocol = Options.IPPROTO_TCP;
+            sock_type = os.SOCK_STREAM;
+        } else if ((flags & zio.Socket.Udp) != 0) {
+            protocol = Options.IPPROTO_UDP;
+            sock_type = os.SOCK_DGRAM;
+        } else if ((flags & zio.Socket.Raw) != 0) {
+            sock_type = os.SOCK_RAW;
+        }
+        
+        const handle = CreateSocket(domain, sock_type | os.SOCK_CLOEXEC, protocol);
+        return switch (os.errno(handle)) {
+            0 => @This() { .handle = @intCast(zio.Handle, handle) },
+            os.EINVAL, os.EAFNOSUPPORT, os.EPROTONOSUPPORT => zio.Socket.Error.InvalidValue,
+            os.ENFILE, os.EMFILE, os.ENOBUFS, os.ENOMEM => zio.Socket.Error.OutOfResources,
+            os.EACCES => zio.Socket.Error.InvalidState,
+            else => unreachable,
+        };
     }
 
     pub fn close(self: *@This()) void {
@@ -76,7 +159,7 @@ pub const Socket = struct {
     }
 
     pub fn getOption(self: @This(), option: *zio.Socket.Option) zio.Socket.OptionError!void {
-        return switch (errno(socketOption(self.handle, &option_ref, Getsockopt, Options))) {
+        return switch (errno(socketOption(self.handle, option, Getsockopt, Options))) {
             0 => {},
             os.ENOPROTOOPT, os.EFAULT, os.EINVAL => zio.Socket.OptionError.InvalidValue,
             os.EBADF, os.ENOTSOCK => zio.Socket.OptionError.InvalidHandle,
@@ -90,12 +173,12 @@ pub const Socket = struct {
         comptime sockopt: var,
         comptime flags: type,
     ) @typeOf(sockopt).ReturnType {
-        var value: c_int = undefined;
+        var number: c_int = undefined;
         var level: c_int = flags.SOL_SOCKET;
         var optname: c_int = undefined;
-        var optval: usize = @ptrToInt(&value);
-        var optlen: c_int = @sizeOf(@typeOf(value));
-        const is_setter = @typeInfo(@typeOf(sockopt)).Fn.args[4].arg_type == c_int;
+        var optval: usize = @ptrToInt(&number);
+        var optlen: c_int = @sizeOf(@typeOf(number));
+        const is_setter = @typeInfo(@typeOf(sockopt)).Fn.args[4].arg_type.? == c_int;
 
         switch (option.*) {
             .Debug => |value| {
@@ -204,7 +287,7 @@ pub const Socket = struct {
         if ((token & zio.Event.Writeable) != 0) {
             var errno_len: c_int = undefined;
             var errno_value: c_int = undefined;
-            if (Getsockopt(self.handle, Options.SOL_SOCKET, options.SO_ERROR, &errno_value, &errno_len) != 0)
+            if (Getsockopt(self.handle, Options.SOL_SOCKET, Options.SO_ERROR, @ptrToInt(&errno_value), &errno_len) != 0)
                 return zio.Socket.ConnectError.InvalidHandle;
             if (errno_value <= 0)
                 return;
@@ -226,10 +309,11 @@ pub const Socket = struct {
             os.EISCONN => zio.Socket.ConnectError.AlreadyConnected,
             os.ETIMEDOUT => zio.Socket.ConnectError.TimedOut,
             os.EINTR => true,
+            else => unreachable,
         };
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *Incoming, token: usize) zio.Socket.AcceptError!void {
         std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
@@ -247,18 +331,19 @@ pub const Socket = struct {
                 os.EFAULT => return zio.Socket.AcceptError.InvalidAddress,
                 os.EAGAIN => return zio.ErrorPending,
                 os.EINTR => continue,
+                else => unreachable,
             }
         }
     }
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
-        return transfer(sel.fhandle, address, buffers, Recvmsg);
+        return transfer(self.handle, address, buffers, Recvmsg);
     }
 
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
         std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
@@ -316,7 +401,7 @@ const Options = struct {
 const MSG_NOSIGNAL = 0x4000;
 const msghdr = extern struct {
     msg_name: usize,
-    msg_namelen: c_uint,
+    msg_namelen: c_int,
     msg_iov: usize,
     msg_iovlen: usize,
     msg_control: usize,
@@ -330,6 +415,7 @@ const C = struct {
     pub extern "c" fn accept4(fd: i32, addr: *os.sockaddr, len: c_uint, flags: c_uint) usize;
     pub extern "c" fn connect(fd: i32, addr: *const os.sockaddr, len: c_int) usize;
     pub extern "c" fn bind(fd: i32, addr: *const os.sockaddr, len: c_uint) usize;
+    pub extern "c" fn socket(domain: u32, sock_type: u32, protocol: u32) usize;
     pub extern "c" fn sendmsg(fd: i32, msg: *const msghdr, flags: c_int) usize;
     pub extern "c" fn recvmsg(fd: i32, msg: *msghdr, flags: c_int) usize;
     pub extern "c" fn listen(fd: i32, backlog: c_uint) usize;
@@ -339,6 +425,17 @@ inline fn errno(value: usize) u16 {
     if (builtin.os != .linux)
         return os.errno(@bitCast(isize, value));
     return os.errno(value);
+}
+
+inline fn CreateSocket(domain: u32, sock_type: u32, protocol: u32) usize {
+    if (builtin.os != .linux)
+        return C.socket(domain, sock_type, protocol);
+    return system.syscall3(
+        system.SYS_socket,
+        @intCast(usize, domain),
+        @intCast(usize, sock_type),
+        @intCast(usize, protocol),
+    );
 }
 
 inline fn Getsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize {
@@ -430,7 +527,7 @@ inline fn Bind(fd: zio.Handle, address: *const zio.Address) usize {
 inline fn Listen(fd: zio.Handle, backlog: c_uint) usize {
     if (builtin.os != .linux)
         return C.listen(fd, backlog);
-    return system.syscall3(
+    return system.syscall2(
         system.SYS_listen,
         @intCast(usize, fd),
         @intCast(usize, backlog),

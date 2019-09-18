@@ -11,9 +11,12 @@ pub const Socket = struct {
     pub const Udp: Flags = 1 << 2;
     pub const Ipv4: Flags = 1 << 3;
     pub const Ipv6: Flags = 1 << 4;
+    pub const Nonblock: Flags = 1 << 5;
 
     pub const Error = error {
-        // TODO
+        InvalidValue,
+        InvalidState,
+        OutOfResources,
     };
 
     pub fn new(flags: Flags) Error!@This() {
@@ -85,7 +88,7 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = zio.ErrorPending || zio.ErrorClosed || error {
+    pub const ConnectError = zio.Error || error {
         Refused,
         TimedOut,
         InvalidState,
@@ -98,7 +101,7 @@ pub const Socket = struct {
         return self.inner.connect(address, token);
     }
 
-    pub const AcceptError = zio.ErrorPending || zio.ErrorClosed || error {
+    pub const AcceptError = zio.Error || error {
         Refused,
         InvalidHandle,
         InvalidAddress,
@@ -106,25 +109,25 @@ pub const Socket = struct {
     };
 
     pub fn accept(self: *@This(), flags: Flags, incoming: *zio.Address.Incoming, token: usize) AcceptError!void {
-        return self.inner.accept(flags, incoming, token);
+        return self.inner.accept(flags, &incoming.inner, token);
     }
 
-    pub const DataError = zio.ErrorPending || zio.ErrorClosed || error {
+    pub const DataError = zio.Error || error {
         InvalidValue,
         InvalidHandle,
         OutOfResources,
     };
 
-    pub fn read(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer, token: usize) DataError!usize {
+    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer, token: usize) DataError!usize {
         if (buffers.len == 0)
-            return 0;
-        return self.inner.read(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len], token);
+            return usize(0);
+        return self.inner.recv(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len], token);
     }
 
-    pub fn write(self: *@This(), address: ?*const zio.Address, buffers: []const zio.ConstBuffer, token: usize) DataError!usize {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.ConstBuffer, token: usize) DataError!usize {
         if (buffers.len == 0)
-            return 0;
-        return self.inner.write(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len], token);
+            return usize(0);
+        return self.inner.send(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len], token);
     }
 };
 
@@ -150,8 +153,8 @@ const Ipv4Address = struct {
 const Ipv6Address = struct {
     pub const Flag = Socket.Ipv6;
     pub fn new(port: u16) zio.Address {
-        const host = zio.Address.parseIpv4("::1").?;
-        return zio.Address.fromIpv4(host, port);
+        const host = zio.Address.parseIpv6("::1").?;
+        return zio.Address.fromIpv6(host, port, 0, 0);
     }
 
     pub fn validate(address: zio.Address) bool {
@@ -175,7 +178,7 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     try server.listen(1);
 
     // Create the client socket
-    const client = try Socket.new(AddressType.Flag | Socket.Tcp);
+    var client = try Socket.new(AddressType.Flag | Socket.Tcp);
     defer client.close();
 
     // Connect the client socket to the server socket
@@ -185,21 +188,21 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     try client.connect(&AddressType.new(port), 0);
     
     // Accept the incoming client from the server
-    var incoming = zio.Address.Incoming(AddressType.new(undefined));
+    var incoming = zio.Address.Incoming.new(AddressType.new(undefined));
     try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
-    expect(AddressType.validate(incoming.getAddress()));
+    expect(AddressType.validate(incoming.getAddressPtr().*));
     var server_client = incoming.getSocket();
     defer server_client.close();
 
     // send data from the servers client to the connected client
     const data = "Hello world"[0..];
-    var output_buffer = [_]zio.ConstBuffer { .fromBytes(data) };
+    var output_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
     var transferred = try server_client.send(null, output_buffer[0..], 0);
     expect(transferred == data.len);
 
     // receive the data from the connected client which was sent by the server client
     var input_data: [data.len]u8 = undefined;
-    var data_buffer = [_]zio.Buffer { .fromBytes(input_data[0..]) };
+    var data_buffer = [_]zio.Buffer { zio.Buffer.fromBytes(input_data[0..]) };
     transferred = try client.recv(null, data_buffer[0..], 0);
     expect(transferred == data.len);
     expect(std.mem.eql(u8, data, input_data[0..]));

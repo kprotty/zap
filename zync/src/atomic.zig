@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const utils = @import("utils.zig");
+const transmute = @import("../../zuma/zuma.zig").mem.transmute;
 
 pub fn yield(spin_count: usize) void {
     var spin = spin_count;
@@ -146,17 +147,6 @@ pub fn Atomic(comptime T: type) type {
                 transmute(Type, value),
                 comptime order.toBuiltin(),
             ));
-        }
-
-        inline fn transmute(comptime To: type, from: var) To {
-            return (
-                extern union {
-                    output: To,
-                    input: @typeOf(from),
-                } {
-                    .input = from,
-                }
-            ).output;
         }
     };
 }

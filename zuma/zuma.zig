@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
 const memory = @import("src/mem.zig");
+const thread = @import("src/thread.zig");
 const allocator = @import("src/allocator.zig");
 
 pub const backend = switch (builtin.os) {
@@ -11,9 +13,11 @@ pub const backend = switch (builtin.os) {
 
 test "zuma" {
     _ = memory;
+    _ = thread;
     _ = allocator;
 }
 
+pub usingnamespace thread;
 pub const mem = struct {
     pub usingnamespace memory;
     pub usingnamespace allocator;

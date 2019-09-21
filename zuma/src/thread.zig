@@ -1,14 +1,10 @@
 const std = @import("std");
 const zuma = @import("../zuma.zig");
 
-pub fn getNumaNodeCount() usize {
-    return zuma.backend.getNumaNodeCount();
-}
-
-pub const CpuType = enum { Physical, Logical };
-pub fn getCpuCoreCount(cpu_type: CpuType) usize {
-    return zuma.backend.getCpuCoreCount(cpu_type == .Physical);
-}
+pub const CpuType = enum { 
+    Physical,
+    Logical,
+};
 
 pub const CpuSet = struct {
     inner: zuma.backend.CpuSet,
@@ -23,6 +19,14 @@ pub const CpuSet = struct {
 
     pub fn get(self: @This(), index: usize) ?bool {
         return self.inner.get(index);
+    }
+
+    pub fn size(self: @This()) usize {
+        return self.inner.size();
+    }
+
+    pub fn getCpus(self: *@This(), numa_node: ?usize, cpu_type: CpuType) void {
+        return self.inner.getCpus(numa_node, cpu_type == .Physical);
     }
 };
 
@@ -58,12 +62,17 @@ pub const Thread = struct {
         return self.inner.join(timeout_ms);
     }
 
-    pub fn setCurrentAffinity(cpu_set: *const CpuSet) !void {
-        return zuma.backend.Thread.setCurrentAffinity(cpu_set);
+    pub const AffinityError = error {
+        InvalidState,
+        InvalidCpuSet,
+    };
+
+    pub fn setCurrentAffinity(cpu_set: *const CpuSet) AffinityError!void {
+        return zuma.backend.Thread.setCurrentAffinity(&cpu_set.inner);
     }
 
-    pub fn getCurrentAffinity(cpu_set: *CpuSet) !void {
-        return zuma.backend.Thread.getCurrentAffinity(cpu_set);
+    pub fn getCurrentAffinity(cpu_set: *CpuSet) AffinityError!void {
+        return zuma.backend.Thread.getCurrentAffinity(&cpu_set.inner);
     }
 };
 

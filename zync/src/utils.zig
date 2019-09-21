@@ -42,13 +42,25 @@ test "popCount" {
     expect(popCount(~u64(0)) == @typeInfo(u64).Int.bits);
 }
 
+pub fn shrType(comptime Int: type) type {
+    const bits = @typeInfo(Int).Int.bits;
+    const log2_bits = @log2(f32, @intToFloat(f32, bits));
+    return @IntType(false, @floatToInt(u64, log2_bits));
+}
+
+test "shrType" {
+    expect(shrType(u8)  == u3);
+    expect(shrType(u16) == u4);
+    expect(shrType(u32) == u5);
+    expect(shrType(u64) == u6);
+}
+
 pub fn nextPowerOfTwo(value: var) @typeOf(value) {
     const T = @typeOf(value);
     switch (@typeInfo(T)) {
         .Int => |int| {
-            const ShrBits = @log2(f32, @intToFloat(f32, int.bits));
-            const ShrType = @IntType(false, @floatToInt(u64, ShrBits));
-            return T(1) << @truncate(ShrType, int.bits - @clz(T, value - 1));
+            const shift_amount = int.bits - @clz(T, value - 1);
+            return T(1) << @truncate(shrType(T), shift_amount);
         },
         .ComptimeInt => {
             const power_of_two = comptime_int(1) << popCount(value);

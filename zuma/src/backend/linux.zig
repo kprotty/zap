@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = @import("posix.zig");
 const builtin = @import("builtin");
 const zuma = @import("../../zuma.zig");
 
@@ -12,12 +13,14 @@ fn toTimespec(ms: u32) linux.timespec {
     };
 }
 
-pub const Thread = if (builtin.link_libc) @import("posix.zig").Thread else struct {
+pub const CpuSet = posix.CpuSet;
+
+pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     id: *i32,
 
     pub fn now(is_monotonic: bool) u64 {
         var ts: linux.timespec = undefined;
-        const clock_type = if (is_monotonic) linux.CLOCK_MONOTONIC else linux.CLOCK_REALTIME;
+        const clock_type = if (is_monotonic) linux.CLOCK_MONOTONIC_RAW else linux.CLOCK_REALTIME;
         return switch (os.errno(linux.clock_gettime(clock_type, &ts))) {
             0 => (@intCast(u64, ts.tv_sec) * 1000) + (@intCast(u64, ts.tv_nsec) / 1000000),
             os.EFAULT, os.EPERM => unreachable,
@@ -93,11 +96,25 @@ pub const Thread = if (builtin.link_libc) @import("posix.zig").Thread else struc
         };
     }
 
-    pub fn setCurrentAffinity(cpu_set: *const CpuSet) !void {
-        // TODO
+    pub fn setCurrentAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {
+        const tid = linux.syscall0(linux.SYS_gettid);
+        return switch (os.errno(linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set))))) {
+            0 => {},
+            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
+            os.EPERM => zuma.Thread.AffinityError.InvalidState,
+            os.ESRCH => unreachable,
+            else => unreachable,
+        };
     }
 
-    pub fn getCurrentAffinity(cpu_set: *CpuSet) !void {
-        // TODO
+    pub fn getCurrentAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {
+        const tid = linux.syscall0(linux.SYS_gettid);
+        return switch (os.errno(linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set))))) {
+            0 => {},
+            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
+            os.EPERM => zuma.Thread.AffinityError.InvalidState,
+            os.ESRCH => unreachable,
+            else => unreachable,
+        };
     }
 };

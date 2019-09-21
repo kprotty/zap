@@ -41,34 +41,35 @@ pub const ConstBuffer = struct {
     }
 };
 
-pub const SockAddr = os.sockaddr;
+pub const SockAddr = struct {
+    pub const Ipv4 = os.sockaddr_in;
+    pub const Ipv6 = os.sockaddr_in6;
 
-pub const Ipv4 = struct {
-    inner: os.sockaddr_in,
+    inner: os.sockaddr,
 
-    pub fn from(address: u32, port: u16) @This() {
+    pub fn fromIpv4(address: u32, port: u16) @This() {
         return @This() {
-            .inner = os.sockaddr_in {
-                .addr = address,
-                .family = os.AF_INET,
-                .zero = [_]u8{0} ** 8,
-                .port = std.mem.nativeToBig(u16, port),
+            .inner = os.sockaddr {
+                .in = Ipv4 {
+                    .addr = address,
+                    .family = os.AF_INET,
+                    .zero = [_]u8{0} ** 8,
+                    .port = std.mem.nativeToBig(u16, port),
+                }
             }
         };
     }
-};
 
-pub const Ipv6 = struct {
-    inner: os.sockaddr_in6,
-
-    pub fn from(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
+    pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
         return @This() {
-            .inner = os.sockaddr_in6 {
-                .scope_id = scope,
-                .flowinfo = flowinfo,
-                .family = os.AF_INET6,
-                .addr = @bitCast([16]u8, address),
-                .port = std.mem.nativeToBig(@typeOf(port), port),
+            .inner = os.sockaddr {
+                .in6 = os.sockaddr_in6 {
+                    .scope_id = scope,
+                    .flowinfo = flowinfo,
+                    .family = os.AF_INET6,
+                    .addr = @bitCast([16]u8, address),
+                    .port = std.mem.nativeToBig(@typeOf(port), port),
+                }
             }
         };
     }
@@ -132,7 +133,7 @@ pub const Socket = struct {
     }
 
     pub fn close(self: *@This()) void {
-        
+        _ = system.close(self.handle);
     }
 
     pub fn fromHandle(handle: zio.Handle) @This() {
@@ -174,11 +175,13 @@ pub const Socket = struct {
         comptime flags: type,
     ) @typeOf(sockopt).ReturnType {
         var number: c_int = undefined;
+        var timeval: os.timeval = undefined;
+        const is_setter = @typeInfo(@typeOf(sockopt)).Fn.args[4].arg_type.? == c_int;
+
         var level: c_int = flags.SOL_SOCKET;
         var optname: c_int = undefined;
         var optval: usize = @ptrToInt(&number);
         var optlen: c_int = @sizeOf(@typeOf(number));
-        const is_setter = @typeInfo(@typeOf(sockopt)).Fn.args[4].arg_type.? == c_int;
 
         switch (option.*) {
             .Debug => |value| {
@@ -211,29 +214,47 @@ pub const Socket = struct {
                 if (is_setter) number = if (value) 1 else 0;
                 optname = flags.SO_OOBINLINE;
             },
-            .RecvBufMax => |value| {
-                if (is_setter) number = value;
-                optname = flags.SO_RCVBUF;
-            },
-            .RecvBufMin => |value| {
-                if (is_setter) number = value;
-                optname = flags.SO_RCVLOWAT;
-            },
-            .RecvTimeout => |value| {
-                if (is_setter) number = value;
-                optname = flags.SO_RCVTIMEO;
-            },
             .SendBufMax => |value| {
                 if (is_setter) number = value;
                 optname = flags.SO_SNDBUF;
+            },
+            .RecvBufMax => |value| {
+                if (is_setter) number = value;
+                optname = flags.SO_RCVBUF;
             },
             .SendBufMin => |value| {
                 if (is_setter) number = value;
                 optname = flags.SO_SNDLOWAT;
             },
-            .SendTimeout => |value| {
+            .RecvBufMin => |value| {
                 if (is_setter) number = value;
+                optname = flags.SO_RCVLOWAT;
+            },
+            .SendTimeout => |value| {
+                if (is_setter) {
+                    if (builtin.os == .windows) {
+                        number = value;
+                    } else {
+                        optval = @ptrToInt(&timeval);
+                        optlen = @sizeOf(@typeOf(timeval));
+                        timeval.tv_sec = @divFloor(value, 1000);
+                        timeval.tv_usec = @mod(value, 1000) * 1000;
+                    }
+                }
                 optname = flags.SO_SNDTIMEO;
+            },
+            .RecvTimeout => |value| {
+                if (is_setter) {
+                    if (builtin.os == .windows) {
+                        number = value;
+                    } else {
+                        optval = @ptrToInt(&timeval);
+                        optlen = @sizeOf(@typeOf(timeval));
+                        timeval.tv_sec = @divFloor(value, 1000);
+                        timeval.tv_usec = @mod(value, 1000) * 1000;
+                    }
+                }
+                optname = flags.SO_RCVTIMEO;
             },
         }
 
@@ -249,12 +270,20 @@ pub const Socket = struct {
                 .Keepalive => option.* = zio.Socket.Option { .Keepalive = number != 0 },
                 .Oobinline => option.* = zio.Socket.Option { .Oobinline = number != 0 },
                 .Tcpnodelay => option.* = zio.Socket.Option { .Tcpnodelay = number != 0 },
-                .RecvBufMax => option.* = zio.Socket.Option { .RecvBufMax = number },
-                .RecvBufMin => option.* = zio.Socket.Option { .RecvBufMin = number },
-                .RecvTimeout => option.* = zio.Socket.Option { .RecvTimeout = number },
                 .SendBufMax => option.* = zio.Socket.Option { .SendBufMax = number },
+                .RecvBufMax => option.* = zio.Socket.Option { .RecvBufMax = number },
                 .SendBufMin => option.* = zio.Socket.Option { .SendBufMin = number },
-                .SendTimeout => option.* = zio.Socket.Option { .SendTimeout = number },
+                .RecvBufMin => option.* = zio.Socket.Option { .RecvBufMin = number },
+                .SendTimeout => {
+                    if (builtin.os != .windows)
+                        number = @intCast(c_int, (timeval.tv_sec * 1000) + @divFloor(timeval.tv_usec, 1000));
+                    option.* = zio.Socket.Option { .SendTimeout = number };
+                },
+                .RecvTimeout => {
+                    if (builtin.os != .windows)
+                        number = @intCast(c_int, (timeval.tv_sec * 1000) + @divFloor(timeval.tv_usec, 1000));
+                    option.* = zio.Socket.Option { .RecvTimeout = number };
+                },
             }
         }
         return result;

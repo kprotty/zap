@@ -28,6 +28,10 @@ pub const CpuSet = struct {
     pub fn getCpus(self: *@This(), numa_node: ?usize, cpu_type: CpuType) void {
         return self.inner.getCpus(numa_node, cpu_type == .Physical);
     }
+
+    pub fn getNodeCount() usize {
+        return self.inner.getNodeCount();
+    }
 };
 
 pub const Thread = struct {

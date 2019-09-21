@@ -166,10 +166,13 @@ pub const Socket = struct {
                 .Retry => |overlapped| {
                     const handle = self.getHandle();
                     const addr = @ptrCast(*const SOCKADDR, address.sockaddr);
-                    if (switch (overlapped) {
-                        null => Mswsock.connect(handle, addr, address.length) == 0,
-                        else => (ConnectEx.?)(handle, addr, address.length, null, 0, null, overlapped) == windows.TRUE,
-                    }) return;
+                    if (overlapped) |ov| {
+                        if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
+                            return;
+                    } else {
+                        if (Mswsock.connect(handle, addr, address.length) == 0)
+                            return;
+                    }
                     break :error_code WSAGetLastError();
                 },
             }

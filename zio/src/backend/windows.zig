@@ -61,29 +61,9 @@ pub const Socket = struct {
         return self;
     }
 
+    const is_overlapped = usize(1);
     pub fn getHandle(self: @This()) zio.Handle {
         return @intToPtr(zio.Handle, @ptrToInt(self.handle) & ~is_overlapped);
-    }
-
-    const is_overlapped = usize(1);
-    const OverlappedResult = union(enum) {
-        Error: c_int,
-        Completed: usize,
-        Retry: ?*windows.OVERLAPPED,
-    };
-
-    fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) OverlappedResult {
-        std.debug.assert(token == 0 or token == @ptrToInt(overlapped));
-        if (token == @ptrToInt(overlapped)) {
-            if (overlapped.Internal == STATUS_SUCCESS)
-                return OverlappedResult { .Completed = overlapped.InternalHigh };
-            return OverlappedResult { .Error = @intCast(c_int, overlapped.Internal) };
-        }
-
-        const use_overlapped = (@ptrToInt(self.handle) & is_overlapped) != 0;
-        if (use_overlapped) 
-            @memset(@ptrCast([*]u8, overlapped), 0, @sizeOf(windows.OVERLAPPED));
-        return OverlappedResult { .Retry = if (use_overlapped) overlapped else null };
     }
 
     var init_error = zync.Lazy(WSAInitialize);
@@ -185,7 +165,7 @@ pub const Socket = struct {
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
                     const handle = self.getHandle();
-                    const addr = @ptrCast(*const SOCKADDR, address);
+                    const addr = @ptrCast(*const SOCKADDR, address.sockaddr);
                     if (switch (overlapped) {
                         null => Mswsock.connect(handle, addr, address.length) == 0,
                         else => (ConnectEx.?)(handle, addr, address.length, null, 0, null, overlapped) == windows.TRUE,
@@ -210,6 +190,26 @@ pub const Socket = struct {
 
     pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
         
+    }
+
+    const OverlappedResult = union(enum) {
+        Error: c_int,
+        Completed: usize,
+        Retry: ?*windows.OVERLAPPED,
+    };
+
+    fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) OverlappedResult {
+        std.debug.assert(token == 0 or token == @ptrToInt(overlapped));
+        if (token == @ptrToInt(overlapped)) {
+            if (overlapped.Internal == STATUS_SUCCESS)
+                return OverlappedResult { .Completed = overlapped.InternalHigh };
+            return OverlappedResult { .Error = @intCast(c_int, overlapped.Internal) };
+        }
+
+        const use_overlapped = (@ptrToInt(self.handle) & is_overlapped) != 0;
+        if (use_overlapped) 
+            @memset(@ptrCast([*]u8, overlapped), 0, @sizeOf(windows.OVERLAPPED));
+        return OverlappedResult { .Retry = if (use_overlapped) overlapped else null };
     }
 };
 

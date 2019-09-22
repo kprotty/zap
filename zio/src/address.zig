@@ -44,7 +44,14 @@ pub const Address = struct {
     }
 
     pub fn parseIpv4(input: []const u8) ?u32 {
-        return null; // TODO
+        if (std.mem.eql(u8, input, "localhost"))
+            return parseIpv4("127.0.0.1");
+
+        var string = input;
+        var result = u32(0);
+        for ([_]void{{}} ** 4) {
+            // TODO
+        }
     }
 
     pub fn parseIpv6(input: []const u8) ?u128 { 

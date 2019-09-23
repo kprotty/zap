@@ -41,6 +41,7 @@ pub const ConstBuffer = struct {
     }
 };
 
+pub const IncomingPadding = 0;
 pub const SockAddr = struct {
     pub const Ipv4 = os.sockaddr_in;
     pub const Ipv6 = os.sockaddr_in6;
@@ -63,7 +64,7 @@ pub const SockAddr = struct {
     pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
         return @This() {
             .inner = os.sockaddr {
-                .in6 = os.sockaddr_in6 {
+                .in6 = Ipv6 {
                     .scope_id = scope,
                     .flowinfo = flowinfo,
                     .family = os.AF_INET6,
@@ -72,26 +73,6 @@ pub const SockAddr = struct {
                 }
             }
         };
-    }
-};
-
-pub const Incoming = struct {
-    handle: zio.Handle,
-    address: zio.Address,
-
-    pub fn new(address: zio.Address) @This() {
-        return @This() {
-            .handle = undefined,
-            .address = address,
-        };
-    }
-
-    pub fn getSocket(self: @This()) Socket {
-        return Socket.fromHandle(self.handle);
-    }
-
-    pub fn getAddressPtr(self: *const @This()) *const zio.Address {
-        return &self.address;
     }
 };
 
@@ -342,7 +323,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *Incoming, token: usize) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;

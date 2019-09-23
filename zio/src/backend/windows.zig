@@ -41,6 +41,37 @@ pub const ConstBuffer = struct {
     }
 };
 
+pub const IncomingPadding = 16;
+pub const SockAddr = struct {
+    pub const Ipv4 = SOCKADDR_IN;
+    pub const Ipv6 = SOCKADDR_IN6;
+
+    inner: SOCKADDR,
+
+    pub fn fromIpv4(address: u32, port: u16) @This() {
+        return @This() {
+            .inner = @bitCast(SOCKADDR, Ipv4 {
+                .sin_family = AF_INET,
+                .sin_zero = [_]u8{0} ** 8,
+                .sin_addr = IN_ADDR { .s_addr = address },
+                .sin_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
+            }),
+        };
+    }
+
+    pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
+        return @This() {
+            .inner = @bitCast(SOCKADDR, Ipv6 {
+                .sin6_family = AF_INET6,
+                .sin6_scope_id = scope,
+                .sin6_flowinfo = flowinfo,
+                .sin6_addr = IN6_ADDR { .Qword = address },
+                .sin6_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
+            }),
+        };
+    }
+};
+
 pub const Socket = struct {
     handle: Handle,
     reader: windows.OVERLAPPED,

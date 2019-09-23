@@ -190,7 +190,7 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     // Accept the incoming client from the server
     var incoming = zio.Address.Incoming.new(AddressType.new(undefined));
     try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
-    expect(AddressType.validate(incoming.getAddressPtr().*));
+    expect(AddressType.validate(incoming.address));
     var server_client = incoming.getSocket();
     defer server_client.close();
 

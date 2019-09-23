@@ -1,20 +1,20 @@
 const std = @import("std");
 const zio = @import("../zio.zig");
 
-pub const Address = struct {
-    pub const Incoming = struct {
-        inner: zio.backend.Incoming,
+pub const Address = extern struct {
+    pub const Incoming = extern struct {
+        handle: zio.Handle,
+        address: zio.Address,
+        padding: [zio.backend.IncomingPadding]u8,
 
         pub fn new(address: Address) @This() {
-            return @This() { .inner = zio.backend.Incoming.new(address) };
+            var self: @This() = undefined;
+            self.address = address;
+            return self;
         }
 
         pub fn getSocket(self: @This()) zio.Socket {
-            return zio.Socket { .inner = self.inner.getSocket() };
-        }
-
-        pub fn getAddressPtr(self: *const @This()) *const Address {
-            return self.inner.getAddressPtr();
+            return zio.Socket.fromHandle(self.handle);
         }
     };
 

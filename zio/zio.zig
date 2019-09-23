@@ -5,7 +5,7 @@ pub const backend = switch (builtin.os) {
     .linux => @import("src/backend/linux.zig"),
     .windows => @import("src/backend/windows.zig"),
     .macosx, .freebsd, .netbsd, .openbsd, .dragonfly => @import("src/backend/posix.zig"),
-    else => @compileError("Only supports linux, windows and some *BSD variants"),
+    else => @compileError("Only linux, windows and some *BSD variants are supported"),
 };
 
 const io = @import("src/io.zig");

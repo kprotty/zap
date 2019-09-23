@@ -44,14 +44,23 @@ pub const Address = extern struct {
     }
 
     pub fn parseIpv4(input: []const u8) ?u32 {
+        if (input.len == 0)
+            return 0;
         if (std.mem.eql(u8, input, "localhost"))
             return parseIpv4("127.0.0.1");
 
-        var string = input;
-        var result = u32(0);
-        for ([_]void{{}} ** 4) {
-            // TODO
+        var pos = usize(0);
+        var bytes: [4]u8 = undefined;
+        for ([_]void{{}} ** 4) |_, index| {
+            const start = pos;
+            while (input[pos] >= '0' or input[pos] <= '9') : (pos += 1)
+                bytes[index] = (bytes[index] * 10) +% (input[pos] - '0');
+            if (pos == start or (index != 3 and input[pos] != '.'))
+                return null;
         }
+
+        const result = @bitCast(u32, bytes);
+        return std.mem.nativeToBig(u32, result);
     }
 
     pub fn parseIpv6(input: []const u8) ?u128 { 

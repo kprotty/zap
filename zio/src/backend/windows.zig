@@ -178,7 +178,12 @@ pub const Socket = struct {
             }
         }) {
             0 => unreachable,
-            // TODO
+            WSAENOTINITIALIZED, WSAENETDOWN, WSAENETUNREACH, WSAENOBUFS => zio.Socket.ConnectError.InvalidState,
+            WSAEADDRINUSE, WSAECONNREFUSED, WSAEHOSTUNREACH => zio.Socket.ConnectError.Refused,
+            WSAEAFNOTSUPPORT, WSAENOTSOCK => zio.Socket.ConnectError.InvalidHandle,
+            WSAEADDRNOTAVAIL, WSAEINVAL => zio.Socket.ConnectError.InvalidAddress,
+            WSAEALREADY, WSAEISCONN => zio.Socket.ConnectError.AlreadyConnected,
+            WSAETIMEDOUT => zio.Socket.ConnectError.TimedOut,
             else => unreachable,
         };
     }

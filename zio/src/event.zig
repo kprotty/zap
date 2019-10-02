@@ -58,6 +58,7 @@ pub const Event = struct {
         }
 
         pub const NotifyError = std.os.UnexpectedError || error {
+            InvalidValue,
             OutOfResources,
         };
 

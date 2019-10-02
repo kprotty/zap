@@ -118,6 +118,8 @@ pub const Event = struct {
         }
 
         pub fn notify(self: *@This(), data: usize) zio.Event.Poller.NotifyError!void {
+            if (self.iocp == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.NotifyError.InvalidValue;
             if (windows.kernel32.PostQueuedCompletionStatus(self.iocp, 0, data, null) != windows.TRUE)
                 return windows.unexpectedError(windows.kernel32.GetLastError());
         }

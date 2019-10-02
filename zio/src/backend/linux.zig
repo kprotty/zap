@@ -1,6 +1,6 @@
 const std = @import("std");
 const posix = @import("posix.zig");
-const zio = @import("zio");
+const zio = @import("zap").zio;
 
 const os = std.os;
 const linux = os.linux;
@@ -19,7 +19,7 @@ pub const Ipv6 = posix.Ipv6;
 pub const Event = struct {
     inner: linux.epoll_event,
 
-    pub fn getData(self: *@This(), poller: *Poller) usize {
+    pub fn readData(self: *@This(), poller: *Poller) usize {
         if (self.inner.data.ptr != ~usize(0))
             return self.inner.data.ptr;
         var value: u64 = undefined;
@@ -27,28 +27,29 @@ pub const Event = struct {
         return if (bytes == @sizeOf(@typeOf(value))) @truncate(usize, value) else 0;
     }
 
-    pub fn getResult(self: *@This()) zio.Result {
-        return zio.Result {
-            .data = 0,
-            .status = switch (self.inner.events & (linux.EPOLLERR | linux.EPOLLHUP | linux.EPOLLRDHUP)) {
-                0 => .Retry,
-                else => .Error,
-            },
-        };
+    pub fn getToken(self: *@This()) usize {
+        var token: usize = 0;
+        if ((self.inner.events & linux.EPOLLIN) != 0)
+            token |= zio.Event.Readable;
+        if ((self.inner.events & linux.EPOLLOUT) != 0)
+            token |= zio.Event.Writeable;
+        if ((self.inner.events & (linux.EPOLLERR | linux.EPOLLHUP)) != 0)
+            token |= zio.Event.Disposable;
+        return token;
     }
 
     pub const Poller = struct {
         epoll_fd: Handle,
         event_fd: Handle,
 
-        pub fn new() zio.Event.Poller.InitError!@This() {
+        pub fn new() zio.Event.Poller.Error!@This() {
             const epoll_fd = linux.epoll_create1(linux.EPOLL_CLOEXEC);
             return switch (linux.getErrno(epoll_fd)) {
                 0 => @This() {
                     .event_fd = 0,
                     .epoll_fd = @intCast(Handle, epoll_fd),
                 },
-                linux.EMFILE, linux.ENOMEM => zio.Event.Poller.InitError.OutOfResources,
+                linux.EMFILE, linux.ENOMEM => zio.Event.Poller.Error.OutOfResources,
                 linux.EINVAL => unreachable,
                 else => unreachable,
             };
@@ -122,10 +123,10 @@ pub const Event = struct {
                 .events = 0,
             };
 
+            if ((flags & zio.Event.Readable) != 0)
+                event.events |= linux.EPOLLIN;
             if ((flags & zio.Event.Writeable) != 0)
                 event.events |= linux.EPOLLOUT; 
-            if ((flags & zio.Event.Readable) != 0)
-                event.events |= linux.EPOLLIN | linux.EPOLLRDHUP;
             if ((flags & zio.Event.EdgeTrigger) != 0) {
                 event.events |= linux.EPOLLET;
             } else {

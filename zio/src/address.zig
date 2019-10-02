@@ -2,7 +2,7 @@ const std = @import("std");
 const zio = @import("zap").zio;
 const expect = std.testing.expect;
 
-pub const Address = extern struct {
+pub const Address = struct {
     pub const Incoming = extern struct {
         handle: zio.Handle,
         address: zio.Address,
@@ -46,9 +46,9 @@ pub const Address = extern struct {
 
     pub fn parseIpv4(input: []const u8) !u32 {
         if (input.len == 0)
-            return 0;
+            return u32(0);
         if (std.mem.eql(u8, input, "localhost"))
-            return parseIpv4("127.0.0.1");
+            return std.net.parseIp4("127.0.0.1");
         return std.net.parseIp4(input);
     }
 

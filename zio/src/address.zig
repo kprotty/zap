@@ -2,7 +2,7 @@ const std = @import("std");
 const zio = @import("zap").zio;
 const expect = std.testing.expect;
 
-pub const Address = struct {
+pub const Address = extern struct {
     pub const Incoming = extern struct {
         handle: zio.Handle,
         address: zio.Address,
@@ -19,7 +19,7 @@ pub const Address = struct {
         }
     };
 
-    length: c_int,
+    length: c_uint,
     sockaddr: zio.backend.SockAddr align(@alignOf(usize)),
 
     pub fn isIpv4(self: @This()) bool {

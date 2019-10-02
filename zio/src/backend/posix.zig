@@ -42,7 +42,7 @@ pub const ConstBuffer = struct {
 };
 
 pub const IncomingPadding = 0;
-pub const SockAddr = struct {
+pub const SockAddr = extern struct {
     pub const Ipv4 = os.sockaddr_in;
     pub const Ipv6 = os.sockaddr_in6;
 
@@ -422,7 +422,7 @@ const msghdr = extern struct {
 const C = struct {
     pub extern "c" fn getsockopt(fd: i32, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize;
     pub extern "c" fn setsockopt(fd: i32, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize;
-    pub extern "c" fn accept4(fd: i32, addr: *os.sockaddr, len: c_uint, flags: c_uint) usize;
+    pub extern "c" fn accept4(fd: i32, addr: *os.sockaddr, len: *c_uint, flags: c_uint) usize;
     pub extern "c" fn connect(fd: i32, addr: *const os.sockaddr, len: c_int) usize;
     pub extern "c" fn bind(fd: i32, addr: *const os.sockaddr, len: c_uint) usize;
     pub extern "c" fn socket(domain: u32, sock_type: u32, protocol: u32) usize;
@@ -480,12 +480,12 @@ inline fn Accept(fd: zio.Handle, socket_flags: zio.Socket.Flags, address: *zio.A
         flags |= os.SOCK_NONBLOCK;
 
     if (builtin.os != .linux)
-        return C.accept4(fd, @ptrCast(*os.sockaddr, &address.sockaddr), address.length, flags);
+        return C.accept4(fd, @ptrCast(*os.sockaddr, &address.sockaddr), &address.length, flags);
     return system.syscall4(
         system.SYS_accept4,
         @intCast(usize, fd),
         @ptrToInt(&address.sockaddr),
-        @intCast(usize, address.length),
+        @ptrToInt(&address.length),
         @intCast(usize, flags),
     );
 }

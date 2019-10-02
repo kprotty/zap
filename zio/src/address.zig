@@ -53,11 +53,10 @@ pub const Address = extern struct {
     }
 
     pub fn parseIpv6(input: []const u8) !std.net.Ip6Addr { 
-        if (input.len != 0)
-            return std.net.parseIp6(input);
-        return std.net.Ip6Addr {
-            .scope_id = 0,
-            .addr = [_]u8 { 0 } ** 16,
-        };
+        if (input.len == 0)
+            return std.net.Ip6Addr { .scope_id = 0, .addr = [_]u8 { 0 } ** 16 };
+        if (std.mem.eql(u8, input, "::1"))
+            return std.net.parseIp6("0:0:0:0:0:0:0:1");
+        return std.net.parseIp6(input);
     }
 };

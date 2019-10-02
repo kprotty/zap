@@ -135,7 +135,7 @@ test "Socket(Tcp) Ipv4" {
     var rng = std.rand.DefaultPrng.init(0);
     const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
     try testBlockingTcp(Ipv4Address, port);
-    //try testBlockingTcp(Ipv6Address, port);
+    try testBlockingTcp(Ipv6Address, port);
 }
 
 const Ipv4Address = struct {
@@ -156,7 +156,7 @@ const Ipv6Address = struct {
 
     pub fn new(port: u16) !zio.Address {
         const host = try zio.Address.parseIpv6("::1");
-        return zio.Address.fromIpv6(host, port, 0, 0);
+        return zio.Address.fromIpv6(host, port, 0, );
     }
 
     pub fn validate(address: zio.Address) bool {

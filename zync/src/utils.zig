@@ -10,6 +10,19 @@ pub fn CachePadded(comptime T: type) type {
     };
 }
 
+pub fn ptrCast(comptime To: type, from: var) To {
+    return @ptrCast(To, @alignCast(@alignOf(To), from));
+}
+
+pub fn cast(comptime To: type, from: var) To {
+    var input = from;
+    var output: To = undefined;
+    const size = std.math.max(@sizeOf(To), @sizeOf(@typeOf(from)));
+    const bytes = std.mem.alignForward(size, @alignOf(To));
+    @memcpy(@ptrCast([*]u8, &output), @ptrCast([*]const u8, &input), bytes);
+    return output;
+}
+
 const expect = std.testing.expect;
 test "cache padding" {
     expect(@sizeOf(CachePadded(u9)) == cache_line);

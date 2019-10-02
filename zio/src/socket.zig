@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("zio");
+const zio = @import("zap").zio;
 const expect = std.testing.expect;
 
 pub const Socket = struct {
@@ -169,43 +169,5 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     var server = try Socket.new(AddressType.Flag | Socket.Tcp);
     defer server.close();
 
-    // Allow the server socket to accept incoming connections
-    try server.setOption(Socket.Option { .SendTimeout = 1000 });
-    try server.setOption(Socket.Option { .RecvTimeout = 1000 });
-    try server.setOption(Socket.Option { .Reuseaddr = true });
-    var option = Socket.Option { .Reuseaddr = undefined };
-    try server.getOption(&option);
-    expect(option.Reuseaddr == true);
-    try server.bind(&AddressType.new(port));
-    try server.listen(1);
-
-    // Create the client socket
-    var client = try Socket.new(AddressType.Flag | Socket.Tcp);
-    defer client.close();
-
-    // Connect the client socket to the server socket
-    try client.setOption(Socket.Option { .SendTimeout = 1000 });
-    try client.setOption(Socket.Option { .RecvTimeout = 1000 });
-    try client.setOption(Socket.Option { .Tcpnodelay = true });
-    try client.connect(&AddressType.new(port), 0);
     
-    // Accept the incoming client from the server
-    var incoming = try zio.Address.Incoming.new(AddressType.new(undefined));
-    try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
-    expect(AddressType.validate(incoming.address));
-    var server_client = incoming.getSocket();
-    defer server_client.close();
-
-    // send data from the servers client to the connected client
-    const data = "Hello world"[0..];
-    var output_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
-    var transferred = try server_client.send(null, output_buffer[0..], 0);
-    expect(transferred == data.len);
-
-    // receive the data from the connected client which was sent by the server client
-    var input_data: [data.len]u8 = undefined;
-    var data_buffer = [_]zio.Buffer { zio.Buffer.fromBytes(input_data[0..]) };
-    transferred = try client.recv(null, data_buffer[0..], 0);
-    expect(transferred == data.len);
-    expect(std.mem.eql(u8, data, input_data[0..]));
 }

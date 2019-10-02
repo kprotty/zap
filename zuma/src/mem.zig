@@ -42,14 +42,3 @@ pub const ModifyError = error {
 pub fn modify(memory: []align(page_size) u8, flags: u32, node: ?usize) ModifyError!void {
     return backend.modify(memory, flags);
 }
-
-pub fn transmute(comptime To: type, from: var) To {
-    return (
-        extern union {
-            output: To,
-            input: @typeOf(from),
-        } {
-            .input = from,
-        }
-    ).output;
-}

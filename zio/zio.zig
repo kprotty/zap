@@ -19,8 +19,8 @@ pub usingnamespace socket;
 pub usingnamespace address;
 
 test "zio" {
-    _ = io;
-    _ = event;
-    _ = socket;
-    _ = address;
+    //_ = io;
+    //_ = event;
+    //_ = socket;
+    //_ = address;
 }

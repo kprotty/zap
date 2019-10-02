@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = @import("posix.zig");
 const builtin = @import("builtin");
-const zuma = @import("../../zuma.zig");
+const zuma = @import("zuma");
 
 const os = std.os;
 const linux = os.linux;

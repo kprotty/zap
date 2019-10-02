@@ -1,5 +1,5 @@
 const std = @import("std");
-const zuma = @import("../zuma.zig");
+const zuma = @import("zuma");
 
 pub const CpuType = enum { 
     Physical,

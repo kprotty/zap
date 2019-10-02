@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const utils = @import("utils.zig");
-const transmute = @import("../../zuma/zuma.zig").mem.transmute;
+const transmute = @import("zuma").mem.transmute;
 
 pub fn yield(spin_count: usize) void {
     var spin = spin_count;

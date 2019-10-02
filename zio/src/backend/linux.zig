@@ -1,6 +1,6 @@
 const std = @import("std");
 const posix = @import("posix.zig");
-const zio = @import("../../zio.zig");
+const zio = @import("zio");
 
 const os = std.os;
 const linux = os.linux;

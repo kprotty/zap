@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio = @import("../zio.zig");
+const zio = @import("zio");
 
 pub const Event = struct {
     inner: zio.backend.Event,

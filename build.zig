@@ -3,16 +3,18 @@ const builtin = @import("builtin");
 
 pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
+    const modules = [_][]const u8 {
+        "zync",
+        "zuma",
+        "zio",
+        "zell",
+    };
 
     const test_all_step = b.step("test", "Run all tests");
-    inline for ([_][]const u8 {
-        "zio",
-        "zync",
-        // "zuma",
-        // "zell",
-    }) |module| {
+    inline for (modules) |module| {
         const tests = b.addTest(module ++ "/" ++ module ++ ".zig");
-        // tests.setNamePrefix(module ++ " ");
+        inline for (modules) |mod|
+            tests.addPackagePath(mod, mod ++ "/" ++ mod ++ ".zig");
         tests.setBuildMode(mode);
 
         const test_step = b.step("test-" ++ module, "Run all tests for " ++ module);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = @import("posix.zig");
-const zio = @import("../../zio.zig");
-const zync = @import("../../../zync/zync.zig");
+const zio = @import("zio");
+const zync = @import("zync");
 
 const windows = std.os.windows;
 

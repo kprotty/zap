@@ -293,7 +293,7 @@ pub const Socket = struct {
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
         std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
         if ((token & zio.Event.Disposable) != 0)
-                return zio.ErrorClosed;
+            return zio.ErrorClosed;
         if ((token & zio.Event.Writeable) != 0) {
             var errno_len: c_int = undefined;
             var errno_value: c_int = undefined;

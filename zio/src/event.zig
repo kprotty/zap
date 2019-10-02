@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const expect = std.testing.expect;
 
 pub const Event = struct {
     inner: zio.backend.Event,
@@ -31,6 +32,18 @@ pub const Event = struct {
             return @This() { .inner = poller };
         }
 
+        pub fn close(self: *@This()) void {
+            self.inner.close();
+        }
+
+        pub fn fromHandle(handle: zio.Handle) @This() {
+            return @This() { .inner = zio.Event.Poller.fromHandle(handle) };
+        }
+
+        pub fn getHandle(self: @This()) zio.Handle {
+            return self.inner.getHandle();
+        }
+
         pub const RegisterError = std.os.UnexpectedError || error {
             InvalidValue,
             OutOfResources,
@@ -57,9 +70,11 @@ pub const Event = struct {
             InvalidEvents,
         };
 
-        pub fn poll(self: *@This(), events: []Event, timeout_ms: ?usize) PollError![]Event {
+        pub fn poll(self: *@This(), events: []Event, timeout_ms: ?u32) PollError![]Event {
             const events_found = try self.inner.poll(@ptrCast([*]zio.backend.Event, events.ptr)[0..events.len], timeout_ms);
             return @ptrCast([*]Event, events_found.ptr)[0..events_found.len];
         }
     };
 };
+
+

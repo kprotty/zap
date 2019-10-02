@@ -411,12 +411,12 @@ const Options = struct {
 const MSG_NOSIGNAL = 0x4000;
 const msghdr = extern struct {
     msg_name: usize,
-    msg_namelen: c_int,
+    msg_namelen: c_uint,
     msg_iov: usize,
     msg_iovlen: usize,
     msg_control: usize,
     msg_controllen: usize,
-    msg_flags: c_int,
+    msg_flags: c_uint,
 };
 
 const C = struct {

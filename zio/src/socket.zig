@@ -199,4 +199,17 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     expect(AddressType.validate(incoming.address));
     var server_client = incoming.getSocket();
     defer server_client.close();
+
+    // send data from the servers client to the connected client
+    const data = "Hello world"[0..];
+    var output_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
+    var transferred = try server_client.send(null, output_buffer[0..], 0);
+    expect(transferred == data.len);
+
+    // receive the data from the connected client which was sent by the server client
+    var input_data: [data.len]u8 = undefined;
+    var data_buffer = [_]zio.Buffer { zio.Buffer.fromBytes(input_data[0..]) };
+    transferred = try client.recv(null, data_buffer[0..], 0);
+    expect(transferred == data.len);
+    expect(std.mem.eql(u8, data, input_data[0..]));
 }

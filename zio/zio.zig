@@ -15,12 +15,12 @@ const address = @import("src/address.zig");
 
 pub usingnamespace io;
 pub usingnamespace event;
-//pub usingnamespace socket;
+pub usingnamespace socket;
 pub usingnamespace address;
 
 test "zio" {
     _ = io;
     _ = event;
-    //_ = socket;
+    _ = socket;
     _ = address;
 }

@@ -135,7 +135,7 @@ test "Socket(Tcp) Ipv4" {
     var rng = std.rand.DefaultPrng.init(0);
     const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
     try testBlockingTcp(Ipv4Address, port);
-    try testBlockingTcp(Ipv6Address, port);
+    //try testBlockingTcp(Ipv6Address, port);
 }
 
 const Ipv4Address = struct {

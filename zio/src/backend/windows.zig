@@ -170,25 +170,24 @@ pub const Socket = struct {
         return @intToPtr(zio.Handle, @ptrToInt(self.handle) & ~is_overlapped);
     }
 
-    var init_error = zync.Lazy(WSAInitialize);
-    fn WSAInitialize() ?zio.Socket.Error {
+    var init_error = zync.Lazy(WSAInitialize).new();
+    fn WSAInitialize() zio.Socket.Error!void {
         const wsa_version = windows.WORD(0x0202);
         var wsa_data: WSAData = undefined;
         if (WSAStartup(wsa_version, &wsa_data) != 0)
-            return zio.Socket.Error.InvalidInitialize;
+            return zio.Socket.Error.InvalidState;
         if (wsa_data.wVersion != wsa_version)
-            return zio.Socket.Error.InvalidInitialize;
+            return zio.Socket.Error.InvalidState;
 
         const dummy_socket = Mswsock.socket(AF_INET, SOCK_STREAM, 0);
         if (dummy_socket == INVALID_SOCKET)
-            return zio.Socket.Error.InvalidInitialize;
+            return zio.Socket.Error.InvalidState;
         defer { _ = Mswsock.closesocket(dummy_socket); }
 
         if (AcceptEx == null)
             _ = findWSAFunction(dummy_socket, WSAID_ACCEPTEX, &AcceptEx) catch |err| return err;
         if (ConnectEx == null)
             _ = findWSAFunction(dummy_socket, WSAID_CONNECTEX, &ConnectEx) catch |err| return err;
-        return null;
     }
 
     fn findWSAFunction(socket: SOCKET, function_guid: windows.GUID, function: var) zio.Socket.Error!void {
@@ -206,7 +205,7 @@ pub const Socket = struct {
             null,
         );
         if (result != 0)
-            return zio.Socket.Error.InvalidInitialize;
+            return zio.Socket.Error.InvalidState;
     }
 
     pub const Linger = extern struct {
@@ -487,7 +486,7 @@ const Mswsock = struct {
         domain: windows.DWORD,
         sock_type: windows.DWORD,
         protocol: windows.DWORD,
-    ) c_int;
+    ) SOCKET;
 
     pub extern "ws2_32" stdcallcc fn closesocket(
         socket: SOCKET,

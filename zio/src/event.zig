@@ -77,4 +77,24 @@ pub const Event = struct {
     };
 };
 
+test "Event.Poller - poll - nonblock" {
+    var poller = try Event.Poller.new();
+    defer poller.close();
 
+    var events: [1]Event = undefined;
+    const events_found = try poller.poll(events[0..], 0);
+    expect(events_found.len == 0);
+}
+
+test "Event.Poller - notify" {
+    var poller = try Event.Poller.new();
+    defer poller.close();
+
+    const value = usize(1234);
+    try poller.notify(value);
+
+    var events: [1]Event = undefined;
+    const events_found = try poller.poll(events[0..], 0);
+    expect(events_found.len == 1);
+    expect(events_found[0].readData(&poller) == value);
+}

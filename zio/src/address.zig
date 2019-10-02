@@ -1,5 +1,6 @@
 const std = @import("std");
 const zio = @import("zio");
+const expect = std.testing.expect;
 
 pub const Address = extern struct {
     pub const Incoming = extern struct {
@@ -36,34 +37,27 @@ pub const Address = extern struct {
         };
     }
 
-    pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
+    pub fn fromIpv6(address: std.net.Ip6Addr, port: u16, flowinfo: u32) @This() {
         return @This() {
             .length = @sizeOf(zio.backend.SockAddr.Ipv6),
-            .sockaddr = zio.backend.SockAddr.fromIpv6(address, port, flowinfo, scope),
+            .sockaddr = zio.backend.SockAddr.fromIpv6(@bitCast(u128, address.addr), port, flowinfo, address.scope_id),
         };
     }
 
-    pub fn parseIpv4(input: []const u8) ?u32 {
+    pub fn parseIpv4(input: []const u8) !u32 {
         if (input.len == 0)
             return 0;
         if (std.mem.eql(u8, input, "localhost"))
             return parseIpv4("127.0.0.1");
-
-        var pos = usize(0);
-        var bytes: [4]u8 = undefined;
-        for ([_]void{{}} ** 4) |_, index| {
-            const start = pos;
-            while (input[pos] >= '0' or input[pos] <= '9') : (pos += 1)
-                bytes[index] = (bytes[index] * 10) +% (input[pos] - '0');
-            if (pos == start or (index != 3 and input[pos] != '.'))
-                return null;
-        }
-
-        const result = @bitCast(u32, bytes);
-        return std.mem.nativeToBig(u32, result);
+        return std.net.parseIp4(input);
     }
 
-    pub fn parseIpv6(input: []const u8) ?u128 { 
-        return null; // TODO
+    pub fn parseIpv6(input: []const u8) !std.net.Ip6Addr { 
+        if (input.len != 0)
+            return std.net.parseIp6(input);
+        return std.net.Ip6Addr {
+            .scope_id = 0,
+            .addr = [_]u8 { 0 } ** 16,
+        };
     }
 };

@@ -131,7 +131,7 @@ pub const Socket = struct {
     }
 };
 
-test "Socket(Tcp) Ipv4 + Ipv6" {
+test "Socket(Tcp) Ipv4" {
     var rng = std.rand.DefaultPrng.init(0);
     const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
     try testBlockingTcp(Ipv4Address, port);
@@ -140,8 +140,9 @@ test "Socket(Tcp) Ipv4 + Ipv6" {
 
 const Ipv4Address = struct {
     pub const Flag = Socket.Ipv4;
-    pub fn new(port: u16) zio.Address {
-        const host = zio.Address.parseIpv4("127.0.0.1").?;
+
+    pub fn new(port: u16) !zio.Address {
+        const host = try zio.Address.parseIpv4("127.0.0.1");
         return zio.Address.fromIpv4(host, port);
     }
 
@@ -152,8 +153,9 @@ const Ipv4Address = struct {
 
 const Ipv6Address = struct {
     pub const Flag = Socket.Ipv6;
-    pub fn new(port: u16) zio.Address {
-        const host = zio.Address.parseIpv6("::1").?;
+
+    pub fn new(port: u16) !zio.Address {
+        const host = try zio.Address.parseIpv6("::1");
         return zio.Address.fromIpv6(host, port, 0, 0);
     }
 
@@ -188,7 +190,7 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     try client.connect(&AddressType.new(port), 0);
     
     // Accept the incoming client from the server
-    var incoming = zio.Address.Incoming.new(AddressType.new(undefined));
+    var incoming = try zio.Address.Incoming.new(AddressType.new(undefined));
     try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
     expect(AddressType.validate(incoming.address));
     var server_client = incoming.getSocket();

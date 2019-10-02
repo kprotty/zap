@@ -19,7 +19,7 @@ pub const Ipv6 = posix.Ipv6;
 pub const Event = struct {
     inner: linux.epoll_event,
 
-    pub fn readData(self: *@This(), poller: *Poller) usize {
+    pub fn readData(self: @This(), poller: *Poller) usize {
         if (self.inner.data.ptr != ~usize(0))
             return self.inner.data.ptr;
         var value: u64 = undefined;

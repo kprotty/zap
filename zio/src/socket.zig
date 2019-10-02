@@ -131,13 +131,6 @@ pub const Socket = struct {
     }
 };
 
-test "Socket(Tcp) Ipv4" {
-    var rng = std.rand.DefaultPrng.init(0);
-    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
-    try testBlockingTcp(Ipv4Address, port);
-    try testBlockingTcp(Ipv6Address, port);
-}
-
 const Ipv4Address = struct {
     pub const Flag = Socket.Ipv4;
 
@@ -163,6 +156,13 @@ const Ipv6Address = struct {
         return address.isIpv6();
     }
 };
+
+test "Socket (Tcp) Blocking Ipv4 + Ipv6" {
+    var rng = std.rand.DefaultPrng.init(0);
+    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
+    try testBlockingTcp(Ipv4Address, port);
+    try testBlockingTcp(Ipv6Address, port);
+}
 
 fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     // Create the server socket
@@ -212,4 +212,54 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     transferred = try client.recv(null, data_buffer[0..], 0);
     expect(transferred == data.len);
     expect(std.mem.eql(u8, data, input_data[0..]));
+}
+
+test "Socket (Tcp) Non-Blocking Ipv4 + Ipv6" {
+    var rng = std.rand.DefaultPrng.init(69420);
+    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
+    try testNonBlockingTcp(Ipv4Address, port);
+    try testNonBlockingTcp(Ipv6Address, port);
+}
+
+fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
+    // Create & setup the server socket
+    var server = try Socket.new(AddressType.Flag | Socket.Tcp | Socket.Nonblock);
+    defer server.close();
+    try server.setOption(Socket.Option { .Reuseaddr = true });
+    var address = try AddressType.new(port);
+    try server.bind(&address);
+    try server.listen(1);
+
+    // Setup an event poller & register the server socket on it
+    var poller = try zio.Event.Poller.new();
+    defer poller.close();
+    const flags = zio.Event.Readable | zio.Event.EdgeTrigger;
+    try poller.register(server.getHandle(), flags, @ptrToInt(&server));
+
+    // Setup a client and register it on the event poller.
+    // Force the send & recv buffers to be small so that IO is fragmented to showcase async.
+    var client = try Socket.new(AddressType.Flag | Socket.Tcp | Socket.Nonblock);
+    defer client.close();
+    try client.setOption(Socket.Option { .SendBufMax = 2048 });
+    try client.setOption(Socket.Option { .RecvBufMax = 2048 });
+
+    // Try and connect the client to the server non-blocking-ly
+    var client_connected = true;
+    var client_received: usize = 0;
+    var client_buffer: [64]u8 = undefined;
+    address = try AddressType.new(port);
+    _ = client.connect(&address, 0) catch |err| switch (err) {
+        zio.ErrorPending => client_connected = false,
+        else => return err,
+    };
+    const conn_flags = if (!client_connected) zio.Event.Writeable else 0;
+    try poller.register(client.getHandle(), flags | conn_flags, @ptrToInt(&client));
+
+    // Setup the server client which will send data to the client
+    const data = "X" ** (64 * 1024);
+    var server_client_sent: usize = 0;
+    var server_client: Socket = undefined;
+    var server_client_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
+    
+    
 }

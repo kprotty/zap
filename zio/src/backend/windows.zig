@@ -76,11 +76,11 @@ pub const SockAddr = struct {
 pub const Event = struct {
     inner: OVERLAPPED_ENTRY,
     
-    pub fn getToken(self: *@This()) usize {
+    pub fn getToken(self: @This()) usize {
         return @ptrToInt(self.inner.lpOverlapped);
     }
 
-    pub fn readData(self: *@This(), poller: *Poller) usize {
+    pub fn readData(self: @This(), poller: *Poller) usize {
         return self.inner.lpCompletionKey;
     }
 

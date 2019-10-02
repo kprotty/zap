@@ -16,7 +16,7 @@ pub const Event = struct {
         return self.inner.getToken();
     }
 
-    pub fn readData(self: *@This(), poller: *Poller) usize {
+    pub fn readData(self: @This(), poller: *Poller) usize {
         return self.inner.readData(&poller.inner);
     }
 

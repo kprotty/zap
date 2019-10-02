@@ -11,7 +11,9 @@ pub fn build(b: *std.build.Builder) void {
     };
 
     const test_all_step = b.step("test", "Run all tests");
-    inline for (modules) |module| {
+    inline for ([_][]const u8 {
+        "zio"
+    }) |module| {
         const tests = b.addTest(module ++ "/" ++ module ++ ".zig");
         inline for (modules) |mod|
             tests.addPackagePath(mod, mod ++ "/" ++ mod ++ ".zig");

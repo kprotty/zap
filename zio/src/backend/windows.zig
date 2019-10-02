@@ -72,6 +72,77 @@ pub const SockAddr = struct {
     }
 };
 
+pub const Event = struct {
+    inner: OVERLAPPED_ENTRY,
+    
+    pub fn getToken(self: *@This()) usize {
+        return @ptrToInt(self.inner.lpOverlapped);
+    }
+
+    pub fn readData(self: *@This(), poller: *Poller) usize {
+        return self.inner.lpCompletionKey;
+    }
+
+    pub const Poller = struct {
+        iocp: Handle,
+
+        pub fn new() zio.Event.Poller.Error!@This() {
+            const handle = windows.kernel32.CreateIoCompletionPort(windows.INVALID_HANDLE_VALUE, null, undefined, 0)
+                orelse return windows.unexpectedError(windows.kernel32.GetLastError());
+            return @This() { .iocp = handle };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = windows.CloseHandle(self.iocp);
+        }
+
+        pub fn fromHandle(handle: zio.Handle) @This() {
+            return @This() { .iocp = handle };
+        }
+
+        pub fn getHandle(self: @This()) zio.Handle {
+            return self.iocp;
+        }
+
+        pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            if (handle == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.RegisterError.InvalidHandle;
+            _ = windows.kernel32.CreateIoCompletionPort(handle, self.iocp, data, 0)
+                orelse return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+
+        pub fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            if (handle == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.RegisterError.InvalidHandle;
+        }
+
+        pub fn notify(self: *@This(), data: usize) zio.Event.Poller.NotifyError!void {
+            if (windows.kernel32.PostQueuedCompletionStatus(self.iocp, 0, data, null) != windows.TRUE)
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+
+        pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
+            var events_found: windows.ULONG = 0;
+            if (GetQueuedCompletionStatusEx(
+                self.iocp,
+                @ptrCast([*]OVERLAPPED_ENTRY, events.ptr),
+                @intCast(windows.ULONG, events.len),
+                &events_found,
+                if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,
+                windows.FALSE,
+            ) == windows.TRUE)
+                return events[0..events_found];
+
+            const err_code = windows.kernel32.GetLastError();
+            if (self.iocp == windows.INVALID_HANDLE_VALUE)
+                return zio.Event.Poller.PollError.InvalidHandle;
+            if (timeout == null or err_code == WAIT_TIMEOUT)
+                return events[0..0];
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+    };
+};
+
 pub const Socket = struct {
     handle: Handle,
     reader: windows.OVERLAPPED,
@@ -80,6 +151,8 @@ pub const Socket = struct {
     pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
         if (init_error.get()) |err|
             return err;
+        
+        // TODO
     }
 
     pub fn close(self: *@This()) void {

@@ -75,7 +75,6 @@ pub const Socket = struct {
     };
 
     pub fn bind(self: *@This(), address: *const zio.Address) BindError!void {
-        std.debug.warn("Binding to {}\n", address.sockaddr.in.sin_port)
         return self.inner.bind(address);
     }
 
@@ -136,7 +135,7 @@ const Ipv4Address = struct {
     pub const Flag = Socket.Ipv4;
 
     pub fn new(port: u16) !zio.Address {
-        const host = try zio.Address.parseIpv4("127.0.0.1");
+        const host = try zio.Address.parseIpv4("localhost");
         return zio.Address.fromIpv4(host, port);
     }
 
@@ -150,7 +149,7 @@ const Ipv6Address = struct {
 
     pub fn new(port: u16) !zio.Address {
         const host = try zio.Address.parseIpv6("::1");
-        return zio.Address.fromIpv6(host, port, 0, );
+        return zio.Address.fromIpv6(host, port, 0);
     }
 
     pub fn validate(address: zio.Address) bool {
@@ -159,7 +158,7 @@ const Ipv6Address = struct {
 };
 
 test "Socket (Tcp) Blocking Ipv4 + Ipv6" {
-    var rng = std.rand.DefaultPrng.init(42069);
+    var rng = std.rand.DefaultPrng.init(11111111);
     try testBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
     try testBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }
@@ -215,67 +214,174 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
 }
 
 test "Socket (Tcp) Non-Blocking Ipv4 + Ipv6" {
-    var rng = std.rand.DefaultPrng.init(69420);
+    var rng = std.rand.DefaultPrng.init(222222222);
     try testNonBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
     try testNonBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }
 
 fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
-    // Create & setup the server socket
-    var server = try Socket.new(AddressType.Flag | Socket.Tcp | Socket.Nonblock);
-    defer server.close();
-    try server.setOption(Socket.Option { .Reuseaddr = true });
-    var address = try AddressType.new(port);
-    try server.bind(&address);
-    try server.listen(1);
+    const data = "X" ** (5 * 1024);
+    const flags = AddressType.Flag | Socket.Tcp | Socket.Nonblock;
 
-    // Setup an event poller & register the server socket on it
+    const Server = struct {
+        server: zio.Socket,
+        client: zio.Socket,
+        client_sent: usize,
+        send_buffer: [1]zio.ConstBuffer,
+        incoming: zio.Address.Incoming,
+
+        pub fn init(self: *@This(), poller: *zio.Event.Poller, addr_port: u16) !void {
+            // Setup the server socket and register for Readable (incoming socket) & EdgeTrigger (dont reregister) events
+            self.server = try Socket.new(flags);
+            errdefer self.close();
+            try self.server.setOption(Socket.Option { .Reuseaddr = true });
+            var address = try AddressType.new(addr_port);
+            try self.server.bind(&address);
+            try self.server.listen(1);
+            try poller.register(
+                self.server.getHandle(),
+                zio.Event.Readable | zio.Event.EdgeTrigger,
+                @ptrToInt(&self.server),
+            );
+
+            // Start accepting an incoming socket
+            self.incoming = zio.Address.Incoming.new(try AddressType.new(addr_port));
+            self.send_buffer[0] = zio.ConstBuffer.fromBytes(data);
+            self.client_sent = 0;
+            try self.handle_server(0, poller);
+        }
+
+        pub fn close(self: *@This()) void {
+            self.server.close();
+            self.client.close();
+        }
+
+        pub fn handle_server(self: *@This(), token: usize, poller: *zio.Event.Poller) !void {
+            // Accept the incoming client
+            _ = self.server.accept(flags, &self.incoming, token) catch |err| switch(err) {
+                zio.ErrorPending => return,
+                else => return err,
+            };
+            expect(AddressType.validate(self.incoming.address));
+
+            // Setup the client & start sending data (see Client struct below)
+            // Since all this client will do is send data, register for Writeable & EdgeTrigger for reason above.
+            self.client = self.incoming.getSocket();
+            try self.client.setOption(Socket.Option { .SendBufMax = 2048 });
+            try self.client.setOption(Socket.Option { .RecvBufMax = 2048 });
+            try poller.register(
+                self.client.getHandle(),
+                zio.Event.Writeable | zio.Event.EdgeTrigger,
+                @ptrToInt(&self.client),
+            );
+            try self.handle_client(0, poller);
+        }
+
+        pub fn handle_client(self: *@This(), io_token: usize, poller: *zio.Event.Poller) !void {
+            // Keep sending data until its all received on the client side
+            var token = io_token;
+            while (self.client_sent < data.len) {
+                self.send_buffer[0] = zio.ConstBuffer.fromBytes(data[0..(data.len - self.client_sent)]);
+                self.client_sent += self.client.send(null, self.send_buffer[0..], token) catch |err| switch(err) {
+                    zio.ErrorPending, zio.ErrorClosed => return,
+                    else => return err,
+                };
+                token = 0;
+            }
+        }
+    };
+
+    const Client = struct {
+        socket: zio.Socket,
+        received: usize,
+        buffer: [2048]u8,
+        connected: bool,
+        recv_buffer: [1]zio.Buffer,
+
+        // Create a client socket and start doing IO
+        // Set the socket buffers as small as possible to force many fragmented reads to test non blocking.
+        // Also start off with being registered for Writeable since that is equivalent to a Connect event.
+        pub fn new(self: *@This(), poller: *zio.Event.Poller, addr_port: u16) !void {
+            self.socket = try Socket.new(flags);
+            errdefer self.close();
+            try self.socket.setOption(Socket.Option { .SendBufMax = 2048 });
+            try self.socket.setOption(Socket.Option { .RecvBufMax = 2048 });
+            try poller.register(
+                self.socket.getHandle(),
+                zio.Event.Writeable | zio.Event.EdgeTrigger,
+                @ptrToInt(&self.socket),
+            );
+            
+            self.received = 0;
+            self.connected = false;
+            self.recv_buffer[0] = zio.Buffer.fromBytes(self.buffer[0..]);
+            try self.handle(0, poller, addr_port);
+        }
+
+        pub fn close(self: *@This()) void {
+            self.socket.close();
+        }
+
+        pub fn handle(self: *@This(), event_token: usize, poller: *zio.Event.Poller, addr_port: u16) !void {
+            var token = event_token;
+            // First, connect to the server socket
+            while (!self.connected) {
+                var address = try AddressType.new(addr_port);
+                _ = self.socket.connect(&address, token) catch |err| switch(err) {
+                    zio.ErrorPending => return,
+                    else => return err,
+                };
+                self.connected = true;
+                try poller.reregister(
+                    self.socket.getHandle(),
+                    zio.Event.Readable | zio.Event.EdgeTrigger,
+                    @ptrToInt(&self.socket),
+                );
+                token = 0;
+            }
+
+            // Then, start receiving data from the server
+            // Handle ErrorInvalidToken since events could be for writer instead of reader
+            while (self.received < data.len) {
+                self.received += self.socket.recv(null, self.recv_buffer[0..], token) catch |err| switch (err) {
+                    zio.ErrorPending => return,
+                    else => return err,
+                };
+                token = 0;
+            }
+        }
+    };
+
+    // Create the event poller, server and client
+    var server: Server = undefined;
+    var client: Client = undefined;
     var poller = try zio.Event.Poller.new();
     defer poller.close();
-    const flags = zio.Event.Readable | zio.Event.EdgeTrigger;
-    try poller.register(server.getHandle(), flags, @ptrToInt(&server));
-
-    // Setup a client and register it on the event poller.
-    // Force the send & recv buffers to be small so that IO is fragmented to showcase async.
-    var client = try Socket.new(AddressType.Flag | Socket.Tcp | Socket.Nonblock);
+    try server.init(&poller, port);
+    defer server.close();
+    try client.new(&poller, port);
     defer client.close();
-    try client.setOption(Socket.Option { .SendBufMax = 2048 });
-    try client.setOption(Socket.Option { .RecvBufMax = 2048 });
 
-    // Try and connect the client to the server non-blocking-ly
-    var client_connected = true;
-    var client_received: usize = 0;
-    var client_buffer: [64]u8 = undefined;
-    address = try AddressType.new(port);
-    _ = client.connect(&address, 0) catch |err| switch (err) {
-        zio.ErrorPending => client_connected = false,
-        else => return err,
-    };
-    const conn_flags = if (!client_connected) zio.Event.Writeable else 0;
-    try poller.register(client.getHandle(), flags | conn_flags, @ptrToInt(&client));
-
-    // Setup the server client which will send data to the client
-    const data = "X" ** (64 * 1024);
-    var server_client_sent: usize = 0;
-    var server_client: Socket = undefined;
-    var server_client_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
-    
-    // process the data through async events
+    // listen and process events
     var events: [64]zio.Event = undefined;
-    while (server_client_sent < data.len or client_received < data.len) {
-        for (try poller.poll(events[0..], null)) |event| {
+    while (server.client_sent < data.len or client.received < data.len) {
+        const socket_events = try poller.poll(events[0..], 2000);
+        if (socket_events.len == 0)
+            return error.EventPollTimedOut;
+
+        // dispatched based on the data registered by the poller
+        for (socket_events) |event| {
             const user_data = event.readData(&poller);
-
-            // handle the incoming client as the server_client
-            if (user_data == @ptrToInt(&server)) {
-            
-            // handle sending data from the server_client to the client
-            } else if (user_data == @ptrToInt(&server_client)) {
-            
-            // handle receiving data from the server_client on the client
-            } else if (user_data == @ptrToInt(&client)) {
-
+            if (user_data == @ptrToInt(&server.server)) {
+                try server.handle_server(event.getToken(), &poller);
+            } else if (user_data == @ptrToInt(&server.client)) {
+                try server.handle_client(event.getToken(), &poller);
+            } else if (user_data == @ptrToInt(&client.socket)) {
+                try client.handle(event.getToken(), &poller, port);
             }
         }
     }
+
+    expect(server.client_sent == data.len);
+    expect(client.received == data.len);
 }

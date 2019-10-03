@@ -75,6 +75,7 @@ pub const Socket = struct {
     };
 
     pub fn bind(self: *@This(), address: *const zio.Address) BindError!void {
+        std.debug.warn("Binding to {}\n", address.sockaddr.in.sin_port)
         return self.inner.bind(address);
     }
 
@@ -158,10 +159,9 @@ const Ipv6Address = struct {
 };
 
 test "Socket (Tcp) Blocking Ipv4 + Ipv6" {
-    var rng = std.rand.DefaultPrng.init(0);
-    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
-    try testBlockingTcp(Ipv4Address, port);
-    try testBlockingTcp(Ipv6Address, port);
+    var rng = std.rand.DefaultPrng.init(42069);
+    try testBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
+    try testBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }
 
 fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
@@ -216,9 +216,8 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
 
 test "Socket (Tcp) Non-Blocking Ipv4 + Ipv6" {
     var rng = std.rand.DefaultPrng.init(69420);
-    const port = rng.random.intRangeLessThanBiased(u16, 1024, 65535);
-    try testNonBlockingTcp(Ipv4Address, port);
-    try testNonBlockingTcp(Ipv6Address, port);
+    try testNonBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
+    try testNonBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }
 
 fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
@@ -261,5 +260,22 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
     var server_client: Socket = undefined;
     var server_client_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
     
-    
+    // process the data through async events
+    var events: [64]zio.Event = undefined;
+    while (server_client_sent < data.len or client_received < data.len) {
+        for (try poller.poll(events[0..], null)) |event| {
+            const user_data = event.readData(&poller);
+
+            // handle the incoming client as the server_client
+            if (user_data == @ptrToInt(&server)) {
+            
+            // handle sending data from the server_client to the client
+            } else if (user_data == @ptrToInt(&server_client)) {
+            
+            // handle receiving data from the server_client on the client
+            } else if (user_data == @ptrToInt(&client)) {
+
+            }
+        }
+    }
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zap").zio;
 
+const c = std.c;
 const os = std.os;
 const system = os.system;
 
@@ -74,6 +75,138 @@ pub const SockAddr = extern struct {
             }
         };
     }
+};
+
+pub const Event = struct {
+    inner: os.Kevent,
+
+    pub fn readData(self: @This(), poller: *Poller) usize {
+        return self.inner.udata;
+    }
+
+    pub fn getToken(self: @This()) usize {
+        var token: usize = 0;
+        if ((self.inner.flags & (os.EV_EOF | os.EV_ERROR)) != 0)
+            token |= zio.Event.Disposable;
+        return token | switch (self.inner.filter) {
+            os.EVFILT_WRITE => zio.Event.Writeable,
+            os.EVFILT_READ => zio.Event.Readable,
+            os.EVFILT_USER => 0,
+            else => unreachable,
+        };
+    }
+
+    pub const Poller = struct {
+        kqueue: Handle,
+
+        pub fn new() zio.Event.Poller.Error!@This() {
+            const handle = c.kqueue();
+            return switch (os.errno(handle)) {
+                0 => @This() { .handle = handle },
+                os.EMFILE, os.ENFILE, os.ENOMEM => zio.Event.Poller.Error.OutOfResources,
+                else => unreachable,
+            };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = c.close(self.kqueue);
+        }
+
+        pub fn getHandle(self: @This()) zio.Handle {
+            return self.kqueue;
+        }
+
+        pub fn fromHandle(handle: zio.Handle) @This() {
+            return @This() { .kqueue = handle };
+        }
+
+        pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            var num_events: usize = 0;
+            var events: [2]os.Kevent = undefined;
+
+            events[0].flags = os.EV_ADD | if ((flags & zio.Event.OneShot) != 0) os.EV_ONESHOT else os.EV_CLEAR;
+            events[0].ident = @intCast(usize, handle);
+            events[0].udata = data;
+            events[0].fflags = 0;
+            events[1] = events[0];
+            
+            if ((flags & zio.Event.Readable) != 0) {
+                events[num_events].filter = os.EVFILT_READ;
+                num_events += 1;
+            }
+            if ((flags & zio.Event.Writeable) != 0) {
+                events[num_events].filter = os.EVFILT_WRITE;
+                num_events += 1;
+            }
+            if (num_events == 0)
+                return zio.Event.Poller.RegisterError.InvalidValue;
+            return self.kevent(events[0..num_events], ([*]os.Kevent)(undefined)[0..0], null);
+        }
+
+        pub fn reregister(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
+            return self.register(handle, flags, data);
+        }
+
+        pub fn notify(self: *@This(), data: usize) zio.Event.Poller.NotifyError!void {
+            var events: [1]os.Kevent = undefined;
+            events[0] = os.Kevent {
+                .data = 0,
+                .flags = 0,
+                .udata = data,
+                .filter = os.EVFILT_USER,
+                .fflags = os.NOTE_TRIGGER,
+                .ident = @intCast(usize, self.kqueue),
+            };
+
+            return self.kevent(events[0..], ([*]os.Kevent)(undefined)[0..0], null) catch |err| switch (err) {
+                .InvalidEvents => unreachable,
+                else => |err| err,
+            };
+        }
+
+        pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
+            const empty_set = ([*]os.Kevent)(undefined)[0..0];
+            const event_set = @ptrCast([*]os.Kevent, events.ptr)[0..events.len];
+            return self.kevent(empty_set, event_set, timeout);
+        }
+
+        pub fn poll(self: *@This(), events: []Event, timeout: ?u32) zio.Event.Poller.PollError![]Event {
+            const timeout_ms = if (timeout) |t| @intCast(i32, t) else -1;
+            const events_ptr = @ptrCast([*]linux.epoll_event, events.ptr);
+            while (true) {
+                const events_found = linux.epoll_wait(self.epoll_fd, events_ptr, @intCast(u32, events.len), timeout_ms);
+                switch (linux.getErrno(events_found)) {
+                    0 => return events[0..events_found],
+                    linux.EBADF, linux.EINVAL => return zio.Event.Poller.PollError.InvalidHandle,
+                    linux.EFAULT => return zio.Event.Poller.PollError.InvalidEvents,
+                    linux.EINTR => continue,
+                    else => unreachable,
+                }
+            }
+        }
+
+        fn kevent(self: *@This(), change_set: []os.Kevent, event_set: []os.Kevent, timeout: ?u32) zio.Event.Poller.PollError!usize {
+            var ts: os.timespec = undefined;
+            var ts_ptr: ?*os.timespec = null;
+            if (timeout) |timeout_ms| {
+                ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+                ts.tv_sec = timeout_ms / 1000;
+                ts_ptr = &ts;
+            }
+
+            while (true) {
+                const events_found = os.kevent(self.kqueue, change_set.ptr, change_set.len, event_set.ptr, event_set.len, ts_ptr);
+                switch (os.errno(events_found)) {
+                    0 => return event_set[0..events_found],
+                    os.EACCES, os.EFAULT, os.ENOENT, os.ENOMEM => return zio.Event.Poller.PollError.InvalidEvents,
+                    os.ESRCH, os.EBADF => return zio.Event.Poller.PollError.InvalidHandle,
+                    os.EINVAL => unreachable,
+                    os.EINTR => continue,
+                    else => unreachable,
+                }
+            }
+        }
+    };
 };
 
 pub const Socket = struct {

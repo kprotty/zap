@@ -92,15 +92,15 @@ pub const Socket = struct {
         var protocol: u32 = 0;
         var sock_type: u32 = 0;
         if ((flags & zio.Socket.Nonblock) != 0)
-            sock_type = os.SOCK_NONBLOCK;
+            sock_type |= os.SOCK_NONBLOCK;
         if ((flags & zio.Socket.Tcp) != 0) {
-            protocol = Options.IPPROTO_TCP;
-            sock_type = os.SOCK_STREAM;
+            protocol |= Options.IPPROTO_TCP;
+            sock_type |= os.SOCK_STREAM;
         } else if ((flags & zio.Socket.Udp) != 0) {
-            protocol = Options.IPPROTO_UDP;
-            sock_type = os.SOCK_DGRAM;
+            protocol |= Options.IPPROTO_UDP;
+            sock_type |= os.SOCK_DGRAM;
         } else if ((flags & zio.Socket.Raw) != 0) {
-            sock_type = os.SOCK_RAW;
+            sock_type |= os.SOCK_RAW;
         }
         
         const handle = CreateSocket(domain, sock_type | os.SOCK_CLOEXEC, protocol);

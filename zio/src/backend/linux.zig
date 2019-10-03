@@ -27,7 +27,7 @@ pub const Event = struct {
         return if (bytes == @sizeOf(@typeOf(value))) @truncate(usize, value) else 0;
     }
 
-    pub fn getToken(self: *@This()) usize {
+    pub fn getToken(self: @This()) usize {
         var token: usize = 0;
         if ((self.inner.events & linux.EPOLLIN) != 0)
             token |= zio.Event.Readable;

@@ -317,7 +317,6 @@ pub const Socket = struct {
         if ((self.sock_flags & zio.Socket.Nonblock) == 0) {
             if (Mswsock.connect(self.handle, @ptrCast(*const SOCKADDR, &address.ip), address.len) == 0)
                 return zio.Result { .status = .Completed, .data = 0 };
-            std.debug.warn("\n{}\n", WSAGetLastError());
             return switch (WSAGetLastError()) {
                 WSAENOTINITIALIZED, WSAENETDOWN, WSAEADDRINUSE, WSAEINTR,
                 WSAEINPROGRESS, WSAEALREADY, WSAEADDRNOTAVAIL, WSAEAFNOTSUPPORT,

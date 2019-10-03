@@ -266,7 +266,7 @@ pub const Socket = struct {
 
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
         return switch (error_code: {
-            switch (self.getOverlappedResult(&self.writer, token)) {
+            switch (try self.getOverlappedResult(&self.writer, token)) {
                 .Completed => |_| return,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
@@ -312,12 +312,13 @@ pub const Socket = struct {
         Retry: ?*windows.OVERLAPPED,
     };
 
-    fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) OverlappedResult {
-        std.debug.assert(token == 0 or token == @ptrToInt(overlapped));
+    fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) zio.Error!OverlappedResult {
         if (token == @ptrToInt(overlapped)) {
             if (overlapped.Internal == STATUS_SUCCESS)
                 return OverlappedResult { .Completed = overlapped.InternalHigh };
             return OverlappedResult { .Error = @intCast(c_int, overlapped.Internal) };
+        } else if (token != 0) {
+            return zio.ErrorInvalidToken;
         }
 
         const use_overlapped = (@ptrToInt(self.handle) & is_overlapped) != 0;

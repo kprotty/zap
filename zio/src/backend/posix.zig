@@ -291,21 +291,21 @@ pub const Socket = struct {
     }
 
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
-        std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
         if ((token & zio.Event.Writeable) != 0) {
-            var errno_len: c_int = undefined;
             var errno_value: c_int = undefined;
+            var errno_len: c_int = @sizeOf(@typeOf(errno_value));
             if (Getsockopt(self.handle, Options.SOL_SOCKET, Options.SO_ERROR, @ptrToInt(&errno_value), &errno_len) != 0)
                 return zio.Socket.ConnectError.InvalidHandle;
-            if (errno_value <= 0)
+            if (errno_value == 0)
                 return;
-            _ = try getConnectError(@intCast(u16, errno_value));
+            _ = try getConnectError(@intCast(u16, -errno_value));
+        } else if (token != 0) {
+            return zio.ErrorInvalidToken;
         }
 
-        while (getConnectError(errno(Connect(self.handle, address))) catch |err| return err)
-            {}
+        while (try getConnectError(errno(Connect(self.handle, address)))) {}
     }
 
     fn getConnectError(errno_value: u16) zio.Socket.ConnectError!bool {
@@ -324,9 +324,10 @@ pub const Socket = struct {
     }
 
     pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
-        std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
+        if (token != 0 and (token & zio.Event.Readable) == 0)
+            return zio.ErrorInvalidToken;
 
         while (true) {
             const fd = Accept(self.handle, flags, &incoming.address);
@@ -347,16 +348,18 @@ pub const Socket = struct {
     }
 
     pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
-        std.debug.assert(token == 0 or (token & zio.Event.Readable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
+        if (token != 0 and (token & zio.Event.Readable) == 0)
+            return zio.ErrorInvalidToken;
         return transfer(self.handle, address, buffers, Recvmsg);
     }
 
     pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
-        std.debug.assert(token == 0 or (token & zio.Event.Writeable) != 0);
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
+        if (token != 0 and (token & zio.Event.Writeable) == 0)
+            return zio.ErrorInvalidToken;
         return transfer(self.handle, address, buffers, Sendmsg);
     }
 

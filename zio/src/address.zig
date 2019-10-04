@@ -1,6 +1,7 @@
 const std = @import("std");
-const zio = @import("zap").zio;
 const expect = std.testing.expect;
+
+const zio = @import("zap").zio;
 
 pub const Address = extern struct {
     pub const Incoming = extern struct {

@@ -2,9 +2,8 @@ const std = @import("std");
 const posix = @import("posix.zig");
 const builtin = @import("builtin");
 
-const zap = @import("zap");
-const zuma = zap.zuma;
-const zync = zap.zync;
+const zync = @import("zap").zync;
+const zuma = @import("zap").zuma;
 
 const os = std.os;
 const linux = os.linux;

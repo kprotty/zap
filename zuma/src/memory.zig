@@ -1,5 +1,5 @@
 const std = @import("std");
-const zync = @import("zync");
+const zync = @import("zap").zync;
 
 /// Constant representing assumed page size
 pub const page_size = std.os.page_size;

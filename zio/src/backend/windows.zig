@@ -1,9 +1,8 @@
 const std = @import("std");
-const zap = @import("zap");
 const posix = @import("posix.zig");
 
-const zio = zap.zio;
-const zync = zap.zync;
+const zio = @import("zap").zio;
+const zync = @import("zap").zync;
 const windows = std.os.windows;
 
 pub const Handle = windows.HANDLE;

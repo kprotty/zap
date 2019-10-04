@@ -1,7 +1,8 @@
 const std = @import("std");
-const zio = @import("../zio.zig");
-const zuma = @import("zap").zuma;
 const expect = std.testing.expect;
+
+const zio = @import("zap").zio;
+const zuma = @import("zap").zuma;
 
 pub const Socket = struct {
     inner: zio.backend.Socket,

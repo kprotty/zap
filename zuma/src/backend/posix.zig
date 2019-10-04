@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zuma = @import("zuma");
-const zync = @import("zync");
+
+const zuma = @import("zap").zuma;
+const zync = @import("zap").zync;
 
 const os = std.os;
 const system = os.system;

@@ -1,9 +1,8 @@
 const std = @import("std");
 const expect = std.testing.expect;
 
-const zap = @import("zap");
-const zuma = zap.zuma;
-const zio = zap.zio;
+const zio = @import("zap").zio;
+const zuma = @import("zap").zuma;
 
 pub const Event = struct {
     inner: zio.backend.Event,

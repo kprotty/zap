@@ -70,6 +70,34 @@ pub const CpuSet = struct {
     }
 
     pub fn getNodeCount() usize {
+        // unsure how to get numa nodes on other platforms
+        if (builtin.os != .linux)
+            return usize(1);
+
+        var node_count: usize = 0;
+        var start: usize = undefined;
+        var stop:  usize = undefined;
+        var buffer: [128]u8 = undefined;
+
+        // nodes in online mapped are of the format "{node_start}-{node_end}" iirc.
+        var data = readFile(c"/sys/devices/system/node/online", buffer[0..]) catch return 1;
+        while (readRange(&data, &start, &stop))
+            node_count += (stop + 1) - start;
+        return node_count;
+    }
+
+    pub fn getNodeSize(numa_node: usize) usize {
+        // TODO
+        switch (builtin.os) {
+            .linux => {
+
+            },
+        }
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////
+
+    pub fn getNodeCount() usize {
         if (builtin.os != .linux)
             return 1;
         var buffer: [64]u8 = undefined;
@@ -111,7 +139,7 @@ pub const CpuSet = struct {
         const bits = count % Bits;
         const bytes = count / Bits;
         if (bytes > 0)
-            @memset(@ptrCast([*]u8, self.bitmask.ptr), 0xff, bytes);
+            @memset(@ptrCast([*]u8, self.bitmask.ptr), ~u8(0), bytes);
         if (bits > 0)
             self.bitmask[bytes] |= (Type(1) << @truncate(zync.shrType(Type), bits)) - 1;
     }

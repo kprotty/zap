@@ -32,6 +32,15 @@ pub const CpuSet = struct {
     pub fn getNodeCount() usize {
         return self.inner.getNodeCount();
     }
+
+    pub fn getNodeSize(numa_node: usize) usize {
+        return self.inner.getNodeSize();
+    }
+};
+
+pub const ClockType = enum {
+    Monotonic,
+    Realtime,
 };
 
 pub const Thread = struct {
@@ -39,9 +48,8 @@ pub const Thread = struct {
 
     // NOTE: Because of linux VDSO shenanigans (https://marcan.st/2017/12/debugging-an-evil-go-runtime-bug/)
     ///      One should ensure that the stack of this function call has at least 1-2 pages of owned memory.
-    pub const ClockTime = enum { Monotonic, Realtime };
-    pub fn now(clock_time: ClockTime) u64 {
-        return zuma.backend.Thread.now(clock_time == .Monotonic);
+    pub fn now(clock_type: ClockType) u64 {
+        return zuma.backend.Thread.now(clock_type == .Monotonic);
     }
 
     pub fn sleep(ms: u32) void {

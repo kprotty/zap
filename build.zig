@@ -15,6 +15,8 @@ pub fn build(b: *std.build.Builder) void {
         const test_package = b.addTest(package ++ "/" ++ package ++ ".zig");
         test_package.setBuildMode(build_mode);
         test_package.addPackagePath("zap", "zap.zig");
+        inline for (packages) |pkg|
+            test_package.addPackagePath(pkg, pkg ++ "/" ++ pkg ++ ".zig");
         test_step.dependOn(&test_package.step);
     }
 

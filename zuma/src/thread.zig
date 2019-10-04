@@ -1,7 +1,8 @@
 const std = @import("std");
 const expect = std.testing.expect;
-const zuma = @import("../zuma.zig");
-const zync = @import("../../zap.zig").zync;
+
+const zync = @import("zync");
+const zuma = @import("zap").zuma;
 
 pub const CpuType = enum { 
     Physical,
@@ -148,3 +149,15 @@ pub const Thread = struct {
     }
 };
 
+test "Thread - random, now, sleep" {
+    expect(Thread.Random.getPtr().random.uintAtMostBiased(usize, 10) <= 10);
+    expect(Thread.now(.Realtime) > 0);
+
+    const delay_ms = 200;
+    const threshold_ms = 200;
+
+    const now = Thread.now(.Monotonic);
+    Thread.sleep(delay_ms);
+    const elapsed = Thread.now(.Monotonic) - now;
+    expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
+}

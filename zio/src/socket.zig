@@ -1,5 +1,6 @@
 const std = @import("std");
-const zio = @import("zap").zio;
+const zio = @import("../zio.zig");
+const zuma = @import("zap").zuma;
 const expect = std.testing.expect;
 
 pub const Socket = struct {
@@ -158,7 +159,7 @@ const Ipv6Address = struct {
 };
 
 test "Socket (Tcp) Blocking Ipv4 + Ipv6" {
-    var rng = std.rand.DefaultPrng.init(11111111);
+    const rng = zuma.Thread.Random.getPtr();
     try testBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
     try testBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }
@@ -214,7 +215,7 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
 }
 
 test "Socket (Tcp) Non-Blocking Ipv4 + Ipv6" {
-    var rng = std.rand.DefaultPrng.init(222222222);
+    const rng = zuma.Thread.Random.getPtr();
     try testNonBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
     try testNonBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
 }

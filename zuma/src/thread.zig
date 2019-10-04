@@ -1,5 +1,6 @@
 const std = @import("std");
-const zuma = @import("zuma");
+const zuma = @import("zap").zuma;
+const expect = std.testing.expect;
 
 pub const CpuType = enum { 
     Physical,
@@ -13,30 +14,82 @@ pub const CpuSet = struct {
         std.mem.secureZero(@This(), @ptrCast([*]@This(), self)[0..1]);
     }
 
-    pub fn set(self: *@This(), index: usize, value: bool) ?void {
+    pub const IndexError = error {
+        InvalidCpu,
+    };
+
+    pub fn set(self: *@This(), index: usize, value: bool) IndexError!void {
         return self.inner.set(index, value);
     }
 
-    pub fn get(self: @This(), index: usize) ?bool {
+    pub fn get(self: @This(), index: usize) IndexError!bool {
         return self.inner.get(index);
     }
 
-    pub fn size(self: @This()) usize {
-        return self.inner.size();
+    pub fn count(self: @This()) usize {
+        return self.inner.count();
     }
 
-    pub fn getCpus(self: *@This(), numa_node: ?usize, cpu_type: CpuType) void {
-        return self.inner.getCpus(numa_node, cpu_type == .Physical);
-    }
+    pub const NodeError = error {
+        InvalidNode,
+        SystemResourceAccess,
+    };
 
     pub fn getNodeCount() usize {
-        return self.inner.getNodeCount();
+        return zuma.backend.CpuSet.getNodeCount();
     }
 
-    pub fn getNodeSize(numa_node: usize) usize {
-        return self.inner.getNodeSize();
+    pub fn getNodeSize(numa_node: usize) NodeError!usize {
+        return zuma.backend.CpuSet.getNodeSize(numa_node);
+    }
+
+    pub const CpuError = IndexError || NodeError;
+
+    pub fn getCpus(self: *@This(), numa_node: ?usize, cpu_type: CpuType) CpuError!void {
+        return self.inner.getCpus(numa_node, cpu_type == .Physical);
     }
 };
+
+test "CpuSet" {
+    // test basic cpu_set functionality
+    var cpu_set: CpuSet = undefined;
+    cpu_set.clear();
+    try cpu_set.set(1, true);
+    expect(cpu_set.count() == 1);
+    expect((try cpu_set.get(1)) == true);
+    try cpu_set.set(1, false);
+    expect((try cpu_set.get(1)) == false);
+
+    // test fetching logical cpus
+    try cpu_set.getCpus(null, .Logical);
+    const logical_count = cpu_set.count();
+    expect(logical_count > 0);
+    cpu_set.clear();
+
+    // test fetching physical cpus
+    try cpu_set.getCpus(null, .Physical);
+    const physical_count = cpu_set.count();
+    expect(physical_count <= logical_count);
+    cpu_set.clear();
+    
+    // test fetching invalid numa nodes
+    if (cpu_set.getCpus(999999, .Logical)) |_| unreachable
+    else |err| switch (err) {
+        CpuSet.NodeError.InvalidNode => expect(cpu_set.count() == 0),
+        else => return err,
+    }
+
+    // test fetching numa node count & node memory size
+    expect(CpuSet.getNodeCount() > 0);
+    expect((try CpuSet.getNodeSize(0)) > 0);
+
+    // test fetching invalid numa node memory size
+    if (CpuSet.getNodeSize(999999)) |_| unreachable
+    else |err| switch (err) {
+        CpuSet.NodeError.InvalidNode => {},
+        else => return err,
+    }
+}
 
 pub const ClockType = enum {
     Monotonic,

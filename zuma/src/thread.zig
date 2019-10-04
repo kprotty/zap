@@ -1,6 +1,7 @@
 const std = @import("std");
-const zuma = @import("../zuma.zig");
 const expect = std.testing.expect;
+const zuma = @import("../zuma.zig");
+const zync = @import("../../zap.zig").zync;
 
 pub const CpuType = enum { 
     Physical,
@@ -98,6 +99,12 @@ pub const ClockType = enum {
 
 pub const Thread = struct {
     inner: zuma.backend.Thread,
+
+    pub threadlocal var Random = zync.Lazy(createThreadLocalRandom).new();
+    fn createThreadLocalRandom() std.rand.DefaultPrng {
+        const seed = now(.Monotonic) ^ u64(@ptrToInt(&Random));
+        return std.rand.DefaultPrng.init(seed);
+    }
 
     // NOTE: Because of linux VDSO shenanigans (https://marcan.st/2017/12/debugging-an-evil-go-runtime-bug/)
     ///      One should ensure that the stack of this function call has at least 1-2 pages of owned memory.

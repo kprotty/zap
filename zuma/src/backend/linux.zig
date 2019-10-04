@@ -180,7 +180,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
 
     pub fn now(is_monotonic: bool) u64 {
         var ts: linux.timespec = undefined;
-        const clock_type = if (is_monotonic) linux.CLOCK_MONOTONIC_RAW else linux.CLOCK_REALTIME;
+        const clock_type = if (is_monotonic) i32(linux.CLOCK_MONOTONIC_RAW) else linux.CLOCK_REALTIME;
         return switch (os.errno(linux.clock_gettime(clock_type, &ts))) {
             0 => (@intCast(u64, ts.tv_sec) * 1000) + (@intCast(u64, ts.tv_nsec) / 1000000),
             os.EFAULT, os.EPERM => unreachable,

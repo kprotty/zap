@@ -1,6 +1,9 @@
 const std = @import("std");
-const zio = @import("zap").zio;
 const expect = std.testing.expect;
+
+const zap = @import("zap");
+const zuma = zap.zuma;
+const zio = zap.zio;
 
 pub const Event = struct {
     inner: zio.backend.Event,
@@ -86,6 +89,21 @@ test "Event.Poller - poll - nonblock" {
     var events: [1]Event = undefined;
     const events_found = try poller.poll(events[0..], 0);
     expect(events_found.len == 0);
+}
+
+test "Event.Poller - poll - blocking" {
+    var poller = try Event.Poller.new();
+    defer poller.close();
+
+    const delay_ms = 100;
+    const error_threshold_ms = 200;
+    var events: [1]Event = undefined;
+    const now = zuma.Thread.now(.Monotonic);
+    const events_found = try poller.poll(events[0..], delay_ms);
+    const elapsed = zuma.Thread.now(.Monotonic) - now;
+
+    expect(events_found.len == 0);
+    expect(elapsed >= delay_ms and elapsed < delay_ms + error_threshold_ms);
 }
 
 test "Event.Poller - notify" {

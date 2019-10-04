@@ -1,5 +1,5 @@
 const std = @import("std");
-const zuma = @import("zap").zuma;
+const zuma = @import("../zuma.zig");
 const expect = std.testing.expect;
 
 pub const CpuType = enum { 

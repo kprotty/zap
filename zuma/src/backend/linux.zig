@@ -256,7 +256,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
     }
 
-    pub fn setCurrentAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {
+    pub fn setAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {
         const tid = linux.syscall0(linux.SYS_gettid);
         return switch (os.errno(linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set)))) {
             0 => {},
@@ -267,7 +267,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
     }
 
-    pub fn getCurrentAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {
+    pub fn getAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {
         const tid = linux.syscall0(linux.SYS_gettid);
         return switch (os.errno(linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set)))) {
             0 => {},

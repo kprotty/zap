@@ -139,12 +139,12 @@ pub const Thread = struct {
         InvalidCpuSet,
     };
 
-    pub fn setCurrentAffinity(cpu_set: *const CpuSet) AffinityError!void {
-        return zuma.backend.Thread.setCurrentAffinity(&cpu_set.inner);
+    pub fn setAffinity(cpu_set: *const CpuSet) AffinityError!void {
+        return zuma.backend.Thread.setAffinity(&cpu_set.inner);
     }
 
-    pub fn getCurrentAffinity(cpu_set: *CpuSet) AffinityError!void {
-        return zuma.backend.Thread.getCurrentAffinity(&cpu_set.inner);
+    pub fn getAffinity(cpu_set: *CpuSet) AffinityError!void {
+        return zuma.backend.Thread.getAffinity(&cpu_set.inner);
     }
 };
 
@@ -159,4 +159,31 @@ test "Thread - random, now, sleep" {
     Thread.sleep(delay_ms);
     const elapsed = Thread.now(.Monotonic) - now;
     expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
+}
+
+test "Thread - getAffinity, setAffinity" {
+    // get the current thread affinity & count
+    var cpu_set: CpuSet = undefined;
+    cpu_set.clear();
+    try Thread.getAffinity(&cpu_set);
+    const cpu_count = cpu_set.count();
+    expect(cpu_count > 0);
+
+    // update the thread affinity to be only the first core
+    var new_cpu_set: CpuSet = undefined;
+    new_cpu_set.clear();
+    try new_cpu_set.set(0, true);
+    try Thread.setAffinity(&new_cpu_set);
+
+    // check if the thread affinity truly is only the first core
+    new_cpu_set.clear();
+    try Thread.getAffinity(&new_cpu_set);
+    expect(new_cpu_set.count() == 1);
+    expect((try new_cpu_set.get(0)) == true);
+
+    // set the affinity back to normal & check that its back to normal
+    try Thread.setAffinity(&cpu_set);
+    cpu_set.clear();
+    try Thread.getAffinity(&cpu_set);
+    expect(cpu_set.count() == cpu_count);
 }

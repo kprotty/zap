@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = @import("posix.zig");
 const builtin = @import("builtin");
 
+const zio = @import("../../zap.zig").zio;
 const zync = @import("../../../zap.zig").zync;
 const zuma = @import("../../../zap.zig").zuma;
 
@@ -242,6 +243,51 @@ pub fn getHugePageSize() ?usize {
     var buffer: [4096]u8 = undefined;
     const huge_page_size_kb = readValue(buffer[0..], "/proc/meminfo\x00", "Hugepagesize:") catch |_| return null;
     return huge_page_size_kb * 1024;
+}
+
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.mem.MapError![]align(zuma.mem.page_size) u8 {
+    // map the memory into the address space
+    var map_flags: u32 = linux.MAP_PRIVATE | linux.MAP_ANONYMOUS;
+    if ((flags & zuma.mem.PAGE_HUGE) != 0)
+        map_flags |= linux.MAP_HUGETLB;
+    const addr = linux.mmap(address, bytes, getProtectFlags(flags), map_flags, -1, 0);
+    switch (linux.getErrno(addr)) {
+        0 => {},
+        os.ENOMEM => return zuma.mem.MapError.OutOfMemory,
+        os.EINVAL => return zuma.mem.MapError.InvalidAddress,
+        os.EACCES, os.EAGAIN, os.EBADF, os.EEXIST, os.ENODEV, os.ETXTBSY, os.EOVERFLOW => unreachable,
+        else => unreachable,
+    }
+
+    // try and mind the address to a numa node
+    const MPOL_PREFERRED = ;
+    if (numa_node) |node| {
+        switch (linux.getErrno(linux.syscall6(linux.SYS_mbind, addr, bytes, MPOL_PREFERRED, mask, node, 0))) {
+            0 => {},
+        }
+    }
+
+    return @intToPtr([*]align(zuma.mem.page_size) u8, addr)[0..bytes];
+}
+
+pub fn unmap(memory: []align(zuma.mem.page_size) u8, node: ?usize) void {
+    
+}
+
+pub fn modify(memory: []align(zuma.mem.page_size) u8, flags: u32, node: ?usize) zuma.mem.ModifyError!void {
+    
+}
+
+//  mmap(address: ?[*]u8, length: usize, prot: usize, flags: u32, fd: i32, offset: u64)
+fn getProtectFlags(flags: u32) usize {
+    var protect_flags: usize = 0;
+    if ((flags & zuma.mem.PAGE_EXEC))
+        protect_flags |= linux.PROT_EXEC;
+    if ((flags & zuma.mem.PAGE_READ))
+        protect_flags |= linux.PROT_READ;
+    if ((flags & zuma.mem.PAGE_WRITE))
+        protect_flags |= linux.PROT_WRITE;
+    return protect_flags;
 }
 
 fn readValue(buffer: []u8, comptime format: []const u8, comptime header: []const u8, format_args: ...) !usize {

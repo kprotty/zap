@@ -1,5 +1,6 @@
 const std = @import("std");
 const expect = std.testing.expect;
+const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
 const zync = @import("../../zap.zig").zync;
 
@@ -51,21 +52,22 @@ pub const PAGE_COMMIT   = 1 << 4;
 pub const PAGE_DECOMMIT = 1 << 5;
 
 pub const MapError = error {
-    // TODO
+    OutOfMemory,
+    InvalidAddress,
 };
 
-pub fn map(handle: ?zio.Handle, address: ?*align(page_size) const u8, bytes: usize, flags: u32, node: ?usize) MapError![]align(page_size) u8 {
-    return backend.map(handle, address, bytes, flags);
+pub fn map(address: ?*[*]u8, bytes: usize, flags: u32, node: ?usize) MapError![]align(page_size) u8 {
+    return backend.map(address, bytes, flags, node);
 }
 
 pub fn unmap(memory: []align(page_size) u8, node: ?usize) void {
-    return backend.unmap(memory);
+    return backend.unmap(memory, node);
 }
 
 pub const ModifyError = error {
     // TODO
 };
 
-pub fn modify(memory: []align(page_size) u8, flags: u32, node: ?usize) ModifyError!void {
-    return backend.modify(memory, flags);
+pub fn modify(memory: []u8, flags: u32, node: ?usize) ModifyError!void {
+    return backend.modify(memory, flags, node);
 }

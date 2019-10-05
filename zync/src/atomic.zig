@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const utils = @import("utils.zig");
+const mem = @import("zap").zuma.mem;
 
 pub fn yield(spin_count: usize) void {
     var spin = spin_count;
@@ -60,15 +61,15 @@ pub fn Atomic(comptime T: type) type {
         }
         
         pub fn new(value: T) @This() {
-            return @This() { .value = utils.cast(Type, value) };
+            return @This() { .value = mem.transmute(Type, value) };
         }
 
         pub inline fn get(self: @This()) T {
-            return utils.cast(T, self.value);
+            return mem.transmute(T, self.value);
         }
 
         pub inline fn set(self: *@This(), value: T) void {
-            self.value = utils.cast(Type, value);
+            self.value = mem.transmute(Type, value);
         }
 
         pub inline fn store(self: *@This(), value: T, comptime order: Order) void {
@@ -77,7 +78,7 @@ pub fn Atomic(comptime T: type) type {
         }
 
         pub fn load(self: *@This(), comptime order: Order) T {
-            return utils.cast(T, @atomicLoad(Type, &self.value, comptime order.toBuiltin()));
+            return mem.transmute(T, @atomicLoad(Type, &self.value, comptime order.toBuiltin()));
         }
 
         pub fn swap(self: *@This(), value: T, comptime order: Order) T {
@@ -117,33 +118,33 @@ pub fn Atomic(comptime T: type) type {
         }
 
         pub fn compareSwap(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
-            return utils.cast(?T, @cmpxchgWeak(
+            return mem.transmute(?T, @cmpxchgWeak(
                 Type,
                 &self.value,
-                utils.cast(Type, cmp),
-                utils.cast(Type, xchg),
+                mem.transmute(Type, cmp),
+                mem.transmute(Type, xchg),
                 comptime success.toBuiltin(),
                 comptime failure.toBuiltin(),
             ));
         }
 
         pub fn compareSwapStrong(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
-            return utils.cast(?T, @cmpxchgStrong(
+            return mem.transmute(?T, @cmpxchgStrong(
                 Type,
                 &self.value,
-                utils.cast(Type, cmp),
-                utils.cast(Type, xchg),
+                mem.transmute(Type, cmp),
+                mem.transmute(Type, xchg),
                 comptime success.toBuiltin(),
                 comptime failure.toBuiltin(),
             ));
         }
 
         fn atomicRmw(self: *@This(), value: T, comptime op: builtin.AtomicRmwOp, comptime order: Order) T {
-            return utils.cast(T, @atomicRmw(
+            return mem.transmute(T, @atomicRmw(
                 Type,
                 &self.value,
                 op,
-                utils.cast(Type, value),
+                mem.transmute(Type, value),
                 comptime order.toBuiltin(),
             ));
         }

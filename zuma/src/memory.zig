@@ -1,6 +1,19 @@
 const std = @import("std");
 const zync = @import("zap").zync;
 
+pub fn ptrCast(comptime To: type, from: var) To {
+    return @ptrCast(To, @alignCast(@alignOf(To), from));
+}
+
+pub fn transmute(comptime To: type, from: var) To {
+    var input = from;
+    var output: To = undefined;
+    const size = std.math.max(@sizeOf(To), @sizeOf(@typeOf(from)));
+    const bytes = std.mem.alignForward(size, @alignOf(To));
+    @memcpy(@ptrCast([*]u8, &output), @ptrCast([*]const u8, &input), bytes);
+    return output;
+}
+
 /// Constant representing assumed page size
 pub const page_size = std.mem.page_size;
 

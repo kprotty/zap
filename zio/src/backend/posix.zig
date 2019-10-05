@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("zap").zio;
+const zio = @import("../../../zap.zig").zio;
 
 const c = std.c;
 const os = std.os;

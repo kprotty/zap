@@ -1,5 +1,5 @@
 const std = @import("std");
-const zync = @import("zap").zync;
+const zync = @import("../zap.zig").zync;
 
 pub fn ptrCast(comptime To: type, from: var) To {
     return @ptrCast(To, @alignCast(@alignOf(To), from));

@@ -2,8 +2,8 @@ const std = @import("std");
 const posix = @import("posix.zig");
 const builtin = @import("builtin");
 
-const zync = @import("zap").zync;
-const zuma = @import("zap").zuma;
+const zync = @import("../../../zap.zig").zync;
+const zuma = @import("../../../zap.zig").zuma;
 
 const os = std.os;
 const linux = os.linux;
@@ -53,7 +53,7 @@ pub const CpuSet = struct {
         return node_count;
     }
 
-    pub fn getNodeSize(numa_node: usize) zuma.CpuSet.CpuError!usize {
+    pub fn getNodeSize(numa_node: usize) zuma.CpuSet.NodeError!usize {
         var buffer: [2048]u8 = undefined;
         var data = try readFile(buffer[0..], "/sys/devices/system/node/node{}/meminfo\x00", numa_node);
 

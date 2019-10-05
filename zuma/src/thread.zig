@@ -1,7 +1,7 @@
 const std = @import("std");
 const expect = std.testing.expect;
-const zync = @import("zap").zync;
-const zuma = @import("zap").zuma;
+const zync = @import("../../zap.zig").zync;
+const zuma = @import("../../zap.zig").zuma;
 
 pub const CpuType = enum { 
     Physical,

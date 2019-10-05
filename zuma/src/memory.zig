@@ -8,8 +8,7 @@ pub fn ptrCast(comptime To: type, from: var) To {
 pub fn transmute(comptime To: type, from: var) To {
     var input = from;
     var output: To = undefined;
-    const size = std.math.max(@sizeOf(To), @sizeOf(@typeOf(from)));
-    const bytes = std.mem.alignForward(size, @alignOf(To));
+    const bytes = comptime std.math.min(@sizeOf(@typeOf(from)), @sizeOf(To));
     @memcpy(@ptrCast([*]u8, &output), @ptrCast([*]const u8, &input), bytes);
     return output;
 }

@@ -367,7 +367,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
     // listen and process events
     var events: [64]zio.Event = undefined;
     while (server.client_sent < data.len or client.received < data.len) {
-        const socket_events = try poller.poll(events[0..], 2000);
+        const socket_events = try poller.poll(events[0..], 500);
         if (socket_events.len == 0)
             return error.EventPollTimedOut;
 

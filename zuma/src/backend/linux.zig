@@ -250,8 +250,10 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     pub fn join(self: *@This(), timeout_ms: ?u32) void {
         var ts: linux.timespec = if (timeout_ms) |t| toTimespec(t) else undefined;
         const timeout = if (timeout_ms) |_| &ts else null;
-        if (@atomicLoad(i32, self.id, .Monotonic) == 0) return;
-        return switch (os.errno(linux.futex_wait(self.id, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, self.id.*, timeout))) {
+        const value = @atomicLoad(i32, self.id, .Monotonic);
+        if (value == 0)
+            return;
+        return switch (os.errno(linux.futex_wait(self.id, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, value, timeout))) {
             0, os.EINTR, os.EAGAIN, os.ETIMEDOUT => {},
             os.EINVAL, os.EPERM, os.ENOSYS, os.EDEADLK => unreachable,
             else => unreachable,

@@ -219,7 +219,7 @@ test "Thread - getStackSize, spawn, yield" {
             };
             
             Thread.yield();
-            update_thread.join(2000);
+            update_thread.join(500);
             expect(self.value.load(.Relaxed) == 1);
         }
     };

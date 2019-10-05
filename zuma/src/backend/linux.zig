@@ -207,37 +207,38 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         if (linux.tls.tls_image) |tls_image|
             size = std.mem.alignForward(size, @alignOf(usize)) + tls_image.alloc_size;
         size = std.mem.alignForward(size, @alignOf(@Frame(function))) + @sizeOf(@Frame(function));
-        size = std.mem.alignForward(size, std.mem.page_size);
+        size = std.mem.alignForward(size, zuma.mem.page_size);
         return size;
     }
 
     pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
         const memory = stack orelse return zuma.Thread.SpawnError.InvalidStack;
-        var id = @ptrCast(*i32, memory[0]);
-        var clone_flags = 
+        var id = @ptrCast(*i32, memory.ptr);
+        var clone_flags: u32 = 
             os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
             os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
             os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM;
 
         var tls_offset: usize = undefined;
-        if (system.tls.tls_image) |tls_image| {
+        if (linux.tls.tls_image) |tls_image| {
             clone_flags |= os.CLONE_SETTLS;
             tls_offset = std.math.max(@sizeOf(i32), @alignOf(usize));
-            tls_offset = system.tls.copyTLS(@ptrToInt(&memory[tls_offset]));
+            tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_offset]));
         }
 
+        const Parameter = @typeOf(parameter);
         const Wrapper = struct {
             extern fn entry(arg: usize) u8 {
-                _ = function(zuma.mem.transmute(@typeOf(parameter), arg));
+                _ = function(zuma.mem.transmute(Parameter, arg));
                 return 0;
             }
         };
         
         var stack_offset = getStackSize(function);
-        stack_offset = std.mem.alignForward(stack_offset, zuma.mem.page_size);
+        stack_offset = std.mem.alignForward(stack_offset, zuma.mem.page_size) - 1;
         const stack_ptr = @ptrToInt(&memory[stack_offset]);
-        const arg = std.mem.transmute(usize, parameter);
-        return switch (os.errno(system.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
+        const arg = zuma.mem.transmute(usize, parameter);
+        return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
             0 => @This() { .id = id },
             os.EPERM, os.EINVAL, os.ENOSPC, os.EUSERS => unreachable,
             os.EAGAIN => zuma.Thread.SpawnError.TooManyThreads,
@@ -249,9 +250,10 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     pub fn join(self: *@This(), timeout_ms: ?u32) void {
         var ts: linux.timespec = if (timeout_ms) |t| toTimespec(t) else undefined;
         const timeout = if (timeout_ms) |_| &ts else null;
+        if (@atomicLoad(i32, self.id, .Monotonic) == 0) return;
         return switch (os.errno(linux.futex_wait(self.id, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, self.id.*, timeout))) {
-            0, os.EINTR, os.EAGAIN => {},
-            os.EINVAL => unreachable,
+            0, os.EINTR, os.EAGAIN, os.ETIMEDOUT => {},
+            os.EINVAL, os.EPERM, os.ENOSYS, os.EDEADLK => unreachable,
             else => unreachable,
         };
     }

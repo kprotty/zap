@@ -138,7 +138,7 @@ pub fn Atomic(comptime T: type) type {
             ));
         }
 
-        inline fn atomicRmw(self: *@This(), value: T, comptime op: builtin.AtomicRmwOp, comptime order: Order) T {
+        fn atomicRmw(self: *@This(), value: T, comptime op: builtin.AtomicRmwOp, comptime order: Order) T {
             return utils.cast(T, @atomicRmw(
                 Type,
                 &self.value,

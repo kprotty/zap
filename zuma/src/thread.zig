@@ -124,7 +124,7 @@ pub const Thread = struct {
         return zuma.backend.Thread.getStackSize(function);
     }
 
-    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
+    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
         if (@sizeOf(parameter) != @sizeOf(usize))
             @compileError("Parameter can only be a pointer sized value");
         return @This() { .inner = zuma.backend.Thread.spawn(stack, function, parameter) };
@@ -186,4 +186,39 @@ test "Thread - getAffinity, setAffinity" {
     cpu_set.clear();
     try Thread.getAffinity(&cpu_set);
     expect(cpu_set.count() == cpu_count);
+}
+
+test "Thread - getStackSize, spawn, yield" {
+    // Check if thread yield at least yields for 1ms
+    const now = Thread.now(.Monotonic);
+    Thread.yield();
+    Thread.yield();
+    expect(Thread.now(.Monotonic) - now > 1);
+
+    try (struct {
+        value: zync.Atomic(usize),
+
+        fn update(self: *@This()) void {
+            _ = self.value.fetchAdd(1, .Relaxed);
+        }
+
+        pub fn run(self: *@This()) !void {
+            self.value.set(0);
+            expect(self.value.get() == 0);
+
+            var update_thread = thread: {
+                const stack_size = Thread.getStackSize(update);
+                if (stack_size > 0) {
+                    var memory: [std.mem.page_size]u8 align(std.mem.page_size) = undefined;
+                    expect(stack_size <= memory.len);
+                    break :thread (try Thread.spawn(memory[0..], update, self));
+                } else {
+                    break :thread (try Thread.spawn(null, update, self));
+                }
+            };
+            
+            update_thread.join(2000);
+            expect(self.value.load(.Relaxed) == 1);
+        }
+    }(undefined)).run();
 }

@@ -203,11 +203,11 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     }
 
     pub fn getStackSize(comptime function: var) usize {
-        var size = @sizeOf(@Frame(function));
-        size = std.mem.alignForward(size, @alignOf(i32)) + @sizeOf(i32);
-        size = std.mem.alignForward(size, zuma.mem.page_size);
+        var size: usize = @sizeOf(i32);
         if (linux.tls.tls_image) |tls_image|
             size = std.mem.alignForward(size, @alignOf(usize)) + tls_image.alloc_size;
+        size = std.mem.alignForward(size, @alignOf(@Frame(function))) + @sizeOf(@Frame(function));
+        size = std.mem.alignForward(size, std.mem.page_size);
         return size;
     }
 
@@ -222,7 +222,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         var tls_offset: usize = undefined;
         if (system.tls.tls_image) |tls_image| {
             clone_flags |= os.CLONE_SETTLS;
-            tls_offset = memory.len - tls_image.alloc_size;
+            tls_offset = std.math.max(@sizeOf(i32), @alignOf(usize));
             tls_offset = system.tls.copyTLS(@ptrToInt(&memory[tls_offset]));
         }
 
@@ -233,7 +233,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
             }
         };
         
-        var stack_offset = @sizeOf(@typeOf(id)) + @sizeOf(@Frame(function));
+        var stack_offset = getStackSize(function);
         stack_offset = std.mem.alignForward(stack_offset, zuma.mem.page_size);
         const stack_ptr = @ptrToInt(&memory[stack_offset]);
         const arg = std.mem.transmute(usize, parameter);

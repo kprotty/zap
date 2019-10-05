@@ -1,5 +1,7 @@
 const std = @import("std");
-const zync = @import("../zap.zig").zync;
+const expect = std.testing.expect;
+const zuma = @import("../../zap.zig").zuma;
+const zync = @import("../../zap.zig").zync;
 
 pub fn ptrCast(comptime To: type, from: var) To {
     return @ptrCast(To, @alignCast(@alignOf(To), from));
@@ -17,15 +19,28 @@ pub fn transmute(comptime To: type, from: var) To {
 pub const page_size = std.mem.page_size;
 
 /// Dynamic, true system page size
-var cached_page_size = zync.Lazy(backend.pageSize).new();
-pub inline fn pageSize() usize {
+var cached_page_size = zync.Lazy(zuma.backend.getPageSize).new();
+pub inline fn getPageSize() usize {
     return cached_page_size.get() orelse page_size;
 }
 
 /// Get the systems huge page size if huge pages are supported, else null
-var cached_huge_page_size = zync.Lazy(backend.hugePageSize).new();
-pub inline fn hugePageSize() ?usize {
+var cached_huge_page_size = zync.Lazy(zuma.backend.getHugePageSize).new();
+pub inline fn getHugePageSize() ?usize {
     return cached_huge_page_size.get();
+}
+
+test "getPageSize, getHugePageSize" {
+    const size = getPageSize();
+    expect(size >= page_size);
+    expect(size == getPageSize());
+
+    const huge_size = getHugePageSize();
+    if (huge_size) |huge_page_size| {
+        expect(huge_page_size >= 1 * 1024 * 1024);
+        expect(huge_page_size > size);
+    }
+    expect(huge_size orelse 0 == getHugePageSize() orelse 0);
 }
 
 pub const PAGE_HUGE     = 1 << 0;

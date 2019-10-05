@@ -43,9 +43,11 @@ test "popCount" {
 }
 
 pub fn intType(comptime is_signed: bool, comptime bits: var) type {
-    return @Type(builtin.TypeInfo.Int {
-        .bits = bits,
-        .is_signed = is_signed,
+    return @Type(builtin.TypeInfo {
+        .Int  = builtin.TypeInfo.Int {
+            .bits = bits,
+            .is_signed = is_signed,
+        },
     });
 }
 

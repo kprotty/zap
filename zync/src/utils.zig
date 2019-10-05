@@ -42,10 +42,17 @@ test "popCount" {
     expect(popCount(~u64(0)) == @typeInfo(u64).Int.bits);
 }
 
+pub fn intType(comptime is_signed: bool, comptime bits: var) type {
+    return @Type(builtin.TypeInfo.Int {
+        .bits = bits,
+        .is_signed = is_signed,
+    });
+}
+
 pub fn shrType(comptime Int: type) type {
     const bits = @typeInfo(Int).Int.bits;
     const log2_bits = @log2(f32, @intToFloat(f32, bits));
-    return @IntType(false, @floatToInt(u64, log2_bits));
+    return intType(false, @floatToInt(u64, log2_bits));
 }
 
 test "shrType" {

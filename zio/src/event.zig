@@ -48,6 +48,7 @@ pub const Event = struct {
 
         pub const RegisterError = std.os.UnexpectedError || error {
             InvalidValue,
+            InvalidHandle,
             OutOfResources,
         };
 

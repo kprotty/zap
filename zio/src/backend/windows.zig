@@ -1,9 +1,10 @@
 const std = @import("std");
+const windows = std.os.windows;
 const posix = @import("posix.zig");
 
 const zio = @import("../../../zap.zig").zio;
 const zync = @import("../../../zap.zig").zync;
-const windows = std.os.windows;
+const zuma = @import("../../../zap.zig").zuma;
 
 pub const Handle = windows.HANDLE;
 
@@ -42,7 +43,7 @@ pub const ConstBuffer = struct {
 };
 
 pub const IncomingPadding = 16;
-pub const SockAddr = struct {
+pub const SockAddr = extern struct {
     pub const Ipv4 = SOCKADDR_IN;
     pub const Ipv6 = SOCKADDR_IN6;
 
@@ -50,24 +51,28 @@ pub const SockAddr = struct {
 
     pub fn fromIpv4(address: u32, port: u16) @This() {
         return @This() {
-            .inner = @bitCast(SOCKADDR, Ipv4 {
-                .sin_family = AF_INET,
-                .sin_zero = [_]u8{0} ** 8,
-                .sin_addr = IN_ADDR { .s_addr = address },
-                .sin_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
-            }),
+            .inner = SOCKADDR {
+                .in = Ipv4 {
+                    .sin_family = AF_INET,
+                    .sin_zero = [_]u8{0} ** 8,
+                    .sin_addr = IN_ADDR { .s_addr = address },
+                    .sin_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
+                },
+            },
         };
     }
 
     pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
         return @This() {
-            .inner = @bitCast(SOCKADDR, Ipv6 {
-                .sin6_family = AF_INET6,
-                .sin6_scope_id = scope,
-                .sin6_flowinfo = flowinfo,
-                .sin6_addr = IN6_ADDR { .Qword = address },
-                .sin6_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
-            }),
+            .inner = SOCKADDR {
+                .in6 = Ipv6 {
+                    .sin6_family = AF_INET6,
+                    .sin6_scope_id = scope,
+                    .sin6_flowinfo = flowinfo,
+                    .sin6_addr = IN6_ADDR { .Qword = address },
+                    .sin6_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
+                },
+            },
         };
     }
 };
@@ -151,8 +156,7 @@ pub const Socket = struct {
     writer: windows.OVERLAPPED,
 
     pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
-        if (init_error.get()) |err|
-            return err;
+        _ = try init_error.get();
         
         // TODO
     }
@@ -217,7 +221,7 @@ pub const Socket = struct {
 
     pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         var option_val = option;
-        if (posix.socketOption(self.getHandle(), option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
+        if (posix.Socket.socketOption(self.getHandle(), &option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
@@ -229,7 +233,7 @@ pub const Socket = struct {
     }
 
     pub fn getOption(self: @This(), option: *zio.Socket.Option) zio.Socket.OptionError!void {
-        if (posix.socketOption(self.getHandle(), option_val, Mswsock.getsockopt, Mswsock.Options) == 0)
+        if (posix.Socket.socketOption(self.getHandle(), option, Mswsock.getsockopt, Mswsock.Options) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
@@ -241,7 +245,7 @@ pub const Socket = struct {
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        if (Mswsock.bind(self.getHandle(), @ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
+        if (Mswsock.bind(self.getHandle(), zuma.mem.ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS => zio.Socket.BindError.InvalidState,
@@ -270,7 +274,7 @@ pub const Socket = struct {
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
                     const handle = self.getHandle();
-                    const addr = @ptrCast(*const SOCKADDR, address.sockaddr);
+                    const addr = zuma.mem.ptrCast(*const SOCKADDR, address.sockaddr);
                     if (overlapped) |ov| {
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return;
@@ -293,7 +297,7 @@ pub const Socket = struct {
         };
     }
 
-    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *Incoming, token: usize) zio.Socket.AcceptError!void {
+    pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         
     }
 
@@ -382,9 +386,9 @@ const WSAEPROVIDERFAILEDINIT: windows.DWORD = 10106;
 
 const SOCKET = windows.HANDLE;
 const INVALID_SOCKET = windows.INVALID_HANDLE_VALUE;
-const SOCKADDR = extern struct {
-    sa_family: c_ushort,
-    sa_data: [14]windows.CHAR,
+const SOCKADDR = extern union {
+    in: SOCKADDR_IN,
+    in6: SOCKADDR_IN6,
 };
 
 const IN_ADDR = extern struct {
@@ -444,7 +448,7 @@ const WSAData = extern struct {
 var ConnectEx: ?extern fn(
     socket: SOCKET,
     name: *const SOCKADDR,
-    name_len: c_int,
+    name_len: c_uint,
     lpSendBuffer: ?windows.PVOID,
     dwSendDataLength: windows.DWORD,
     lpdwBytesSent: ?*windows.DWORD,
@@ -503,19 +507,19 @@ const Mswsock = struct {
     pub extern "ws2_32" stdcallcc fn bind(
         socket: SOCKET,
         addr: *const SOCKADDR,
-        addr_len: c_int,
+        addr_len: c_uint,
     ) c_int;
 
     pub extern "ws2_32" stdcallcc fn connect(
         socket: SOCKET,
         addr: *const SOCKADDR,
-        addr_len: c_int,
+        addr_len: c_uint,
     ) c_int;
 
     pub extern "ws2_32" stdcallcc fn accept(
         socket: SOCKET,
         addr: *SOCKADDR,
-        addr_len: c_int,
+        addr_len: c_uint,
     ) c_int;
 
     pub extern "ws2_32" stdcallcc fn setsockopt(

@@ -282,6 +282,7 @@ pub const Socket = struct {
         };
     }
 
+    const Timeval = if (builtin.os == .windows) void else os.timeval;
     pub fn socketOption(
         handle: zio.Handle,
         option: *zio.Socket.Option,
@@ -289,7 +290,7 @@ pub const Socket = struct {
         comptime flags: type,
     ) @typeOf(sockopt).ReturnType {
         var number: c_int = undefined;
-        var timeval: os.timeval = undefined;
+        var timeval: Timeval = undefined;
         const is_setter = @typeInfo(@typeOf(sockopt)).Fn.args[4].arg_type.? == c_int;
 
         var level: c_int = flags.SOL_SOCKET;

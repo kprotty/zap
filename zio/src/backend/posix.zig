@@ -464,7 +464,7 @@ pub const Socket = struct {
         }
     }
 
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
+    pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
         if (token != 0 and (token & zio.Event.Readable) == 0)
@@ -472,7 +472,7 @@ pub const Socket = struct {
         return transfer(self.handle, address, buffers, Recvmsg);
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
+    pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
         if (token != 0 and (token & zio.Event.Writeable) == 0)

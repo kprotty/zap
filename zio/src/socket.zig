@@ -120,16 +120,57 @@ pub const Socket = struct {
         OutOfResources,
     };
 
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []zio.Buffer, token: usize) DataError!usize {
-        if (buffers.len == 0)
-            return usize(0);
-        return self.inner.recv(address, @ptrCast([*]zio.backend.Buffer, buffers.ptr)[0..buffers.len], token);
+    /// Convert an array of zig buffers into backend buffers
+    threadlocal var buffer_cache: [256]zio.Buffer = undefined;
+    fn toBackendBuffers(buffers: var) []zio.backend.Buffer {
+        const zio_buffers = buffer_cache[0..std.math.min(buffer_cache.len, buffers.len)];
+        for (zio_buffers) |*buffer, index|
+            buffer.* = zio.Buffer.fromBytes(buffers[index]);
+        return @ptrCast([*]zio.backend.Buffer, zio_buffers.ptr)[0..zio_buffers.len];
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const zio.ConstBuffer, token: usize) DataError!usize {
-        if (buffers.len == 0)
-            return usize(0);
-        return self.inner.send(address, @ptrCast([*]const zio.backend.ConstBuffer, buffers.ptr)[0..buffers.len], token);
+    pub fn recv(self: *@This(), buffer: []u8, token: usize) DataError!usize {
+        return self.read(buffer, token);
+    }
+
+    pub fn send(self: *@This(), buffer: []const u8, token: usize) DataError!usize {
+        return self.write(buffer, token);
+    }
+
+    pub fn read(self: *@This(), buffer: []u8, token: usize) DataError!usize {
+        var buffers = [_][]u8 { buffer };
+        return self.readv(buffers[0..], token);
+    }
+
+    pub fn write(self: *@This(), buffer: []const u8, token: usize) DataError!usize {
+        var buffers = [_][]const u8 { buffer };
+        return self.writev(buffers[0..], token);
+    }
+
+    pub fn readv(self: *@This(), buffers: []const []u8, token: usize) DataError!usize {
+        return self.recvmsg(null, buffers, token);
+    }
+
+    pub fn writev(self: *@This(), buffers: []const []const u8, token: usize) DataError!usize {
+        return self.sendmsg(null, buffers, token);
+    }
+
+    pub fn recvfrom(self: *@This(), address: *zio.Address, buffer: []u8, token: usize) DataError!usize {
+        var buffers = [_][]u8 { buffer };
+        return self.recvmsg(address, buffers[0..], token);
+    }
+
+    pub fn sendto(self: *@This(), address: *zio.Address, buffer: []const u8, token: usize) DataError!usize {
+        var buffers = [_][]const u8 { buffer };
+        return self.sendmsg(address, buffers[0..], token);
+    }
+
+    pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []const []u8, token: usize) DataError!usize {
+        return self.inner.recvmsg(address, toBackendBuffers(buffers), token);
+    }
+
+    pub fn sendmsg(self: *@This(), address: ?*zio.Address, buffers: []const []const u8, token: usize) DataError!usize {
+        return self.inner.sendmsg(address, toBackendBuffers(buffers), token);
     }
 };
 
@@ -202,15 +243,13 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     defer server_client.close();
 
     // send data from the servers client to the connected client
-    const data = "Hello world"[0..];
-    var output_buffer = [_]zio.ConstBuffer { zio.ConstBuffer.fromBytes(data) };
-    var transferred = try server_client.send(null, output_buffer[0..], 0);
+    const data = "Hello world";
+    var transferred = try server_client.write(data, 0);
     expect(transferred == data.len);
 
     // receive the data from the connected client which was sent by the server client
     var input_data: [data.len]u8 = undefined;
-    var data_buffer = [_]zio.Buffer { zio.Buffer.fromBytes(input_data[0..]) };
-    transferred = try client.recv(null, data_buffer[0..], 0);
+    transferred = try client.read(input_data[0..], 0);
     expect(transferred == data.len);
     expect(std.mem.eql(u8, data, input_data[0..]));
 }
@@ -229,7 +268,6 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
         server: zio.Socket,
         client: zio.Socket,
         client_sent: usize,
-        send_buffer: [1]zio.ConstBuffer,
         incoming: zio.Address.Incoming,
 
         pub fn init(self: *@This(), poller: *zio.Event.Poller, addr_port: u16) !void {
@@ -248,7 +286,6 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
 
             // Start accepting an incoming socket
             self.incoming = zio.Address.Incoming.new(try AddressType.new(addr_port));
-            self.send_buffer[0] = zio.ConstBuffer.fromBytes(data);
             self.client_sent = 0;
             try self.handle_server(0, poller);
         }
@@ -283,8 +320,8 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Keep sending data until its all received on the client side
             var token = io_token;
             while (self.client_sent < data.len) {
-                self.send_buffer[0] = zio.ConstBuffer.fromBytes(data[0..(data.len - self.client_sent)]);
-                self.client_sent += self.client.send(null, self.send_buffer[0..], token) catch |err| switch(err) {
+                const buffer = data[0..(data.len - self.client_sent)];
+                self.client_sent += self.client.write(buffer, token) catch |err| switch(err) {
                     zio.ErrorPending, zio.ErrorClosed => return,
                     else => return err,
                 };
@@ -298,7 +335,6 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
         received: usize,
         buffer: [2048]u8,
         connected: bool,
-        recv_buffer: [1]zio.Buffer,
 
         // Create a client socket and start doing IO
         // Set the socket buffers as small as possible to force many fragmented reads to test non blocking.
@@ -316,7 +352,6 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             
             self.received = 0;
             self.connected = false;
-            self.recv_buffer[0] = zio.Buffer.fromBytes(self.buffer[0..]);
             try self.handle(0, poller, addr_port);
         }
 
@@ -345,7 +380,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Then, start receiving data from the server
             // Handle ErrorInvalidToken since events could be for writer instead of reader
             while (self.received < data.len) {
-                self.received += self.socket.recv(null, self.recv_buffer[0..], token) catch |err| switch (err) {
+                self.received += self.socket.read(self.buffer[0..], token) catch |err| switch (err) {
                     zio.ErrorPending => return,
                     else => return err,
                 };

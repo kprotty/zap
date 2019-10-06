@@ -15,23 +15,6 @@ pub const Buffer = struct {
         return self.inner.buf[0..self.inner.len];
     }
 
-    pub fn fromBytes(bytes: []u8) @This() {
-        return @This() {
-            .inner = WSABUF {
-                .buf = bytes.ptr,
-                .len = @intCast(windows.DWORD, bytes.len),
-            }
-        };
-    }
-};
-
-pub const ConstBuffer = struct {
-    inner: WSABUF,
-
-    pub fn getBytes(self: @This()) []const u8 {
-        return self.inner.buf[0..self.inner.len];
-    }
-
     pub fn fromBytes(bytes: []const u8) @This() {
         return @This() {
             .inner = WSABUF {
@@ -161,6 +144,7 @@ pub const Socket = struct {
         var sock_type: windows.DWORD = 0;
         var protocol: windows.DWORD = 0;
 
+        // convert the socket flags
         if ((flags & zio.Socket.Ipv4) != 0) {
             family |= AF_INET;
         } else if ((flags & zio.Socket.Ipv6) != 0) {
@@ -176,12 +160,16 @@ pub const Socket = struct {
             sock_type |= SOCK_DGRAM;
             protocol |= Mswsock.Options.IPPROTO_UDP;
         }  
-    
+
         var self: @This() = undefined;
-        self.handle = switch ((flags & zio.Socket.Nonblock) != 0) {
-            true => WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED),
-            else => Mswsock.socket(family, sock_type, protocol),
-        };
+        if ((flags & zio.Socket.Nonblock) == 0) {
+            self.handle = Mswsock.socket(family, sock_type, protocol);
+        } else {
+            self.handle = WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED);
+            if (self.handle != INVALID_SOCKET)
+                self.handle = @intToPtr(Handle, @ptrToInt(self.handle) | is_overlapped);
+        }
+        
         if (self.handle != INVALID_SOCKET)
             return self;
         return switch (WSAGetLastError()) {
@@ -332,11 +320,11 @@ pub const Socket = struct {
         
     }
 
-    pub fn recv(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
+    pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
+    pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
         
     }
 

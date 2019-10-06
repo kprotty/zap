@@ -8,33 +8,16 @@ const system = os.system;
 
 pub const Handle = i32;
 
-pub const Buffer = struct {
+pub const Buffer = extern struct {
     inner: os.iovec,
 
     pub fn getBytes(self: @This()) []u8 {
         return self.inner.iov_base[0..self.inner.iov_len];
     }
 
-    pub fn fromBytes(bytes: []u8) @This() {
-        return @This() {
-            .inner = os.iovec {
-                .iov_base = bytes.ptr,
-                .iov_len = bytes.len,
-            }
-        };
-    }
-};
-
-pub const ConstBuffer = struct {
-    inner: os.iovec_const,
-
-    pub fn getBytes(self: @This()) []const u8 {
-        return self.inner.iov_base[0..self.inner.iov_len];
-    }
-
     pub fn fromBytes(bytes: []const u8) @This() {
         return @This() {
-            .inner = os.iovec_const {
+            .inner = os.iovec {
                 .iov_base = bytes.ptr,
                 .iov_len = bytes.len,
             }
@@ -489,7 +472,7 @@ pub const Socket = struct {
         return transfer(self.handle, address, buffers, Recvmsg);
     }
 
-    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const ConstBuffer, token: usize) zio.Socket.DataError!usize {
+    pub fn send(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
         if ((token & zio.Event.Disposable) != 0)
             return zio.ErrorClosed;
         if (token != 0 and (token & zio.Event.Writeable) == 0)

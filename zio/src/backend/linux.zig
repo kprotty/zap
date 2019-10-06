@@ -7,9 +7,7 @@ const linux = os.linux;
 
 pub const Handle = posix.Handle;
 pub const Socket = posix.Socket;
-
 pub const Buffer = posix.Buffer;
-pub const ConstBuffer = posix.ConstBuffer;
 
 pub const IncomingPadding = posix.IncomingPadding;
 pub const SockAddr = posix.SockAddr;

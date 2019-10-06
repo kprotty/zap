@@ -44,6 +44,23 @@ test "getPageSize, getHugePageSize" {
     expect(huge_size orelse 0 == getHugePageSize() orelse 0);
 }
 
+pub const NumaMemoryError = NumaError || error {
+    InvalidAddress,
+};
+
+pub fn getNodeForMemory(ptr: usize) NumaMemoryError!usize {
+    return zuma.backend.getNodeForMemory(ptr);
+}
+
+pub const NumaError = error {
+    InvalidNode,
+    InvalidResourceAccess,
+};
+
+pub fn getAvailableMemory(numa_node: ?usize) NumaError!usize {
+    return zuma.backend.getAvailableMemory(nuam_node);
+}
+
 pub const PAGE_HUGE     = 1 << 0;
 pub const PAGE_EXEC     = 1 << 1;
 pub const PAGE_READ     = 1 << 2;
@@ -57,11 +74,11 @@ pub const MapError = error {
 };
 
 pub fn map(address: ?*[*]u8, bytes: usize, flags: u32, node: ?usize) MapError![]align(page_size) u8 {
-    return backend.map(address, bytes, flags, node);
+    return zuma.backend.map(address, bytes, flags, node);
 }
 
 pub fn unmap(memory: []align(page_size) u8, node: ?usize) void {
-    return backend.unmap(memory, node);
+    return zuma.backend.unmap(memory, node);
 }
 
 pub const ModifyError = error {
@@ -69,5 +86,5 @@ pub const ModifyError = error {
 };
 
 pub fn modify(memory: []u8, flags: u32, node: ?usize) ModifyError!void {
-    return backend.modify(memory, flags, node);
+    return zuma.backend.modify(memory, flags, node);
 }

@@ -157,8 +157,39 @@ pub const Socket = struct {
 
     pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
         _ = try init_error.get();
-        
-        // TODO
+        var family: windows.DWORD = 0;
+        var sock_type: windows.DWORD = 0;
+        var protocol: windows.DWORD = 0;
+
+        if ((flags & zio.Socket.Ipv4) != 0) {
+            family |= AF_INET;
+        } else if ((flags & zio.Socket.Ipv6) != 0) {
+            family |= AF_INET6;
+        }
+        if ((flags & zio.Socket.Raw) != 0) {
+            family |= AF_UNSPEC;
+            sock_type |= SOCK_RAW;
+        } else if ((flags & zio.Socket.Tcp) != 0) {
+            sock_type |= SOCK_STREAM;
+            protocol |= Mswsock.Options.IPPROTO_TCP;
+        } else if ((flags & zio.Socket.Udp) != 0) {
+            sock_type |= SOCK_DGRAM;
+            protocol |= Mswsock.Options.IPPROTO_UDP;
+        }  
+    
+        var self: @This() = undefined;
+        self.handle = switch ((flags & zio.Socket.Nonblock) != 0) {
+            true => WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED),
+            else => Mswsock.socket(family, sock_type, protocol),
+        };
+        if (self.handle != INVALID_SOCKET)
+            return self;
+        return switch (WSAGetLastError()) {
+            WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS, WSAEINVALIDPROVIDER, WSAEINVALIDPROCTABLE, WSAEPROVIDERFAILEDINIT => zio.Socket.Error.InvalidState,
+            WSAEAFNOTSUPPORT, WSAEFAULT, WSAEINVAL, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT => zio.Socket.Error.InvalidValue,
+            WSAEMFILE, WSAENOBUFS => zio.Socket.Error.OutOfResources,
+            else => unreachable,
+        };
     }
 
     pub fn close(self: *@This()) void {
@@ -539,22 +570,22 @@ const Mswsock = struct {
     ) c_int;
 
     pub const Options = struct {
-        pub const IPPROTO_TCP: c_int = 6;
-        pub const IPPROTO_UDP: c_int = 17;
-        pub const SOL_SOCKET: c_int = 0xffff;
-        pub const SO_DEBUG: c_int = 0x0001;
-        pub const TCP_NODELAY: c_int = 0x0001;
-        pub const SO_LINGER: c_int = 0x0080;
-        pub const SO_BROADCAST: c_int = 0x0020;
-        pub const SO_REUSEADDR: c_int = 0x0004;
-        pub const SO_KEEPALIVE: c_int = 0x0008;
-        pub const SO_OOBINLINE: c_int = 0x0100;
-        pub const SO_RCVBUF: c_int = 0x1002;
-        pub const SO_RCVLOWAT: c_int = 0x1004;
-        pub const SO_RCVTIMEO: c_int = 0x1006;
-        pub const SO_SNDBUF: c_int = 0x1001;
-        pub const SO_SNDLOWAT: c_int = 0x1003;
-        pub const SO_SNDTIMEO: c_int = 0x1005;
+        pub const IPPROTO_TCP = 6;
+        pub const IPPROTO_UDP = 17;
+        pub const SOL_SOCKET = 0xffff;
+        pub const SO_DEBUG = 0x0001;
+        pub const TCP_NODELAY = 0x0001;
+        pub const SO_LINGER = 0x0080;
+        pub const SO_BROADCAST = 0x0020;
+        pub const SO_REUSEADDR = 0x0004;
+        pub const SO_KEEPALIVE = 0x0008;
+        pub const SO_OOBINLINE = 0x0100;
+        pub const SO_RCVBUF = 0x1002;
+        pub const SO_RCVLOWAT = 0x1004;
+        pub const SO_RCVTIMEO = 0x1006;
+        pub const SO_SNDBUF = 0x1001;
+        pub const SO_SNDLOWAT = 0x1003;
+        pub const SO_SNDTIMEO = 0x1005;
     };
 };
 

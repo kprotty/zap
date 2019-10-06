@@ -16,28 +16,10 @@ pub const Buffer = struct {
         return self.inner.getBytes();
     }
 
-    pub fn fromBytes(bytes: []u8) @This() {
+    pub fn fromBytes(bytes: []const u8) @This() {
         return @This() { .inner = zio.backend.Buffer.fromBytes(bytes) };
     }
 };
-
-pub const ConstBuffer = struct {
-    inner: zio.backend.ConstBuffer,
-
-    pub fn getBytes(self: @This()) []const u8 {
-        return self.inner.getBytes();
-    }
-
-    pub fn fromBytes(bytes: []const u8) @This() {
-        return @This() { .inner = zio.backend.ConstBuffer.fromBytes(bytes) };
-    }
-};
-
-test "ConstBuffer" {
-    const hello_world = "Hello world";
-    const buffer = ConstBuffer.fromBytes(hello_world);
-    expect(std.mem.eql(u8, buffer.getBytes(), hello_world));
-}
 
 test "Buffer" {
     const hello_world = "Hello world";

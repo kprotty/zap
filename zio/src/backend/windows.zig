@@ -356,7 +356,38 @@ pub const Socket = struct {
     }
 
     pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
-        
+        return switch (error_code: {
+            switch (try self.getOverlappedResult(&self.writer, token)) {
+                .Completed => |transferred| return transferred,
+                .Error => |code| break :error_code code,
+                .Retry => |overlapped| {
+                    var transferred: windows.DWORD = undefined;
+                    const result = WSASendTo(
+                        self.getHandle(),
+                        @ptrCast([*]const WSABUF, buffers.ptr),
+                        @intCast(windows.DWORD, buffers.len),
+                        if (overlapped == null) &transferred else null,
+                        windows.DWORD(0),
+                        if (address) |addr| zuma.mem.ptrCast(*const SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| addr.length else 0,
+                        overlapped,
+                        null,
+                    );
+                    if (result == SOCKET_ERROR)
+                        break :error_code WSAGetLastError();
+                    return usize(transferred);
+                },
+            }
+        }) {
+            0 => unreachable,
+            WSAEAFNOTSUPPORT, WSAEINVAL, WSAENETDOWN, WSAENOTCONN, WSAENOTSOCK, WSAESHUTDOWN => zio.Socket.DataError.InvalidHandle,
+            WSAEACCES, WSAEADDRNOTAVAIL, WSAEDESTADDRREQ, WSAEFAULT, WSAEHOSTUNREACH => zio.Socket.DataError.InvalidValue,
+            WSAECONNRESET, WSAENETRESET, WSAENETUNREACH, WSA_OPERATION_ABORTED => zio.ErrorClosed,
+            WSAEINPROGRESS, WSAEINTR, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
+            WSAEMSGSIZE, WSAENOBUFS => zio.Socket.DataError.OutOfResources,
+            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
+            else => unreachable,
+        };
     }
 
     const OverlappedResult = union(enum) {
@@ -404,6 +435,8 @@ const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
 const WSAEACCES: windows.DWORD = 10013;
 const WSAEMSGSIZE: windows.DWORD = 10040;
+const WSAESHUTDOWN: windows.DWORD = 10058;
+const WSAEDESTADDRREQ: windows.DWORD = 10039;
 const WSAENOTINITIALIZED: windows.DWORD = 10093;
 const WSAEADDRINUSE: windows.DWORD = 10048;
 const WSAEADDRNOTAVAIL: windows.DWORD = 10049;

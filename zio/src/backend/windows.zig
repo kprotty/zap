@@ -321,7 +321,38 @@ pub const Socket = struct {
     }
 
     pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
-        
+        return switch (error_code: {
+            switch (try self.getOverlappedResult(&self.reader, token)) {
+                .Completed => |transferred| return transferred,
+                .Error => |code| break :error_code code,
+                .Retry => |overlapped| {
+                    var transferred: windows.DWORD = undefined;
+                    const result = WSARecvFrom(
+                        self.getHandle(),
+                        @ptrCast([*]WSABUF, buffers.ptr),
+                        @intCast(windows.DWORD, buffers.len),
+                        if (overlapped == null) &transferred else null,
+                        @ptrCast(*windows.DWORD, &self.reader.Offset),
+                        if (address) |addr| zuma.mem.ptrCast(*SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| &addr.length else null,
+                        overlapped,
+                        null,
+                    );
+                    if (result == SOCKET_ERROR)
+                        break :error_code WSAGetLastError();
+                    return usize(transferred);
+                },
+            }
+        }) {
+            0 => unreachable,
+            WSAEINPROGRESS, WSAEINTR, WSAENETDOWN, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
+            WSAECONNRESET, WSAENETRESET, WSA_OPERATION_ABORTED => zio.ErrorClosed,
+            WSAEINVAL, WSAENOTCONN => zio.Socket.DataError.InvalidHandle,
+            WSAEMSGSIZE => zio.Socket.DataError.OutOfResources,
+            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
+            WSAEFAULT => zio.Socket.DataError.InvalidValue,
+            else => unreachable,
+        };
     }
 
     pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
@@ -367,6 +398,7 @@ const WAIT_TIMEOUT: windows.DWORD = 258;
 const ERROR_IO_PENDING: windows.DWORD = 997;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: windows.DWORD = 0xc8000006;
 
+const WSA_OPERATION_ABORTED: windows.DWORD = 995;
 const WSA_IO_PENDING: windows.DWORD = 997;
 const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
@@ -612,7 +644,7 @@ extern "ws2_32" stdcallcc fn WSASendTo(
     lpNumberOfBytesSent: ?*windows.DWORD,
     dwFlags: windows.DWORD,
     lpTo: ?*const SOCKADDR,
-    iToLen: c_int,
+    iToLen: c_uint,
     lpOverlapped: ?*windows.OVERLAPPED,
     lpCompletionRouting: ?OverlappedCompletionRoutine,
 ) c_int;
@@ -624,7 +656,7 @@ extern "ws2_32" stdcallcc fn WSARecvFrom(
     lpNumberOfBytesRecv: ?*windows.DWORD,
     lpFlags: *windows.DWORD,
     lpFrom: ?*SOCKADDR,
-    lpFromLen: ?*c_int,
+    lpFromLen: ?*c_uint,
     lpOverlapped: ?*windows.OVERLAPPED,
     lpCompletionRouting: ?OverlappedCompletionRoutine,
 ) c_int;

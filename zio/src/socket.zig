@@ -115,6 +115,7 @@ pub const Socket = struct {
     }
 
     pub const DataError = zio.Error || error {
+        InvalidState,
         InvalidValue,
         InvalidHandle,
         OutOfResources,

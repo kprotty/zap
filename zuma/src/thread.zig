@@ -17,7 +17,7 @@ pub const Thread = struct {
         return std.rand.DefaultPrng.init(seed);
     }
 
-    // NOTE: Because of linux VDSO shenanigans (https://marcan.st/2017/12/debugging-an-evil-go-runtime-bug/)
+    /// NOTE: Because of linux VDSO shenanigans (https://marcan.st/2017/12/debugging-an-evil-go-runtime-bug/)
     ///      One should ensure that the stack of this function call has at least 1-2 pages of owned memory.
     pub fn now(clock_type: ClockType) u64 {
         return zuma.backend.Thread.now(clock_type == .Monotonic);
@@ -35,7 +35,7 @@ pub const Thread = struct {
         return zuma.backend.Thread.getStackSize(function);
     }
 
-    pub const SpawnError = error {
+    pub const SpawnError = error{
         OutOfMemory,
         InvalidStack,
         TooManyThreads,
@@ -44,14 +44,14 @@ pub const Thread = struct {
     pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
         if (@sizeOf(@typeOf(parameter)) != @sizeOf(usize))
             @compileError("Parameter can only be a pointer sized value");
-        return @This() { .inner = try zuma.backend.Thread.spawn(stack, function, parameter) };
+        return @This(){ .inner = try zuma.backend.Thread.spawn(stack, function, parameter) };
     }
 
     pub fn join(self: *@This(), timeout_ms: ?u32) void {
         return self.inner.join(timeout_ms);
     }
 
-    pub const AffinityError = error {
+    pub const AffinityError = error{
         InvalidState,
         InvalidCpuSet,
     };
@@ -110,7 +110,6 @@ test "Thread - getStackSize, spawn, yield" {
         value: zync.Atomic(usize),
 
         fn update(self: *@This()) void {
-
             _ = self.value.fetchAdd(1, .Relaxed);
         }
 
@@ -128,7 +127,7 @@ test "Thread - getStackSize, spawn, yield" {
                     break :thread (try Thread.spawn(null, update, self));
                 }
             };
-            
+
             Thread.yield();
             update_thread.join(500);
             expect(self.value.load(.Relaxed) == 1);

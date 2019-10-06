@@ -32,14 +32,14 @@ pub const Address = extern struct {
     }
 
     pub fn fromIpv4(address: u32, port: u16) @This() {
-        return @This() {
+        return @This(){
             .length = @sizeOf(zio.backend.SockAddr.Ipv4),
             .sockaddr = zio.backend.SockAddr.fromIpv4(address, port),
         };
     }
 
     pub fn fromIpv6(address: std.net.Ip6Addr, port: u16, flowinfo: u32) @This() {
-        return @This() {
+        return @This(){
             .length = @sizeOf(zio.backend.SockAddr.Ipv6),
             .sockaddr = zio.backend.SockAddr.fromIpv6(@bitCast(u128, address.addr), port, flowinfo, address.scope_id),
         };
@@ -53,9 +53,9 @@ pub const Address = extern struct {
         return std.net.parseIp4(input);
     }
 
-    pub fn parseIpv6(input: []const u8) !std.net.Ip6Addr { 
+    pub fn parseIpv6(input: []const u8) !std.net.Ip6Addr {
         if (input.len == 0)
-            return std.net.Ip6Addr { .scope_id = 0, .addr = [_]u8 { 0 } ** 16 };
+            return std.net.Ip6Addr{ .scope_id = 0, .addr = [_]u8{0} ** 16 };
         if (std.mem.eql(u8, input, "::1"))
             return std.net.parseIp6("0:0:0:0:0:0:0:1");
         return std.net.parseIp6(input);

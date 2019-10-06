@@ -7,7 +7,11 @@ pub const Handle = zio.backend.Handle;
 pub const ErrorClosed = error.Closed;
 pub const ErrorPending = error.Pending;
 pub const ErrorInvalidToken = error.InvalidToken;
-pub const Error = error { Closed, Pending, InvalidToken };
+pub const Error = error{
+    Closed,
+    Pending,
+    InvalidToken,
+};
 
 pub const Buffer = struct {
     inner: zio.backend.Buffer,
@@ -17,7 +21,7 @@ pub const Buffer = struct {
     }
 
     pub fn fromBytes(bytes: []const u8) @This() {
-        return @This() { .inner = zio.backend.Buffer.fromBytes(bytes) };
+        return @This(){ .inner = zio.backend.Buffer.fromBytes(bytes) };
     }
 };
 

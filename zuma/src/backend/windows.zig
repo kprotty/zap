@@ -85,8 +85,8 @@ pub const CpuSet = struct {
                     }
                 }
             }
-        
-        // Get all logical processors ignoring numa configuration
+
+            // Get all logical processors ignoring numa configuration
         } else if (!populated) {
             var system_mask: windows.DWORD_PTR = undefined;
             const process_mask = @ptrCast(*windows.DWORD_PTR, &self.affinity.Mask);
@@ -97,44 +97,26 @@ pub const CpuSet = struct {
 };
 
 pub const Thread = struct {
-    
-    pub fn now(is_monotonic: bool) u64 {
-        
-    }
+    pub fn now(is_monotonic: bool) u64 {}
 
-    pub fn sleep(ms: u32) void {
-        
-    }
+    pub fn sleep(ms: u32) void {}
 
-    pub fn yield() void {
-        
-    }
+    pub fn yield() void {}
 
-    pub fn getStackSize(comptime function: var) usize {
-        
-    }
+    pub fn getStackSize(comptime function: var) usize {}
 
-    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
-        
-    }
+    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {}
 
-    pub fn join(self: *@This(), timeout_ms: ?u32) void {
-        
-    }
+    pub fn join(self: *@This(), timeout_ms: ?u32) void {}
 
-    pub fn setAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {
-        
-    }
+    pub fn setAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {}
 
-    pub fn getAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {
-        
-    }
+    pub fn getAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {}
 };
 
 ///-----------------------------------------------------------------------------///
 ///                                API Definitions                              ///
 ///-----------------------------------------------------------------------------///
-
 const USHORT = u16;
 const ERROR_INSUFFICIENT_BUFFER = 122;
 const KAFFINITY = windows.ULONG_PTR;

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const atomic = @import("atomic.zig");
 
 pub const cache_line = 64;
-pub fn CachePadded(comptime T: type) type { 
+pub fn CachePadded(comptime T: type) type {
     return packed struct {
         value: T,
         padding: [std.mem.alignForward(@sizeOf(T), cache_line) - @sizeOf(T)]u8,
@@ -43,8 +43,8 @@ test "popCount" {
 }
 
 pub fn intType(comptime is_signed: bool, comptime bits: var) type {
-    return @Type(builtin.TypeInfo {
-        .Int  = builtin.TypeInfo.Int {
+    return @Type(builtin.TypeInfo{
+        .Int = builtin.TypeInfo.Int{
             .bits = bits,
             .is_signed = is_signed,
         },
@@ -58,7 +58,7 @@ pub fn shrType(comptime Int: type) type {
 }
 
 test "shrType" {
-    expect(shrType(u8)  == u3);
+    expect(shrType(u8) == u3);
     expect(shrType(u16) == u4);
     expect(shrType(u32) == u5);
     expect(shrType(u64) == u6);
@@ -85,7 +85,7 @@ test "nextPowerOfTwo" {
     expect(nextPowerOfTwo(u8(127)) == u8(128));
 }
 
-pub fn Lazy(initializer: var) type {    
+pub fn Lazy(initializer: var) type {
     return struct {
         pub const Type = @typeOf(initializer).ReturnType;
         pub const State = enum {
@@ -98,7 +98,7 @@ pub fn Lazy(initializer: var) type {
         state: atomic.Atomic(State),
 
         pub fn new() @This() {
-            return @This() {
+            return @This(){
                 .value = undefined,
                 .state = atomic.Atomic(State).new(.Uninitialized),
             };

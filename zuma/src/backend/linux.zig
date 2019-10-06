@@ -12,8 +12,7 @@ const linux = os.linux;
 pub const CpuSet = struct {
     pub fn getNodeCount() usize {
         // data in the format of many? "{node_start}-{node_end}"
-        var data = readFile(c"/sys/devices/system/node/online")
-            catch return 1;
+        var data = readFile(c"/sys/devices/system/node/online") catch return 1;
         var node_count: usize = 0;
         while (readInt(&data)) |start|
             node_count += ((readInt(&data) orelse start) + 1) - start;
@@ -43,7 +42,7 @@ pub const CpuSet = struct {
                 error.InvalidRead => zuma.CpuSet.TopologyError.InvalidResourceAccess,
             };
 
-        // fetch all the of the cpu's set for the current process
+            // fetch all the of the cpu's set for the current process
         } else {
             const current_process = 0;
             const cpu_set_ptr = @ptrCast(*linux.cpu_set_t, &linux_cpu_set);
@@ -70,8 +69,7 @@ pub const CpuSet = struct {
 
     fn isPhysicalCpu(cpu: usize) bool {
         // data in format of "{physical_cpu},{sibling_cpu}"
-        var data = readFile(c"/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu)
-            catch return false;
+        var data = readFile(c"/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu) catch return false;
         if (readInt(&data)) |physical_cpu|
             return cpu == physical_cpu;
         return false;
@@ -183,8 +181,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
         const memory = stack orelse return zuma.Thread.SpawnError.InvalidStack;
         var id = @ptrCast(*i32, memory.ptr);
-        var clone_flags: u32 = 
-            os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
+        var clone_flags: u32 = os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
             os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
             os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM;
 
@@ -202,13 +199,13 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
                 return 0;
             }
         };
-        
+
         var stack_offset = getStackSize(function);
         stack_offset = std.mem.alignForward(stack_offset, zuma.mem.page_size) - 1;
         const stack_ptr = @ptrToInt(&memory[stack_offset]);
         const arg = zuma.mem.transmute(usize, parameter);
         return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
-            0 => @This() { .id = id },
+            0 => @This(){ .id = id },
             os.EPERM, os.EINVAL, os.ENOSPC, os.EUSERS => unreachable,
             os.EAGAIN => zuma.Thread.SpawnError.TooManyThreads,
             os.ENOMEM => zuma.Thread.SpawnError.OutOfMemory,
@@ -256,7 +253,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     }
 
     fn toTimespec(ms: u32) linux.timespec {
-        return linux.timespec {
+        return linux.timespec{
             .tv_sec = @intCast(isize, ms / 1000),
             .tv_nsec = @intCast(isize, (ms % 1000) * 1000000),
         };
@@ -264,22 +261,19 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
 };
 
 pub fn getPageSize() ?usize {
-    const map_size_kb = readValue(c"/proc/meminfo", "Mapped:") 
-        catch |_| return null;
-    const map_size = readValue(c"/proc/vmstat", "nr_mapped:")
-        catch |_| return null;
+    const map_size_kb = readValue(c"/proc/meminfo", "Mapped:") catch |_| return null;
+    const map_size = readValue(c"/proc/vmstat", "nr_mapped:") catch |_| return null;
     return map_size_kb / map_size;
 }
 
 pub fn getHugePageSize() ?usize {
-    const huge_page_size_kb = readValue(c"/proc/meminfo", "Hugepagesize:") 
-        catch |_| return null;
+    const huge_page_size_kb = readValue(c"/proc/meminfo", "Hugepagesize:") catch |_| return null;
     return huge_page_size_kb * 1024;
 }
 
 pub fn getNodeAvailableMemory(numa_node: usize) zuma.CpuSet.NodeError!usize {
-    const bytes_kb = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node)
-        catch |_| return zuma.CpuSet.NodeError.InvalidNode;
+    const value = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node);
+    const bytes_kb = value catch |_| return zuma.CpuSet.NodeError.InvalidNode;
     return bytes_kb * 1024;
 }
 
@@ -308,13 +302,9 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.me
     return @intToPtr([*]align(zuma.mem.page_size) u8, addr)[0..bytes];
 }
 
-pub fn unmap(memory: []align(zuma.mem.page_size) u8, node: ?usize) void {
-    
-}
+pub fn unmap(memory: []align(zuma.mem.page_size) u8, node: ?usize) void {}
 
-pub fn modify(memory: []align(zuma.mem.page_size) u8, flags: u32, node: ?usize) zuma.mem.ModifyError!void {
-    
-}
+pub fn modify(memory: []align(zuma.mem.page_size) u8, flags: u32, node: ?usize) zuma.mem.ModifyError!void {}
 
 //  mmap(address: ?[*]u8, length: usize, prot: usize, flags: u32, fd: i32, offset: u64)
 fn getProtectFlags(flags: u32) usize {
@@ -330,18 +320,15 @@ fn getProtectFlags(flags: u32) usize {
 
 fn readValue(comptime format: [*]const u8, comptime header: []const u8, format_args: ...) !usize {
     var data = try readFile(format, format_args);
-    const offset = std.mem.indexOf(u8, data, header)
-        orelse return error.InvalidValue;
-    data = data[(offset + header.len) ..];
-    return readInt(&data)
-        orelse return error.InvalidValue;
+    const offset = std.mem.indexOf(u8, data, header) orelse return error.InvalidValue;
+    data = data[(offset + header.len)..];
+    return readInt(&data) orelse return error.InvalidValue;
 }
 
 threadlocal var buffer: [4096]u8 = undefined;
 fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
     // open the file in read-only mode. Will only return a constant slice to the buffer
-    const path = std.fmt.bufPrint(buffer[0..], comptime std.mem.toSliceConst(u8, format), format_args) 
-        catch |_| return error.InvalidPath;
+    const path = std.fmt.bufPrint(buffer[0..], comptime std.mem.toSliceConst(u8, format), format_args) catch |_| return error.InvalidPath;
     const fd = linux.syscall2(linux.SYS_open, @ptrToInt(path.ptr), linux.O_RDONLY | linux.O_CLOEXEC);
     if (linux.getErrno(fd) != 0)
         return error.InvalidPath;
@@ -368,7 +355,7 @@ fn readInt(input: *[]const u8) ?usize {
 
     // read the number
     var number: usize = 0;
-    while (pos < source.len and (source[pos] >= '0' and source[pos] <= '9')) : (pos += 1)   
+    while (pos < source.len and (source[pos] >= '0' and source[pos] <= '9')) : (pos += 1)
         number = (number * 10) + usize(source[pos] - '0');
     return number;
 }

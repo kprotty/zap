@@ -25,13 +25,11 @@ pub const Event = struct {
     pub const Poller = struct {
         inner: zio.backend.Event.Poller,
 
-        pub const Error = std.os.UnexpectedError || error {
-            OutOfResources,
-        };
+        pub const Error = std.os.UnexpectedError || error{OutOfResources};
 
         pub fn new() Error!@This() {
             const poller = try zio.backend.Event.Poller.new();
-            return @This() { .inner = poller };
+            return @This(){ .inner = poller };
         }
 
         pub fn close(self: *@This()) void {
@@ -39,14 +37,14 @@ pub const Event = struct {
         }
 
         pub fn fromHandle(handle: zio.Handle) @This() {
-            return @This() { .inner = zio.Event.Poller.fromHandle(handle) };
+            return @This(){ .inner = zio.Event.Poller.fromHandle(handle) };
         }
 
         pub fn getHandle(self: @This()) zio.Handle {
             return self.inner.getHandle();
         }
 
-        pub const RegisterError = std.os.UnexpectedError || error {
+        pub const RegisterError = std.os.UnexpectedError || error{
             InvalidValue,
             InvalidHandle,
             OutOfResources,
@@ -60,7 +58,7 @@ pub const Event = struct {
             return self.inner.reregister(handle, flags, user_data);
         }
 
-        pub const NotifyError = std.os.UnexpectedError || error {
+        pub const NotifyError = std.os.UnexpectedError || error{
             InvalidValue,
             InvalidHandle,
             OutOfResources,
@@ -70,7 +68,7 @@ pub const Event = struct {
             return self.inner.notify(user_data);
         }
 
-        pub const PollError = std.os.UnexpectedError || error {
+        pub const PollError = std.os.UnexpectedError || error{
             InvalidHandle,
             InvalidEvents,
         };

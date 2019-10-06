@@ -15,7 +15,7 @@ pub const Socket = struct {
     pub const Ipv6: Flags = 1 << 4;
     pub const Nonblock: Flags = 1 << 5;
 
-    pub const Error = error {
+    pub const Error = error{
         InvalidValue,
         InvalidState,
         OutOfResources,
@@ -23,7 +23,7 @@ pub const Socket = struct {
 
     pub fn new(flags: Flags) Error!@This() {
         const socket = try zio.backend.Socket.new(flags);
-        return @This() { .inner = socket };
+        return @This(){ .inner = socket };
     }
 
     pub fn close(self: *@This()) void {
@@ -31,7 +31,7 @@ pub const Socket = struct {
     }
 
     pub inline fn fromHandle(handle: zio.Handle) @This() {
-        return @This() { .inner = zio.backend.Socket.fromHandle(handle) };
+        return @This(){ .inner = zio.backend.Socket.fromHandle(handle) };
     }
 
     pub inline fn getHandle(self: @This()) zio.Handle {
@@ -40,22 +40,22 @@ pub const Socket = struct {
 
     const Linger = zio.backend.Socket.Linger;
     pub const Option = union(enum) {
-        Debug: bool,        // SO_DEBUG
-        Linger: Linger,     // SO_LINGER
-        Broadcast: bool,    // SO_BROADCAST
-        Reuseaddr: bool,    // SO_REUSEADDR
-        Keepalive: bool,    // SO_KEEPALIVE
-        Oobinline: bool,    // SO_OOBINLINE
-        Tcpnodelay: bool,   // TCP_NODELAY
-        RecvBufMax: c_int,  // SO_RCVBUF
-        RecvBufMin: c_int,  // SO_RCVLOWAT
+        Debug: bool, // SO_DEBUG
+        Linger: Linger, // SO_LINGER
+        Broadcast: bool, // SO_BROADCAST
+        Reuseaddr: bool, // SO_REUSEADDR
+        Keepalive: bool, // SO_KEEPALIVE
+        Oobinline: bool, // SO_OOBINLINE
+        Tcpnodelay: bool, // TCP_NODELAY
+        RecvBufMax: c_int, // SO_RCVBUF
+        RecvBufMin: c_int, // SO_RCVLOWAT
         RecvTimeout: c_int, // SO_RCVTIMEO
-        SendBufMax: c_int,  // SO_SNDBUF
-        SendBufMin: c_int,  // SO_SNDLOWAT
+        SendBufMax: c_int, // SO_SNDBUF
+        SendBufMin: c_int, // SO_SNDLOWAT
         SendTimeout: c_int, // SO_SNDTIMEO
     };
 
-    pub const OptionError = error {
+    pub const OptionError = error{
         InvalidState,
         InvalidValue,
         InvalidHandle,
@@ -69,7 +69,7 @@ pub const Socket = struct {
         return self.inner.getOption(option);
     }
 
-    pub const BindError = error {
+    pub const BindError = error{
         AddressInUse,
         InvalidState,
         InvalidHandle,
@@ -80,7 +80,7 @@ pub const Socket = struct {
         return self.inner.bind(address);
     }
 
-    pub const ListenError = error {
+    pub const ListenError = error{
         AddressInUse,
         InvalidState,
         InvalidHandle,
@@ -90,7 +90,7 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = zio.Error || error {
+    pub const ConnectError = zio.Error || error{
         Refused,
         TimedOut,
         InvalidState,
@@ -103,7 +103,7 @@ pub const Socket = struct {
         return self.inner.connect(address, token);
     }
 
-    pub const AcceptError = zio.Error || error {
+    pub const AcceptError = zio.Error || error{
         Refused,
         InvalidHandle,
         InvalidAddress,
@@ -114,7 +114,7 @@ pub const Socket = struct {
         return self.inner.accept(flags, incoming, token);
     }
 
-    pub const DataError = zio.Error || error {
+    pub const DataError = zio.Error || error{
         InvalidState,
         InvalidValue,
         InvalidHandle,
@@ -139,12 +139,12 @@ pub const Socket = struct {
     }
 
     pub fn read(self: *@This(), buffer: []u8, token: usize) DataError!usize {
-        var buffers = [_][]u8 { buffer };
+        var buffers = [_][]u8{buffer};
         return self.readv(buffers[0..], token);
     }
 
     pub fn write(self: *@This(), buffer: []const u8, token: usize) DataError!usize {
-        var buffers = [_][]const u8 { buffer };
+        var buffers = [_][]const u8{buffer};
         return self.writev(buffers[0..], token);
     }
 
@@ -157,12 +157,12 @@ pub const Socket = struct {
     }
 
     pub fn recvfrom(self: *@This(), address: *zio.Address, buffer: []u8, token: usize) DataError!usize {
-        var buffers = [_][]u8 { buffer };
+        var buffers = [_][]u8{buffer};
         return self.recvmsg(address, buffers[0..], token);
     }
 
     pub fn sendto(self: *@This(), address: *zio.Address, buffer: []const u8, token: usize) DataError!usize {
-        var buffers = [_][]const u8 { buffer };
+        var buffers = [_][]const u8{buffer};
         return self.sendmsg(address, buffers[0..], token);
     }
 
@@ -213,10 +213,10 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     defer server.close();
 
     // Setup socket options for server handling
-    try server.setOption(Socket.Option { .SendTimeout = 1000 });
-    try server.setOption(Socket.Option { .RecvTimeout = 1000 });
-    try server.setOption(Socket.Option { .Reuseaddr = true });
-    var option = Socket.Option { .Reuseaddr = undefined };
+    try server.setOption(Socket.Option{ .SendTimeout = 1000 });
+    try server.setOption(Socket.Option{ .RecvTimeout = 1000 });
+    try server.setOption(Socket.Option{ .Reuseaddr = true });
+    var option = Socket.Option{ .Reuseaddr = undefined };
     try server.getOption(&option);
     expect(option.Reuseaddr == true);
 
@@ -230,9 +230,9 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     defer client.close();
 
     // Connect the client socket to the server socket
-    try client.setOption(Socket.Option { .SendTimeout = 1000 });
-    try client.setOption(Socket.Option { .RecvTimeout = 1000 });
-    try client.setOption(Socket.Option { .Tcpnodelay = true });
+    try client.setOption(Socket.Option{ .SendTimeout = 1000 });
+    try client.setOption(Socket.Option{ .RecvTimeout = 1000 });
+    try client.setOption(Socket.Option{ .Tcpnodelay = true });
     address = try AddressType.new(port);
     try client.connect(&address, 0);
 
@@ -275,7 +275,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Setup the server socket and register for Readable (incoming socket) & EdgeTrigger (dont reregister) events
             self.server = try Socket.new(flags);
             errdefer self.close();
-            try self.server.setOption(Socket.Option { .Reuseaddr = true });
+            try self.server.setOption(Socket.Option{ .Reuseaddr = true });
             var address = try AddressType.new(addr_port);
             try self.server.bind(&address);
             try self.server.listen(1);
@@ -298,7 +298,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
 
         pub fn handle_server(self: *@This(), token: usize, poller: *zio.Event.Poller) !void {
             // Accept the incoming client
-            _ = self.server.accept(flags, &self.incoming, token) catch |err| switch(err) {
+            _ = self.server.accept(flags, &self.incoming, token) catch |err| switch (err) {
                 zio.ErrorPending => return,
                 else => return err,
             };
@@ -307,8 +307,8 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Setup the client & start sending data (see Client struct below)
             // Since all this client will do is send data, register for Writeable & EdgeTrigger for reason above.
             self.client = self.incoming.getSocket();
-            try self.client.setOption(Socket.Option { .SendBufMax = 2048 });
-            try self.client.setOption(Socket.Option { .RecvBufMax = 2048 });
+            try self.client.setOption(Socket.Option{ .SendBufMax = 2048 });
+            try self.client.setOption(Socket.Option{ .RecvBufMax = 2048 });
             try poller.register(
                 self.client.getHandle(),
                 zio.Event.Writeable | zio.Event.EdgeTrigger,
@@ -322,7 +322,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             var token = io_token;
             while (self.client_sent < data.len) {
                 const buffer = data[0..(data.len - self.client_sent)];
-                self.client_sent += self.client.write(buffer, token) catch |err| switch(err) {
+                self.client_sent += self.client.write(buffer, token) catch |err| switch (err) {
                     zio.ErrorPending, zio.ErrorClosed => return,
                     else => return err,
                 };
@@ -343,14 +343,14 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
         pub fn new(self: *@This(), poller: *zio.Event.Poller, addr_port: u16) !void {
             self.socket = try Socket.new(flags);
             errdefer self.close();
-            try self.socket.setOption(Socket.Option { .SendBufMax = 2048 });
-            try self.socket.setOption(Socket.Option { .RecvBufMax = 2048 });
+            try self.socket.setOption(Socket.Option{ .SendBufMax = 2048 });
+            try self.socket.setOption(Socket.Option{ .RecvBufMax = 2048 });
             try poller.register(
                 self.socket.getHandle(),
                 zio.Event.Writeable | zio.Event.EdgeTrigger,
                 @ptrToInt(&self.socket),
             );
-            
+
             self.received = 0;
             self.connected = false;
             try self.handle(0, poller, addr_port);
@@ -365,7 +365,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // First, connect to the server socket
             while (!self.connected) {
                 var address = try AddressType.new(addr_port);
-                _ = self.socket.connect(&address, token) catch |err| switch(err) {
+                _ = self.socket.connect(&address, token) catch |err| switch (err) {
                     zio.ErrorPending => return,
                     else => return err,
                 };

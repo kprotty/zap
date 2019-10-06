@@ -43,7 +43,7 @@ pub const Event = struct {
         pub fn new() zio.Event.Poller.Error!@This() {
             const epoll_fd = linux.epoll_create1(linux.EPOLL_CLOEXEC);
             return switch (linux.getErrno(epoll_fd)) {
-                0 => @This() {
+                0 => @This(){
                     .event_fd = 0,
                     .epoll_fd = @intCast(Handle, epoll_fd),
                 },
@@ -56,7 +56,7 @@ pub const Event = struct {
         pub fn close(self: *@This()) void {
             _ = linux.close(self.epoll_fd);
             if (self.event_fd != 0)
-                _ = linux.close(self.event_fd);    
+                _ = linux.close(self.event_fd);
         }
 
         pub fn getHandle(self: @This()) zio.Handle {
@@ -64,7 +64,7 @@ pub const Event = struct {
         }
 
         pub fn fromHandle(handle: zio.Handle) @This() {
-            return @This() {
+            return @This(){
                 .epoll_fd = handle,
                 .event_fd = 0,
             };
@@ -116,15 +116,15 @@ pub const Event = struct {
         }
 
         fn epoll_ctl(self: @This(), handle: Handle, op: u32, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
-            var event = linux.epoll_event {
-                .data = linux.epoll_data { .ptr = data },
+            var event = linux.epoll_event{
+                .data = linux.epoll_data{ .ptr = data },
                 .events = 0,
             };
 
             if ((flags & zio.Event.Readable) != 0)
                 event.events |= linux.EPOLLIN;
             if ((flags & zio.Event.Writeable) != 0)
-                event.events |= linux.EPOLLOUT; 
+                event.events |= linux.EPOLLOUT;
             if ((flags & zio.Event.EdgeTrigger) != 0) {
                 event.events |= linux.EPOLLET;
             } else {

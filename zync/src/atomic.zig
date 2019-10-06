@@ -7,8 +7,12 @@ pub fn yield(spin_count: usize) void {
     var spin = spin_count;
     while (spin > 0) : (spin -= 1) {
         switch (builtin.arch) {
-            .i386, .x86_64 => asm volatile("pause" ::: "memory"),
-            .arm, .aarch64 => asm volatile("yield"),
+            .i386, .x86_64 => asm volatile ("pause"
+                :
+                :
+                : "memory"
+            ),
+            .arm, .aarch64 => asm volatile ("yield"),
             else => _ = @ptrCast(*volatile usize, &spin).*,
         }
     }
@@ -59,9 +63,9 @@ pub fn Atomic(comptime T: type) type {
                 else => utils.intType(false, comptime utils.nextPowerOfTwo(@sizeOf(B) * 8)),
             };
         }
-        
+
         pub fn new(value: T) @This() {
-            return @This() { .value = mem.transmute(Type, value) };
+            return @This(){ .value = mem.transmute(Type, value) };
         }
 
         pub inline fn get(self: @This()) T {
@@ -118,35 +122,15 @@ pub fn Atomic(comptime T: type) type {
         }
 
         pub fn compareSwap(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
-            return mem.transmute(?T, @cmpxchgWeak(
-                Type,
-                &self.value,
-                mem.transmute(Type, cmp),
-                mem.transmute(Type, xchg),
-                comptime success.toBuiltin(),
-                comptime failure.toBuiltin(),
-            ));
+            return mem.transmute(?T, @cmpxchgWeak(Type, &self.value, mem.transmute(Type, cmp), mem.transmute(Type, xchg), comptime success.toBuiltin(), comptime failure.toBuiltin()));
         }
 
         pub fn compareSwapStrong(self: *@This(), cmp: T, xchg: T, comptime success: Order, comptime failure: Order) ?T {
-            return mem.transmute(?T, @cmpxchgStrong(
-                Type,
-                &self.value,
-                mem.transmute(Type, cmp),
-                mem.transmute(Type, xchg),
-                comptime success.toBuiltin(),
-                comptime failure.toBuiltin(),
-            ));
+            return mem.transmute(?T, @cmpxchgStrong(Type, &self.value, mem.transmute(Type, cmp), mem.transmute(Type, xchg), comptime success.toBuiltin(), comptime failure.toBuiltin()));
         }
 
         fn atomicRmw(self: *@This(), value: T, comptime op: builtin.AtomicRmwOp, comptime order: Order) T {
-            return mem.transmute(T, @atomicRmw(
-                Type,
-                &self.value,
-                op,
-                mem.transmute(Type, value),
-                comptime order.toBuiltin(),
-            ));
+            return mem.transmute(T, @atomicRmw(Type, &self.value, op, mem.transmute(Type, value), comptime order.toBuiltin()));
         }
     };
 }
@@ -160,8 +144,13 @@ test "yield, fence" {
 }
 
 test "size rounding" {
-    expect(Atomic(struct { x: usize }).Type == utils.intType(false, @typeInfo(usize).Int.bits));
-    expect(Atomic(enum(u2) { X, Y }).Type == u8);
+    expect(Atomic(struct {
+        x: usize,
+    }).Type == utils.intType(false, @typeInfo(usize).Int.bits));
+    expect(Atomic(enum(u2) {
+        X,
+        Y,
+    }).Type == u8);
     expect(Atomic(u42).Type == u64);
     expect(Atomic(u64).Type == u64);
 }
@@ -170,7 +159,13 @@ test "get, set, load, store, swap, compareSwap" {
     var f = Atomic(f32).new(3.14);
     expect(f.get() == 3.14);
 
-    var e = Atomic(enum { A, B, C, D, E }).new(.A);
+    var e = Atomic(enum {
+        A,
+        B,
+        C,
+        D,
+        E,
+    }).new(.A);
     expect(e.get() == .A);
     e.set(.B);
     expect(e.load(.Relaxed) == .B);
@@ -182,13 +177,13 @@ test "get, set, load, store, swap, compareSwap" {
 
 test "add, sub, and, nand, or, xor, min, max" {
     var n = Atomic(u8).new(0);
-    expect(n.fetchAdd(4, .Relaxed) == 0);           // n = 0 ADD 4 = 4
-    expect(n.fetchSub(1, .Relaxed) == 4);           // n = 4 SUB 1 = 3
-    expect(n.fetchAnd(2, .Relaxed) == 3);           // n = 3(0b11) AND 2(0b10) = 2(0b10)
-    expect(n.fetchNand(2, .Relaxed) == 2);          // n = 2(0b00000010) NAND 2 = 0b11111101
-    expect(n.fetchOr(2, .Relaxed) == ~u8(2));       // n = 0b11111101 OR 0b00000010 = 0b11111111
+    expect(n.fetchAdd(4, .Relaxed) == 0); // n = 0 ADD 4 = 4
+    expect(n.fetchSub(1, .Relaxed) == 4); // n = 4 SUB 1 = 3
+    expect(n.fetchAnd(2, .Relaxed) == 3); // n = 3(0b11) AND 2(0b10) = 2(0b10)
+    expect(n.fetchNand(2, .Relaxed) == 2); // n = 2(0b00000010) NAND 2 = 0b11111101
+    expect(n.fetchOr(2, .Relaxed) == ~u8(2)); // n = 0b11111101 OR 0b00000010 = 0b11111111
     expect(n.fetchXor(~u8(0), .Relaxed) == ~u8(0)); // n = 0b11111111 XOR 0b11111111 = 0
-    expect(n.min(1, .Relaxed) == 0);                // n = (0 < 1) ? 0 : 1 = 0
-    expect(n.max(1, .Relaxed) == 0);                // n = (1 > 0) ? 1 : 0 = 1
+    expect(n.min(1, .Relaxed) == 0); // n = (0 < 1) ? 0 : 1 = 0
+    expect(n.max(1, .Relaxed) == 0); // n = (1 > 0) ? 1 : 0 = 1
     expect(n.load(.Relaxed) == 1);
-} 
+}

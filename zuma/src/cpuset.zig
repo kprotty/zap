@@ -4,7 +4,7 @@ const expect = std.testing.expect;
 const zync = @import("../../zap.zig").zync;
 const zuma = @import("../../zap.zig").zuma;
 
-pub const CpuType = enum { 
+pub const CpuType = enum {
     Physical,
     Logical,
 };
@@ -50,4 +50,3 @@ pub const CpuSet = struct {
         return zuma.backend.CpuSet.getCpus(self, numa_node, cpu_type == .Physical);
     }
 };
-

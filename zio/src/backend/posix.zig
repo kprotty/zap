@@ -16,11 +16,11 @@ pub const Buffer = extern struct {
     }
 
     pub fn fromBytes(bytes: []const u8) @This() {
-        return @This() {
-            .inner = os.iovec {
+        return @This(){
+            .inner = os.iovec{
                 .iov_base = bytes.ptr,
                 .iov_len = bytes.len,
-            }
+            },
         };
     }
 };
@@ -33,29 +33,29 @@ pub const SockAddr = extern struct {
     inner: os.sockaddr,
 
     pub fn fromIpv4(address: u32, port: u16) @This() {
-        return @This() {
-            .inner = os.sockaddr {
-                .in = Ipv4 {
+        return @This(){
+            .inner = os.sockaddr{
+                .in = Ipv4{
                     .addr = address,
                     .family = os.AF_INET,
                     .zero = [_]u8{0} ** 8,
                     .port = std.mem.nativeToBig(u16, port),
-                }
-            }
+                },
+            },
         };
     }
 
     pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
-        return @This() {
-            .inner = os.sockaddr {
-                .in6 = Ipv6 {
+        return @This(){
+            .inner = os.sockaddr{
+                .in6 = Ipv6{
                     .scope_id = scope,
                     .flowinfo = flowinfo,
                     .family = os.AF_INET6,
                     .addr = @bitCast([16]u8, address),
                     .port = std.mem.nativeToBig(@typeOf(port), port),
-                }
-            }
+                },
+            },
         };
     }
 };
@@ -85,7 +85,7 @@ pub const Event = struct {
         pub fn new() zio.Event.Poller.Error!@This() {
             const handle = c.kqueue();
             return switch (os.errno(handle)) {
-                0 => @This() { .handle = handle },
+                0 => @This(){ .handle = handle },
                 os.EMFILE, os.ENFILE, os.ENOMEM => zio.Event.Poller.Error.OutOfResources,
                 else => unreachable,
             };
@@ -100,7 +100,7 @@ pub const Event = struct {
         }
 
         pub fn fromHandle(handle: zio.Handle) @This() {
-            return @This() { .kqueue = handle };
+            return @This(){ .kqueue = handle };
         }
 
         pub fn register(self: *@This(), handle: zio.Handle, flags: u8, data: usize) zio.Event.Poller.RegisterError!void {
@@ -112,7 +112,7 @@ pub const Event = struct {
             events[0].udata = data;
             events[0].fflags = 0;
             events[1] = events[0];
-            
+
             if ((flags & zio.Event.Readable) != 0) {
                 events[num_events].filter = os.EVFILT_READ;
                 num_events += 1;
@@ -132,7 +132,7 @@ pub const Event = struct {
 
         pub fn notify(self: *@This(), data: usize) zio.Event.Poller.NotifyError!void {
             var events: [1]os.Kevent = undefined;
-            events[0] = os.Kevent {
+            events[0] = os.Kevent{
                 .data = 0,
                 .flags = 0,
                 .udata = data,
@@ -204,7 +204,7 @@ pub const Socket = struct {
         } else if (builtin.os == .linux) {
             domain = os.AF_PACKET;
         }
-        
+
         var protocol: u32 = 0;
         var sock_type: u32 = 0;
         if ((flags & zio.Socket.Nonblock) != 0)
@@ -218,10 +218,10 @@ pub const Socket = struct {
         } else if ((flags & zio.Socket.Raw) != 0) {
             sock_type |= os.SOCK_RAW;
         }
-        
+
         const handle = CreateSocket(domain, sock_type | os.SOCK_CLOEXEC, protocol);
         return switch (os.errno(handle)) {
-            0 => @This() { .handle = @intCast(zio.Handle, handle) },
+            0 => @This(){ .handle = @intCast(zio.Handle, handle) },
             os.EINVAL, os.EAFNOSUPPORT, os.EPROTONOSUPPORT => zio.Socket.Error.InvalidValue,
             os.ENFILE, os.EMFILE, os.ENOBUFS, os.ENOMEM => zio.Socket.Error.OutOfResources,
             os.EACCES => zio.Socket.Error.InvalidState,
@@ -234,7 +234,7 @@ pub const Socket = struct {
     }
 
     pub fn fromHandle(handle: zio.Handle) @This() {
-        return @This() { .handle = handle };
+        return @This(){ .handle = handle };
     }
 
     pub fn getHandle(self: @This()) zio.Handle {
@@ -362,25 +362,25 @@ pub const Socket = struct {
         if (result == 0) {
             switch (option.*) {
                 .Linger => {},
-                .Debug => option.* = zio.Socket.Option { .Debug = number != 0 },
-                .Broadcast => option.* = zio.Socket.Option { .Debug = number != 0 },
-                .Reuseaddr => option.* = zio.Socket.Option { .Reuseaddr = number != 0 },
-                .Keepalive => option.* = zio.Socket.Option { .Keepalive = number != 0 },
-                .Oobinline => option.* = zio.Socket.Option { .Oobinline = number != 0 },
-                .Tcpnodelay => option.* = zio.Socket.Option { .Tcpnodelay = number != 0 },
-                .SendBufMax => option.* = zio.Socket.Option { .SendBufMax = number },
-                .RecvBufMax => option.* = zio.Socket.Option { .RecvBufMax = number },
-                .SendBufMin => option.* = zio.Socket.Option { .SendBufMin = number },
-                .RecvBufMin => option.* = zio.Socket.Option { .RecvBufMin = number },
+                .Debug => option.* = zio.Socket.Option{ .Debug = number != 0 },
+                .Broadcast => option.* = zio.Socket.Option{ .Debug = number != 0 },
+                .Reuseaddr => option.* = zio.Socket.Option{ .Reuseaddr = number != 0 },
+                .Keepalive => option.* = zio.Socket.Option{ .Keepalive = number != 0 },
+                .Oobinline => option.* = zio.Socket.Option{ .Oobinline = number != 0 },
+                .Tcpnodelay => option.* = zio.Socket.Option{ .Tcpnodelay = number != 0 },
+                .SendBufMax => option.* = zio.Socket.Option{ .SendBufMax = number },
+                .RecvBufMax => option.* = zio.Socket.Option{ .RecvBufMax = number },
+                .SendBufMin => option.* = zio.Socket.Option{ .SendBufMin = number },
+                .RecvBufMin => option.* = zio.Socket.Option{ .RecvBufMin = number },
                 .SendTimeout => {
                     if (builtin.os != .windows)
                         number = @intCast(c_int, (timeval.tv_sec * 1000) + @divFloor(timeval.tv_usec, 1000));
-                    option.* = zio.Socket.Option { .SendTimeout = number };
+                    option.* = zio.Socket.Option{ .SendTimeout = number };
                 },
                 .RecvTimeout => {
                     if (builtin.os != .windows)
                         number = @intCast(c_int, (timeval.tv_sec * 1000) + @divFloor(timeval.tv_usec, 1000));
-                    option.* = zio.Socket.Option { .RecvTimeout = number };
+                    option.* = zio.Socket.Option{ .RecvTimeout = number };
                 },
             }
         }
@@ -481,7 +481,7 @@ pub const Socket = struct {
     }
 
     fn transfer(handle: zio.Handle, address: var, buffers: var, comptime Transfer: var) zio.Socket.DataError!usize {
-        var message_header = msghdr {
+        var message_header = msghdr{
             .msg_name = if (address) |addr| @ptrToInt(&addr.sockaddr) else 0,
             .msg_namelen = if (address) |addr| addr.length else 0,
             .msg_iov = @ptrToInt(buffers.ptr),

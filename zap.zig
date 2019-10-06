@@ -20,7 +20,7 @@ pub const zuma = struct {
     pub const backend = switch (builtin.os) {
         .linux => @import("zuma/src/backend/linux.zig"),
         .windows => @import("zuma/src/backend/windows.zig"),
-        else => @import("zuma/src/backend/posix.zig"),  
+        else => @import("zuma/src/backend/posix.zig"),
     };
 };
 
@@ -37,4 +37,3 @@ pub const zio = struct {
         else => @compileError("Only linux, windows and some *BSD variants are supported"),
     };
 };
-

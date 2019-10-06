@@ -10,110 +10,137 @@ const os = std.os;
 const linux = os.linux;
 
 pub const CpuSet = struct {
-    const Size = 128;
-    const Type = usize;
-    const Bits = @typeInfo(Type).Int.bits;
-    
-    bitmask: [Size / @sizeOf(Type)]Type,
-
-    pub fn set(self: *@This(), index: usize, is_set: bool) zuma.CpuSet.IndexError!void {
-        if (index / Bits >= self.bitmask.len)
-            return zuma.CpuSet.IndexError.InvalidCpu;
-        const mask = Type(1) << @truncate(zync.shrType(Type), index % Bits);
-        if (is_set) {
-            self.bitmask[index / Bits] |= mask;
-        } else {
-            self.bitmask[index / Bits] &= ~mask;
-        }
-    }
-
-    pub fn get(self: @This(), index: usize) zuma.CpuSet.IndexError!bool {
-        if (index / Bits >= self.bitmask.len)
-            return zuma.CpuSet.IndexError.InvalidCpu;
-        const mask = Type(1) << @truncate(zync.shrType(Type), index % Bits);
-        return (self.bitmask[index / Bits] & mask) != 0;
-    }
-
-    pub fn count(self: @This()) usize {
-        var bits: usize = 0;
-        for (self.bitmask) |value|
-            bits += zync.popCount(value);
-        return bits;
-    }
-
     pub fn getNodeCount() usize {
-        const format = "/sys/devices/system/node/online\x00";
-        var buffer: [128]u8 = undefined;
-        var data = readFile(buffer[0..], format) catch return 1;
-        
-        // data in the format of many "{numa_node_start}-{numa_node_end}"
-        var end: usize = 0;
-        var begin: usize = 0;
+        // data in the format of many? "{node_start}-{node_end}"
+        var data = readFile(c"/sys/devices/system/node/online")
+            catch return 1;
         var node_count: usize = 0;
-        while (readRange(&data, &begin, &end))
-            node_count += (end + 1) - begin;
-        return node_count;
+        while (readInt(&data)) |start|
+            node_count += ((readInt(&data) orelse start) + 1) - start;
+        return node_code;
     }
 
-    pub fn getNodeSize(numa_node: usize) zuma.CpuSet.NodeError!usize {
-        var buffer: [2048]u8 = undefined;
-        const format = "/sys/devices/system/node/node{}/meminfo\x00";
-        const node_size_kb = readValue(buffer[0..], format, "MemTotal:", numa_node) 
-            catch |_| return zuma.CpuSet.NodeError.InvalidNode;
-        return node_size_kb * 1024;
+    pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!usize {
+        // get the linux cpu set and count the number of bits
+        const linux_cpu_set = try getLinuxCpuSet(numa_node, only_physical_cpus);
+        return linux_cpu_set.count();
     }
 
-    pub fn getCpus(self: *@This(), numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.CpuError!void {
+    pub fn getCpus(self: *zuma.CpuSet, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!void {
+        // get the linux cpu set and find the first word with set bits
+        const linux_cpu_set = try getLinuxCpuSet(numa_node, only_physical_cpus);
+        self.* = fromLinuxCpuSet(linux_cpu_set);
+    }
+
+    fn getLinuxCpuSet(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!cpu_set_t {
+        var linux_cpu_set: cpu_set_t = undefined;
+        std.mem.set(usize, linux_cpu_set.bitmask, 0);
+
+        // fetch the cpu_set_t for a given numa node
         if (numa_node) |node| {
-            try self.setNumaNodeCpus(node);
+            getNumaLinuxCpuSet(node, &linux_cpu_set) catch |err| return switch (err) {
+                error.InvalidPath => zuma.CpuSet.TopologyError.InvalidNode,
+                error.InvalidRead => zuma.CpuSet.TopologyError.InvalidResourceAccess,
+            };
+
+        // fetch all the of the cpu's set for the current process
         } else {
-            const result = linux.sched_getaffinity(0, @sizeOf(@This()), @ptrCast(*linux.cpu_set_t, self));
+            const current_process = 0;
+            const cpu_set_ptr = @ptrCast(*linux.cpu_set_t, &linux_cpu_set);
+            const result = linux.sched_getaffinity(current_process, @sizeOf(linux_cpu_set), cpu_set_ptr);
             if (linux.getErrno(result) != 0)
-                return zuma.CpuSet.CpuError.SystemResourceAccess;
+                return zuma.CpuSet.CpuError.InvalidResourceAccess;
         }
 
-        // iterate all the set cpus & unset any that arent physical
+        // filter out set cpu_set_t bits to physical cpus if required
         if (only_physical_cpus) {
-            for (self.bitmask) |*value, index| {
-                var bits = value.*;
-                var pos: zync.shrType(Type) = 0;
-                while (bits != 0) : (bits ^= Type(1) << pos) {
-                    pos = @truncate(@typeOf(pos), @ctz(Type, ~bits) - 1);
-                    const bit = usize(pos) + usize(index * Bits);
+            for (linux_cpu_set.bitmask) |word, index| {
+                var bits = word;
+                var pos: zync.shrType(usize) = undefined;
+                while (bits != 0) : (bits ^= usize(1) << pos) {
+                    pos = @truncate(@typeOf(pos), @ctz(usize, ~bits) - 1);
+                    const bit = usize(pos) + (index * @typeInfo(usize).Int.bits);
                     if (!isPhysicalCpu(bit))
-                        try self.set(bit, false);
+                        linux_cpu_set.set(bit, false);
                 }
             }
         }
-    }
-
-    fn setNumaNodeCpus(self: *@This(), numa_node: usize) zuma.CpuSet.CpuError!void {
-        const format = "/sys/devices/system/node/node{}/cpulist\x00";
-        var buffer: [256]u8 = undefined;
-        var data = readFile(buffer[0..], format, numa_node) catch |err| return switch(err) {
-            error.InvalidPath => zuma.CpuSet.CpuError.InvalidNode,
-            error.InvalidRead => zuma.CpuSet.CpuError.SystemResourceAccess,
-        };
-
-        // data in the format of many "{cpu_start}-{cpu_end}"
-        var end: usize = 0;
-        var begin: usize = 0;
-        while (readRange(&data, &begin, &end))
-            while (begin <= end) : (begin += 1)
-                try self.set(begin, true);
+        return linux_cpu_set;
     }
 
     fn isPhysicalCpu(cpu: usize) bool {
-        const format = "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list\x00";
-        var buffer: [format.len]u8 = undefined;
-        var data = readFile(buffer[0..], format, cpu) catch return false;
-
         // data in format of "{physical_cpu},{sibling_cpu}"
-        var physical_cpu: usize = 0;
-        if (!readRange(&data, &physical_cpu, null))
-            return false;
-        return cpu == physical_cpu;
+        var data = readFile(c"/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", cpu)
+            catch return false;
+        if (readInt(&data)) |physical_cpu|
+            return cpu == physical_cpu;
+        return false;
     }
+
+    fn getNumaLinuxCpuSet(numa_node: usize, cpu_set: *cpu_set_t) !void {
+        // data is in the format of many? "{cpu_start}-{cpu_end}"
+        var data = try readFile(c"/sys/devices/system/node/node{}/cpulist", numa_node);
+        while (readInt(&data)) |start| {
+            cpu_set.set(start, true);
+            var end = readInt(&data) orelse start;
+            while (end != start) : (end -= 1)
+                cpu_set.set(end, true);
+        }
+    }
+
+    /// Convert a linux cpu set into a zuma.CpuSet
+    pub fn fromLinuxCpuSet(linux_cpu_set: cpu_set_t) zuma.CpuSet {
+        var cpu_set: zuma.CpuSet = undefined;
+        for (linux_cpu_set.bitmask) |word, index| {
+            if (word != 0) {
+                cpu_set.group = index;
+                cpu_set.mask = word;
+                return cpu_set;
+            }
+        }
+        cpu_set.clear();
+        return cpu_set;
+    }
+
+    /// Convert a zuma.CpuSet into a linux cpu set
+    pub fn toLinuxCpuSet(cpu_set: zuma.CpuSet) cpu_set_t {
+        var linux_cpu_set: cpu_set_t = undefined;
+        std.mem.set(usize, linux_cpu_set.bitmask[0..], 0);
+        linux_cpu_set.bitmask[cpu_set.group] = cpu_set.mask;
+        return linux_cpu_set;
+    }
+
+    /// More ergonomic equivalent of std.os.linux.cpu_set_t
+    const cpu_set_t = struct {
+        const byte_size = 128;
+        const bits = @typeInfo(usize).Int.bits;
+        bitmask: [byte_size / @sizeOf(usize)]usize,
+
+        pub fn count(self: @This()) usize {
+            var sum: usize = 0;
+            for (self.bitmask) |word|
+                sum += zync.popCount(word);
+            return sum;
+        }
+
+        pub fn get(self: @This(), index: usize) bool {
+            if (index / bits >= self.bitmask.len)
+                return false;
+            const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+            return (self.bitmask[index / bits] & mask) != 0;
+        }
+
+        pub fn set(self: *@This(), index: usize, is_set: bool) void {
+            if (index / bits >= self.bitmask.len)
+                return;
+            const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+            if (is_set) {
+                self.bitmask[index / bits] |= mask;
+            } else {
+                self.bitmask[index / bits] &= ~mask;
+            }
+        }
+    };
 };
 
 pub const Thread = if (builtin.link_libc) posix.Thread else struct {
@@ -202,9 +229,11 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
     }
 
-    pub fn setAffinity(cpu_set: *const CpuSet) zuma.Thread.AffinityError!void {
+    pub fn setAffinity(cpu_set: zuma.CpuSet) zuma.Thread.AffinityError!void {
+        var cpu_set_t = CpuSet.toLinuxCpuSet(cpu_set);
         const tid = linux.syscall0(linux.SYS_gettid);
-        return switch (os.errno(linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set)))) {
+        const result = linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
+        return switch (os.errno(result)) {
             0 => {},
             os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
             os.EPERM => zuma.Thread.AffinityError.InvalidState,
@@ -213,10 +242,12 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
     }
 
-    pub fn getAffinity(cpu_set: *CpuSet) zuma.Thread.AffinityError!void {
+    pub fn getAffinity(cpu_set: *zuma.CpuSet) zuma.Thread.AffinityError!void {
+        var cpu_set_t: CpuSet.cpu_set_t = undefined;
         const tid = linux.syscall0(linux.SYS_gettid);
-        return switch (os.errno(linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet), @ptrToInt(cpu_set)))) {
-            0 => {},
+        const result = linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
+        return switch (os.errno(result)) {
+            0 => cpu_set.* = CpuSet.fromLinuxCpuSet(cpu_set_t),
             os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
             os.EPERM => zuma.Thread.AffinityError.InvalidState,
             os.ESRCH => unreachable,
@@ -233,16 +264,23 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
 };
 
 pub fn getPageSize() ?usize {
-    var buffer: [4096]u8 = undefined;
-    const map_size_kb = readValue(buffer[0..], "/proc/meminfo\x00", "Mapped:") catch |_| return null;
-    const map_size = readValue(buffer[0..], "/proc/vmstat\x00", "nr_mapped:") catch |_| return null;
+    const map_size_kb = readValue(c"/proc/meminfo", "Mapped:") 
+        catch |_| return null;
+    const map_size = readValue(c"/proc/vmstat", "nr_mapped:")
+        catch |_| return null;
     return map_size_kb / map_size;
 }
 
 pub fn getHugePageSize() ?usize {
-    var buffer: [4096]u8 = undefined;
-    const huge_page_size_kb = readValue(buffer[0..], "/proc/meminfo\x00", "Hugepagesize:") catch |_| return null;
+    const huge_page_size_kb = readValue(c"/proc/meminfo", "Hugepagesize:") 
+        catch |_| return null;
     return huge_page_size_kb * 1024;
+}
+
+pub fn getNodeAvailableMemory(numa_node: usize) zuma.CpuSet.NodeError!usize {
+    const bytes_kb = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node)
+        catch |_| return zuma.CpuSet.NodeError.InvalidNode;
+    return bytes_kb * 1024;
 }
 
 pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.mem.MapError![]align(zuma.mem.page_size) u8 {
@@ -260,7 +298,7 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.me
     }
 
     // try and mind the address to a numa node
-    const MPOL_PREFERRED = ;
+    const MPOL_PREFERRED = 0;
     if (numa_node) |node| {
         switch (linux.getErrno(linux.syscall6(linux.SYS_mbind, addr, bytes, MPOL_PREFERRED, mask, node, 0))) {
             0 => {},
@@ -290,71 +328,47 @@ fn getProtectFlags(flags: u32) usize {
     return protect_flags;
 }
 
-fn readValue(buffer: []u8, comptime format: []const u8, comptime header: []const u8, format_args: ...) !usize {
-    var data = try readFile(buffer, format, format_args);
-    const offset = std.mem.indexOf(u8, data, header) 
+fn readValue(comptime format: [*]const u8, comptime header: []const u8, format_args: ...) !usize {
+    var data = try readFile(format, format_args);
+    const offset = std.mem.indexOf(u8, data, header)
         orelse return error.InvalidValue;
-
-    var value: usize = 0;
-    data = data[(offset + header.len)..];
-    if (!readRange(&data, &value, null))
-        return error.InvalidNode;
-    return value;
+    data = data[(offset + header.len) ..];
+    return readInt(&data)
+        orelse return error.InvalidValue;
 }
 
-fn readFile(buffer: []u8, comptime format: []const u8, format_args: ...) ![]const u8 {
+threadlocal var buffer: [4096]u8 = undefined;
+fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
     // open the file in read-only mode. Will only return a constant slice to the buffer
-    const path = std.fmt.bufPrint(buffer, format, format_args) 
-        catch |e| return error.InvalidPath;
+    const path = std.fmt.bufPrint(buffer[0..], comptime std.mem.toSliceConst(u8, format), format_args) 
+        catch |_| return error.InvalidPath;
     const fd = linux.syscall2(linux.SYS_open, @ptrToInt(path.ptr), linux.O_RDONLY | linux.O_CLOEXEC);
     if (linux.getErrno(fd) != 0)
         return error.InvalidPath;
     defer _ = linux.syscall1(linux.SYS_close, fd);
 
     // read as much content from the file as possible
-    const length = linux.syscall3(linux.SYS_read, fd, @ptrToInt(buffer.ptr), buffer.len);
+    const length = linux.syscall3(linux.SYS_read, fd, @ptrToInt(buffer[0..].ptr), buffer.len);
     if (linux.getErrno(length) != 0)
         return error.InvalidRead;
     return buffer[0..length];
 }
 
-fn readRange(noalias input: *[]const u8, noalias start: *usize, noalias end: ?*usize) bool {
-    // in order to not repeat
-    const Char = struct {
-        pub inline fn isDigit(char: u8) bool {
-            return char >= '0' and char <= '9';
-        }
-    };
-
-    // consume the buffer based on inputs read
+fn readInt(input: *[]const u8) ?usize {
+    // update the input after reading
     var pos: usize = 0;
     const source = input.*;
     defer input.* = source[pos..];
 
-    // skip non digits
-    while (pos < source.len and !Char.isDigit(source[pos]))
+    // skip non integer characters
+    while (pos < source.len and !(source[pos] >= '0' and source[pos] <= '9'))
         pos += 1;
     if (pos >= source.len)
-        return false;
+        return null;
 
-    // read the first number
+    // read the number
     var number: usize = 0;
-    while (pos < source.len and Char.isDigit(source[pos])) : (pos += 1)
+    while (pos < source.len and (source[pos] >= '0' and source[pos] <= '9')) : (pos += 1)   
         number = (number * 10) + usize(source[pos] - '0');
-    start.* = number;
-
-    // skip more non digits
-    while (pos < source.len and !Char.isDigit(source[pos]))
-        pos += 1;
-    if (pos >= source.len)
-        return true;
-
-    // try and read the second number
-    if (end) |end_ptr| {
-        number = 0;
-        while (pos < source.len and Char.isDigit(source[pos])) : (pos += 1)
-            number = (number * 10) + usize(source[pos] - '0');
-        end_ptr.* = number;
-    }
-    return true;
+    return number;
 }

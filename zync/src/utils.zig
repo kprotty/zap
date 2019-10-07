@@ -112,14 +112,13 @@ pub fn Lazy(initializer: var) type {
             if (self.state.load(.Relaxed) == .Initialized)
                 return &self.value;
 
-            if (self.state.compareSwap(.Uninitialized, .Initializing, .Relaxed, .Relaxed)) |_| {
-                while (self.state.load(.Relaxed) == .Initializing)
+            if (self.state.compareSwap(.Uninitialized, .Initializing, .Acquire, .Relaxed)) |_| {
+                while (self.state.load(.Acquire) == .Initializing)
                     atomic.yield(1);
                 return &self.value;
             }
 
             self.value = initializer();
-            atomic.fence(.AcqRel);
             self.state.store(.Initialized, .Release);
             return &self.value;
         }
@@ -128,14 +127,13 @@ pub fn Lazy(initializer: var) type {
 
 test "lazy init" {
     const Pi = struct {
-        threadlocal var current: Lazy(new) = undefined;
-        fn new() f32 {
+        var current = Lazy(create).new();
+        fn create() f32 {
             expect(current.state.get() == .Initializing);
             return f32(3.14);
         }
     };
 
-    Pi.current = @typeOf(Pi.current).new();
     expect(Pi.current.state.get() == .Uninitialized);
     expect(Pi.current.get() == 3.14);
     expect(Pi.current.state.get() == .Initialized);

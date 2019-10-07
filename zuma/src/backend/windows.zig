@@ -398,19 +398,19 @@ extern "kernel32" stdcallcc fn GetNumaAvailableMemoryNodeEx(
 
 extern "kernel32" stdcallcc fn GetLargePageMinimum() usize;
 
-extern "kernel32" stdcallcc fn OpenProcessToken(
+extern "advapi32" stdcallcc fn OpenProcessToken(
     ProcessHandle: windows.HANDLE,
     DesiredAccess: windows.DWORD,
     TokenHandle: *windows.HANDLE,
 ) windows.BOOL;
 
-extern "kernel32" stdcallcc fn LookupPrivilegeValueA(
+extern "advapi32" stdcallcc fn LookupPrivilegeValueA(
     lpSystemName: ?[*]const u8,
     lpName: [*c]const u8,
     lpLuid: *LUID,
 ) windows.BOOL;
 
-extern "kernel32" stdcallcc fn AdjustTokenPrivileges(
+extern "advapi32" stdcallcc fn AdjustTokenPrivileges(
     TokenHandle: windows.HANDLE,
     DisableAllPrivileges: windows.BOOL,
     NewState: *TOKEN_PRIVILEGES,

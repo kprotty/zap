@@ -41,7 +41,7 @@ pub const Thread = struct {
         TooManyThreads,
     };
 
-    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
+    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
         if (@sizeOf(@typeOf(parameter)) != @sizeOf(usize))
             @compileError("Parameter can only be a pointer sized value");
         return @This(){ .inner = try zuma.backend.Thread.spawn(stack, function, parameter) };
@@ -120,7 +120,7 @@ test "Thread - getStackSize, spawn, yield" {
             var update_thread = thread: {
                 const stack_size = Thread.getStackSize(update);
                 if (stack_size > 0) {
-                    var memory: [zuma.mem.page_size]u8 align(zuma.mem.page_size) = undefined;
+                    var memory: [zuma.page_size]u8 align(zuma.page_size) = undefined;
                     expect(stack_size <= memory.len);
                     break :thread (try Thread.spawn(memory[0..], update, self));
                 } else {

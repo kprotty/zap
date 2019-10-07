@@ -264,7 +264,7 @@ pub const Socket = struct {
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        if (Mswsock.bind(self.getHandle(), zuma.mem.ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
+        if (Mswsock.bind(self.getHandle(), zuma.ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
             return;
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS => zio.Socket.BindError.InvalidState,
@@ -293,7 +293,7 @@ pub const Socket = struct {
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
                     const handle = self.getHandle();
-                    const addr = zuma.mem.ptrCast(*const SOCKADDR, address.sockaddr);
+                    const addr = zuma.ptrCast(*const SOCKADDR, address.sockaddr);
                     if (overlapped) |ov| {
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return;
@@ -331,7 +331,7 @@ pub const Socket = struct {
                         @intCast(windows.DWORD, buffers.len),
                         if (overlapped == null) &transferred else null,
                         @ptrCast(*windows.DWORD, &self.reader.Offset),
-                        if (address) |addr| zuma.mem.ptrCast(*SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| zuma.ptrCast(*SOCKADDR, addr.sockaddr) else null,
                         if (address) |addr| &addr.length else null,
                         overlapped,
                         null,
@@ -366,7 +366,7 @@ pub const Socket = struct {
                         @intCast(windows.DWORD, buffers.len),
                         if (overlapped == null) &transferred else null,
                         windows.DWORD(0),
-                        if (address) |addr| zuma.mem.ptrCast(*const SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| zuma.ptrCast(*const SOCKADDR, addr.sockaddr) else null,
                         if (address) |addr| addr.length else 0,
                         overlapped,
                         null,

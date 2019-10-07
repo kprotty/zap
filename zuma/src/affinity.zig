@@ -36,7 +36,7 @@ pub const CpuAffinity = struct {
         }
     }
 
-    pub const TopologyError = zuma.mem.NumaError;
+    pub const TopologyError = zuma.NumaError;
 
     pub fn getNodeCount() usize {
         return zuma.backend.CpuAffinity.getNodeCount();

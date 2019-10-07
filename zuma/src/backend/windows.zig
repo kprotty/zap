@@ -111,14 +111,14 @@ pub const CpuAffinity = struct {
         const heap = windows.kernel32.GetProcessHeap() orelse return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         const data = windows.kernel32.HeapAlloc(heap, 0, size) orelse return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         defer std.debug.assert(windows.kernel32.HeapFree(heap, 0, data) == windows.TRUE);
-        var buffer = zuma.mem.ptrCast([*]const u8, data)[0..size];
+        var buffer = zuma.ptrCast([*]const u8, data)[0..size];
 
         // Populate the process info buffer & iterate it
-        var processor_info = zuma.mem.ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, data);
+        var processor_info = zuma.ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, data);
         if (GetLogicalProcessorInformationEx(relationship, processor_info, &size) == windows.FALSE)
             return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         while (buffer.len > 0) : (buffer = buffer[processor_info.Size..]) {
-            processor_info = zuma.mem.ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer.ptr);
+            processor_info = zuma.ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer.ptr);
             if (found_processor_info(processor_info, found_processor_info_args))
                 break;
         }
@@ -134,7 +134,7 @@ pub const Thread = struct {
 
     pub fn getStackSize(comptime function: var) usize {}
 
-    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {}
+    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {}
 
     pub fn join(self: *@This(), timeout_ms: ?u32) void {}
 
@@ -143,11 +143,11 @@ pub const Thread = struct {
     pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {}
 };
 
-pub fn getNodeSize(numa_node: usize) zuma.mem.NumaError!usize {
+pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
     var byte_size: windows.ULONGLONG = undefined;
     if (GetNumaAvailableMemoryNodeEx(@truncate(USHORT, numa_node), &byte_size) == windows.TRUE)
         return @intCast(usize, byte_size);
-    return zuma.mem.NumaError.InvalidNode;
+    return zuma.NumaError.InvalidNode;
 }
 
 ///-----------------------------------------------------------------------------///

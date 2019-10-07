@@ -172,11 +172,11 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         if (linux.tls.tls_image) |tls_image|
             size = std.mem.alignForward(size, @alignOf(usize)) + tls_image.alloc_size;
         size = std.mem.alignForward(size, @alignOf(@Frame(function))) + @sizeOf(@Frame(function));
-        size = std.mem.alignForward(size, zuma.mem.page_size);
+        size = std.mem.alignForward(size, zuma.page_size);
         return size;
     }
 
-    pub fn spawn(stack: ?[]align(zuma.mem.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
+    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
         const memory = stack orelse return zuma.Thread.SpawnError.InvalidStack;
         var id = @ptrCast(*i32, memory.ptr);
         var clone_flags: u32 = os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
@@ -193,15 +193,15 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         const Parameter = @typeOf(parameter);
         const Wrapper = struct {
             extern fn entry(arg: usize) u8 {
-                _ = function(zuma.mem.transmute(Parameter, arg));
+                _ = function(zuma.transmute(Parameter, arg));
                 return 0;
             }
         };
 
         var stack_offset = getStackSize(function);
-        stack_offset = std.mem.alignForward(stack_offset, zuma.mem.page_size) - 1;
+        stack_offset = std.mem.alignForward(stack_offset, zuma.page_size) - 1;
         const stack_ptr = @ptrToInt(&memory[stack_offset]);
-        const arg = zuma.mem.transmute(usize, parameter);
+        const arg = zuma.transmute(usize, parameter);
         return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
             0 => @This(){ .id = id },
             os.EPERM, os.EINVAL, os.ENOSPC, os.EUSERS => unreachable,
@@ -269,22 +269,22 @@ pub fn getHugePageSize() ?usize {
     return huge_page_size_kb * 1024;
 }
 
-pub fn getNodeAvailableMemory(numa_node: usize) zuma.mem.NumaError!usize {
+pub fn getNodeAvailableMemory(numa_node: usize) zuma.NumaError!usize {
     const value = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node);
-    const bytes_kb = value catch |_| return zuma.mem.NumaError.InvalidNode;
+    const bytes_kb = value catch |_| return zuma.NumaError.InvalidNode;
     return bytes_kb * 1024;
 }
 
-pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.mem.MapError![]align(zuma.mem.page_size) u8 {
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MapError![]align(zuma.page_size) u8 {
     // map the memory into the address space
     var map_flags: u32 = linux.MAP_PRIVATE | linux.MAP_ANONYMOUS;
-    if ((flags & zuma.mem.PAGE_HUGE) != 0)
+    if ((flags & zuma.PAGE_HUGE) != 0)
         map_flags |= linux.MAP_HUGETLB;
     const addr = linux.mmap(address, bytes, getProtectFlags(flags), map_flags, -1, 0);
     switch (linux.getErrno(addr)) {
         0 => {},
-        os.ENOMEM => return zuma.mem.MapError.OutOfMemory,
-        os.EINVAL => return zuma.mem.MapError.InvalidAddress,
+        os.ENOMEM => return zuma.MapError.OutOfMemory,
+        os.EINVAL => return zuma.MapError.InvalidAddress,
         os.EACCES, os.EAGAIN, os.EBADF, os.EEXIST, os.ENODEV, os.ETXTBSY, os.EOVERFLOW => unreachable,
         else => unreachable,
     }
@@ -297,21 +297,21 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.me
         }
     }
 
-    return @intToPtr([*]align(zuma.mem.page_size) u8, addr)[0..bytes];
+    return @intToPtr([*]align(zuma.page_size) u8, addr)[0..bytes];
 }
 
-pub fn unmap(memory: []align(zuma.mem.page_size) u8, node: ?usize) void {}
+pub fn unmap(memory: []align(zuma.page_size) u8, node: ?usize) void {}
 
-pub fn modify(memory: []align(zuma.mem.page_size) u8, flags: u32, node: ?usize) zuma.mem.ModifyError!void {}
+pub fn modify(memory: []align(zuma.page_size) u8, flags: u32, node: ?usize) zuma.ModifyError!void {}
 
 //  mmap(address: ?[*]u8, length: usize, prot: usize, flags: u32, fd: i32, offset: u64)
 fn getProtectFlags(flags: u32) usize {
     var protect_flags: usize = 0;
-    if ((flags & zuma.mem.PAGE_EXEC))
+    if ((flags & zuma.PAGE_EXEC))
         protect_flags |= linux.PROT_EXEC;
-    if ((flags & zuma.mem.PAGE_READ))
+    if ((flags & zuma.PAGE_READ))
         protect_flags |= linux.PROT_READ;
-    if ((flags & zuma.mem.PAGE_WRITE))
+    if ((flags & zuma.PAGE_WRITE))
         protect_flags |= linux.PROT_WRITE;
     return protect_flags;
 }

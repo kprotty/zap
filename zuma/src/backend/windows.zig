@@ -9,7 +9,7 @@ pub const CpuAffinity = struct {
         var node: windows.ULONG = undefined;
         if (GetNumaHighestNodeNumber(&node) == windows.TRUE)
             return @intCast(usize, node);
-        return usize(1);
+        return 1;
     }
 
     pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
@@ -51,7 +51,7 @@ pub const CpuAffinity = struct {
     ) bool {
         if (processor_info.Relationship != RelationNumaNode)
             return false;
-        if (usize(processor_info.Value.NumaNode.NodeNumber) != numa_node)
+        if (processor_info.Value.NumaNode.NodeNumber != numa_node)
             return false;
         affinity.* = processor_info.Value.NumaNode.GroupMask;
         return true;
@@ -126,21 +126,85 @@ pub const CpuAffinity = struct {
 };
 
 pub const Thread = struct {
-    pub fn now(is_monotonic: bool) u64 {}
+    handle: windows.HANDLE,
 
-    pub fn sleep(ms: u32) void {}
+    var frequency = zync.Lazy(getQPCFrequency).new();
+    fn getQPCFrequency() windows.LARGE_INTEGER {
+        var qpc_frequency: windows.LARGE_INTEGER = undefined;
+        if (QueryPerformanceFrequency(&qpc_frequency) == windows.TRUE)
+            return qpc_frequency;
+        return windows.LARGE_INTEGER(1000000); // assume nanosecond frequency
+    }
 
-    pub fn yield() void {}
+    pub fn now(is_monotonic: bool) u64 {
+        if (is_monotonic) {
+            var counter: windows.LARGE_INTEGER = undefined;
+            std.debug.assert(QueryPerformanceCounter(&counter) == windows.TRUE);
+            return @intCast(u64, @divFloor(counter, frequency.get()));
+        } else {
+            var filetime: FILETIME = undefined;
+            GetSystemTimePreciseAsFileTime(&filetime);
+            return u64(filetime.dwLowDateTime) | (u64(filetime.dwHighDateTime) << 32);
+        }
+    }
 
-    pub fn getStackSize(comptime function: var) usize {}
+    pub fn sleep(ms: u32) void {
+        Sleep(windows.DWORD(ms));
+    }
 
-    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {}
+    pub fn yield() void {
+        _ = SwitchToThread();
+    }
 
-    pub fn join(self: *@This(), timeout_ms: ?u32) void {}
+    pub fn getStackSize(comptime function: var) usize {
+        return 0; // windows doesnt allow custom thread stacks
+    }
 
-    pub fn setAffinity(cpu_affinity: *const zuma.CpuAffinity) zuma.Thread.AffinityError!void {}
+    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
+        const Parameter = @typeOf(parameter);
+        const Wrapper = struct {
+            extern fn entry(arg: windows.LPVOID) windows.DWORD {
+                _ = function(zuma.transmute(Parameter, arg));
+                return 0;
+            }
+        };
 
-    pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {}
+        if (stack != null)
+            return zuma.Thread.SpawnError.InvalidStack;
+        const param = zuma.transmute(*c_void, parameter);
+        const commit_stack_size = std.mem.alignForward(@sizeOf(@Frame(function)), zuma.page_size);
+        if (windows.kernel32.CreateThread(null, commit_stack_size, Wrapper.entry, param, 0, null)) |handle| {
+            return @This() { .handle = handle };
+        } else {
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+    }
+
+    pub fn join(self: *@This(), timeout_ms: ?u32) void {
+        if (self.handle == windows.INVALID_HANDLE_VALUE)
+            return;
+        _ = windows.kernel32.WaitForSingleObject(self.handle, timeout_ms orelse windows.INFINITE);
+        _ = windows.kernel32.CloseHandle(self.handle);
+        self.handle = windows.INVALID_HANDLE_VALUE;
+    }
+
+    pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
+        var group_affinity = GROUP_AFFINITY {
+            .Group = @intCast(u16, cpu_affinity.group),
+            .Mask = cpu_affinity.mask,
+            .Reserved = undefined,
+        };
+        if (SetThreadGroupAffinity(GetCurrentThread(), &group_affinity, null) == windows.FALSE)
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+    }
+
+    pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {
+        var group_affinity: GROUP_AFFINITY = undefined;
+        if (GetThreadGroupAffinity(GetCurrentThread(), &group_affinity) == windows.FALSE)
+            return windows.unexpectedError(windows.kernel32.GetLastError());
+        cpu_affinity.group = group_affinity.Group;
+        cpu_affinity.mask = group_affinity.Mask;
+    }
 };
 
 pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
@@ -230,6 +294,15 @@ const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = extern struct {
     },
 };
 
+const FILETIME = extern struct {
+    dwLowDateTime: windows.DWORD,
+    dwHighDateTime: windows.DWORD,
+};
+
+extern "kernel32" stdcallcc fn GetSystemTimePreciseAsFileTime(
+    lpSystemTimeAsFileTime: *FILETIME,
+) void;
+
 extern "kernel32" stdcallcc fn QueryPerformanceFrequency(
     lpFrequency: *windows.LARGE_INTEGER,
 ) windows.BOOL;
@@ -237,6 +310,10 @@ extern "kernel32" stdcallcc fn QueryPerformanceFrequency(
 extern "kernel32" stdcallcc fn QueryPerformanceCounter(
     lpPerformanceCount: *windows.LARGE_INTEGER,
 ) windows.BOOL;
+
+extern "kernel32" stdcallcc fn Sleep(dwMilliseconds: windows.DWORD) void;
+
+extern "kernel32" stdcallcc fn SwitchToThread() windows.BOOL;
 
 extern "kernel32" stdcallcc fn GetCurrentThread() windows.HANDLE;
 
@@ -249,7 +326,7 @@ extern "kernel32" stdcallcc fn SetThreadGroupAffinity(
     hThread: windows.HANDLE,
     GroupAffinity: *const GROUP_AFFINITY,
     PreviousGroupAffinity: ?*GROUP_AFFINITY,
-) DWORD_PTR;
+) windows.BOOL;
 
 extern "kernel32" stdcallcc fn GetLogicalProcessorInformationEx(
     RelationshipType: LOGICAL_PROCESSOR_RELATIONSHIP,

@@ -35,7 +35,7 @@ pub const Thread = struct {
         return zuma.backend.Thread.getStackSize(function);
     }
 
-    pub const SpawnError = error{
+    pub const SpawnError = std.os.UnexpectedError || error{
         OutOfMemory,
         InvalidStack,
         TooManyThreads,
@@ -51,7 +51,7 @@ pub const Thread = struct {
         return self.inner.join(timeout_ms);
     }
 
-    pub const AffinityError = error{
+    pub const AffinityError = std.os.UnexpectedError || error{
         InvalidState,
         InvalidCpuAffinity,
     };

@@ -174,7 +174,7 @@ pub const Thread = struct {
         const param = zuma.transmute(*c_void, parameter);
         const commit_stack_size = std.mem.alignForward(@sizeOf(@Frame(function)), zuma.page_size);
         if (windows.kernel32.CreateThread(null, commit_stack_size, Wrapper.entry, param, 0, null)) |handle| {
-            return @This() { .handle = handle };
+            return @This(){ .handle = handle };
         } else {
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
@@ -189,7 +189,7 @@ pub const Thread = struct {
     }
 
     pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
-        var group_affinity = GROUP_AFFINITY {
+        var group_affinity = GROUP_AFFINITY{
             .Group = @intCast(u16, cpu_affinity.group),
             .Mask = cpu_affinity.mask,
             .Reserved = undefined,
@@ -207,6 +207,34 @@ pub const Thread = struct {
     }
 };
 
+pub fn getPageSize() ?usize {
+    var system_info: windows.SYSTEM_INFO = undefined;
+    windows.kernel32.GetSystemInfo(&system_info);
+    return system_info.dwPageSize;
+}
+
+pub fn getHugePageSize() ?usize {
+    // Get a token to the current process
+    var token: windows.HANDLE = undefined;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == windows.FALSE)
+        return null;
+    defer _ = windows.kernel32.CloseHandle(token);
+
+    // Use the token to update the process privilege to support huge pages
+    var token_privilege: TOKEN_PRIVILEGES = undefined;
+    if (LookupPrivilegeValueA(null, c"SeLockMemoryPrivilege", &token_privilege.Privileges[0].Luid) == windows.FALSE)
+        return null;
+    token_privilege.PrivilegeCount = 1;
+    token_privilege.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (AdjustTokenPrivileges(token, windows.FALSE, &token_privilege, 0, null, null) == windows.FALSE)
+        return null;
+
+    // Get the system's configured huge page size
+    if (windows.kernel32.GetLastError() != ERROR_SUCCESS)
+        return null;
+    return GetLargePageMinimum();
+}
+
 pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
     var byte_size: windows.ULONGLONG = undefined;
     if (GetNumaAvailableMemoryNodeEx(@truncate(USHORT, numa_node), &byte_size) == windows.TRUE)
@@ -218,6 +246,7 @@ pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
 ///                                API Definitions                              ///
 ///-----------------------------------------------------------------------------///
 const USHORT = u16;
+const ERROR_SUCCESS = 0;
 const ERROR_INSUFFICIENT_BUFFER = 122;
 const KAFFINITY = windows.ULONG_PTR;
 const GROUP_AFFINITY = extern struct {
@@ -299,6 +328,24 @@ const FILETIME = extern struct {
     dwHighDateTime: windows.DWORD,
 };
 
+const SE_PRIVILEGE_ENABLED: windows.DWORD = 0x02;
+const LUID = extern struct {
+    LowPart: windows.ULONG,
+    HighPart: windows.LONG,
+};
+
+const LUID_AND_ATTRIBUTES = extern struct {
+    Luid: LUID,
+    Attributes: windows.DWORD,
+};
+
+const TOKEN_QUERY: windows.DWORD = 0x08;
+const TOKEN_ADJUST_PRIVILEGES: windows.DWORD = 0x20;
+const TOKEN_PRIVILEGES = extern struct {
+    PrivilegeCount: windows.DWORD,
+    Privileges: [1]LUID_AND_ATTRIBUTES,
+};
+
 extern "kernel32" stdcallcc fn GetSystemTimePreciseAsFileTime(
     lpSystemTimeAsFileTime: *FILETIME,
 ) void;
@@ -315,6 +362,7 @@ extern "kernel32" stdcallcc fn Sleep(dwMilliseconds: windows.DWORD) void;
 
 extern "kernel32" stdcallcc fn SwitchToThread() windows.BOOL;
 
+extern "kernel32" stdcallcc fn GetCurrentProcess() windows.HANDLE;
 extern "kernel32" stdcallcc fn GetCurrentThread() windows.HANDLE;
 
 extern "kernel32" stdcallcc fn GetThreadGroupAffinity(
@@ -346,4 +394,27 @@ extern "kernel32" stdcallcc fn GetNumaNodeProcessorMaskEx(
 extern "kernel32" stdcallcc fn GetNumaAvailableMemoryNodeEx(
     Node: USHORT,
     AvailableBytes: *windows.ULONGLONG,
+) windows.BOOL;
+
+extern "kernel32" stdcallcc fn GetLargePageMinimum() usize;
+
+extern "kernel32" stdcallcc fn OpenProcessToken(
+    ProcessHandle: windows.HANDLE,
+    DesiredAccess: windows.DWORD,
+    TokenHandle: *windows.HANDLE,
+) windows.BOOL;
+
+extern "kernel32" stdcallcc fn LookupPrivilegeValueA(
+    lpSystemName: ?[*]const u8,
+    lpName: [*c]const u8,
+    lpLuid: *LUID,
+) windows.BOOL;
+
+extern "kernel32" stdcallcc fn AdjustTokenPrivileges(
+    TokenHandle: windows.HANDLE,
+    DisableAllPrivileges: windows.BOOL,
+    NewState: *TOKEN_PRIVILEGES,
+    BufferLength: windows.DWORD,
+    PreviousState: ?*TOKEN_PRIVILEGES,
+    ReturnLength: ?*windows.DWORD,
 ) windows.BOOL;

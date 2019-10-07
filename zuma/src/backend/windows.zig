@@ -13,45 +13,100 @@ pub const CpuSet = struct {
     }
 
     pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!usize {
-        // For a numa node, get its corresponding GROUP_AFFINITY and count the mask bits
         if (numa_node) |node| {
-            const affinity = try getNumaGroupAffinity(node, only_physical_cpus);
+            var affinity: GROUP_AFFINITY = undefined;
+            try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
             return zync.popCount(affinity.Mask);
-            
         }
-
-
+        var cpu_count: usize = 0;
+        try iterateProcessorInfo(RelationProcessorCore, findAffinityCount, &cpu_count, only_physical_cpus);
+        return cpu_count;
     }
 
-    pub fn getCpus(self: *zuma.CpuSet, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!void {
-        
-    }
-
-    fn getNumaGroupAffinity(numa_node: usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!GROUP_AFFINITY {
+    pub fn getCpus(cpu_set: *zuma.CpuSet, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!void {
         var affinity: GROUP_AFFINITY = undefined;
+        if (numa_node) |node| {
+            affinity = try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
+        } else {
+            try iterateProcessorInfo(RelationProcessorCore, findFirstAffinity, &affinity, only_physical_cpus);
+        }
+        cpu_set.group = affinity.Group;
+        cpu_set.mask = affinity.Mask;
+    }
+
+    /// Find the GROUP_AFFINITY of a NUMA node.
+    /// If it only needs logical cpus, calls GetNumaNodeProcessorMaskEx instead to save on allocation
+    fn getNumaGroupAffinity(affinity: *GROUP_AFFINITY, numa_node: usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!void {
         if (only_physical_cpus) {
-            try iterProcessInfo(RelationNumaNode, findNumaGroupAffinity, numa_node, &affinity);
-        } else if (GetNumaNodeProcessorMaskEx(@truncate(USHORT, numa_node), &affinity) == windows.FALSE) {
+            try iterateProcessorInfo(RelationNumaNode, findNumaGroupAffinity, numa_node, affinity);
+        } else if (GetNumaNodeProcessorMaskEx(@truncate(USHORT, numa_node), affinity) == windows.FALSE) {
             return zuma.CpuSet.CpuError.InvalidNode;
         }
-        return affinity;
     }
 
-    fn findNumaGroupAffinity(process_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, numa_node: usize, affinity: *GROUP_AFFINITY) bool {
-        if (process_info.Relationship != RelationNumaNode)
+    fn findNumaGroupAffinity(
+        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        numa_node: usize,
+        affinity: *GROUP_AFFINITY,
+    ) bool {
+        if (processor_info.Relationship != RelationNumaNode)
             return false;
-        if (usize(process_info.Value.NumaNode.NodeNumber) != numa_node)
+        if (usize(processor_info.Value.NumaNode.NodeNumber) != numa_node)
             return false;
-        affinity.* = process_info.Value.NumaNode.GroupMask;
+        affinity.* = processor_info.Value.NumaNode.GroupMask;
         return true;
     }
 
-    fn iterProcessInfo(relationship: LOGICAL_PROCESSOR_RELATIONSHIP, comptime apply: var, apply_args: ...) zuma.CpuSet.TopologyError!void {
+    fn findAffinityCount(
+        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        cpu_count: *usize,
+        only_physical_cpus: bool,
+    ) bool {
+        if (processor_info.Relationship == RelationProcessorCore) {
+            std.debug.assert(processor_info.Value.Processor.GroupCount == 1);
+            const affinity = processor_info.Value.Processor.GroupMask[0];
+            cpu_count.* += if (only_physical_cpus) 1 else zync.popCount(affinity.Mask);
+        }
+        return false;
+    }
+
+    fn findFirstAffinity(
+        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        affinity: *?GROUP_AFFINITY,
+        only_physical_cpus: bool,
+    ) bool {
+        // Ensure the processor_info describes a CPU core
+        if (processor_info.Relationship != RelationProcessorCore)
+            return false;
+        std.debug.assert(processor_info.Value.Processor.GroupCount == 1);
+
+        // Get the processor_info's GROUP_AFFINITY, filtering out logical cpu bits if needed
+        const processor_affinity = &processor_info.Value.Processor.GroupMask[0];
+        if (only_physical_cpus) {
+            const physical_cpu = @ctz(KAFFINITY, processor_affinity.Mask) - 1;
+            processor_affinity.Mask = KAFFINITY(1) << @truncate(zync.shrType(KAFFINITY), physical_cpu);
+        }
+
+        // Update the affinity with the new mask of the current processor_info's GROUP_AFFINITY
+        if (affinity.*) |current_affinity| {
+            if (processor_affinity.Group != current_affinity.Group)
+                return false;
+            processor_affinity.Mask |= current_affinity.Mask;
+        }
+        affinity.* = processor_affinity.*;
+        return false;
+    }
+
+    fn iterateProcessorInfo(
+        comptime relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
+        comptime found_processor_info: var,
+        found_processor_info_args: ...,
+    ) zuma.CpuSet.TopologyError!void {
         // Find the size in bytes for the process info buffer
         var size: windows.DWORD = 0;
         if (GetLogicalProcessorInformationEx(relationship, null, &size) != windows.FALSE)
             return zuma.CpuSet.TopologyError.InvalidResourceAccess;
-        
+
         // Allocate a correctly sized process info buffer on the process heap
         const heap = windows.kernel32.GetProcessHeap() orelse return zuma.CpuSet.TopologyError.InvalidResourceAccess;
         const data = windows.kernel32.HeapAlloc(heap, 0, size) orelse return zuma.CpuSet.TopologyError.InvalidResourceAccess;
@@ -64,59 +119,8 @@ pub const CpuSet = struct {
             return zuma.CpuSet.TopologyError.InvalidResourceAccess;
         while (buffer.len > 0) : (buffer = buffer[processor_info.Size..]) {
             processor_info = zuma.mem.ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer.ptr);
-            if (!apply(process_info, apply_args))
+            if (found_processor_info(processor_info, found_processor_info_args))
                 break;
-        }
-    }
-}
-
-    pub fn getCpus(self: *@This(), numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.CpuError!void {
-        // Set numa node processors
-        var populated = false;
-        if (numa_node) |node| {
-            if (GetNumaNodeProcessorMaskEx(@truncate(USHORT, node), &self.affinity) == windows.FALSE)
-                return zuma.CpuSet.CpuError.InvalidNode;
-            populated = true;
-        }
-
-        // Filter out to only physical processors
-        if (only_physical_cpus) {
-            // Allocate a buffer for the processor information
-            var length: windows.DWORD = 0;
-            if (GetLogicalProcessorInformationEx(RelationProcessorCore, null, &length) != windows.FALSE)
-                return zuma.CpuSet.CpuError.SystemResourceAccess;
-            if (windows.kernel32.GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-                return zuma.CpuSet.CpuError.SystemResourceAccess;
-            const heap = windows.kernel32.GetProcessHeap() orelse return zuma.CpuSet.CpuError.SystemResourceAccess;
-            const data = windows.kernel32.HeapAlloc(heap, 0, length) orelse return zuma.CpuSet.CpuError.SystemResourceAccess;
-            defer std.debug.assert(windows.kernel32.HeapFree(heap, 0, data) == windows.TRUE);
-            var buffer = zuma.mem.ptrCast([*]u8, data)[0..length];
-
-            // Fetch the processor info & unset those that are logical & set those that are physical
-            var processor_info = zuma.mem.ptrCast(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, data);
-            if (GetLogicalProcessorInformationEx(RelationProcessorCore, processor_info, &length) == windows.FALSE)
-                return zuma.CpuSet.CpuError.SystemResourceAccess;
-            self.affinity.Mask = 0;
-            while (buffer.len > 0) : (buffer = buffer[processor_info.Size..]) {
-                processor_info = zuma.mem.ptrCast(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer.ptr);
-                if (processor_info.Relationship == RelationProcessorCore) {
-                    const num_groups = processor_info.Value.Processor.GroupCount;
-                    for ((processor_info.Value.Processor.GroupMask[0..].ptr)[0..num_groups]) |group| {
-                        if (group.Group == self.affinity.Group) {
-                            const mask_type = @typeOf(group.Mask);
-                            const mask = @ctz(mask_type, group.Mask);
-                            self.affinity.Mask |= mask_type(1) << @truncate(zync.shrType(mask_type), mask);
-                        }
-                    }
-                }
-            }
-
-            // Get all logical processors ignoring numa configuration
-        } else if (!populated) {
-            var system_mask: windows.DWORD_PTR = undefined;
-            const process_mask = @ptrCast(*windows.DWORD_PTR, &self.affinity.Mask);
-            if (GetProcessAffinityMask(GetCurrentProcess(), process_mask, &system_mask) == windows.FALSE)
-                return zuma.CpuSet.CpuError.SystemResourceAccess;
         }
     }
 };
@@ -140,11 +144,11 @@ pub const Thread = struct {
 };
 
 pub fn getNodeSize(numa_node: usize) zuma.CpuSet.NodeError!usize {
-        var byte_size: windows.ULONGLONG = undefined;
-        if (GetNumaAvailableMemoryNodeEx(@truncate(USHORT, numa_node), &byte_size) == windows.TRUE)
-            return @intCast(usize, byte_size);
-        return zuma.CpuSet.NodeError.InvalidNode;
-    }
+    var byte_size: windows.ULONGLONG = undefined;
+    if (GetNumaAvailableMemoryNodeEx(@truncate(USHORT, numa_node), &byte_size) == windows.TRUE)
+        return @intCast(usize, byte_size);
+    return zuma.CpuSet.NodeError.InvalidNode;
+}
 
 ///-----------------------------------------------------------------------------///
 ///                                API Definitions                              ///
@@ -235,28 +239,22 @@ extern "kernel32" stdcallcc fn QueryPerformanceCounter(
 ) windows.BOOL;
 
 extern "kernel32" stdcallcc fn GetCurrentThread() windows.HANDLE;
-extern "kernel32" stdcallcc fn GetCurrentProcess() windows.HANDLE;
 
 extern "kernel32" stdcallcc fn GetThreadGroupAffinity(
     hThread: windows.HANDLE,
     GroupAffinity: *GROUP_AFFINITY,
 ) windows.BOOL;
 
-extern "kernel32" stdcallcc fn SetThreadAffinityMask(
+extern "kernel32" stdcallcc fn SetThreadGroupAffinity(
     hThread: windows.HANDLE,
-    dwThreadAffinityMask: windows.DWORD_PTR,
+    GroupAffinity: *const GROUP_AFFINITY,
+    PreviousGroupAffinity: ?*GROUP_AFFINITY,
 ) DWORD_PTR;
 
 extern "kernel32" stdcallcc fn GetLogicalProcessorInformationEx(
     RelationshipType: LOGICAL_PROCESSOR_RELATIONSHIP,
     Buffer: ?*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     ReturnedLength: *windows.DWORD,
-) windows.BOOL;
-
-extern "kernel32" stdcallcc fn GetProcessAffinityMask(
-    hProcess: windows.HANDLE,
-    lpProcessAffinityMask: *windows.DWORD_PTR,
-    lpSystemAffinityMask: *windows.DWORD_PTR,
 ) windows.BOOL;
 
 extern "kernel32" stdcallcc fn GetNumaHighestNodeNumber(

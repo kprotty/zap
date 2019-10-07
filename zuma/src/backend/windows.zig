@@ -189,11 +189,10 @@ pub const Thread = struct {
     }
 
     pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
-        var group_affinity = GROUP_AFFINITY{
-            .Group = @intCast(u16, cpu_affinity.group),
-            .Mask = cpu_affinity.mask,
-            .Reserved = undefined,
-        };
+        var group_affinity: GROUP_AFFINITY = undefined;
+        group_affinity.Mask = cpu_affinity.mask;
+        group_affinity.Group = @intCast(u16, cpu_affinity.group);
+        std.mem.set(windows.WORD, group_affinity.Reserved[0..], 0);
         if (SetThreadGroupAffinity(GetCurrentThread(), &group_affinity, null) == windows.FALSE)
             return windows.unexpectedError(windows.kernel32.GetLastError());
     }
@@ -209,6 +208,7 @@ pub const Thread = struct {
 
 pub fn getPageSize() ?usize {
     var system_info: windows.SYSTEM_INFO = undefined;
+    @memset(@ptrCast([*]u8, &system_info), 0, @sizeOf(@typeOf(system_info)));
     windows.kernel32.GetSystemInfo(&system_info);
     return system_info.dwPageSize;
 }

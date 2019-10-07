@@ -4,10 +4,6 @@ const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
 const zync = @import("../../zap.zig").zync;
 
-pub fn ptrCast(comptime To: type, from: var) To {
-    return @ptrCast(To, @alignCast(@alignOf(To), from));
-}
-
 pub fn transmute(comptime To: type, from: var) To {
     var input = from;
     var output: To = undefined;

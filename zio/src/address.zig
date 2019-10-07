@@ -21,7 +21,7 @@ pub const Address = extern struct {
     };
 
     length: c_uint,
-    sockaddr: zio.backend.SockAddr align(@alignOf(usize)),
+    sockaddr: zio.backend.SockAddr,
 
     pub fn isIpv4(self: @This()) bool {
         return self.length == @sizeOf(zio.backend.SockAddr.Ipv4);

@@ -52,7 +52,7 @@ pub const SockAddr = extern struct {
                     .sin6_family = AF_INET6,
                     .sin6_scope_id = scope,
                     .sin6_flowinfo = flowinfo,
-                    .sin6_addr = IN6_ADDR{ .Qword = address },
+                    .sin6_addr = IN6_ADDR{ .Byte = @bitCast([16]u8, address) },
                     .sin6_port = @intCast(c_ushort, std.mem.nativeToBig(u16, port)),
                 },
             },
@@ -293,7 +293,7 @@ pub const Socket = struct {
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
                     const handle = self.getHandle();
-                    const addr = zuma.ptrCast(*const SOCKADDR, address.sockaddr);
+                    const addr = zuma.ptrCast(*const SOCKADDR, &address.sockaddr);
                     if (overlapped) |ov| {
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return;
@@ -331,7 +331,7 @@ pub const Socket = struct {
                         @intCast(windows.DWORD, buffers.len),
                         if (overlapped == null) &transferred else null,
                         @ptrCast(*windows.DWORD, &self.reader.Offset),
-                        if (address) |addr| zuma.ptrCast(*SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| zuma.ptrCast(*SOCKADDR, &addr.sockaddr) else null,
                         if (address) |addr| &addr.length else null,
                         overlapped,
                         null,
@@ -366,7 +366,7 @@ pub const Socket = struct {
                         @intCast(windows.DWORD, buffers.len),
                         if (overlapped == null) &transferred else null,
                         windows.DWORD(0),
-                        if (address) |addr| zuma.ptrCast(*const SOCKADDR, addr.sockaddr) else null,
+                        if (address) |addr| zuma.ptrCast(*const SOCKADDR, &addr.sockaddr) else null,
                         if (address) |addr| addr.length else 0,
                         overlapped,
                         null,
@@ -479,7 +479,6 @@ const IN_ADDR = extern struct {
 const IN6_ADDR = extern union {
     Byte: [16]windows.CHAR,
     Word: [8]windows.WORD,
-    Qword: u128,
 };
 
 const SOCKADDR_IN = extern struct {

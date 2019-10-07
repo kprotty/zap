@@ -9,7 +9,59 @@ const zuma = @import("../../../zap.zig").zuma;
 const os = std.os;
 const linux = os.linux;
 
-pub const CpuSet = struct {
+/// More ergonomic equivalent of std.os.linux.cpu_set_t
+const cpu_set_t = struct {
+    const byte_size = 128;
+    const bits = @typeInfo(usize).Int.bits;
+    bitmask: [byte_size / @sizeOf(usize)]usize,
+
+    pub fn count(self: @This()) usize {
+        var sum: usize = 0;
+        for (self.bitmask) |word|
+            sum += zync.popCount(word);
+        return sum;
+    }
+
+    pub fn get(self: @This(), index: usize) bool {
+        if (index / bits >= self.bitmask.len)
+            return false;
+        const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+        return (self.bitmask[index / bits] & mask) != 0;
+    }
+
+    pub fn set(self: *@This(), index: usize, is_set: bool) void {
+        if (index / bits >= self.bitmask.len)
+            return;
+        const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+        if (is_set) {
+            self.bitmask[index / bits] |= mask;
+        } else {
+            self.bitmask[index / bits] &= ~mask;
+        }
+    }
+
+    pub fn fromCpuAffinity(cpu_affinity: zuma.CpuAffinity) @This() {
+        var self: @This() = undefined;
+        std.mem.set(usize, self.bitmask[0..], 0);
+        self.bitmask[cpu_affinity.group] = cpu_affinity.mask;
+        return self;
+    }
+
+    pub fn toCpuAffinity(self: @This()) zuma.CpuAffinity {
+        var cpu_affinity: zuma.CpuAffinity = undefined;
+        for (self.bitmask) |word, index| {
+            if (word != 0) {
+                cpu_affinity.group = index;
+                cpu_affinity.mask = word;
+                return cpu_affinity;
+            }
+        }
+        cpu_affinity.clear();
+        return cpu_affinity;
+    }
+};
+
+pub const CpuAffinity = struct {
     pub fn getNodeCount() usize {
         // data in the format of many? "{node_start}-{node_end}"
         var data = readFile(c"/sys/devices/system/node/online") catch return 1;
@@ -19,36 +71,36 @@ pub const CpuSet = struct {
         return node_code;
     }
 
-    pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!usize {
+    pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
         // get the linux cpu set and count the number of bits
-        const linux_cpu_set = try getLinuxCpuSet(numa_node, only_physical_cpus);
-        return linux_cpu_set.count();
+        const cpu_set = try getCpuSet(numa_node, only_physical_cpus);
+        return cpu_set.count();
     }
 
-    pub fn getCpus(self: *zuma.CpuSet, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!void {
+    pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         // get the linux cpu set and find the first word with set bits
-        const linux_cpu_set = try getLinuxCpuSet(numa_node, only_physical_cpus);
+        const linux_cpu_set = try getCpuSet(numa_node, only_physical_cpus);
         self.* = fromLinuxCpuSet(linux_cpu_set);
     }
 
-    fn getLinuxCpuSet(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuSet.TopologyError!cpu_set_t {
-        var linux_cpu_set: cpu_set_t = undefined;
-        std.mem.set(usize, linux_cpu_set.bitmask, 0);
+    fn getCpuSet(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!cpu_set_t {
+        var cpu_set: cpu_set_t = undefined;
+        std.mem.set(usize, cpu_set.bitmask[0..], 0);
 
         // fetch the cpu_set_t for a given numa node
         if (numa_node) |node| {
-            getNumaLinuxCpuSet(node, &linux_cpu_set) catch |err| return switch (err) {
-                error.InvalidPath => zuma.CpuSet.TopologyError.InvalidNode,
-                error.InvalidRead => zuma.CpuSet.TopologyError.InvalidResourceAccess,
+            getNumaCpuSet(node, &cpu_set) catch |err| return switch (err) {
+                error.InvalidPath => zuma.CpuAffinity.TopologyError.InvalidNode,
+                error.InvalidRead => zuma.CpuAffinity.TopologyError.InvalidResourceAccess,
             };
 
             // fetch all the of the cpu's set for the current process
         } else {
             const current_process = 0;
-            const cpu_set_ptr = @ptrCast(*linux.cpu_set_t, &linux_cpu_set);
-            const result = linux.sched_getaffinity(current_process, @sizeOf(linux_cpu_set), cpu_set_ptr);
+            const cpu_set_ptr = @ptrCast(*linux.cpu_set_t, &cpu_set);
+            const result = linux.sched_getaffinity(current_process, @sizeOf(cpu_set), cpu_set_ptr);
             if (linux.getErrno(result) != 0)
-                return zuma.CpuSet.CpuError.InvalidResourceAccess;
+                return zuma.CpuAffinity.CpuError.InvalidResourceAccess;
         }
 
         // filter out set cpu_set_t bits to physical cpus if required
@@ -75,7 +127,7 @@ pub const CpuSet = struct {
         return false;
     }
 
-    fn getNumaLinuxCpuSet(numa_node: usize, cpu_set: *cpu_set_t) !void {
+    fn getNumaCpuSet(numa_node: usize, cpu_set: *cpu_set_t) !void {
         // data is in the format of many? "{cpu_start}-{cpu_end}"
         var data = try readFile(c"/sys/devices/system/node/node{}/cpulist", numa_node);
         while (readInt(&data)) |start| {
@@ -85,60 +137,6 @@ pub const CpuSet = struct {
                 cpu_set.set(end, true);
         }
     }
-
-    /// Convert a linux cpu set into a zuma.CpuSet
-    pub fn fromLinuxCpuSet(linux_cpu_set: cpu_set_t) zuma.CpuSet {
-        var cpu_set: zuma.CpuSet = undefined;
-        for (linux_cpu_set.bitmask) |word, index| {
-            if (word != 0) {
-                cpu_set.group = index;
-                cpu_set.mask = word;
-                return cpu_set;
-            }
-        }
-        cpu_set.clear();
-        return cpu_set;
-    }
-
-    /// Convert a zuma.CpuSet into a linux cpu set
-    pub fn toLinuxCpuSet(cpu_set: zuma.CpuSet) cpu_set_t {
-        var linux_cpu_set: cpu_set_t = undefined;
-        std.mem.set(usize, linux_cpu_set.bitmask[0..], 0);
-        linux_cpu_set.bitmask[cpu_set.group] = cpu_set.mask;
-        return linux_cpu_set;
-    }
-
-    /// More ergonomic equivalent of std.os.linux.cpu_set_t
-    const cpu_set_t = struct {
-        const byte_size = 128;
-        const bits = @typeInfo(usize).Int.bits;
-        bitmask: [byte_size / @sizeOf(usize)]usize,
-
-        pub fn count(self: @This()) usize {
-            var sum: usize = 0;
-            for (self.bitmask) |word|
-                sum += zync.popCount(word);
-            return sum;
-        }
-
-        pub fn get(self: @This(), index: usize) bool {
-            if (index / bits >= self.bitmask.len)
-                return false;
-            const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
-            return (self.bitmask[index / bits] & mask) != 0;
-        }
-
-        pub fn set(self: *@This(), index: usize, is_set: bool) void {
-            if (index / bits >= self.bitmask.len)
-                return;
-            const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
-            if (is_set) {
-                self.bitmask[index / bits] |= mask;
-            } else {
-                self.bitmask[index / bits] &= ~mask;
-            }
-        }
-    };
 };
 
 pub const Thread = if (builtin.link_libc) posix.Thread else struct {
@@ -226,26 +224,26 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
     }
 
-    pub fn setAffinity(cpu_set: zuma.CpuSet) zuma.Thread.AffinityError!void {
-        var cpu_set_t = CpuSet.toLinuxCpuSet(cpu_set);
+    pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
+        var cpu_set = cpu_set_t.fromCpuAffinity(cpu_affinity);
         const tid = linux.syscall0(linux.SYS_gettid);
         const result = linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
         return switch (os.errno(result)) {
             0 => {},
-            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
+            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuAffinity,
             os.EPERM => zuma.Thread.AffinityError.InvalidState,
             os.ESRCH => unreachable,
             else => unreachable,
         };
     }
 
-    pub fn getAffinity(cpu_set: *zuma.CpuSet) zuma.Thread.AffinityError!void {
-        var cpu_set_t: CpuSet.cpu_set_t = undefined;
+    pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {
+        var cpu_set: cpu_set_t = undefined;
         const tid = linux.syscall0(linux.SYS_gettid);
         const result = linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
         return switch (os.errno(result)) {
-            0 => cpu_set.* = CpuSet.fromLinuxCpuSet(cpu_set_t),
-            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuSet,
+            0 => cpu_affinity.* = cpu_set.toCpuAffinity(),
+            os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuAffinity,
             os.EPERM => zuma.Thread.AffinityError.InvalidState,
             os.ESRCH => unreachable,
             else => unreachable,
@@ -271,9 +269,9 @@ pub fn getHugePageSize() ?usize {
     return huge_page_size_kb * 1024;
 }
 
-pub fn getNodeAvailableMemory(numa_node: usize) zuma.CpuSet.NodeError!usize {
+pub fn getNodeAvailableMemory(numa_node: usize) zuma.mem.NumaError!usize {
     const value = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node);
-    const bytes_kb = value catch |_| return zuma.CpuSet.NodeError.InvalidNode;
+    const bytes_kb = value catch |_| return zuma.mem.NumaError.InvalidNode;
     return bytes_kb * 1024;
 }
 

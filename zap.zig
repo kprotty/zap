@@ -14,8 +14,8 @@ pub const zync = struct {
 
 pub const zuma = struct {
     pub const mem = @import("zuma/src/memory.zig");
-    pub usingnamespace @import("zuma/src/cpuset.zig");
     pub usingnamespace @import("zuma/src/thread.zig");
+    pub usingnamespace @import("zuma/src/affinity.zig");
 
     pub const backend = switch (builtin.os) {
         .linux => @import("zuma/src/backend/linux.zig"),

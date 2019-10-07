@@ -53,15 +53,15 @@ pub const Thread = struct {
 
     pub const AffinityError = error{
         InvalidState,
-        InvalidCpuSet,
+        InvalidCpuAffinity,
     };
 
-    pub fn setAffinity(cpu_set: zuma.CpuSet) AffinityError!void {
-        return zuma.backend.Thread.setAffinity(cpu_set);
+    pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) AffinityError!void {
+        return zuma.backend.Thread.setAffinity(cpu_affinity);
     }
 
-    pub fn getAffinity(cpu_set: *zuma.CpuSet) AffinityError!void {
-        return zuma.backend.Thread.getAffinity(cpu_set);
+    pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) AffinityError!void {
+        return zuma.backend.Thread.getAffinity(cpu_affinity);
     }
 };
 
@@ -80,29 +80,29 @@ test "Thread - random, now, sleep" {
 
 test "Thread - getAffinity, setAffinity" {
     // get the current thread affinity & count
-    var cpu_set: zuma.CpuSet = undefined;
-    cpu_set.clear();
-    try Thread.getAffinity(&cpu_set);
-    const cpu_count = cpu_set.count();
+    var cpu_affinity: zuma.CpuAffinity = undefined;
+    cpu_affinity.clear();
+    try Thread.getAffinity(&cpu_affinity);
+    const cpu_count = cpu_affinity.count();
     expect(cpu_count > 0);
 
     // update the thread affinity to be only the first core
-    var new_cpu_set: zuma.CpuSet = undefined;
-    new_cpu_set.clear();
-    new_cpu_set.set(0, true);
-    try Thread.setAffinity(new_cpu_set);
+    var new_cpu_affinity: zuma.CpuAffinity = undefined;
+    new_cpu_affinity.clear();
+    new_cpu_affinity.set(0, true);
+    try Thread.setAffinity(new_cpu_affinity);
 
     // check if the thread affinity truly is only the first core
-    new_cpu_set.clear();
-    try Thread.getAffinity(&new_cpu_set);
-    expect(new_cpu_set.count() == 1);
-    expect(new_cpu_set.get(0) == true);
+    new_cpu_affinity.clear();
+    try Thread.getAffinity(&new_cpu_affinity);
+    expect(new_cpu_affinity.count() == 1);
+    expect(new_cpu_affinity.get(0) == true);
 
     // set the affinity back to normal & check that its back to normal
-    try Thread.setAffinity(cpu_set);
-    cpu_set.clear();
-    try Thread.getAffinity(&cpu_set);
-    expect(cpu_set.count() == cpu_count);
+    try Thread.setAffinity(cpu_affinity);
+    cpu_affinity.clear();
+    try Thread.getAffinity(&cpu_affinity);
+    expect(cpu_affinity.count() == cpu_count);
 }
 
 test "Thread - getStackSize, spawn, yield" {

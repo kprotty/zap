@@ -121,7 +121,6 @@ test "Thread - getStackSize, spawn, yield" {
                 const stack_size = Thread.getStackSize(update);
                 if (stack_size > 0) {
                     var memory: [zuma.page_size]u8 align(zuma.page_size) = undefined;
-                    expect(stack_size <= memory.len);
                     break :thread (try Thread.spawn(memory[0..], update, self));
                 } else {
                     break :thread (try Thread.spawn(null, update, self));

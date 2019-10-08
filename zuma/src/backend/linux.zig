@@ -227,7 +227,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
         var cpu_set = cpu_set_t.fromCpuAffinity(cpu_affinity);
         const tid = linux.syscall0(linux.SYS_gettid);
-        const result = linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
+        const result = linux.syscall3(linux.SYS_sched_setaffinity, tid, @sizeOf(cpu_set_t), @ptrToInt(&cpu_set));
         return switch (os.errno(result)) {
             0 => {},
             os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuAffinity,
@@ -240,7 +240,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {
         var cpu_set: cpu_set_t = undefined;
         const tid = linux.syscall0(linux.SYS_gettid);
-        const result = linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(CpuSet.cpu_set_t), @ptrToInt(&cpu_set));
+        const result = linux.syscall3(linux.SYS_sched_getaffinity, tid, @sizeOf(cpu_set_t), @ptrToInt(&cpu_set));
         return switch (os.errno(result)) {
             0 => cpu_affinity.* = cpu_set.toCpuAffinity(),
             os.EFAULT, os.EINVAL => zuma.Thread.AffinityError.InvalidCpuAffinity,
@@ -259,18 +259,18 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
 };
 
 pub fn getPageSize() ?usize {
-    const map_size_kb = readValue(c"/proc/meminfo", "Mapped:") catch |_| return null;
-    const map_size = readValue(c"/proc/vmstat", "nr_mapped:") catch |_| return null;
+    const map_size_kb = readValue(c"/proc/meminfo", "Mapped:"[0..]) catch |_| return null;
+    const map_size = readValue(c"/proc/vmstat", "nr_mapped:"[0..]) catch |_| return null;
     return map_size_kb / map_size;
 }
 
 pub fn getHugePageSize() ?usize {
-    const huge_page_size_kb = readValue(c"/proc/meminfo", "Hugepagesize:") catch |_| return null;
+    const huge_page_size_kb = readValue(c"/proc/meminfo", "Hugepagesize:"[0..]) catch |_| return null;
     return huge_page_size_kb * 1024;
 }
 
 pub fn getNodeAvailableMemory(numa_node: usize) zuma.NumaError!usize {
-    const value = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:", numa_node);
+    const value = readValue(c"/sys/devices/system/node/node{}/meminfo", "MemTotal:"[0..], numa_node);
     const bytes_kb = value catch |_| return zuma.NumaError.InvalidNode;
     return bytes_kb * 1024;
 }
@@ -326,7 +326,8 @@ fn readValue(comptime format: [*]const u8, comptime header: []const u8, format_a
 threadlocal var buffer: [4096]u8 = undefined;
 fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
     // open the file in read-only mode. Will only return a constant slice to the buffer
-    const path = std.fmt.bufPrint(buffer[0..], comptime std.mem.toSliceConst(u8, format), format_args) catch |_| return error.InvalidPath;
+    const format_len = (comptime std.mem.len(u8, format)) + 1;
+    const path = std.fmt.bufPrint(buffer[0..], format[0..format_len], format_args) catch |_| return error.InvalidPath;
     const fd = linux.syscall2(linux.SYS_open, @ptrToInt(path.ptr), linux.O_RDONLY | linux.O_CLOEXEC);
     if (linux.getErrno(fd) != 0)
         return error.InvalidPath;

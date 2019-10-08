@@ -17,13 +17,13 @@ pub const page_size = std.mem.page_size;
 
 /// Dynamic, true system page size
 var cached_page_size = zync.Lazy(zuma.backend.getPageSize).new();
-pub inline fn getPageSize() usize {
+pub fn getPageSize() usize {
     return cached_page_size.get() orelse page_size;
 }
 
 /// Get the systems huge page size if huge pages are supported, else null
 var cached_huge_page_size = zync.Lazy(zuma.backend.getHugePageSize).new();
-pub inline fn getHugePageSize() ?usize {
+pub fn getHugePageSize() ?usize {
     return cached_huge_page_size.get();
 }
 

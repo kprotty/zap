@@ -9,7 +9,7 @@ const system = os.system;
 pub const Handle = i32;
 
 pub const Buffer = extern struct {
-    inner: os.iovec,
+    inner: os.iovec_const,
 
     pub fn getBytes(self: @This()) []u8 {
         return self.inner.iov_base[0..self.inner.iov_len];

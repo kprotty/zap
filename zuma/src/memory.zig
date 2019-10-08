@@ -40,7 +40,9 @@ test "getPageSize, getHugePageSize" {
     expect(huge_size orelse 0 == getHugePageSize() orelse 0);
 }
 
-pub const NumaMemoryError = NumaError || error{InvalidAddress};
+pub const NumaMemoryError = NumaError || error{
+    InvalidAddress
+};
 
 pub fn getNodeForMemory(ptr: usize) NumaMemoryError!usize {
     return zuma.backend.getNodeForMemory(ptr);
@@ -62,12 +64,13 @@ pub const PAGE_WRITE = 1 << 3;
 pub const PAGE_COMMIT = 1 << 4;
 pub const PAGE_DECOMMIT = 1 << 5;
 
-pub const MapError = error{
+pub const MemoryError = NumaMemoryError || error{
     OutOfMemory,
-    InvalidAddress,
+    InvalidMemory,
+    InvalidFlags,
 };
 
-pub fn map(address: ?*[*]u8, bytes: usize, flags: u32, node: ?usize) MapError![]align(page_size) u8 {
+pub fn map(address: ?*[*]u8, bytes: usize, flags: u32, node: ?usize) MemoryError![]align(page_size) u8 {
     return zuma.backend.map(address, bytes, flags, node);
 }
 
@@ -75,10 +78,6 @@ pub fn unmap(memory: []align(page_size) u8, node: ?usize) void {
     return zuma.backend.unmap(memory, node);
 }
 
-pub const ModifyError = error{
-// TODO
-};
-
-pub fn modify(memory: []u8, flags: u32, node: ?usize) ModifyError!void {
+pub fn modify(memory: []u8, flags: u32, node: ?usize) MemoryError!void {
     return zuma.backend.modify(memory, flags, node);
 }

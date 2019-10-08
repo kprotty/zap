@@ -168,25 +168,24 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     }
 
     pub fn getStackSize(comptime function: var) usize {
-        var size: usize = @sizeOf(i32);
-        if (linux.tls.tls_image) |tls_image|
-            size = std.mem.alignForward(size, @alignOf(usize)) + tls_image.alloc_size;
-        size = std.mem.alignForward(size, @alignOf(@Frame(function))) + @sizeOf(@Frame(function));
-        size = std.mem.alignForward(size, zuma.page_size);
-        return size;
+        return computeStackSize(function);
     }
 
     pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
+        var tls_offset: usize = 0;
+        var tid_offset: usize = 0;
+        var stack_offset: usize = 0;
+        const stack_size = computeStackSize(function, &tid_offset, &tls_offset, &stack_offset);
+
         const memory = stack orelse return zuma.Thread.SpawnError.InvalidStack;
-        var id = @ptrCast(*i32, memory.ptr);
+        if (memory.len < stack_size)
+            return zuma.Thread.SpawnError.InvalidStack;
+
         var clone_flags: u32 = os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
             os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
             os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM;
-
-        var tls_offset: usize = undefined;
         if (linux.tls.tls_image) |tls_image| {
             clone_flags |= os.CLONE_SETTLS;
-            tls_offset = std.math.max(@sizeOf(i32), @alignOf(usize));
             tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_offset]));
         }
 
@@ -198,10 +197,9 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
             }
         };
 
-        var stack_offset = getStackSize(function);
-        stack_offset = std.mem.alignForward(stack_offset, zuma.page_size) - 1;
-        const stack_ptr = @ptrToInt(&memory[stack_offset]);
         const arg = zuma.transmute(usize, parameter);
+        const stack_ptr = @ptrToInt(&memory[stack_offset]);
+        const id = @ptrCast(*i32, @alignCast(@alignOf(*i32), &memory[tid_offset]));
         return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
             0 => @This(){ .id = id },
             os.EPERM, os.EINVAL, os.ENOSPC, os.EUSERS => unreachable,
@@ -209,6 +207,30 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
             os.ENOMEM => zuma.Thread.SpawnError.OutOfMemory,
             else => unreachable,
         };
+    }
+
+    fn computeStackSize(comptime function: var, offsets: ...) usize {
+        // pid offset
+        var size: usize = 0;
+        if (offsets.len > 0)
+            offsets[0].* = size;
+        size += @sizeOf(i32);
+
+        // tls offset
+        if (linux.tls.tls_image) |tls_image| {
+            size = std.mem.alignForward(size, @alignOf(usize));
+            if (offsets.len > 1)
+                offsets[1].* = size;
+            size += tls_image.alloc_size;
+        }
+
+        // stack offset
+        size = std.mem.alignForward(size, zuma.page_size);
+        if (offsets.len > 2)
+            offsets[2].* = size;
+        size = std.mem.alignForward(size, @alignOf(@Frame(function)));
+        size += @sizeOf(@Frame(function));
+        return size;
     }
 
     pub fn join(self: *@This(), timeout_ms: ?u32) void {

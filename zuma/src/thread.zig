@@ -113,26 +113,26 @@ test "Thread - getStackSize, spawn, yield" {
             _ = self.value.fetchAdd(1, .Relaxed);
         }
 
-        pub fn run(self: *@This()) !void {
+        pub fn run(self: *@This(), thread_memory: ?[]align(zuma.page_size) u8) !void {
             self.value.set(0);
             expect(self.value.get() == 0);
+            defer expect(self.value.load(.Relaxed) == 1);
 
-            var update_thread = thread: {
-                const stack_size = Thread.getStackSize(update);
-                if (stack_size > 0) {
-                    var memory: [zuma.page_size]u8 align(zuma.page_size) = undefined;
-                    break :thread (try Thread.spawn(memory[0..], update, self));
-                } else {
-                    break :thread (try Thread.spawn(null, update, self));
-                }
-            };
-
+            var update_thread = try Thread.spawn(thread_memory, update, self);
             Thread.yield();
             update_thread.join(500);
-            expect(self.value.load(.Relaxed) == 1);
         }
     };
 
     var thread_test: ThreadTest = undefined;
-    try thread_test.run();
+    const allocator = std.debug.global_allocator;
+    const stack_size = Thread.getStackSize(ThreadTest.update);
+
+    if (stack_size == 0) {
+        try thread_test.run(null);
+    } else {
+        const stack_memory = try allocator.alignedAlloc(u8, zuma.page_size, stack_size);
+        defer allocator.free(stack_memory);
+        try thread_test.run(stack_memory);
+    }
 }

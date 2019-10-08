@@ -40,9 +40,7 @@ test "getPageSize, getHugePageSize" {
     expect(huge_size orelse 0 == getHugePageSize() orelse 0);
 }
 
-pub const NumaMemoryError = NumaError || error{
-    InvalidAddress
-};
+pub const NumaMemoryError = NumaError || error{InvalidAddress};
 
 pub fn getNodeForMemory(ptr: usize) NumaMemoryError!usize {
     return zuma.backend.getNodeForMemory(ptr);
@@ -70,14 +68,25 @@ pub const MemoryError = NumaMemoryError || error{
     InvalidFlags,
 };
 
-pub fn map(address: ?*[*]u8, bytes: usize, flags: u32, node: ?usize) MemoryError![]align(page_size) u8 {
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, node: ?usize) MemoryError![]align(page_size) u8 {
     return zuma.backend.map(address, bytes, flags, node);
 }
 
-pub fn unmap(memory: []align(page_size) u8, node: ?usize) void {
+pub fn unmap(memory: []u8, node: ?usize) void {
     return zuma.backend.unmap(memory, node);
 }
 
 pub fn modify(memory: []u8, flags: u32, node: ?usize) MemoryError!void {
     return zuma.backend.modify(memory, flags, node);
+}
+
+test "Virtual memory" {
+    for ([_]?usize{ null, 0 }) |node| {
+        const memory = try map(null, page_size, PAGE_READ | PAGE_WRITE, node);
+        defer unmap(memory, node);
+        try modify(memory, PAGE_COMMIT | PAGE_READ | PAGE_WRITE, node);
+        @ptrCast(*volatile u8, memory.ptr).* = 69;
+        expect(memory[0] == 69);
+        try modify(memory, PAGE_DECOMMIT, node);
+    }
 }

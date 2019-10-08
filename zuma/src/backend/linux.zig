@@ -302,7 +302,7 @@ const MPOL_BIND = 2;
 const MPOL_DEFAULT = 0;
 const MPOL_PREFERRED = 1;
 
-pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MapError![]align(zuma.page_size) u8 {
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MemoryError![]align(zuma.page_size) u8 {
     // map the memory into the address space
     var map_flags: u32 = linux.MAP_PRIVATE | linux.MAP_ANONYMOUS;
     if ((flags & zuma.PAGE_HUGE) != 0)
@@ -310,24 +310,24 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.Ma
     const addr = linux.mmap(address, bytes, getProtectFlags(flags), map_flags, -1, 0);
     switch (linux.getErrno(addr)) {
         0 => {},
-        os.ENOMEM => return zuma.MapError.OutOfMemory,
-        os.EINVAL => return zuma.MapError.InvalidAddress,
+        os.ENOMEM => return zuma.MemoryError.OutOfMemory,
+        os.EINVAL => return zuma.MemoryError.InvalidAddress,
         os.EACCES, os.EAGAIN, os.EBADF, os.EEXIST, os.ENODEV, os.ETXTBSY, os.EOVERFLOW => unreachable,
         else => unreachable,
     }
 
     // try and bind the address range memory to a (preferred) numa node
     if (numa_node) |node| {
+        var node_mask: [32]c_ulong = undefined;
         const bits = @typeInfo(c_ulong).Int.bits;
-        const node_mask: [32]c_ulong = undefined;
         std.mem.set(c_ulong, node_mask[0..], 0);
-        node_mask[node / bits] = c_ulong(1) << @truncate(zync.shrType(c_ulong), node % bit);
+        node_mask[node / bits] = c_ulong(1) << @truncate(zync.shrType(c_ulong), node % bits);
 
-        const result = linux.syscall6(linux.SYS_mbind, addr, bytes, MPOL_PREFERRED, @ptrToInt(node_mask.ptr), node_mask.len, 0);
+        const result = linux.syscall6(linux.SYS_mbind, addr, bytes, MPOL_PREFERRED, @ptrToInt(node_mask[0..].ptr), node_mask.len, 0);
         switch (linux.getErrno(result)) {
             0 => {},
-            os.ENOMEM => return zuma.MapError.OutOfMemory,
-            os.EINVAL => return zuma.MapError.InvalidNode,
+            os.ENOMEM => return zuma.MemoryError.OutOfMemory,
+            os.EINVAL => return zuma.MemoryError.InvalidNode,
             os.EFAULT, os.EIO, os.EPERM => unreachable,
             else => unreachable,
         }
@@ -336,11 +336,11 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.Ma
     return @intToPtr([*]align(zuma.page_size) u8, addr)[0..bytes];
 }
 
-pub fn unmap(memory: []align(zuma.page_size) u8, node: ?usize) void {
+pub fn unmap(memory: []u8, node: ?usize) void {
     _ = linux.munmap(memory.ptr, memory.len);
 }
 
-pub fn modify(memory: []align(zuma.page_size) u8, flags: u32, node: ?usize) zuma.MemoryError!void {
+pub fn modify(memory: []u8, flags: u32, node: ?usize) zuma.MemoryError!void {
     const protect_flags = getProtectFlags(flags);
     if (protect_flags != 0) {
         switch (linux.getErrno(linux.mprotect(memory.ptr, memory.len, protect_flags))) {
@@ -363,19 +363,21 @@ pub fn modify(memory: []align(zuma.page_size) u8, flags: u32, node: ?usize) zuma
                     os.ENOMEM => return zuma.MemoryError.OutOfMemory,
                     os.EACCES, os.EIO, os.EPERM => unreachable,
                     os.EAGAIN => continue,
+                    else => unreachable,
                 }
             }
-        }
+        },
+        else => {},
     }
 }
 
 fn getProtectFlags(flags: u32) usize {
     var protect_flags: usize = 0;
-    if ((flags & zuma.PAGE_EXEC))
+    if ((flags & zuma.PAGE_EXEC) != 0)
         protect_flags |= linux.PROT_EXEC;
-    if ((flags & zuma.PAGE_READ))
+    if ((flags & zuma.PAGE_READ) != 0)
         protect_flags |= linux.PROT_READ;
-    if ((flags & zuma.PAGE_WRITE))
+    if ((flags & zuma.PAGE_WRITE) != 0)
         protect_flags |= linux.PROT_WRITE;
     return protect_flags;
 }

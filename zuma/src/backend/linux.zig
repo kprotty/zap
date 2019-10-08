@@ -325,9 +325,14 @@ fn readValue(comptime format: [*]const u8, comptime header: []const u8, format_a
 
 threadlocal var buffer: [4096]u8 = undefined;
 fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
+    // Get the formatted string
+    const format_str = format[0 .. (comptime std.mem.len(u8, format)) + 1];
+    const path = switch (format_args.len) {
+        0 => format_str,
+        else => std.fmt.bufPrint(buffer[0..], format_str, format_args) catch |_| return error.InvalidPath,
+    };
+
     // open the file in read-only mode. Will only return a constant slice to the buffer
-    const format_len = (comptime std.mem.len(u8, format)) + 1;
-    const path = std.fmt.bufPrint(buffer[0..], format[0..format_len], format_args) catch |_| return error.InvalidPath;
     const fd = linux.syscall2(linux.SYS_open, @ptrToInt(path.ptr), linux.O_RDONLY | linux.O_CLOEXEC);
     if (linux.getErrno(fd) != 0)
         return error.InvalidPath;

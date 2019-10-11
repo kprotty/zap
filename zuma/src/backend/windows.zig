@@ -286,7 +286,7 @@ pub fn modify(memory: []u8, flags: u32, numa_node: ?usize) zuma.MemoryError!void
             var old_protect_flags: windows.DWORD = 0;
             if (VirtualProtect(addr_ptr, memory.len, getProtectFlags(flags), &old_protect_flags) == windows.FALSE)
                 return windows.unexpectedError(windows.kernel32.GetLastError());
-        }
+        },
     }
 }
 

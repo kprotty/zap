@@ -55,11 +55,11 @@ test "CpuAffinity" {
     var cpu_affinity: CpuAffinity = undefined;
     cpu_affinity.clear();
     expect(cpu_affinity.count() == 0);
-    
+
     cpu_affinity.set(1, true);
     expect(cpu_affinity.count() == 1);
     expect(cpu_affinity.get(1) == true);
-    
+
     cpu_affinity.set(5, true);
     expect(cpu_affinity.count() == 2);
     expect(cpu_affinity.get(5) == true);
@@ -73,7 +73,6 @@ test "CpuAffinity" {
     var node_count = CpuAffinity.getNodeCount();
     expect(node_count > 0);
     while (node_count > 0) : (node_count -= 1) {
-
         cpu_affinity.clear();
         try cpu_affinity.getCpus(node_count - 1, .Logical);
         const logical_node_count = cpu_affinity.count();

@@ -11,10 +11,14 @@ pub const ClockType = enum {
 pub const Thread = struct {
     inner: zuma.backend.Thread,
 
-    pub threadlocal var Random = zync.Lazy(createThreadLocalRandom).new();
+    threadlocal var random_instance = zync.Lazy(createThreadLocalRandom).new();
     fn createThreadLocalRandom() std.rand.DefaultPrng {
-        const seed = now(.Monotonic) ^ u64(@ptrToInt(&Random));
+        const seed = now(.Monotonic) ^ u64(@ptrToInt(&random_instance));
         return std.rand.DefaultPrng.init(seed);
+    }
+
+    pub fn getRandom() *std.rand.Random {
+        return &random_instance.getPtr().random;
     }
 
     /// NOTE: Because of linux VDSO shenanigans (https://marcan.st/2017/12/debugging-an-evil-go-runtime-bug/)
@@ -66,7 +70,7 @@ pub const Thread = struct {
 };
 
 test "Thread - random, now, sleep" {
-    expect(Thread.Random.getPtr().random.uintAtMostBiased(usize, 10) <= 10);
+    expect(Thread.getRandom().uintAtMostBiased(usize, 10) <= 10);
     expect(Thread.now(.Realtime) > 0);
 
     const delay_ms = 200;

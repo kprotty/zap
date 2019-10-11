@@ -204,9 +204,9 @@ const Ipv6Address = struct {
 };
 
 test "Socket (Tcp) Blocking Ipv4 + Ipv6" {
-    const rng = zuma.Thread.Random.getPtr();
-    try testBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
-    try testBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
+    const rng = zuma.Thread.getRandom();
+    try testBlockingTcp(Ipv4Address, rng.intRangeLessThanBiased(u16, 1024, 65535));
+    try testBlockingTcp(Ipv6Address, rng.intRangeLessThanBiased(u16, 1024, 65535));
 }
 
 fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
@@ -258,9 +258,9 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
 }
 
 test "Socket (Tcp) Non-Blocking Ipv4 + Ipv6" {
-    const rng = zuma.Thread.Random.getPtr();
-    try testNonBlockingTcp(Ipv4Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
-    try testNonBlockingTcp(Ipv6Address, rng.random.intRangeLessThanBiased(u16, 1024, 65535));
+    const rng = zuma.Thread.getRandom();
+    try testNonBlockingTcp(Ipv4Address, rng.intRangeLessThanBiased(u16, 1024, 65535));
+    try testNonBlockingTcp(Ipv6Address, rng.intRangeLessThanBiased(u16, 1024, 65535));
 }
 
 fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {

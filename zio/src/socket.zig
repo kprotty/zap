@@ -124,7 +124,9 @@ pub const Socket = struct {
     /// Convert an array of zig buffers into backend buffers
     threadlocal var buffer_cache: [256]zio.Buffer = undefined;
     fn toBackendBuffers(buffers: var) []zio.backend.Buffer {
-        const zio_buffers = buffer_cache[0..std.math.min(buffer_cache.len, buffers.len)];
+        // TODO: https://github.com/ziglang/zig/issues/3433
+        const cache = @intToPtr([*]zio.Buffer, @ptrToInt(&buffer_cache[0]))[0..buffer_cache.len];
+        const zio_buffers = cache[0..std.math.min(cache.len, buffers.len)];
         for (zio_buffers) |*buffer, index|
             buffer.* = zio.Buffer.fromBytes(buffers[index]);
         return @ptrCast([*]zio.backend.Buffer, zio_buffers.ptr)[0..zio_buffers.len];

@@ -393,7 +393,6 @@ threadlocal var buffer: [4096]u8 = undefined;
 fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
     // TODO: https://github.com/ziglang/zig/issues/3433
     const buf = @intToPtr([*]u8, @ptrToInt(&buffer[0]))[0..buffer.len];
-    // Get the formatted string
     const format_str = format[0..(comptime std.mem.len(u8, format) + 1)];
     const path = std.fmt.bufPrint(buf[0..], format_str, format_args) catch |_| return error.InvalidPath;
 

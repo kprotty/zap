@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const utils = @import("utils.zig");
+
+const zync = @import("../../zap.zig").zync;
 const zuma = @import("../../zap.zig").zuma;
 
 pub fn yield(spin_count: usize) void {
@@ -56,11 +57,11 @@ pub fn Atomic(comptime T: type) type {
         /// and store them in an atomic-type compatible backing with conversions in and out.
         fn baseType(comptime B: type) type {
             return switch (@typeInfo(B)) {
-                .Int => |int| utils.intType(int.is_signed, std.math.max(8, comptime utils.nextPowerOfTwo(int.bits))),
-                .Float => |float| utils.intType(false, std.math.max(8, comptime utils.nextPowerOfTwo(float.bits))),
+                .Int => |int| zync.intType(int.is_signed, std.math.max(8, comptime zync.nextPowerOfTwo(int.bits))),
+                .Float => |float| zync.intType(false, std.math.max(8, comptime zync.nextPowerOfTwo(float.bits))),
                 .Enum => baseType(@TagType(B)),
                 .Bool => u8,
-                else => utils.intType(false, comptime utils.nextPowerOfTwo(@sizeOf(B) * 8)),
+                else => zync.intType(false, comptime zync.nextPowerOfTwo(@sizeOf(B) * 8)),
             };
         }
 
@@ -146,7 +147,7 @@ test "yield, fence" {
 test "size rounding" {
     expect(Atomic(struct {
         x: usize,
-    }).Type == utils.intType(false, @typeInfo(usize).Int.bits));
+    }).Type == zync.intType(false, @typeInfo(usize).Int.bits));
     expect(Atomic(enum(u2) {
         X,
         Y,

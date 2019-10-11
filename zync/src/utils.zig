@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const atomic = @import("atomic.zig");
+const zync = @import("../../zap.zig").zync;
 
 pub const cache_line = 64;
 pub fn CachePadded(comptime T: type) type {
@@ -95,12 +95,12 @@ pub fn Lazy(initializer: var) type {
         };
 
         value: Type,
-        state: atomic.Atomic(State),
+        state: zync.Atomic(State),
 
         pub fn new() @This() {
             return @This(){
                 .value = undefined,
-                .state = atomic.Atomic(State).new(.Uninitialized),
+                .state = zync.Atomic(State).new(.Uninitialized),
             };
         }
 
@@ -114,7 +114,7 @@ pub fn Lazy(initializer: var) type {
 
             if (self.state.compareSwap(.Uninitialized, .Initializing, .Acquire, .Relaxed)) |_| {
                 while (self.state.load(.Acquire) == .Initializing)
-                    atomic.yield(1);
+                    zync.yield(1);
                 return &self.value;
             }
 

@@ -68,7 +68,7 @@ pub const CpuAffinity = struct {
         var node_count: usize = 0;
         while (readInt(&data)) |start|
             node_count += ((readInt(&data) orelse start) + 1) - start;
-        return node_code;
+        return node_count;
     }
 
     pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
@@ -79,8 +79,8 @@ pub const CpuAffinity = struct {
 
     pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         // get the linux cpu set and find the first word with set bits
-        const linux_cpu_set = try getCpuSet(numa_node, only_physical_cpus);
-        self.* = fromLinuxCpuSet(linux_cpu_set);
+        const cpu_set = try getCpuSet(numa_node, only_physical_cpus);
+        self.* = cpu_set.toCpuAffinity();
     }
 
     fn getCpuSet(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!cpu_set_t {
@@ -98,25 +98,25 @@ pub const CpuAffinity = struct {
         } else {
             const current_process = 0;
             const cpu_set_ptr = @ptrCast(*linux.cpu_set_t, &cpu_set);
-            const result = linux.sched_getaffinity(current_process, @sizeOf(cpu_set), cpu_set_ptr);
+            const result = linux.sched_getaffinity(current_process, @sizeOf(cpu_set_t), cpu_set_ptr);
             if (linux.getErrno(result) != 0)
-                return zuma.CpuAffinity.CpuError.InvalidResourceAccess;
+                return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         }
 
         // filter out set cpu_set_t bits to physical cpus if required
         if (only_physical_cpus) {
-            for (linux_cpu_set.bitmask) |word, index| {
+            for (cpu_set.bitmask) |word, index| {
                 var bits = word;
                 var pos: zync.shrType(usize) = undefined;
                 while (bits != 0) : (bits ^= usize(1) << pos) {
                     pos = @truncate(@typeOf(pos), @ctz(usize, ~bits) - 1);
                     const bit = usize(pos) + (index * @typeInfo(usize).Int.bits);
                     if (!isPhysicalCpu(bit))
-                        linux_cpu_set.set(bit, false);
+                        cpu_set.set(bit, false);
                 }
             }
         }
-        return linux_cpu_set;
+        return cpu_set;
     }
 
     fn isPhysicalCpu(cpu: usize) bool {
@@ -391,12 +391,11 @@ fn readValue(comptime format: [*]const u8, comptime header: []const u8, format_a
 
 threadlocal var buffer: [4096]u8 = undefined;
 fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
+    // TODO: https://github.com/ziglang/zig/issues/3433
+    const buf = @intToPtr([*]u8, @ptrToInt(&buffer[0]))[0..buffer.len];
     // Get the formatted string
-    const format_str = format[0 .. (comptime std.mem.len(u8, format)) + 1];
-    const path = switch (format_args.len) {
-        0 => format_str,
-        else => std.fmt.bufPrint(buffer[0..], format_str, format_args) catch |_| return error.InvalidPath,
-    };
+    const format_str = format[0..(comptime std.mem.len(u8, format) + 1)];
+    const path = std.fmt.bufPrint(buf[0..], format_str, format_args) catch |_| return error.InvalidPath;
 
     // open the file in read-only mode. Will only return a constant slice to the buffer
     const fd = linux.syscall2(linux.SYS_open, @ptrToInt(path.ptr), linux.O_RDONLY | linux.O_CLOEXEC);
@@ -405,10 +404,10 @@ fn readFile(comptime format: [*]const u8, format_args: ...) ![]const u8 {
     defer _ = linux.syscall1(linux.SYS_close, fd);
 
     // read as much content from the file as possible
-    const length = linux.syscall3(linux.SYS_read, fd, @ptrToInt(buffer[0..].ptr), buffer.len);
+    const length = linux.syscall3(linux.SYS_read, fd, @ptrToInt(buf.ptr), buf.len);
     if (linux.getErrno(length) != 0)
         return error.InvalidRead;
-    return buffer[0..length];
+    return buf[0..length];
 }
 
 fn readInt(input: *[]const u8) ?usize {

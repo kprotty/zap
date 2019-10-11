@@ -50,3 +50,38 @@ pub const CpuAffinity = struct {
         return zuma.backend.CpuAffinity.getCpus(self, numa_node, cpu_type == .Physical);
     }
 };
+
+test "CpuAffinity" {
+    var cpu_affinity: CpuAffinity = undefined;
+    cpu_affinity.clear();
+    expect(cpu_affinity.count() == 0);
+    
+    cpu_affinity.set(1, true);
+    expect(cpu_affinity.count() == 1);
+    expect(cpu_affinity.get(1) == true);
+    
+    cpu_affinity.set(5, true);
+    expect(cpu_affinity.count() == 2);
+    expect(cpu_affinity.get(5) == true);
+    expect(cpu_affinity.get(3) == false);
+
+    const logical_cpu_count = try CpuAffinity.getCpuCount(null, .Logical);
+    expect(logical_cpu_count > 0);
+    const physical_cpu_count = try CpuAffinity.getCpuCount(null, .Physical);
+    expect(physical_cpu_count > 0 and physical_cpu_count <= logical_cpu_count);
+
+    var node_count = CpuAffinity.getNodeCount();
+    expect(node_count > 0);
+    while (node_count > 0) : (node_count -= 1) {
+
+        cpu_affinity.clear();
+        try cpu_affinity.getCpus(node_count - 1, .Logical);
+        const logical_node_count = cpu_affinity.count();
+        expect(logical_node_count > 0);
+
+        cpu_affinity.clear();
+        try cpu_affinity.getCpus(node_count - 1, .Physical);
+        const physical_node_count = cpu_affinity.count();
+        expect(physical_node_count > 0 and physical_node_count <= logical_node_count);
+    }
+}

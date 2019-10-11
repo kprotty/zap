@@ -172,9 +172,11 @@ pub const Event = struct {
             var ts: os.timespec = undefined;
             var ts_ptr: ?*os.timespec = null;
             if (timeout) |timeout_ms| {
-                ts.tv_nsec = (timeout_ms % 1000) * 1000000;
-                ts.tv_sec = timeout_ms / 1000;
-                ts_ptr = &ts;
+                if (timeout_ms > 0) {
+                    ts.tv_nsec = (timeout_ms % 1000) * 1000000;
+                    ts.tv_sec = timeout_ms / 1000;
+                    ts_ptr = &ts;
+                }
             }
 
             while (true) {

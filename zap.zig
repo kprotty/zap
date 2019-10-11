@@ -8,6 +8,7 @@ test "zap" {
 }
 
 pub const zync = struct {
+    pub usingnamespace @import("zync/src/futex.zig");
     pub usingnamespace @import("zync/src/utils.zig");
     pub usingnamespace @import("zync/src/atomic.zig");
 };

@@ -4,6 +4,9 @@ const windows = std.os.windows;
 const zuma = @import("../../../zap.zig").zuma;
 const zync = @import("../../../zap.zig").zync;
 
+var current_process = zync.Lazy(GetCurrentProcess).new();
+threadlocal var current_thread = zync.Lazy(GetCurrentThread).new();
+
 pub const CpuAffinity = struct {
     pub fn getNodeCount() usize {
         var node: windows.ULONG = undefined;
@@ -193,13 +196,13 @@ pub const Thread = struct {
         group_affinity.Mask = cpu_affinity.mask;
         group_affinity.Group = @intCast(u16, cpu_affinity.group);
         std.mem.set(windows.WORD, group_affinity.Reserved[0..], 0);
-        if (SetThreadGroupAffinity(GetCurrentThread(), &group_affinity, null) == windows.FALSE)
+        if (SetThreadGroupAffinity(current_thread.get(), &group_affinity, null) == windows.FALSE)
             return windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
     pub fn getAffinity(cpu_affinity: *zuma.CpuAffinity) zuma.Thread.AffinityError!void {
         var group_affinity: GROUP_AFFINITY = undefined;
-        if (GetThreadGroupAffinity(GetCurrentThread(), &group_affinity) == windows.FALSE)
+        if (GetThreadGroupAffinity(current_thread.get(), &group_affinity) == windows.FALSE)
             return windows.unexpectedError(windows.kernel32.GetLastError());
         cpu_affinity.group = group_affinity.Group;
         cpu_affinity.mask = group_affinity.Mask;
@@ -216,7 +219,7 @@ pub fn getPageSize() ?usize {
 pub fn getHugePageSize() ?usize {
     // Get a token to the current process
     var token: windows.HANDLE = undefined;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == windows.FALSE)
+    if (OpenProcessToken(current_process.get(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == windows.FALSE)
         return null;
     defer _ = windows.kernel32.CloseHandle(token);
 

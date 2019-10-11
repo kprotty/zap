@@ -242,6 +242,21 @@ pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
     return zuma.NumaError.InvalidNode;
 }
 
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MemoryError![]align(zuma.page_size) u8 {
+    const protect_flags = getProtectFlags(flags);
+    const addr_ptr = @ptrCast(?windows.LPVOID, address);
+    const alloc_type = windows.MEM_RESERVE | (if ((flags & zuma.PAGE_COMMIT) != 0) windows.MEM_COMMIT else 0);
+
+}
+
+pub fn unmap(memory: []u8, numa_node: ?usize) void {
+    
+}
+
+pub fn modify(memory: []u8, flags: u32, numa_node: ?usize) zuma.MemoryError!void {
+    
+}
+
 ///-----------------------------------------------------------------------------///
 ///                                API Definitions                              ///
 ///-----------------------------------------------------------------------------///

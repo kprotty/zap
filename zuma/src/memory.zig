@@ -62,7 +62,7 @@ pub const PAGE_WRITE = 1 << 3;
 pub const PAGE_COMMIT = 1 << 4;
 pub const PAGE_DECOMMIT = 1 << 5;
 
-pub const MemoryError = NumaMemoryError || error{
+pub const MemoryError = std.os.UnexpectedError || NumaMemoryError || error{
     OutOfMemory,
     InvalidMemory,
     InvalidFlags,

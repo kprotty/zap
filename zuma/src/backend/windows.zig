@@ -248,16 +248,67 @@ pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
 pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MemoryError![]align(zuma.page_size) u8 {
     const protect_flags = getProtectFlags(flags);
     const addr_ptr = @ptrCast(?windows.LPVOID, address);
-    const alloc_type = windows.MEM_RESERVE | (if ((flags & zuma.PAGE_COMMIT) != 0) windows.MEM_COMMIT else 0);
-
+    const alloc_type = windows.MEM_RESERVE | getAllocType(flags);
+    const addr = if (numa_node) |node|
+        VirtualAllocExNuma(current_process.get(), addr_ptr, bytes, alloc_type, protect_flags, @intCast(windows.DWORD, node))
+    else
+        windows.kernel32.VirtualAlloc(addr_ptr, bytes, alloc_type, protect_flags);
+    const mem_addr = addr orelse return windows.unexpectedError(windows.kernel32.GetLastError());
+    return @ptrCast([*]align(zuma.page_size) u8, @alignCast(zuma.page_size, mem_addr))[0..bytes];
 }
 
 pub fn unmap(memory: []u8, numa_node: ?usize) void {
-    
+    const addr_ptr = @ptrCast(windows.LPVOID, memory.ptr);
+    std.debug.assert(windows.kernel32.VirtualFree(addr_ptr, 0, windows.MEM_RELEASE) == windows.TRUE);
 }
 
 pub fn modify(memory: []u8, flags: u32, numa_node: ?usize) zuma.MemoryError!void {
-    
+    const addr_ptr = @ptrCast(windows.LPVOID, memory.ptr);
+    switch (flags & (zuma.PAGE_COMMIT | zuma.PAGE_DECOMMIT)) {
+        zuma.PAGE_COMMIT | zuma.PAGE_DECOMMIT => {
+            return zuma.MemoryError.InvalidFlags;
+        },
+        zuma.PAGE_COMMIT => {
+            const alloc_type = getAllocType(flags);
+            const protect_flags = getProtectFlags(flags);
+            const addr = if (numa_node) |node|
+                VirtualAllocExNuma(current_process.get(), addr_ptr, memory.len, alloc_type, protect_flags, @intCast(windows.DWORD, node))
+            else
+                windows.kernel32.VirtualAlloc(addr_ptr, memory.len, alloc_type, protect_flags);
+            if (addr == null)
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+        },
+        zuma.PAGE_DECOMMIT => {
+            if (windows.kernel32.VirtualFree(addr_ptr, memory.len, windows.MEM_DECOMMIT) == windows.FALSE)
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+        },
+        else => {
+            var old_protect_flags: windows.DWORD = 0;
+            if (VirtualProtect(addr_ptr, memory.len, getProtectFlags(flags), &old_protect_flags) == windows.FALSE)
+                return windows.unexpectedError(windows.kernel32.GetLastError());
+        }
+    }
+}
+
+fn getAllocType(flags: u32) windows.DWORD {
+    var alloc_type: windows.DWORD = 0;
+    if ((flags & zuma.PAGE_HUGE) != 0)
+        alloc_type |= windows.MEM_LARGE_PAGES;
+    if ((flags & zuma.PAGE_COMMIT) != 0)
+        alloc_type |= windows.MEM_COMMIT;
+    return alloc_type;
+}
+
+fn getProtectFlags(flags: u32) windows.DWORD {
+    return switch (flags & (zuma.PAGE_EXEC | zuma.PAGE_READ | zuma.PAGE_WRITE)) {
+        zuma.PAGE_EXEC => windows.PAGE_EXECUTE,
+        zuma.PAGE_READ => windows.PAGE_READONLY,
+        zuma.PAGE_READ | zuma.PAGE_EXEC => windows.PAGE_EXECUTE_READ,
+        zuma.PAGE_EXEC | zuma.PAGE_WRITE => windows.PAGE_EXECUTE_WRITECOPY,
+        zuma.PAGE_WRITE, zuma.PAGE_READ | zuma.PAGE_WRITE => windows.PAGE_READWRITE,
+        zuma.PAGE_READ | zuma.PAGE_EXEC | zuma.PAGE_WRITE => windows.PAGE_EXECUTE_READWRITE,
+        else => unreachable,
+    };
 }
 
 ///-----------------------------------------------------------------------------///
@@ -363,6 +414,22 @@ const TOKEN_PRIVILEGES = extern struct {
     PrivilegeCount: windows.DWORD,
     Privileges: [1]LUID_AND_ATTRIBUTES,
 };
+
+extern "kernel32" stdcallcc fn VirtualProtect(
+    lpAddress: ?windows.LPVOID,
+    dwSize: windows.SIZE_T,
+    flNewProtect: windows.DWORD,
+    lpflOldProtect: *windows.DWORD,
+) windows.BOOL;
+
+extern "kernel32" stdcallcc fn VirtualAllocExNuma(
+    hProcess: windows.HANDLE,
+    lpAddress: ?windows.LPVOID,
+    dwSize: windows.SIZE_T,
+    flAllocationType: windows.DWORD,
+    flProtect: windows.DWORD,
+    nndPreferred: windows.DWORD,
+) ?windows.LPVOID;
 
 extern "kernel32" stdcallcc fn GetSystemTimePreciseAsFileTime(
     lpSystemTimeAsFileTime: *FILETIME,

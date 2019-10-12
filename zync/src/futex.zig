@@ -89,10 +89,10 @@ const Windows = struct {
 
     pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         const addr = @ptrCast(*const c_void, ptr);
-        switch (wakeup_count) {
+        return switch (wakeup_count) {
             1 => WakeByAddressSingle(addr),
             else => WakeByAddressAll(addr),
-        }
+        };
     }
 
     pub fn wait(self: *@This(), ptr: *const u32, expected: u32, timeout_ms: ?u32) Futex.WaitError!void {
@@ -109,9 +109,9 @@ const Windows = struct {
     }
 
     const ERROR_TIMEOUT = 1460;
-    extern "Synchronization" stdcallcc fn WakeByAddressAll(Address: *const c_void) void;
-    extern "Synchronization" stdcallcc fn WakeByAddressSingle(Address: *const c_void) void;
-    extern "Synchronization" stdcallcc fn WaitOnAddress(
+    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WakeByAddressAll(Address: *const c_void) void;
+    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WakeByAddressSingle(Address: *const c_void) void;
+    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WaitOnAddress(
         Address: *const c_void,
         CompareAddress: *const c_void,
         AddressSize: system.SIZE_T,

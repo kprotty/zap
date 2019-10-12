@@ -16,11 +16,9 @@ const Backend = switch (builtin.os) {
 };
 
 pub const Futex = struct {
-    value: zync.Atomic(u32),
     inner: Backend,
 
-    pub fn init(self: *@This(), value: u32) void {
-        self.value.set(value);
+    pub fn init(self: *@This()) void {
         self.inner.init();
     }
 
@@ -30,16 +28,18 @@ pub const Futex = struct {
 
     pub const WaitError = error{TimedOut};
 
-    pub fn wait(self: *@This(), expected: u32, timeout_ms: ?u32) WaitError!void {
-        try self.inner.wait(&self.value.value, expected, timeout_ms);
+    pub fn wait(self: *@This(), ptr: *const u32, expected: u32, timeout_ms: ?u32) WaitError!void {
+        if (@atomicLoad(u32, ptr, .Monotonic) != expected)
+            return;
+        return self.inner.wait(ptr, expected, timeout_ms);
     }
 
-    pub fn notifyOne(self: *@This()) void {
-        self.inner.notify(&self.value.value, i32(1));
+    pub fn notifyOne(self: *@This(), ptr: *const u32) void {
+        self.inner.notify(ptr, i32(1));
     }
 
-    pub fn notifyAll(self: *@This()) void {
-        self.inner.notify(&self.value.value, std.math.maxInt(i32));
+    pub fn notifyAll(self: *@This(), ptr: *const u32) void {
+        self.inner.notify(ptr, std.math.maxInt(i32));
     }
 };
 
@@ -47,7 +47,7 @@ const Linux = struct {
     pub fn init(self: *@This()) void {}
     pub fn deinit(self: *@This()) void {}
 
-    pub fn notify(self: *@This(), ptr: *u32, wakeup_count: i32) void {
+    pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         const addr = @ptrCast(*const i32, ptr);
         const flags = system.FUTEX_WAKE | system.FUTEX_PRIVATE_FLAG;
         return switch (os.errno(system.futex_wake(addr, flags, wakeup_count))) {
@@ -57,7 +57,7 @@ const Linux = struct {
         };
     }
 
-    pub fn wait(self: *@This(), ptr: *u32, expected: u32, timeout_ms: ?u32) Futex.WaitError!void {
+    pub fn wait(self: *@This(), ptr: *const u32, expected: u32, timeout_ms: ?u32) Futex.WaitError!void {
         var ts: os.timespec = undefined;
         var ts_ptr: ?*os.timespec = null;
         if (timeout_ms) |timeout| {
@@ -73,8 +73,8 @@ const Linux = struct {
         const flags = system.FUTEX_WAIT | system.FUTEX_PRIVATE_FLAG;
         while (true) {
             switch (os.errno(system.futex_wait(addr, flags, value, ts_ptr))) {
-                0 => return,
-                os.EACCES, os.EAGAIN, os.EFAULT, os.EINVAL, os.ENOSYS => unreachable,
+                0, os.EAGAIN => return,
+                os.EACCES, os.EFAULT, os.EINVAL, os.ENOSYS => unreachable,
                 os.ETIMEDOUT => return Futex.WaitError.TimedOut,
                 os.EINTR => continue,
                 else => unreachable,
@@ -87,7 +87,7 @@ const Windows = struct {
     pub fn init(self: *@This()) void {}
     pub fn deinit(self: *@This()) void {}
 
-    pub fn notify(self: *@This(), ptr: *u32, wakeup_count: i32) void {
+    pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         const addr = @ptrCast(system.LPVOID, ptr);
         switch (wakeup_count) {
             1 => WakeByAddressSingle(addr),
@@ -95,7 +95,7 @@ const Windows = struct {
         }
     }
 
-    pub fn wait(self: *@This(), ptr: *u32, expect: u32, timeout_ms: ?u32) Futex.WaitError!void {
+    pub fn wait(self: *@This(), ptr: *const u32, expect: u32, timeout_ms: ?u32) Futex.WaitError!void {
         var compare = expect;
         const addr = @ptrCast(system.LPVOID, ptr);
         const compare_addr = @ptrCast(system.LPVOID, &compare);
@@ -132,14 +132,14 @@ const Posix = struct {
         std.debug.assert(system.pthread_cond_destroy(&self.cond) == 0);
     }
 
-    pub fn notify(self: *@This(), ptr: *u32, wakeup_count: i32) void {
+    pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         std.debug.assert(switch (wakeup_count) {
             1 => system.pthread_cond_signal(&self.cond),
             else => system.pthread_cond_broadcast(&self.cond),
         } == 0);
     }
 
-    pub fn wait(self: *@This(), ptr: *u32, expect: u32, timeout_ms: ?u32) Futex.WaitError!void {
+    pub fn wait(self: *@This(), ptr: *const u32, expect: u32, timeout_ms: ?u32) Futex.WaitError!void {
         std.debug.assert(system.pthread_mutex_lock(&self.mutex) == 0);
         defer std.debug.assert(system.pthread_mutex_unlock(&self.mutex) == 0);
 
@@ -162,46 +162,56 @@ const Posix = struct {
 };
 
 test "Futex" {
-    // test futex initialization & value 
-    var futex: Futex = undefined;
-    futex.init(0);
-    defer futex.deinit();
+    // test futex initialization & value
+    const FutexValue = struct {
+        value: zync.Atomic(u32),
+        inner: Futex,
+    };
+
+    var futex: FutexValue = undefined;
+    futex.value.set(0);
+    futex.inner.init();
+    defer futex.inner.deinit();
     expect(futex.value.get() == 0);
     
     // Test .wait() delay
     const delay_ms = 100;
     const threshold_ms = 200;
     const now = zuma.Thread.now(.Monotonic);
-    expectError(Futex.WaitError.TimedOut, futex.wait(0, delay_ms));
+    expectError(Futex.WaitError.TimedOut, futex.inner.wait(&futex.value.value, 0, delay_ms));
     const elapsed = zuma.Thread.now(.Monotonic) - now;
     expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
 
     const FutexNotifier = struct {
         pub fn run(ptr: usize) void {
-            const self = @intToPtr(*Futex, ptr & ~usize(1));
+            const self = @intToPtr(*FutexValue, ptr & ~usize(1));
             _ = self.value.fetchAdd(1, .Relaxed);
             if ((ptr & 1) != 0) {
-                self.notifyAll();
+                self.inner.notifyAll(&self.value.value);
             } else {
-                self.notifyOne();
+                self.inner.notifyOne(&self.value.value);
             }
         }
 
-        pub fn spawn(self: *Futex, notify_all: bool) !void {
+        pub fn spawn(self: *FutexValue, notify_all: bool) !zuma.Thread {
             const ptr = @ptrToInt(self) | usize(@bitCast(u1, notify_all));
             const stack_size = zuma.Thread.getStackSize(run);
             if (stack_size > 0) {
                 const allocator = std.debug.global_allocator;
                 const stack = try allocator.alignedAlloc(u8, zuma.page_size, stack_size);
                 defer allocator.free(stack);
-                _ = (try zuma.Thread.spawn(stack, run, ptr)).join(100);
+                return try zuma.Thread.spawn(stack, run, ptr);
             } else {
-                _ = (try zuma.Thread.spawn(null, run, ptr)).join(100);
+                return try zuma.Thread.spawn(null, run, ptr);
             }
         }
     };
 
-    try FutexNotifier.spawn(&futex, true);
-    try FutexNotifier.spawn(&futex, false);
+    var notify_all_thread = try FutexNotifier.spawn(&futex, true);
+    defer _ = notify_all_thread.join(100);
+    var notify_one_thread = try FutexNotifier.spawn(&futex, false);
+    defer _ = notify_one_thread.join(100);
+
+    try futex.inner.wait(&futex.value.value, 0, 500);
     expect(futex.value.get() == 2);
 }

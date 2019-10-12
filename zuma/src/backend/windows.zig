@@ -9,9 +9,9 @@ threadlocal var current_thread = zync.Lazy(GetCurrentThread).new();
 
 pub const CpuAffinity = struct {
     pub fn getNodeCount() usize {
-        var node: windows.ULONG = undefined;
+        var node: windows.ULONG = 0;
         if (GetNumaHighestNodeNumber(&node) == windows.TRUE)
-            return @intCast(usize, node);
+            return @intCast(usize, node) + 1;
         return 1;
     }
 

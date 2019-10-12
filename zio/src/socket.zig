@@ -105,6 +105,7 @@ pub const Socket = struct {
 
     pub const AcceptError = zio.Error || error{
         Refused,
+        InvalidState,
         InvalidHandle,
         InvalidAddress,
         OutOfResources,

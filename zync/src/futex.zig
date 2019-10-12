@@ -88,19 +88,19 @@ const Windows = struct {
     pub fn deinit(self: *@This()) void {}
 
     pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
-        const addr = @ptrCast(system.LPVOID, ptr);
+        const addr = @ptrCast(*const c_void, ptr);
         switch (wakeup_count) {
             1 => WakeByAddressSingle(addr),
             else => WakeByAddressAll(addr),
         }
     }
 
-    pub fn wait(self: *@This(), ptr: *const u32, expect: u32, timeout_ms: ?u32) Futex.WaitError!void {
-        var compare = expect;
-        const addr = @ptrCast(system.LPVOID, ptr);
-        const compare_addr = @ptrCast(system.LPVOID, &compare);
+    pub fn wait(self: *@This(), ptr: *const u32, expected: u32, timeout_ms: ?u32) Futex.WaitError!void {
+        var compare = expected;
+        const addr = @ptrCast(*const c_void, ptr);
+        const compare_addr = @ptrCast(*const c_void, &compare);
 
-        if (WaitOnAddress(addr, compare_addr, @sizeOf(@typeOf(expect)), timeout_ms orelse system.INFINITE) == system.TRUE)
+        if (WaitOnAddress(addr, compare_addr, @sizeOf(@typeOf(expected)), timeout_ms orelse system.INFINITE) == system.TRUE)
             return;
         return switch (system.kernel32.GetLastError()) {
             ERROR_TIMEOUT => Futex.WaitError.TimedOut,
@@ -108,11 +108,12 @@ const Windows = struct {
         };
     }
 
-    extern "Synchronization" stdcallcc fn WakeByAddressAll(Address: system.LPVOID) void;
-    extern "Synchronization" stdcallcc fn WakeByAddressSingle(Address: system.LPVOID) void;
+    const ERROR_TIMEOUT = 1460;
+    extern "Synchronization" stdcallcc fn WakeByAddressAll(Address: *const c_void) void;
+    extern "Synchronization" stdcallcc fn WakeByAddressSingle(Address: *const c_void) void;
     extern "Synchronization" stdcallcc fn WaitOnAddress(
-        Address: system.LPVOID,
-        CompareAddress: system.LPVOID,
+        Address: *const c_void,
+        CompareAddress: *const c_void,
         AddressSize: system.SIZE_T,
         dwMilliseconds: system.DWORD,
     ) system.BOOL;
@@ -183,6 +184,7 @@ test "Futex" {
     expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
 
     const FutexNotifier = struct {
+        // update the value and notify the futex
         pub fn run(ptr: usize) void {
             const self = @intToPtr(*FutexValue, ptr & ~usize(1));
             _ = self.value.fetchAdd(1, .Relaxed);
@@ -193,6 +195,7 @@ test "Futex" {
             }
         }
 
+        // Create a thread for run()
         pub fn spawn(self: *FutexValue, notify_all: bool) !zuma.Thread {
             const ptr = @ptrToInt(self) | usize(@bitCast(u1, notify_all));
             const stack_size = zuma.Thread.getStackSize(run);
@@ -206,12 +209,13 @@ test "Futex" {
             }
         }
     };
-
+    
+    // Spawn threads which update the futex & use both notifyOne() and notifyAll()
     var notify_all_thread = try FutexNotifier.spawn(&futex, true);
     defer _ = notify_all_thread.join(100);
     var notify_one_thread = try FutexNotifier.spawn(&futex, false);
     defer _ = notify_one_thread.join(100);
-
-    try futex.inner.wait(&futex.value.value, 0, 500);
+    while (futex.value.load(.Relaxed) != 2)
+        try futex.inner.wait(&futex.value.value, futex.value.get(), 500);
     expect(futex.value.get() == 2);
 }

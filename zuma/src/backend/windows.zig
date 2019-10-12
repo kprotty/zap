@@ -29,8 +29,9 @@ pub const CpuAffinity = struct {
     pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         var affinity: GROUP_AFFINITY = undefined;
         if (numa_node) |node| {
-            affinity = try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
+            try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
         } else {
+            affinity.Mask = ~KAFFINITY(0);
             try iterateProcessorInfo(RelationProcessorCore, findFirstAffinity, &affinity, only_physical_cpus);
         }
         self.group = affinity.Group;
@@ -43,12 +44,12 @@ pub const CpuAffinity = struct {
         if (only_physical_cpus) {
             try iterateProcessorInfo(RelationNumaNode, findNumaGroupAffinity, numa_node, affinity);
         } else if (GetNumaNodeProcessorMaskEx(@truncate(USHORT, numa_node), affinity) == windows.FALSE) {
-            return zuma.CpuAffinity.CpuError.InvalidNode;
+            return zuma.CpuAffinity.TopologyError.InvalidNode;
         }
     }
 
     fn findNumaGroupAffinity(
-        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        processor_info: *SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
         numa_node: usize,
         affinity: *GROUP_AFFINITY,
     ) bool {
@@ -61,7 +62,7 @@ pub const CpuAffinity = struct {
     }
 
     fn findAffinityCount(
-        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        processor_info: *SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
         cpu_count: *usize,
         only_physical_cpus: bool,
     ) bool {
@@ -74,8 +75,8 @@ pub const CpuAffinity = struct {
     }
 
     fn findFirstAffinity(
-        processor_info: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-        affinity: *?GROUP_AFFINITY,
+        processor_info: *SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        affinity: *GROUP_AFFINITY,
         only_physical_cpus: bool,
     ) bool {
         // Ensure the processor_info describes a CPU core
@@ -91,12 +92,10 @@ pub const CpuAffinity = struct {
         }
 
         // Update the affinity with the new mask of the current processor_info's GROUP_AFFINITY
-        if (affinity.*) |current_affinity| {
-            if (processor_affinity.Group != current_affinity.Group)
-                return false;
-            processor_affinity.Mask |= current_affinity.Mask;
-        }
-        affinity.* = processor_affinity.*;
+        if (affinity.Mask == ~KAFFINITY(0))
+            affinity.Group = processor_affinity.Group;
+        if (affinity.Group == processor_affinity.Group)
+            affinity.Mask |= processor_affinity.Mask;
         return false;
     }
 
@@ -114,14 +113,16 @@ pub const CpuAffinity = struct {
         const heap = windows.kernel32.GetProcessHeap() orelse return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         const data = windows.kernel32.HeapAlloc(heap, 0, size) orelse return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         defer std.debug.assert(windows.kernel32.HeapFree(heap, 0, data) == windows.TRUE);
-        var buffer = @ptrCast([*]const u8, data)[0..size];
+        var buffer = @ptrCast([*]u8, data)[0..size];
 
         // Populate the process info buffer & iterate it
-        var processor_info = @ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, data);
+        const data_ptr = @alignCast(@alignOf(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX), data);
+        var processor_info = @ptrCast(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, data_ptr);
         if (GetLogicalProcessorInformationEx(relationship, processor_info, &size) == windows.FALSE)
             return zuma.CpuAffinity.TopologyError.InvalidResourceAccess;
         while (buffer.len > 0) : (buffer = buffer[processor_info.Size..]) {
-            processor_info = @ptrCast(*const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer.ptr);
+            const buffer_ptr = @alignCast(@alignOf(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX), buffer.ptr);
+            processor_info = @ptrCast(*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, buffer_ptr);
             if (found_processor_info(processor_info, found_processor_info_args))
                 break;
         }

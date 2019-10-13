@@ -138,10 +138,9 @@ pub const Socket = struct {
 
     pub fn new(flags: zio.Socket.Flags) zio.Socket.Error!@This() {
         _ = try init_error.get();
-        var self: @This() = undefined;
-        self.handle = createSocket(flags);
-        if (self.handle != INVALID_SOCKET)
-            return self;
+        const handle = createSocket(flags);
+        if (handle != INVALID_SOCKET)
+            return fromHandle(handle, flags);
         return switch (WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS, WSAEINVALIDPROVIDER, WSAEINVALIDPROCTABLE, WSAEPROVIDERFAILEDINIT => zio.Socket.Error.InvalidState,
             WSAEAFNOTSUPPORT, WSAEFAULT, WSAEINVAL, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT => zio.Socket.Error.InvalidValue,
@@ -154,13 +153,16 @@ pub const Socket = struct {
         _ = Mswsock.closesocket(self.handle);
     }
 
-    pub fn fromHandle(handle: Handle) @This() {
+    const is_overlapped = usize(1);
+
+    pub fn fromHandle(handle: Handle, flags: zio.Socket.Flags) @This() {
         var self: @This() = undefined;
         self.handle = handle;
+        if ((flags & zio.Socket.Nonblock) != 0)
+            self.handle = @intToPtr(Handle, @ptrToInt(handle) | is_overlapped);
         return self;
     }
 
-    const is_overlapped = usize(1);
     pub fn getHandle(self: @This()) Handle {
         return @intToPtr(Handle, @ptrToInt(self.handle) & ~is_overlapped);
     }
@@ -212,6 +214,10 @@ pub const Socket = struct {
         l_linger: c_ushort,
     };
 
+    inline fn setUpdateContext(option: c_int, handle: Handle, value: usize, length: c_int) c_int {
+        return Mswsock.setsockopt(handle, Mswsock.Options.SOL_SOCKET, option, value, length);
+    }
+
     pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         var option_val = option;
         if (posix.Socket.socketOption(self.getHandle(), &option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
@@ -260,22 +266,28 @@ pub const Socket = struct {
         };
     }
 
+    fn finishConnect(handle: Handle) zio.Socket.ConnectError!void {
+        if (setUpdateContext(Mswsock.Options.SO_UPDATE_CONNECT_CONTEXT, handle, 0, 0) != 0)
+            return zio.Socket.ConnectError.InvalidState;
+    }
+
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
         return switch (error_code: {
+            const handle = self.getHandle();
             switch (try self.getOverlappedResult(&self.writer, token)) {
-                .Completed => |_| return,
                 .Error => |code| break :error_code code,
+                .Completed => |_| return finishConnect(handle),
                 .Retry => |overlapped| {
-                    const handle = self.getHandle();
                     const addr = @ptrCast(*const SOCKADDR, &address.sockaddr);
                     if (overlapped) |ov| {
+                        var bind_address = zio.Address.fromIpv4(0, 0);
+                        self.bind(&bind_address) catch return zio.Socket.ConnectError.InvalidHandle;
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
-                            return;
+                            return finishConnect(handle);
                     } else {
                         if (Mswsock.connect(handle, addr, address.length) == 0)
                             return;
                     }
-                    std.debug.warn("\nConnect: {}\n", WSAGetLastError());
                     break :error_code WSAGetLastError();
                 },
             }
@@ -292,28 +304,31 @@ pub const Socket = struct {
         };
     }
 
+    fn finishAccept(handle_ptr: *Handle, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
+        if (setUpdateContext(Mswsock.Options.SO_UPDATE_ACCEPT_CONTEXT, incoming.handle, @ptrToInt(handle_ptr), @sizeOf(Handle)) != 0)
+            return zio.Socket.AcceptError.InvalidState;
+        const addr_len = incoming.address.length;
+        const addr = @ptrCast(windows.PVOID, &incoming.address);
+        var sock_addr = @ptrCast(*SOCKADDR, &incoming.address);
+        (GetAcceptExSockaddrs.?)(addr, 0, 0, addr_len + IncomingPadding, &sock_addr, 0, &sock_addr, addr_len);
+    }
+
     pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         return switch (error_code: {
-            const addr_len = incoming.address.length;
+            var handle = self.getHandle();
             switch (try self.getOverlappedResult(&self.writer, token)) {
-                .Completed => |_| {
-                    const addr = @ptrCast(windows.PVOID, &incoming.address);
-                    var sock_addr = @ptrCast(*SOCKADDR, &incoming.address);
-                    return (GetAcceptExSockaddrs.?)(addr, 0, 0, addr_len + IncomingPadding, &sock_addr, 0, &sock_addr, addr_len);
-                },
                 .Error => |code| break :error_code code,
+                .Completed => |_| return finishAccept(&handle, incoming),
                 .Retry => |overlapped| {
-                    const handle = self.getHandle();
                     if (overlapped) |ov| {
                         incoming.handle = createSocket(flags);
                         if (incoming.handle == INVALID_SOCKET)
                             return zio.Socket.AcceptError.OutOfResources;
                         var received: windows.DWORD = undefined;
+                        const addr_len = incoming.address.length;
                         const addr = @ptrCast(windows.PVOID, &incoming.address);
-                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &received, ov) == windows.TRUE) {
-                            var sock_addr = @ptrCast(*SOCKADDR, &incoming.address);
-                            return (GetAcceptExSockaddrs.?)(addr, 0, 0, addr_len + IncomingPadding, &sock_addr, 0, &sock_addr, addr_len);
-                        }
+                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &received, ov) == windows.TRUE)
+                            return finishAccept(&handle, incoming);
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
                         incoming.handle = Mswsock.accept(handle, addr, &incoming.address.length);
@@ -384,21 +399,24 @@ pub const Socket = struct {
                 .Completed => |transferred| return transferred,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
-                    var transferred: windows.DWORD = undefined;
-                    const result = WSASendTo(
-                        self.getHandle(),
-                        @ptrCast([*]const WSABUF, buffers.ptr),
-                        @intCast(windows.DWORD, buffers.len),
-                        if (overlapped == null) &transferred else null,
-                        windows.DWORD(0),
-                        if (address) |addr| @ptrCast(*const SOCKADDR, &addr.sockaddr) else null,
-                        if (address) |addr| addr.length else 0,
-                        overlapped,
-                        null,
-                    );
-                    if (result == SOCKET_ERROR)
-                        break :error_code WSAGetLastError();
-                    return usize(transferred);
+                    const handle = self.getHandle();
+                    var transferred: c_int = undefined;
+                    const addr_len = if (address) |addr| addr.length else 0;
+                    const addr_ptr = if (address) |addr| @ptrCast(*const SOCKADDR, &addr.sockaddr) else null;
+                    if (overlapped) |ov| {
+                        const buf_ptr = @ptrCast([*]const WSABUF, buffers.ptr);
+                        const buf_len = @intCast(windows.DWORD, buffers.len);
+                        const transfer_ptr = @ptrCast(*windows.DWORD, &transferred);
+                        if (WSASendTo(handle, buf_ptr, buf_len, transfer_ptr, 0, addr_ptr, addr_len, ov, null) == SOCKET_ERROR)
+                            transferred = SOCKET_ERROR;
+                    } else {
+                        const buf_len = @intCast(windows.DWORD, buffers[0].inner.len);
+                        const buf_ptr = @ptrCast(*const c_void, buffers[0].inner.buf);
+                        transferred = Mswsock.sendto(handle, buf_ptr, buf_len, 0, addr_ptr, addr_len);
+                    }
+                    if (transferred != SOCKET_ERROR)
+                        return @intCast(usize, transferred);
+                    break :error_code WSAGetLastError();
                 },
             }
         }) {
@@ -456,11 +474,8 @@ pub const Socket = struct {
         }
 
         if ((flags & zio.Socket.Nonblock) == 0)
-            return Mswsock.socket(family, sock_type, protocol);
-        var handle = WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED);
-        if (handle != INVALID_SOCKET)
-            handle = @intToPtr(Handle, @ptrToInt(handle) | is_overlapped);
-        return handle;
+            return WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED);
+        return Mswsock.socket(family, sock_type, protocol);
     }
 };
 
@@ -727,6 +742,8 @@ const Mswsock = struct {
         pub const SO_SNDBUF = 0x1001;
         pub const SO_SNDLOWAT = 0x1003;
         pub const SO_SNDTIMEO = 0x1005;
+        pub const SO_UPDATE_ACCEPT_CONTEXT = 0x700B;
+        pub const SO_UPDATE_CONNECT_CONTEXT = 0x7010;
     };
 };
 

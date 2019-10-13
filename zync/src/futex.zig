@@ -177,7 +177,7 @@ test "Futex" {
     
     // Test .wait() delay
     const delay_ms = 100;
-    const threshold_ms = 200;
+    const threshold_ms = 500;
     const now = zuma.Thread.now(.Monotonic);
     expectError(Futex.WaitError.TimedOut, futex.inner.wait(&futex.value.value, 0, delay_ms));
     const elapsed = zuma.Thread.now(.Monotonic) - now;

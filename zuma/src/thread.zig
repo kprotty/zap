@@ -74,7 +74,7 @@ test "Thread - random, now, sleep" {
     expect(Thread.now(.Realtime) > 0);
 
     const delay_ms = 200;
-    const threshold_ms = 200;
+    const threshold_ms = 500;
 
     const now = Thread.now(.Monotonic);
     Thread.sleep(delay_ms);

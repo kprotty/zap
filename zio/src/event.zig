@@ -94,7 +94,7 @@ test "Event.Poller - poll - blocking" {
     defer poller.close();
 
     const delay_ms = 100;
-    const error_threshold_ms = 200;
+    const error_threshold_ms = 500;
     var events: [1]Event = undefined;
     const now = zuma.Thread.now(.Monotonic);
     const events_found = try poller.poll(events[0..], delay_ms);

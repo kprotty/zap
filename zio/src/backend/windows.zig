@@ -142,7 +142,7 @@ pub const Socket = struct {
         const handle = createSocket(flags);
         if (handle != INVALID_SOCKET)
             return fromHandle(handle, flags);
-        return switch (WSAGetLastError()) {
+        return switch (Winsock2.get().?.WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS, WSAEINVALIDPROVIDER, WSAEINVALIDPROCTABLE, WSAEPROVIDERFAILEDINIT => zio.Socket.Error.InvalidState,
             WSAEAFNOTSUPPORT, WSAEFAULT, WSAEINVAL, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT => zio.Socket.Error.InvalidValue,
             WSAEMFILE, WSAENOBUFS => zio.Socket.Error.OutOfResources,
@@ -151,7 +151,7 @@ pub const Socket = struct {
     }
 
     pub fn close(self: *@This()) void {
-        _ = Mswsock.closesocket(self.handle);
+        _ = Winsock2.get().?.closesocket(self.handle);
     }
 
     const is_overlapped = usize(1);
@@ -172,7 +172,7 @@ pub const Socket = struct {
     fn WSAInitialize() zio.Socket.Error!void {
         const wsa_version = windows.WORD(0x0202);
         var wsa_data: WSAData = undefined;
-        if (WSAStartup(wsa_version, &wsa_data) != 0)
+        if (Winsock2.get().?.WSAStartup(wsa_version, &wsa_data) != 0)
             return zio.Socket.Error.InvalidState;
         if (wsa_data.wVersion != wsa_version)
             return zio.Socket.Error.InvalidState;
@@ -181,7 +181,7 @@ pub const Socket = struct {
         if (dummy_socket == INVALID_SOCKET)
             return zio.Socket.Error.InvalidState;
         defer {
-            _ = Mswsock.closesocket(dummy_socket);
+            _ = Winsock2.get().?.closesocket(dummy_socket);
         }
 
         if (AcceptEx == null)
@@ -195,7 +195,7 @@ pub const Socket = struct {
     fn findWSAFunction(socket: SOCKET, function_guid: windows.GUID, function: var) zio.Socket.Error!void {
         var guid = function_guid;
         var dwBytes: windows.DWORD = undefined;
-        const result = WSAIoctl(
+        const result = Winsock2.get().?.WSAIoctl(
             socket,
             SIO_GET_EXTENSION_FUNCTION_POINTER,
             @ptrCast(windows.PVOID, &guid),
@@ -216,14 +216,14 @@ pub const Socket = struct {
     };
 
     inline fn setUpdateContext(option: c_int, handle: Handle, value: usize, length: c_int) c_int {
-        return Mswsock.setsockopt(handle, Mswsock.Options.SOL_SOCKET, option, value, length);
+        return Winsock2.get().?.setsockopt(handle, Options.SOL_SOCKET, option, value, length);
     }
 
     pub fn setOption(self: *@This(), option: zio.Socket.Option) zio.Socket.OptionError!void {
         var option_val = option;
-        if (posix.Socket.socketOption(self.getHandle(), &option_val, Mswsock.setsockopt, Mswsock.Options) == 0)
+        if (posix.Socket.socketOption(self.getHandle(), &option_val, Winsock2.get().?.setsockopt, Options) == 0)
             return;
-        return switch (WSAGetLastError()) {
+        return switch (Winsock2.get().?.WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
             WSAENETRESET, WSAENOTCONN, WSAENOTSOCK => zio.Socket.OptionError.InvalidHandle,
             WSAEINVAL, WSAENOPROTOOPT => zio.Socket.OptionError.InvalidValue,
@@ -233,9 +233,9 @@ pub const Socket = struct {
     }
 
     pub fn getOption(self: @This(), option: *zio.Socket.Option) zio.Socket.OptionError!void {
-        if (posix.Socket.socketOption(self.getHandle(), option, Mswsock.getsockopt, Mswsock.Options) == 0)
+        if (posix.Socket.socketOption(self.getHandle(), option, Winsock2.get().?.getsockopt, Options) == 0)
             return;
-        return switch (WSAGetLastError()) {
+        return switch (Winsock2.get().?.WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAEINPROGRESS => zio.Socket.OptionError.InvalidState,
             WSAEFAULT, WSAENOPROTOOPT => zio.Socket.OptionError.InvalidValue,
             WSAENOTSOCK => zio.Socket.OptionError.InvalidHandle,
@@ -245,9 +245,9 @@ pub const Socket = struct {
     }
 
     pub fn bind(self: *@This(), address: *const zio.Address) zio.Socket.BindError!void {
-        if (Mswsock.bind(self.getHandle(), @ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
+        if (Winsock2.get().?.bind(self.getHandle(), @ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
             return;
-        return switch (WSAGetLastError()) {
+        return switch (Winsock2.get().?.WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS => zio.Socket.BindError.InvalidState,
             WSAEADDRNOTAVAIL, WSAEFAULT => zio.Socket.BindError.InvalidAddress,
             WSAEADDRINUSE => zio.Socket.BindError.AddressInUse,
@@ -257,9 +257,9 @@ pub const Socket = struct {
     }
 
     pub fn listen(self: *@This(), backlog: c_uint) zio.Socket.ListenError!void {
-        if (Mswsock.listen(self.getHandle(), backlog) == 0)
+        if (Winsock2.get().?.listen(self.getHandle(), backlog) == 0)
             return;
-        return switch (WSAGetLastError()) {
+        return switch (Winsock2.get().?.WSAGetLastError()) {
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS, WSAEINPROGRESS, WSAEINVAL => zio.Socket.ListenError.InvalidState,
             WSAEISCONN, WSAEMFILE, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.ListenError.InvalidHandle,
             WSAEADDRINUSE => zio.Socket.ListenError.AddressInUse,
@@ -268,7 +268,7 @@ pub const Socket = struct {
     }
 
     fn finishConnect(handle: Handle) zio.Socket.ConnectError!void {
-        if (setUpdateContext(Mswsock.Options.SO_UPDATE_CONNECT_CONTEXT, handle, 0, 0) != 0)
+        if (setUpdateContext(Options.SO_UPDATE_CONNECT_CONTEXT, handle, 0, 0) != 0)
             return zio.Socket.ConnectError.InvalidState;
     }
 
@@ -290,10 +290,10 @@ pub const Socket = struct {
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return finishConnect(handle);
                     } else {
-                        if (WSAConnect(handle, addr, address.length, null, null, null, null) == 0)
+                        if (Winsock2.get().?.WSAConnect(handle, addr, address.length, null, null, null, null) == 0)
                             return;
                     }
-                    break :error_code WSAGetLastError();
+                    break :error_code Winsock2.get().?.WSAGetLastError();
                 },
             }
         }) {
@@ -310,7 +310,7 @@ pub const Socket = struct {
     }
 
     fn finishAccept(handle_ptr: *Handle, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
-        if (setUpdateContext(Mswsock.Options.SO_UPDATE_ACCEPT_CONTEXT, incoming.handle, @ptrToInt(handle_ptr), @sizeOf(Handle)) != 0)
+        if (setUpdateContext(Options.SO_UPDATE_ACCEPT_CONTEXT, incoming.handle, @ptrToInt(handle_ptr), @sizeOf(Handle)) != 0)
             return zio.Socket.AcceptError.InvalidState;
 
         var local_addr: *SOCKADDR = undefined;
@@ -341,18 +341,18 @@ pub const Socket = struct {
                             return finishAccept(&handle, incoming);
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
-                        incoming.handle = WSAAccept(handle, addr, &incoming.address.length, null, null);
+                        incoming.handle = Winsock2.get().?.WSAAccept(handle, addr, &incoming.address.length, null, null);
                         if (incoming.handle != INVALID_SOCKET)
                             return;
                     }
-                    break :error_code WSAGetLastError();
+                    break :error_code Winsock2.get().?.WSAGetLastError();
                 },
             }
         }) {
             0 => unreachable,
             WSAECONNRESET => err: {
                 if (token != 0)
-                    _ = Mswsock.closesocket(incoming.handle);
+                    _ = Winsock2.get().?.closesocket(incoming.handle);
                 break :err zio.Socket.AcceptError.Refused;
             },
             WSAENOTINITIALIZED, WSAEINTR, WSAEINPROGRESS, WSAENETDOWN => zio.Socket.AcceptError.InvalidState,
@@ -372,7 +372,7 @@ pub const Socket = struct {
                 .Retry => |overlapped| {
                     self.flags = 0;
                     var transferred: windows.DWORD = 0;
-                    const result = WSARecvFrom(
+                    const result = Winsock2.get().?.WSARecvFrom(
                         self.getHandle(),
                         @ptrCast([*]WSABUF, buffers.ptr),
                         @intCast(windows.DWORD, buffers.len),
@@ -384,7 +384,7 @@ pub const Socket = struct {
                         null,
                     );
                     if (result == SOCKET_ERROR)
-                        break :error_code WSAGetLastError();
+                        break :error_code Winsock2.get().?.WSAGetLastError();
                     return transferred;
                 },
             }
@@ -407,7 +407,7 @@ pub const Socket = struct {
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
                     var transferred: windows.DWORD = 0;
-                    const result = WSASendTo(
+                    const result = Winsock2.get().?.WSASendTo(
                         self.getHandle(),
                         @ptrCast([*]const WSABUF, buffers.ptr),
                         @intCast(windows.DWORD, buffers.len),
@@ -419,7 +419,7 @@ pub const Socket = struct {
                         null,
                     );
                     if (result == SOCKET_ERROR)
-                        break :error_code WSAGetLastError();
+                        break :error_code Winsock2.get().?.WSAGetLastError();
                     return transferred;
                 },
             }
@@ -471,14 +471,14 @@ pub const Socket = struct {
             sock_type |= SOCK_RAW;
         } else if ((flags & zio.Socket.Tcp) != 0) {
             sock_type |= SOCK_STREAM;
-            protocol |= Mswsock.Options.IPPROTO_TCP;
+            protocol |= Options.IPPROTO_TCP;
         } else if ((flags & zio.Socket.Udp) != 0) {
             sock_type |= SOCK_DGRAM;
-            protocol |= Mswsock.Options.IPPROTO_UDP;
+            protocol |= Options.IPPROTO_UDP;
         }
 
         const overlapped = if ((flags & zio.Socket.Nonblock) != 0) WSA_FLAG_OVERLAPPED else 0;
-        return WSASocketA(family, sock_type, protocol, 0, 0, overlapped);
+        return Winsock2.get().?.WSASocketA(family, sock_type, protocol, 0, 0, overlapped);
     }
 };
 
@@ -660,126 +660,126 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
     fAlertable: windows.BOOL,
 ) windows.BOOL;
 
-const Mswsock = struct {
-    pub extern "ws2_32" stdcallcc fn closesocket(
-        socket: SOCKET,
-    ) c_int;
+pub const Options = struct {
+    pub const IPPROTO_TCP = 6;
+    pub const IPPROTO_UDP = 17;
+    pub const SOL_SOCKET = 0xffff;
+    pub const SO_DEBUG = 0x0001;
+    pub const TCP_NODELAY = 0x0001;
+    pub const SO_LINGER = 0x0080;
+    pub const SO_BROADCAST = 0x0020;
+    pub const SO_REUSEADDR = 0x0004;
+    pub const SO_KEEPALIVE = 0x0008;
+    pub const SO_OOBINLINE = 0x0100;
+    pub const SO_RCVBUF = 0x1002;
+    pub const SO_RCVLOWAT = 0x1004;
+    pub const SO_RCVTIMEO = 0x1006;
+    pub const SO_SNDBUF = 0x1001;
+    pub const SO_SNDLOWAT = 0x1003;
+    pub const SO_SNDTIMEO = 0x1005;
+    pub const SO_UPDATE_ACCEPT_CONTEXT = 0x700B;
+    pub const SO_UPDATE_CONNECT_CONTEXT = 0x7010;
+};
 
-    pub extern "ws2_32" stdcallcc fn listen(
+const Winsock2 = zuma.backend.DynamicLibrary(c"ws2_32", struct {
+    closesocket: extern fn(
+        socket: SOCKET,
+    ) c_int,
+
+    listen: extern fn(
         socket: SOCKET,
         backlog: c_uint,
-    ) c_int;
+    ) c_int,
 
-    pub extern "ws2_32" stdcallcc fn bind(
+    bind: extern fn(
         socket: SOCKET,
         addr: *const SOCKADDR,
         addr_len: c_uint,
-    ) c_int;
+    ) c_int,
 
-    pub extern "ws2_32" stdcallcc fn setsockopt(
+    setsockopt: extern fn (
         socket: SOCKET,
         level: c_int,
         optname: c_int,
         optval: usize,
         optlen: c_int,
-    ) c_int;
+    ) c_int,
 
-    pub extern "ws2_32" stdcallcc fn getsockopt(
+    getsockopt: extern fn (
         socket: SOCKET,
         level: c_int,
         optname: c_int,
         optval: usize,
         optlen: *c_int,
-    ) c_int;
+    ) c_int,
 
-    pub const Options = struct {
-        pub const IPPROTO_TCP = 6;
-        pub const IPPROTO_UDP = 17;
-        pub const SOL_SOCKET = 0xffff;
-        pub const SO_DEBUG = 0x0001;
-        pub const TCP_NODELAY = 0x0001;
-        pub const SO_LINGER = 0x0080;
-        pub const SO_BROADCAST = 0x0020;
-        pub const SO_REUSEADDR = 0x0004;
-        pub const SO_KEEPALIVE = 0x0008;
-        pub const SO_OOBINLINE = 0x0100;
-        pub const SO_RCVBUF = 0x1002;
-        pub const SO_RCVLOWAT = 0x1004;
-        pub const SO_RCVTIMEO = 0x1006;
-        pub const SO_SNDBUF = 0x1001;
-        pub const SO_SNDLOWAT = 0x1003;
-        pub const SO_SNDTIMEO = 0x1005;
-        pub const SO_UPDATE_ACCEPT_CONTEXT = 0x700B;
-        pub const SO_UPDATE_CONNECT_CONTEXT = 0x7010;
-    };
-};
+    WSAGetLastError: extern fn () c_int,
+    WSACleanup: extern fn () c_int,
+    WSAStartup: extern fn (
+        wVersionRequested: windows.WORD,
+        lpWSAData: *WSAData,
+    ) c_int,
 
-extern "ws2_32" stdcallcc fn WSAGetLastError() c_int;
-extern "ws2_32" stdcallcc fn WSACleanup() c_int;
-extern "ws2_32" stdcallcc fn WSAStartup(
-    wVersionRequested: windows.WORD,
-    lpWSAData: *WSAData,
-) c_int;
+    WSAIoctl: extern fn (
+        socket: SOCKET,
+        dwIoControlMode: windows.DWORD,
+        lpvInBuffer: windows.PVOID,
+        cbInBuffer: windows.DWORD,
+        lpvOutBuffer: windows.PVOID,
+        cbOutBuffer: windows.DWORD,
+        lpcbBytesReturned: *windows.DWORD,
+        lpOverlapped: ?*windows.OVERLAPPED,
+        lpCompletionRoutine: ?extern fn (*windows.OVERLAPPED) usize,
+    ) c_int,
 
-extern "ws2_32" stdcallcc fn WSAIoctl(
-    socket: SOCKET,
-    dwIoControlMode: windows.DWORD,
-    lpvInBuffer: windows.PVOID,
-    cbInBuffer: windows.DWORD,
-    lpvOutBuffer: windows.PVOID,
-    cbOutBuffer: windows.DWORD,
-    lpcbBytesReturned: *windows.DWORD,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRoutine: ?extern fn (*windows.OVERLAPPED) usize,
-) c_int;
+    WSASocketA: extern fn (
+        family: windows.DWORD,
+        sock_type: windows.DWORD,
+        protocol: windows.DWORD,
+        lpProtocolInfo: usize,
+        group: usize,
+        dwFlags: windows.DWORD,
+    ) SOCKET,
 
-extern "ws2_32" stdcallcc fn WSASocketA(
-    family: windows.DWORD,
-    sock_type: windows.DWORD,
-    protocol: windows.DWORD,
-    lpProtocolInfo: usize,
-    group: usize,
-    dwFlags: windows.DWORD,
-) SOCKET;
+    WSAAccept: extern fn (
+        socket: SOCKET,
+        addr: *SOCKADDR,
+        addrlen: *c_uint,
+        lpfnCondition: ?extern fn() void,
+        dwCallbackData: ?*windows.DWORD, 
+    ) SOCKET,
 
-extern "ws2_32" stdcallcc fn WSAAccept(
-    socket: SOCKET,
-    addr: *SOCKADDR,
-    addrlen: *c_uint,
-    lpfnCondition: ?extern fn() void,
-    dwCallbackData: ?*windows.DWORD, 
-) SOCKET;
+    WSAConnect: extern fn (
+        socket: SOCKET,
+        name: *const SOCKADDR,
+        namelen: c_uint,
+        lpCallerData: ?[*]const WSABUF,
+        lpCalleeData: ?[*]const WSABUF,
+        lpSQOS: ?*c_void,
+        lpGQOS: ?*c_void,
+    ) c_int,
 
-extern "ws2_32" stdcallcc fn WSAConnect(
-    socket: SOCKET,
-    name: *const SOCKADDR,
-    namelen: c_uint,
-    lpCallerData: ?[*]const WSABUF,
-    lpCalleeData: ?[*]const WSABUF,
-    lpSQOS: ?*c_void,
-    lpGQOS: ?*c_void,
-) c_int;
+    WSASendTo: extern fn (
+        socket: SOCKET,
+        lpBuffers: [*]const WSABUF,
+        dwBufferCount: windows.DWORD,
+        lpNumberOfBytesSent: ?*windows.DWORD,
+        dwFlags: windows.DWORD,
+        lpTo: ?*const SOCKADDR,
+        iToLen: c_uint,
+        lpOverlapped: ?*windows.OVERLAPPED,
+        lpCompletionRouting: ?OverlappedCompletionRoutine,
+    ) c_int,
 
-extern "ws2_32" stdcallcc fn WSASendTo(
-    socket: SOCKET,
-    lpBuffers: [*]const WSABUF,
-    dwBufferCount: windows.DWORD,
-    lpNumberOfBytesSent: ?*windows.DWORD,
-    dwFlags: windows.DWORD,
-    lpTo: ?*const SOCKADDR,
-    iToLen: c_uint,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRouting: ?OverlappedCompletionRoutine,
-) c_int;
-
-extern "ws2_32" stdcallcc fn WSARecvFrom(
-    socket: SOCKET,
-    lpBuffers: [*]WSABUF,
-    dwBufferCount: windows.DWORD,
-    lpNumberOfBytesRecv: ?*windows.DWORD,
-    lpFlags: *windows.DWORD,
-    lpFrom: ?*SOCKADDR,
-    lpFromLen: ?*c_uint,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    lpCompletionRouting: ?OverlappedCompletionRoutine,
-) c_int;
+    WSARecvFrom: extern fn (
+        socket: SOCKET,
+        lpBuffers: [*]WSABUF,
+        dwBufferCount: windows.DWORD,
+        lpNumberOfBytesRecv: ?*windows.DWORD,
+        lpFlags: *windows.DWORD,
+        lpFrom: ?*SOCKADDR,
+        lpFromLen: ?*c_uint,
+        lpOverlapped: ?*windows.OVERLAPPED,
+        lpCompletionRouting: ?OverlappedCompletionRoutine,
+    ) c_int,
+});

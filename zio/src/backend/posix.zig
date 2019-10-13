@@ -271,7 +271,7 @@ pub const Socket = struct {
     pub fn socketOption(
         handle: zio.Handle,
         option: *zio.Socket.Option,
-        comptime sockopt: var,
+        sockopt: var,
         comptime flags: type,
     ) @typeOf(sockopt).ReturnType {
         var number: c_int = undefined;

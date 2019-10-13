@@ -135,9 +135,8 @@ pub const Thread = struct {
     var frequency = zync.Lazy(getQPCFrequency).new();
     fn getQPCFrequency() u64 {
         var qpc_frequency: windows.LARGE_INTEGER = undefined;
-        if (QueryPerformanceFrequency(&qpc_frequency) == windows.TRUE)
-            return @intCast(u64, qpc_frequency) / 1000;
-        return 1000000; // assume nanosecond frequency
+        std.debug.assert(QueryPerformanceFrequency(&qpc_frequency) == windows.TRUE);
+        return @intCast(u64, qpc_frequency) / 1000;
     }
 
     pub fn now(is_monotonic: bool) u64 {

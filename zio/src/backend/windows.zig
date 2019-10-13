@@ -290,7 +290,7 @@ pub const Socket = struct {
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return finishConnect(handle);
                     } else {
-                        if (Mswsock.connect(handle, addr, address.length) == 0)
+                        if (WSAConnect(handle, addr, address.length, null, null, null, null) == 0)
                             return;
                     }
                     break :error_code WSAGetLastError();
@@ -341,7 +341,7 @@ pub const Socket = struct {
                             return finishAccept(&handle, incoming);
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
-                        incoming.handle = Mswsock.accept(handle, addr, &incoming.address.length);
+                        incoming.handle = WSAAccept(handle, addr, &incoming.address.length, null, null);
                         if (incoming.handle != INVALID_SOCKET)
                             return;
                     }
@@ -477,9 +477,8 @@ pub const Socket = struct {
             protocol |= Mswsock.Options.IPPROTO_UDP;
         }
 
-        if ((flags & zio.Socket.Nonblock) == 0)
-            return WSASocketA(family, sock_type, protocol, 0, 0, WSA_FLAG_OVERLAPPED);
-        return Mswsock.socket(family, sock_type, protocol);
+        const overlapped = if ((flags & zio.Socket.Nonblock) != 0) WSA_FLAG_OVERLAPPED else 0;
+        return WSASocketA(family, sock_type, protocol, 0, 0, overlapped);
     }
 };
 
@@ -662,12 +661,6 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
 ) windows.BOOL;
 
 const Mswsock = struct {
-    pub extern "ws2_32" stdcallcc fn socket(
-        af: windows.DWORD,
-        stype: windows.DWORD,
-        protocol: windows.DWORD,
-    ) SOCKET;
-
     pub extern "ws2_32" stdcallcc fn closesocket(
         socket: SOCKET,
     ) c_int;
@@ -682,18 +675,6 @@ const Mswsock = struct {
         addr: *const SOCKADDR,
         addr_len: c_uint,
     ) c_int;
-
-    pub extern "ws2_32" stdcallcc fn connect(
-        socket: SOCKET,
-        name: *const SOCKADDR,
-        namelen: c_uint,
-    ) c_int;
-
-    pub extern "ws2_32" stdcallcc fn accept(
-        socket: SOCKET,
-        addr: *SOCKADDR,
-        addrlen: *c_uint,
-    ) SOCKET;
 
     pub extern "ws2_32" stdcallcc fn setsockopt(
         socket: SOCKET,
@@ -760,6 +741,24 @@ extern "ws2_32" stdcallcc fn WSASocketA(
     group: usize,
     dwFlags: windows.DWORD,
 ) SOCKET;
+
+extern "ws2_32" stdcallcc fn WSAAccept(
+    socket: SOCKET,
+    addr: *SOCKADDR,
+    addrlen: *c_uint,
+    lpfnCondition: ?extern fn() void,
+    dwCallbackData: ?*windows.DWORD, 
+) SOCKET;
+
+extern "ws2_32" stdcallcc fn WSAConnect(
+    socket: SOCKET,
+    name: *const SOCKADDR,
+    namelen: c_uint,
+    lpCallerData: ?[*]const WSABUF,
+    lpCalleeData: ?[*]const WSABUF,
+    lpSQOS: ?*c_void,
+    lpGQOS: ?*c_void,
+) c_int;
 
 extern "ws2_32" stdcallcc fn WSASendTo(
     socket: SOCKET,

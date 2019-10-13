@@ -116,7 +116,7 @@ pub const Event = struct {
                 @ptrCast([*]OVERLAPPED_ENTRY, events.ptr),
                 @intCast(windows.ULONG, events.len),
                 &events_found,
-                if (timeout) |t| @intCast(windows.DWORD, t) else windows.INFINITE,
+                timeout orelse windows.INFINITE,
                 windows.FALSE,
             ) == windows.TRUE)
                 return events[0..events_found];
@@ -174,7 +174,7 @@ pub const Socket = struct {
         if (wsa_data.wVersion != wsa_version)
             return zio.Socket.Error.InvalidState;
 
-        const dummy_socket = Mswsock.socket(AF_INET, SOCK_STREAM, 0);
+        const dummy_socket = createSocket(zio.Socket.Ipv4 | zio.Socket.Tcp);
         if (dummy_socket == INVALID_SOCKET)
             return zio.Socket.Error.InvalidState;
         defer {
@@ -275,6 +275,7 @@ pub const Socket = struct {
                         if (Mswsock.connect(handle, addr, address.length) == 0)
                             return;
                     }
+                    std.debug.warn("\nConnect: {}\n", WSAGetLastError());
                     break :error_code WSAGetLastError();
                 },
             }
@@ -285,6 +286,7 @@ pub const Socket = struct {
             WSAEAFNOTSUPPORT, WSAENOTSOCK => zio.Socket.ConnectError.InvalidHandle,
             WSAEADDRNOTAVAIL, WSAEINVAL => zio.Socket.ConnectError.InvalidAddress,
             WSAEALREADY, WSAEISCONN => zio.Socket.ConnectError.AlreadyConnected,
+            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
             WSAETIMEDOUT => zio.Socket.ConnectError.TimedOut,
             else => unreachable,
         };
@@ -314,7 +316,7 @@ pub const Socket = struct {
                         }
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
-                        incoming.handle = Mswsock.accept(handle, addr, addr_len);
+                        incoming.handle = Mswsock.accept(handle, addr, &incoming.address.length);
                         if (incoming.handle != INVALID_SOCKET)
                             return;
                     }
@@ -332,7 +334,7 @@ pub const Socket = struct {
             WSAEINVAL, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.AcceptError.InvalidHandle,
             WSAEMFILE, WSAENOBUFS => zio.Socket.AcceptError.OutOfResources,
             WSAEFAULT => zio.Socket.AcceptError.InvalidAddress,
-            WSAEWOULDBLOCK => zio.ErrorPending,
+            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
             else => unreachable,
         };
     }
@@ -343,28 +345,32 @@ pub const Socket = struct {
                 .Completed => |transferred| return transferred,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
-                    var transferred: windows.DWORD = undefined;
-                    const result = WSARecvFrom(
-                        self.getHandle(),
-                        @ptrCast([*]WSABUF, buffers.ptr),
-                        @intCast(windows.DWORD, buffers.len),
-                        if (overlapped == null) &transferred else null,
-                        @ptrCast(*windows.DWORD, &self.reader.Offset),
-                        if (address) |addr| @ptrCast(*SOCKADDR, &addr.sockaddr) else null,
-                        if (address) |addr| &addr.length else null,
-                        overlapped,
-                        null,
-                    );
-                    if (result == SOCKET_ERROR)
-                        break :error_code WSAGetLastError();
-                    return usize(transferred);
+                    const handle = self.getHandle();
+                    var transferred: c_int = undefined;
+                    const addr_len = if (address) |addr| &addr.length else null;
+                    const addr_ptr = if (address) |addr| @ptrCast(*SOCKADDR, &addr.sockaddr) else null;
+                    if (overlapped) |ov| {
+                        const buf_ptr = @ptrCast([*]WSABUF, buffers.ptr);
+                        const buf_len = @intCast(windows.DWORD, buffers.len);
+                        const transfer_ptr = @ptrCast(*windows.DWORD, &transferred);
+                        const flags_ptr = @ptrCast(*windows.DWORD, &self.reader.Offset);
+                        if (WSARecvFrom(handle, buf_ptr, buf_len, transfer_ptr, flags_ptr, addr_ptr, addr_len, ov, null) == SOCKET_ERROR)
+                            transferred = SOCKET_ERROR;
+                    } else {
+                        const buf_len = @intCast(windows.DWORD, buffers[0].inner.len);
+                        const buf_ptr = @intToPtr(*c_void, @ptrToInt(buffers[0].inner.buf)); // forgive me rust
+                        transferred = Mswsock.recvfrom(handle, buf_ptr, buf_len, 0, addr_ptr, addr_len);
+                    }
+                    if (transferred != SOCKET_ERROR)
+                        return @intCast(usize, transferred);
+                    break :error_code WSAGetLastError();
                 },
             }
         }) {
             0 => unreachable,
+            WSAEDISCON, WSAECONNRESET, WSAENETRESET, WSA_OPERATION_ABORTED, WSAECONNABORTED, WSAETIMEDOUT => zio.ErrorClosed,
             WSAEINPROGRESS, WSAEINTR, WSAENETDOWN, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
-            WSAECONNRESET, WSAENETRESET, WSA_OPERATION_ABORTED => zio.ErrorClosed,
-            WSAEINVAL, WSAENOTCONN => zio.Socket.DataError.InvalidHandle,
+            WSAEINVAL, WSAENOTCONN, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.DataError.InvalidHandle,
             WSAEMSGSIZE => zio.Socket.DataError.OutOfResources,
             WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
             WSAEFAULT => zio.Socket.DataError.InvalidValue,
@@ -397,9 +403,9 @@ pub const Socket = struct {
             }
         }) {
             0 => unreachable,
-            WSAEAFNOTSUPPORT, WSAEINVAL, WSAENETDOWN, WSAENOTCONN, WSAENOTSOCK, WSAESHUTDOWN => zio.Socket.DataError.InvalidHandle,
+            WSAEAFNOTSUPPORT, WSAEINVAL, WSAENETDOWN, WSAENOTCONN, WSAENOTSOCK, WSAESHUTDOWN, WSAEOPNOTSUPP => zio.Socket.DataError.InvalidHandle,
+            WSAECONNRESET, WSAECONNABORTED, WSAETIMEDOUT, WSAENETRESET, WSAENETUNREACH, WSA_OPERATION_ABORTED => zio.ErrorClosed,
             WSAEACCES, WSAEADDRNOTAVAIL, WSAEDESTADDRREQ, WSAEFAULT, WSAEHOSTUNREACH => zio.Socket.DataError.InvalidValue,
-            WSAECONNRESET, WSAENETRESET, WSAENETUNREACH, WSA_OPERATION_ABORTED => zio.ErrorClosed,
             WSAEINPROGRESS, WSAEINTR, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
             WSAEMSGSIZE, WSAENOBUFS => zio.Socket.DataError.OutOfResources,
             WSAEWOULDBLOCK, WSA_IO_PENDING => zio.ErrorPending,
@@ -463,7 +469,7 @@ pub const Socket = struct {
 ///-----------------------------------------------------------------------------///
 const AF_UNSPEC: windows.DWORD = 0;
 const AF_INET: windows.DWORD = 2;
-const AF_INET6: windows.DWORD = 6;
+const AF_INET6: windows.DWORD = 23;
 const SOCK_STREAM: windows.DWORD = 1;
 const SOCK_DGRAM: windows.DWORD = 2;
 const SOCK_RAW: windows.DWORD = 3;
@@ -490,12 +496,14 @@ const WSAEMFILE: windows.DWORD = 10024;
 const WSAECONNRESET: windows.DWORD = 10054;
 const WSAEINTR: windows.DWORD = 10004;
 const WSAEALREADY: windows.DWORD = 10037;
+const WSAECONNABORTED: windows.DWORD = 10053;
 const WSAECONNREFUSED: windows.DWORD = 10061;
 const WSAEISCONN: windows.DWORD = 10056;
 const WSAENOTCONN: windows.DWORD = 10057;
 const WSAENETDOWN: windows.DWORD = 10050;
 const WSAEINVAL: windows.DWORD = 10022;
 const WSAEFAULT: windows.DWORD = 10014;
+const WSAEDISCON: windows.DWORD = 10101;
 const WSAENETUNREACH: windows.DWORD = 10051;
 const WSAEHOSTUNREACH: windows.DWORD = 10065;
 const WSAENETRESET: windows.DWORD = 10052;
@@ -636,8 +644,8 @@ extern "kernel32" stdcallcc fn GetQueuedCompletionStatusEx(
 
 const Mswsock = struct {
     pub extern "ws2_32" stdcallcc fn socket(
-        domain: windows.DWORD,
-        sock_type: windows.DWORD,
+        af: windows.DWORD,
+        stype: windows.DWORD,
         protocol: windows.DWORD,
     ) SOCKET;
 
@@ -658,15 +666,33 @@ const Mswsock = struct {
 
     pub extern "ws2_32" stdcallcc fn connect(
         socket: SOCKET,
-        addr: *const SOCKADDR,
-        addr_len: c_uint,
+        name: *const SOCKADDR,
+        namelen: c_uint,
     ) c_int;
 
     pub extern "ws2_32" stdcallcc fn accept(
         socket: SOCKET,
         addr: *SOCKADDR,
-        addr_len: c_uint,
+        addrlen: *c_uint,
     ) SOCKET;
+
+    pub extern "ws2_32" stdcallcc fn sendto(
+        socket: SOCKET,
+        buf: *const c_void,
+        len: windows.DWORD,
+        flags: c_uint,
+        to: ?*const SOCKADDR,
+        tolen: c_uint,
+    ) c_int;
+
+    pub extern "ws2_32" stdcallcc fn recvfrom(
+        socket: SOCKET,
+        buf: *c_void,
+        len: windows.DWORD,
+        flags: c_uint,
+        to: ?*SOCKADDR,
+        tolen: ?*c_uint,
+    ) c_int;
 
     pub extern "ws2_32" stdcallcc fn setsockopt(
         socket: SOCKET,

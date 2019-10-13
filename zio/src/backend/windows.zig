@@ -133,6 +133,7 @@ pub const Event = struct {
 
 pub const Socket = struct {
     handle: Handle,
+    flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
 
@@ -307,16 +308,21 @@ pub const Socket = struct {
     fn finishAccept(handle_ptr: *Handle, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
         if (setUpdateContext(Mswsock.Options.SO_UPDATE_ACCEPT_CONTEXT, incoming.handle, @ptrToInt(handle_ptr), @sizeOf(Handle)) != 0)
             return zio.Socket.AcceptError.InvalidState;
+        
+        var local_addr: *SOCKADDR = undefined;
+        var local_addr_len: windows.DWORD = 0;
+        var remote_addr: *SOCKADDR = undefined;
+        var remote_addr_len: windows.DWORD = 0;
         const addr_len = incoming.address.length;
-        const addr = @ptrCast(windows.PVOID, &incoming.address);
-        var sock_addr = @ptrCast(*SOCKADDR, &incoming.address);
-        (GetAcceptExSockaddrs.?)(addr, 0, 0, addr_len + IncomingPadding, &sock_addr, 0, &sock_addr, addr_len);
+        const addr = @ptrCast(windows.PVOID, &incoming.address.sockaddr);
+        (GetAcceptExSockaddrs.?)(addr, 0, 0, addr_len, &local_addr, &local_addr_len, &remote_addr, &remote_addr_len);
+        incoming.address.sockaddr.inner = remote_addr.*;
     }
 
     pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         return switch (error_code: {
             var handle = self.getHandle();
-            switch (try self.getOverlappedResult(&self.writer, token)) {
+            switch (try self.getOverlappedResult(&self.reader, token)) {
                 .Error => |code| break :error_code code,
                 .Completed => |_| return finishAccept(&handle, incoming),
                 .Retry => |overlapped| {
@@ -324,10 +330,10 @@ pub const Socket = struct {
                         incoming.handle = createSocket(flags);
                         if (incoming.handle == INVALID_SOCKET)
                             return zio.Socket.AcceptError.OutOfResources;
-                        var received: windows.DWORD = undefined;
+                        self.flags = 0;
                         const addr_len = incoming.address.length;
-                        const addr = @ptrCast(windows.PVOID, &incoming.address);
-                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &received, ov) == windows.TRUE)
+                        const addr = @ptrCast(windows.PVOID, &incoming.address.sockaddr);
+                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &self.flags, ov) == windows.TRUE)
                             return finishAccept(&handle, incoming);
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
@@ -360,25 +366,22 @@ pub const Socket = struct {
                 .Completed => |transferred| return transferred,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
-                    const handle = self.getHandle();
-                    var transferred: c_int = undefined;
-                    const addr_len = if (address) |addr| &addr.length else null;
-                    const addr_ptr = if (address) |addr| @ptrCast(*SOCKADDR, &addr.sockaddr) else null;
-                    if (overlapped) |ov| {
-                        const buf_ptr = @ptrCast([*]WSABUF, buffers.ptr);
-                        const buf_len = @intCast(windows.DWORD, buffers.len);
-                        const transfer_ptr = @ptrCast(*windows.DWORD, &transferred);
-                        const flags_ptr = @ptrCast(*windows.DWORD, &self.reader.Offset);
-                        if (WSARecvFrom(handle, buf_ptr, buf_len, transfer_ptr, flags_ptr, addr_ptr, addr_len, ov, null) == SOCKET_ERROR)
-                            transferred = SOCKET_ERROR;
-                    } else {
-                        const buf_len = @intCast(windows.DWORD, buffers[0].inner.len);
-                        const buf_ptr = @intToPtr(*c_void, @ptrToInt(buffers[0].inner.buf)); // forgive me rust
-                        transferred = Mswsock.recvfrom(handle, buf_ptr, buf_len, 0, addr_ptr, addr_len);
-                    }
-                    if (transferred != SOCKET_ERROR)
-                        return @intCast(usize, transferred);
-                    break :error_code WSAGetLastError();
+                    self.flags = 0;
+                    var transferred: windows.DWORD = 0;
+                    const result = WSARecvFrom(
+                        self.getHandle(),
+                        @ptrCast([*]WSABUF, buffers.ptr),
+                        @intCast(windows.DWORD, buffers.len),
+                        &transferred,
+                        &self.flags,
+                        if (address) |addr| @ptrCast(*SOCKADDR, &addr.sockaddr) else null,
+                        if (address) |addr| &addr.length else null,
+                        overlapped,
+                        null,
+                    );
+                    if (result == SOCKET_ERROR)
+                        break :error_code WSAGetLastError();
+                    return transferred;
                 },
             }
         }) {
@@ -399,24 +402,21 @@ pub const Socket = struct {
                 .Completed => |transferred| return transferred,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
-                    const handle = self.getHandle();
-                    var transferred: c_int = undefined;
-                    const addr_len = if (address) |addr| addr.length else 0;
-                    const addr_ptr = if (address) |addr| @ptrCast(*const SOCKADDR, &addr.sockaddr) else null;
-                    if (overlapped) |ov| {
-                        const buf_ptr = @ptrCast([*]const WSABUF, buffers.ptr);
-                        const buf_len = @intCast(windows.DWORD, buffers.len);
-                        const transfer_ptr = @ptrCast(*windows.DWORD, &transferred);
-                        if (WSASendTo(handle, buf_ptr, buf_len, transfer_ptr, 0, addr_ptr, addr_len, ov, null) == SOCKET_ERROR)
-                            transferred = SOCKET_ERROR;
-                    } else {
-                        const buf_len = @intCast(windows.DWORD, buffers[0].inner.len);
-                        const buf_ptr = @ptrCast(*const c_void, buffers[0].inner.buf);
-                        transferred = Mswsock.sendto(handle, buf_ptr, buf_len, 0, addr_ptr, addr_len);
-                    }
-                    if (transferred != SOCKET_ERROR)
-                        return @intCast(usize, transferred);
-                    break :error_code WSAGetLastError();
+                    var transferred: windows.DWORD = 0;
+                    const result = WSASendTo(
+                        self.getHandle(),
+                        @ptrCast([*]const WSABUF, buffers.ptr),
+                        @intCast(windows.DWORD, buffers.len),
+                        &transferred,
+                        windows.DWORD(0),
+                        if (address) |addr| @ptrCast(*const SOCKADDR, &addr.sockaddr) else null,
+                        if (address) |addr| addr.length else 0,
+                        overlapped,
+                        null,
+                    );
+                    if (result == SOCKET_ERROR)
+                        break :error_code WSAGetLastError();
+                    return transferred;
                 },
             }
         }) {
@@ -630,9 +630,9 @@ var GetAcceptExSockaddrs: ?extern fn (
     dwLocalAddressLength: windows.DWORD,
     dwRemoteAddressLength: windows.DWORD,
     LocalSockaddr: **SOCKADDR,
-    LocalSockaddrLength: windows.DWORD,
+    LocalSockaddrLength: *windows.DWORD,
     RemoteSockaddr: **SOCKADDR,
-    RemoteSockaddrLength: windows.DWORD,
+    RemoteSockaddrLength: *windows.DWORD,
 ) void = null;
 
 const OverlappedCompletionRoutine = extern fn (
@@ -690,24 +690,6 @@ const Mswsock = struct {
         addr: *SOCKADDR,
         addrlen: *c_uint,
     ) SOCKET;
-
-    pub extern "ws2_32" stdcallcc fn sendto(
-        socket: SOCKET,
-        buf: *const c_void,
-        len: windows.DWORD,
-        flags: c_uint,
-        to: ?*const SOCKADDR,
-        tolen: c_uint,
-    ) c_int;
-
-    pub extern "ws2_32" stdcallcc fn recvfrom(
-        socket: SOCKET,
-        buf: *c_void,
-        len: windows.DWORD,
-        flags: c_uint,
-        to: ?*SOCKADDR,
-        tolen: ?*c_uint,
-    ) c_int;
 
     pub extern "ws2_32" stdcallcc fn setsockopt(
         socket: SOCKET,

@@ -281,7 +281,11 @@ pub const Socket = struct {
                 .Retry => |overlapped| {
                     const addr = @ptrCast(*const SOCKADDR, &address.sockaddr);
                     if (overlapped) |ov| {
-                        var bind_address = zio.Address.fromIpv4(0, 0);
+                        var bind_address = switch (address.length) {
+                            @sizeOf(SockAddr.Ipv4) => zio.Address.fromIpv4(0, 0),
+                            @sizeOf(SockAddr.Ipv6) => zio.Address.fromIpv6(zio.Address.parseIpv6("") catch unreachable, 0, 0),
+                            else => return zio.Socket.ConnectError.InvalidAddress,
+                        };
                         self.bind(&bind_address) catch return zio.Socket.ConnectError.InvalidHandle;
                         if ((ConnectEx.?)(handle, addr, address.length, null, 0, null, ov) == windows.TRUE)
                             return finishConnect(handle);

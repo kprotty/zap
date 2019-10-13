@@ -94,14 +94,16 @@ test "Event.Poller - poll - blocking" {
     defer poller.close();
 
     const delay_ms = 100;
-    const error_threshold_ms = 500;
+    const threshold_ms = 300;
+    const max_delay = delay_ms + threshold_ms;
+    const min_delay = delay_ms - std.math.min(delay_ms, threshold_ms);
+
     var events: [1]Event = undefined;
     const now = zuma.Thread.now(.Monotonic);
     const events_found = try poller.poll(events[0..], delay_ms);
     const elapsed = zuma.Thread.now(.Monotonic) - now;
-
     expect(events_found.len == 0);
-    expect(elapsed >= delay_ms and elapsed < delay_ms + error_threshold_ms);
+    expect(elapsed > min_delay and elapsed < max_delay);
 }
 
 test "Event.Poller - notify" {

@@ -175,13 +175,16 @@ test "Futex" {
     defer futex.inner.deinit();
     expect(futex.value.get() == 0);
 
-    // Test .wait() delay
     const delay_ms = 100;
-    const threshold_ms = 500;
+    const threshold_ms = 300;
+    const max_delay = delay_ms + threshold_ms;
+    const min_delay = delay_ms - std.math.min(delay_ms, threshold_ms);
+
+    // Test .wait() delay
     const now = zuma.Thread.now(.Monotonic);
     expectError(Futex.WaitError.TimedOut, futex.inner.wait(&futex.value.value, 0, delay_ms));
     const elapsed = zuma.Thread.now(.Monotonic) - now;
-    expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
+    expect(elapsed > min_delay and elapsed < max_delay);
 
     const FutexNotifier = struct {
         // update the value and notify the futex

@@ -74,12 +74,14 @@ test "Thread - random, now, sleep" {
     expect(Thread.now(.Realtime) > 0);
 
     const delay_ms = 200;
-    const threshold_ms = 500;
+    const threshold_ms = 300;
+    const max_delay = delay_ms + threshold_ms;
+    const min_delay = delay_ms - std.math.min(delay_ms, threshold_ms);
 
     const now = Thread.now(.Monotonic);
     Thread.sleep(delay_ms);
     const elapsed = Thread.now(.Monotonic) - now;
-    expect(elapsed >= delay_ms and elapsed < delay_ms + threshold_ms);
+    expect(elapsed > min_delay and elapsed < max_delay);
 }
 
 test "Thread - getAffinity, setAffinity" {

@@ -2,8 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 test "zap" {
-    // _ = zync;
-    // _ = zuma;
+    _ = zync;
+    _ = zuma;
     _ = zio;
 }
 

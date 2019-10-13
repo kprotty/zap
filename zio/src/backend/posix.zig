@@ -235,7 +235,7 @@ pub const Socket = struct {
         _ = system.close(self.handle);
     }
 
-    pub fn fromHandle(handle: zio.Handle) @This() {
+    pub fn fromHandle(handle: zio.Handle, flags: zio.Socket.Flags) @This() {
         return @This(){ .handle = handle };
     }
 

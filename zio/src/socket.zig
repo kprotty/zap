@@ -30,8 +30,8 @@ pub const Socket = struct {
         return self.inner.close();
     }
 
-    pub inline fn fromHandle(handle: zio.Handle) @This() {
-        return @This(){ .inner = zio.backend.Socket.fromHandle(handle) };
+    pub inline fn fromHandle(handle: zio.Handle, flags: Flags) @This() {
+        return @This(){ .inner = zio.backend.Socket.fromHandle(handle, flags) };
     }
 
     pub inline fn getHandle(self: @This()) zio.Handle {
@@ -243,7 +243,7 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     var incoming = zio.Address.Incoming.new(try AddressType.new(port));
     try server.accept(AddressType.Flag | Socket.Tcp, &incoming, 0);
     expect(AddressType.validate(incoming.address));
-    var server_client = incoming.getSocket();
+    var server_client = incoming.getSocket(AddressType.Flag | Socket.Tcp);
     defer server_client.close();
 
     // send data from the servers client to the connected client
@@ -309,7 +309,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
 
             // Setup the client & start sending data (see Client struct below)
             // Since all this client will do is send data, register for Writeable & EdgeTrigger for reason above.
-            self.client = self.incoming.getSocket();
+            self.client = self.incoming.getSocket(flags);
             try self.client.setOption(Socket.Option{ .SendBufMax = 2048 });
             try self.client.setOption(Socket.Option{ .RecvBufMax = 2048 });
             try poller.register(

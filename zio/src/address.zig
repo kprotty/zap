@@ -15,8 +15,8 @@ pub const Address = extern struct {
             return self;
         }
 
-        pub fn getSocket(self: @This()) zio.Socket {
-            return zio.Socket.fromHandle(self.handle);
+        pub fn getSocket(self: @This(), flags: zio.Socket.Flags) zio.Socket {
+            return zio.Socket.fromHandle(self.handle, flags);
         }
     };
 

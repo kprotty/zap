@@ -321,7 +321,7 @@ pub fn DynamicLibrary(comptime dll_name: [*c]const u8, comptime Imports: type) t
 
         fn loadImports() ?Imports {
             var imports: Imports = undefined;
-            const module = GetModuleHandleA(dll_name) orelse return null;
+            const module = GetModuleHandleA(dll_name) orelse LoadLibraryA(dll_name) orelse return null;
             inline for (@typeInfo(Imports).Struct.fields) |field| {
                 const ptr = windows.kernel32.GetProcAddress(module, (field.name ++ "\x00")[0..].ptr) orelse return null;
                 @field(imports, field.name) = @intToPtr(field.field_type, @ptrToInt(ptr));
@@ -434,6 +434,10 @@ const TOKEN_PRIVILEGES = extern struct {
     PrivilegeCount: windows.DWORD,
     Privileges: [1]LUID_AND_ATTRIBUTES,
 };
+
+extern "kernel32" stdcallcc fn LoadLibraryA(
+    lpLibFileName: [*c]const u8,
+) ?windows.HMODULE;
 
 extern "kernel32" stdcallcc fn GetModuleHandleA(
     lpModuleName: [*c]const u8,

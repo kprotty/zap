@@ -84,14 +84,16 @@ const Linux = struct {
 };
 
 const Windows = struct {
-    pub fn init(self: *@This()) void {}
     pub fn deinit(self: *@This()) void {}
+    pub fn init(self: *@This()) void {
+        synchronization.get() catch |_| @panic("Windows platform not supported");
+    }
 
     pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         const addr = @ptrCast(*const c_void, ptr);
         return switch (wakeup_count) {
-            1 => WakeByAddressSingle(addr),
-            else => WakeByAddressAll(addr),
+            1 => (WakeByAddressSingle.?)(addr),
+            else => (WakeByAddressAll.?)(addr),
         };
     }
 
@@ -100,7 +102,7 @@ const Windows = struct {
         const addr = @ptrCast(*const c_void, ptr);
         const compare_addr = @ptrCast(*const c_void, &compare);
 
-        if (WaitOnAddress(addr, compare_addr, @sizeOf(@typeOf(expected)), timeout_ms orelse system.INFINITE) == system.TRUE)
+        if ((WaitOnAddress.?)(addr, compare_addr, @sizeOf(@typeOf(expected)), timeout_ms orelse system.INFINITE) == system.TRUE)
             return;
         return switch (system.kernel32.GetLastError()) {
             ERROR_TIMEOUT => Futex.WaitError.TimedOut,
@@ -109,14 +111,32 @@ const Windows = struct {
     }
 
     const ERROR_TIMEOUT = 1460;
-    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WakeByAddressAll(Address: *const c_void) void;
-    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WakeByAddressSingle(Address: *const c_void) void;
-    extern "api-ms-win-core-synch-l1-2-0" stdcallcc fn WaitOnAddress(
+    var WakeByAddressAll: ?extern fn (Address: *const c_void) void = null;
+    var WakeByAddressSingle: ?extern fn (Address: *const c_void) void = null;
+    var WaitOnAddress: ?extern fn (
         Address: *const c_void,
         CompareAddress: *const c_void,
         AddressSize: system.SIZE_T,
         dwMilliseconds: system.DWORD,
-    ) system.BOOL;
+    ) system.BOOL = null;
+
+    extern "kernel32" stdcallcc fn GetModuleHandleA(lpModuleName: [*c]const u8) ?system.HMODULE;
+    var synchronization = zync.Lazy(loadSynchronization).new();
+
+    fn loadFunction(module: system.HMODULE, comptime FuncPtr: type, comptime proc_name: [*]const u8) !FuncPtr {
+        const proc = system.kernel32.GetProcAddress(module, proc_name) orelse return error.InvalidFunction;
+        return @intToPtr(FuncPtr, @ptrToInt(proc));
+    }
+
+    fn loadSynchronization() !void {
+        const synch_dll = GetModuleHandleA(c"api-ms-win-core-synch-l1-2-0") orelse return error.InvalidDll;
+        if (WaitOnAddress == null)
+            WaitOnAddress = try loadFunction(synch_dll, @typeOf(WaitOnAddress), c"WaitOnAddress");
+        if (WakeByAddressAll == null)
+            WakeByAddressAll = try loadFunction(synch_dll, @typeOf(WakeByAddressAll), c"WakeByAddressAll");
+        if (WakeByAddressSingle == null)
+            WakeByAddressSingle = try loadFunction(synch_dll, @typeOf(WakeByAddressSingle), c"WakeByAddressSingle");
+    }
 };
 
 const Posix = struct {

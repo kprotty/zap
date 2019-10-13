@@ -312,7 +312,7 @@ pub const Socket = struct {
     fn finishAccept(handle_ptr: *Handle, incoming: *zio.Address.Incoming) zio.Socket.AcceptError!void {
         if (setUpdateContext(Mswsock.Options.SO_UPDATE_ACCEPT_CONTEXT, incoming.handle, @ptrToInt(handle_ptr), @sizeOf(Handle)) != 0)
             return zio.Socket.AcceptError.InvalidState;
-        
+
         var local_addr: *SOCKADDR = undefined;
         var local_addr_len: windows.DWORD = 0;
         var remote_addr: *SOCKADDR = undefined;

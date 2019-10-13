@@ -174,7 +174,7 @@ test "Futex" {
     futex.inner.init();
     defer futex.inner.deinit();
     expect(futex.value.get() == 0);
-    
+
     // Test .wait() delay
     const delay_ms = 100;
     const threshold_ms = 500;
@@ -209,7 +209,7 @@ test "Futex" {
             }
         }
     };
-    
+
     // Spawn threads which update the futex & use both notifyOne() and notifyAll()
     var notify_all_thread = try FutexNotifier.spawn(&futex, true);
     defer _ = notify_all_thread.join(100);

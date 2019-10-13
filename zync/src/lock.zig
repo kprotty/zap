@@ -6,12 +6,6 @@ const zuma = @import("../../zap.zig").zuma;
 
 const expect = std.testing.expect;
 
-pub usingnamespace switch (builtin.os) {
-    .linux => if (builtin.link_libc) ImplPthread else ImplFutex,
-    .windows => ImplFutex,
-    else => ImplPthread,
-};
-
 pub const Spinlock = struct {
     value: zync.Atomic(bool),
 
@@ -25,28 +19,35 @@ pub const Spinlock = struct {
     }
 
     pub fn tryAcquire(self: *@This(), timeout_ms: ?u32) bool {
-        const timeout = timeout_ms orelse return self.value.comp
-
+        const timeout = timeout_ms orelse return self.lock();
         var backoff: usize = 1;
         const now = zuma.Thread.now(.Monotonic);
         while (!self.lock()) {
             zync.yield(backoff);
             backoff += std.math.max(1, backoff / 2);
-
-        };
+            if (zuma.Thread.now(.Monotonic) - now >= timeout)
+                return false;
+        }
+        return true;
     }
 
     pub fn acquire(self: *@This()) void {
         var backoff: usize = 1;
-        while (!self.value.compareSwap(false, true, .Acquire, .Relaxed)) |_| {
+        while (!self.lock()) {
             zync.yield(backoff);
             backoff += std.math.max(1, backoff / 2);
-        };
+        }
     }
 
     pub fn release(self: *@This()) void {
         self.value.store(false, .Release);
     }
+};
+
+pub usingnamespace switch (builtin.os) {
+    .linux => if (builtin.link_libc) ImplPthread else ImplFutex,
+    .windows => ImplFutex,
+    else => ImplPthread,
 };
 
 const ImplFutex = struct {
@@ -71,16 +72,10 @@ const ImplFutex = struct {
             return self.value.compareSwap(.Unlocked, .Locked, .Acquire, .Relaxed) == null;
         }
 
-        pub fn acquire(self: *@This()) bool {
+        pub fn acquire(self: *@This()) bool {}
 
-        }
-
-        pub fn release(self: *@This()) void {
-
-        }
+        pub fn release(self: *@This()) void {}
     };
 };
 
-const ImplPthread = struct {
-
-};
+const ImplPthread = struct {};

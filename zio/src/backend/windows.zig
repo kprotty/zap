@@ -682,16 +682,16 @@ pub const Options = struct {
 };
 
 const Winsock2 = zuma.backend.DynamicLibrary(c"ws2_32", struct {
-    closesocket: extern fn(
+    closesocket: extern fn (
         socket: SOCKET,
     ) c_int,
 
-    listen: extern fn(
+    listen: extern fn (
         socket: SOCKET,
         backlog: c_uint,
     ) c_int,
 
-    bind: extern fn(
+    bind: extern fn (
         socket: SOCKET,
         addr: *const SOCKADDR,
         addr_len: c_uint,
@@ -745,8 +745,8 @@ const Winsock2 = zuma.backend.DynamicLibrary(c"ws2_32", struct {
         socket: SOCKET,
         addr: *SOCKADDR,
         addrlen: *c_uint,
-        lpfnCondition: ?extern fn() void,
-        dwCallbackData: ?*windows.DWORD, 
+        lpfnCondition: ?extern fn () void,
+        dwCallbackData: ?*windows.DWORD,
     ) SOCKET,
 
     WSAConnect: extern fn (

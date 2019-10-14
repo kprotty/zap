@@ -86,7 +86,7 @@ const Linux = struct {
 const Windows = struct {
     pub fn init(self: *@This()) void {}
     pub fn deinit(self: *@This()) void {}
-    
+
     pub fn notify(self: *@This(), ptr: *const u32, wakeup_count: i32) void {
         const addr = @ptrCast(*const c_void, ptr);
         return switch (wakeup_count) {
@@ -101,7 +101,7 @@ const Windows = struct {
         const compare_addr = @ptrCast(*const c_void, &compare);
 
         const timeout = timeout_ms orelse system.INFINITE;
-        if (Synchronization.get().?.WaitOnAddress(addr, compare_addr, @sizeOf(@typeOf(expected)),  timeout) == system.TRUE)
+        if (Synchronization.get().?.WaitOnAddress(addr, compare_addr, @sizeOf(@typeOf(expected)), timeout) == system.TRUE)
             return;
         return switch (system.kernel32.GetLastError()) {
             ERROR_TIMEOUT => Futex.WaitError.TimedOut,

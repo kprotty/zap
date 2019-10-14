@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{matrix.os}}
     steps:
     - uses: actions/checkout@v1
-    - uses: goto-bus-stop/setup-zig@v1.1.0
+    - uses: kprotty/setup-zig@v1.1.0
       with:
         version: master
     - run: zig build test

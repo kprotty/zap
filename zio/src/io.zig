@@ -4,13 +4,16 @@ const zio = @import("../../zap.zig").zio;
 
 pub const Handle = zio.backend.Handle;
 
-pub const ErrorClosed = error.Closed;
-pub const ErrorPending = error.Pending;
-pub const ErrorInvalidToken = error.InvalidToken;
-pub const Error = error{
-    Closed,
-    Pending,
-    InvalidToken,
+pub const Error = struct {
+    pub const Closed = Set.Closed;
+    pub const Pending = Set.Pending;
+    pub const InvalidToken = Set.InvalidToken;
+
+    pub const Set = error {
+        Closed,
+        Pending,
+        InvalidToken,
+    };
 };
 
 pub const Buffer = struct {

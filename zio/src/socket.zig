@@ -90,8 +90,7 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = zio.Error || error{
-        Refused,
+    pub const ConnectError = zio.Error.Set || error{
         TimedOut,
         InvalidState,
         InvalidHandle,
@@ -103,8 +102,7 @@ pub const Socket = struct {
         return self.inner.connect(address, token);
     }
 
-    pub const AcceptError = zio.Error || error{
-        Refused,
+    pub const AcceptError = zio.Error.Set || error{
         InvalidState,
         InvalidHandle,
         InvalidAddress,
@@ -115,10 +113,11 @@ pub const Socket = struct {
         return self.inner.accept(flags, incoming, token);
     }
 
-    pub const DataError = zio.Error || error{
+    pub const DataError = zio.Error.Set || error{
         InvalidState,
         InvalidValue,
         InvalidHandle,
+        BufferTooLarge,
         OutOfResources,
     };
 
@@ -133,46 +132,64 @@ pub const Socket = struct {
         return @ptrCast([*]zio.backend.Buffer, zio_buffers.ptr)[0..zio_buffers.len];
     }
 
+    /// Alias for `read()`
     pub fn recv(self: *@This(), buffer: []u8, token: usize) DataError!usize {
         return self.read(buffer, token);
     }
 
+    /// Alias for `write()`
     pub fn send(self: *@This(), buffer: []const u8, token: usize) DataError!usize {
         return self.write(buffer, token);
     }
 
+    /// Alias for `readv()` using one buffer
     pub fn read(self: *@This(), buffer: []u8, token: usize) DataError!usize {
         var buffers = [_][]u8{buffer};
         return self.readv(buffers[0..], token);
     }
 
+    /// Alias for `writev()` using one buffer
     pub fn write(self: *@This(), buffer: []const u8, token: usize) DataError!usize {
         var buffers = [_][]const u8{buffer};
         return self.writev(buffers[0..], token);
     }
 
+    /// Alias for `recvmsg()` with a null address
     pub fn readv(self: *@This(), buffers: []const []u8, token: usize) DataError!usize {
         return self.recvmsg(null, buffers, token);
     }
 
+    /// Alias for `sendmsg()` with a null address
     pub fn writev(self: *@This(), buffers: []const []const u8, token: usize) DataError!usize {
         return self.sendmsg(null, buffers, token);
     }
 
+    /// Alias for `recvmsg()` using one buffer
     pub fn recvfrom(self: *@This(), address: *zio.Address, buffer: []u8, token: usize) DataError!usize {
         var buffers = [_][]u8{buffer};
         return self.recvmsg(address, buffers[0..], token);
     }
 
+    /// Alias for `sendmsg()` using one buffer
     pub fn sendto(self: *@This(), address: *zio.Address, buffer: []const u8, token: usize) DataError!usize {
         var buffers = [_][]const u8{buffer};
         return self.sendmsg(address, buffers[0..], token);
     }
 
+    /// Tries to read data over the given socket into an array of buffers.
+    /// The optional address specifies the IP address the data is directed to.
+    /// The token represents a contiuation for non blocking IO which can be retrieved
+    /// from `zio.Event.getToken()` after polling for events using `zio.Event.Poller.poll()`.
+    /// If the token is 0, the read request is performed synchronously and blocks until completion.
     pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []const []u8, token: usize) DataError!usize {
         return self.inner.recvmsg(address, toBackendBuffers(buffers), token);
     }
 
+    /// Tries to write data over the given socket using an array of buffers.
+    /// The optional address specifies the IP address the data is directed to.
+    /// The token represents a contiuation for non blocking IO which can be retrieved
+    /// from `zio.Event.getToken()` after polling for events using `zio.Event.Poller.poll()`.
+    /// If the token is 0, the read request is performed synchronously and blocks until completion.
     pub fn sendmsg(self: *@This(), address: ?*zio.Address, buffers: []const []const u8, token: usize) DataError!usize {
         return self.inner.sendmsg(address, toBackendBuffers(buffers), token);
     }
@@ -302,7 +319,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
         pub fn handle_server(self: *@This(), token: usize, poller: *zio.Event.Poller) !void {
             // Accept the incoming client
             _ = self.server.accept(flags, &self.incoming, token) catch |err| switch (err) {
-                zio.ErrorPending => return,
+                zio.Error.Pending => return,
                 else => return err,
             };
             expect(AddressType.validate(self.incoming.address));
@@ -326,7 +343,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             while (self.client_sent < data.len) {
                 const buffer = data[0..(data.len - self.client_sent)];
                 self.client_sent += self.client.write(buffer, token) catch |err| switch (err) {
-                    zio.ErrorPending, zio.ErrorClosed => return,
+                    zio.Error.Pending, zio.Error.Closed => return,
                     else => return err,
                 };
                 token = 0;
@@ -369,7 +386,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             while (!self.connected) {
                 var address = try AddressType.new(addr_port);
                 _ = self.socket.connect(&address, token) catch |err| switch (err) {
-                    zio.ErrorPending => return,
+                    zio.Error.Pending => return,
                     else => return err,
                 };
                 self.connected = true;
@@ -385,7 +402,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Handle ErrorInvalidToken since events could be for writer instead of reader
             while (self.received < data.len) {
                 self.received += self.socket.read(self.buffer[0..], token) catch |err| switch (err) {
-                    zio.ErrorPending => return,
+                    zio.Error.Pending => return,
                     else => return err,
                 };
                 token = 0;

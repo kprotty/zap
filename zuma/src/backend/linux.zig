@@ -181,9 +181,10 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         if (memory.len < stack_size)
             return zuma.Thread.CreateError.InvalidStack;
 
-        var clone_flags: u32 = os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
-            os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
-            os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM;
+        var clone_flags: u32 = 
+            os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM | os.CLONE_DETACHED |
+            os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID | 
+            os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES;
         if (linux.tls.tls_image) |tls_image| {
             clone_flags |= os.CLONE_SETTLS;
             tls_offset = linux.tls.copyTLS(@ptrToInt(&memory[tls_offset]));
@@ -198,7 +199,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         };
 
         const arg = zuma.transmute(usize, parameter);
-        const stack_ptr = @ptrToInt(&memory[stack_offset]);
+        const stack_ptr = @ptrToInt(memory.ptr) + stack_offset;
         const tid = @ptrCast(*i32, @alignCast(@alignOf(*i32), &memory[tid_offset]));
         return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, tid, tls_offset, tid))) {
             0 => tid,
@@ -225,11 +226,11 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         }
 
         // stack offset
+        size = std.mem.alignForward(size, @alignOf(@Frame(function)));
+        size += @sizeOf(@Frame(function));
         size = std.mem.alignForward(size, zuma.page_size);
         if (offsets.len > 2)
             offsets[2].* = size;
-        size = std.mem.alignForward(size, @alignOf(@Frame(function)));
-        size += @sizeOf(@Frame(function));
         return size;
     }
 
@@ -239,7 +240,7 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         const value = @atomicLoad(i32, handle, .Monotonic);
         if (value == 0)
             return;
-        return switch (os.errno(linux.futex_wait(handle, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, value, timeout))) {
+        return switch (os.errno(linux.futex_wait(handle, linux.FUTEX_WAIT, value, timeout))) {
             0, os.EINTR, os.EAGAIN => {},
             os.ETIMEDOUT => zuma.Thread.JoinError.TimedOut,
             os.EINVAL, os.EPERM, os.ENOSYS, os.EDEADLK => unreachable,

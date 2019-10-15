@@ -179,7 +179,7 @@ test "Thread - getStackSize, spawn, yield" {
     const now = Thread.now(.Monotonic);
     expectError(Thread.JoinError.TimedOut, delayed_thread.join(1));
     try delayed_thread.join(500);
-    expect(value.load(.Relaxed) == 1);
+    expect(value.load(.Relaxed) == 2);
     const elapsed = Thread.now(.Monotonic) - now;
     expect(elapsed > min_delay and elapsed < max_delay);
 }

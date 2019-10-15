@@ -399,7 +399,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             }
 
             // Then, start receiving data from the server
-            // Handle ErrorInvalidToken since events could be for writer instead of reader
+            // Handle Error.InvalidToken since events could be for writer instead of reader
             while (self.received < data.len) {
                 self.received += self.socket.read(self.buffer[0..], token) catch |err| switch (err) {
                     zio.Error.Pending => return,

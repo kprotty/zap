@@ -203,11 +203,11 @@ test "Futex" {
     };
 
     // Spawn threads which update the futex & use both notifyOne() and notifyAll()
-    var notify_all_thread = try zuma.Thread.spawn(run, @ptrToInt(&futex) | 1);
-    var notify_one_thread = try zuma.Thread.spawn(run, @ptrToInt(&futex) | 0);
+    var notify_all_thread = try zuma.Thread.spawn(FutexNotifier.run, @ptrToInt(&futex) | 1);
+    var notify_one_thread = try zuma.Thread.spawn(FutexNotifier.run, @ptrToInt(&futex) | 0);
     while (futex.value.load(.Relaxed) != 2)
         try futex.inner.wait(&futex.value.value, futex.value.get(), 500);
     expect(futex.value.get() == 2);
-    try notify_all_thread.join();
-    try notify_one_thread.join();
+    try notify_all_thread.join(500);
+    try notify_one_thread.join(500);
 }

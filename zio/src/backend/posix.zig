@@ -411,7 +411,7 @@ pub const Socket = struct {
 
     pub fn connect(self: *@This(), address: *const zio.Address, token: usize) zio.Socket.ConnectError!void {
         if ((token & zio.Event.Disposable) != 0)
-            return zio.ErrorClosed;
+            return zio.Error.Closed;
         if ((token & zio.Event.Writeable) != 0) {
             var errno_value: c_int = undefined;
             var errno_len: c_int = @sizeOf(@typeOf(errno_value));
@@ -421,7 +421,7 @@ pub const Socket = struct {
                 return;
             _ = try getConnectError(@intCast(u16, -errno_value));
         } else if (token != 0) {
-            return zio.ErrorInvalidToken;
+            return zio.Error.InvalidToken;
         }
 
         while (try getConnectError(errno(Connect(self.handle, address)))) {}
@@ -432,11 +432,11 @@ pub const Socket = struct {
             0 => false,
             os.EFAULT, os.EAFNOSUPPORT, os.EADDRNOTAVAIL, os.EADDRINUSE => zio.Socket.ConnectError.InvalidAddress,
             os.EBADF, os.EACCES, os.ENOTSOCK, os.EPROTOTYPE => zio.Socket.ConnectError.InvalidHandle,
-            os.ECONNREFUSED, os.EPERM => zio.Socket.ConnectError.Refused,
-            os.EAGAIN, os.EALREADY, os.EINPROGRESS => zio.ErrorPending,
+            os.EAGAIN, os.EALREADY, os.EINPROGRESS => zio.Error.Pending,
             os.ENETUNREACH => zio.Socket.ConnectError.InvalidState,
             os.EISCONN => zio.Socket.ConnectError.AlreadyConnected,
             os.ETIMEDOUT => zio.Socket.ConnectError.TimedOut,
+            os.ECONNREFUSED, os.EPERM => zio.Error.Closed,
             os.EINTR => true,
             else => unreachable,
         };
@@ -444,9 +444,9 @@ pub const Socket = struct {
 
     pub fn accept(self: *@This(), flags: zio.Socket.Flags, incoming: *zio.Address.Incoming, token: usize) zio.Socket.AcceptError!void {
         if ((token & zio.Event.Disposable) != 0)
-            return zio.ErrorClosed;
+            return zio.Error.Closed;
         if (token != 0 and (token & zio.Event.Readable) == 0)
-            return zio.ErrorInvalidToken;
+            return zio.Error.InvalidToken;
 
         while (true) {
             const fd = Accept(self.handle, flags, &incoming.address);
@@ -457,9 +457,9 @@ pub const Socket = struct {
                 },
                 os.EMFILE, os.ENFILE, os.ENOBUFS, os.ENOMEM => return zio.Socket.AcceptError.OutOfResources,
                 os.EBADF, os.EINVAL, os.ENOTSOCK, os.EOPNOTSUPP => return zio.Socket.AcceptError.InvalidHandle,
-                os.EPERM, os.ECONNABORTED, os.EPROTO => return zio.Socket.AcceptError.Refused,
+                os.EPERM, os.ECONNABORTED, os.EPROTO => return zio.Error.Closed,
                 os.EFAULT => return zio.Socket.AcceptError.InvalidAddress,
-                os.EAGAIN => return zio.ErrorPending,
+                os.EAGAIN => return zio.Error.Pending,
                 os.EINTR => continue,
                 else => unreachable,
             }
@@ -468,17 +468,17 @@ pub const Socket = struct {
 
     pub fn recvmsg(self: *@This(), address: ?*zio.Address, buffers: []Buffer, token: usize) zio.Socket.DataError!usize {
         if ((token & zio.Event.Disposable) != 0)
-            return zio.ErrorClosed;
+            return zio.Error.Closed;
         if (token != 0 and (token & zio.Event.Readable) == 0)
-            return zio.ErrorInvalidToken;
+            return zio.Error.InvalidToken;
         return transfer(self.handle, address, buffers, Recvmsg);
     }
 
     pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const Buffer, token: usize) zio.Socket.DataError!usize {
         if ((token & zio.Event.Disposable) != 0)
-            return zio.ErrorClosed;
+            return zio.Error.Closed;
         if (token != 0 and (token & zio.Event.Writeable) == 0)
-            return zio.ErrorInvalidToken;
+            return zio.Error.InvalidToken;
         return transfer(self.handle, address, buffers, Sendmsg);
     }
 
@@ -500,8 +500,8 @@ pub const Socket = struct {
                 os.EOPNOTSUPP, os.EINVAL, os.EFAULT, os.EISCONN, os.ENOTCONN => return zio.Socket.DataError.InvalidValue,
                 os.EACCES, os.EBADF, os.EDESTADDRREQ, os.ENOTSOCK => return zio.Socket.DataError.InvalidHandle,
                 os.ENOMEM, os.ENOBUFS => return zio.Socket.DataError.OutOfResources,
-                os.EPIPE, os.ECONNRESET => return zio.ErrorClosed,
-                os.EAGAIN => return zio.ErrorPending,
+                os.EPIPE, os.ECONNRESET => return zio.Error.Closed,
+                os.EAGAIN => return zio.Error.Pending,
                 os.EMSGSIZE => unreachable,
                 os.EINTR => continue,
                 else => unreachable,
@@ -570,7 +570,7 @@ inline fn CreateSocket(domain: u32, sock_type: u32, protocol: u32) usize {
     );
 }
 
-inline fn Getsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize {
+fn Getsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize, optlen: *c_int) usize {
     if (builtin.os != .linux)
         return C.setsockopt(fd, level, optname, optval, optlen);
     return system.syscall5(
@@ -583,7 +583,7 @@ inline fn Getsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize
     );
 }
 
-inline fn Setsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize {
+fn Setsockopt(fd: zio.Handle, level: c_int, optname: c_int, optval: usize, optlen: c_int) usize {
     if (builtin.os != .linux)
         return C.setsockopt(fd, level, optname, optval, optlen);
     return system.syscall5(

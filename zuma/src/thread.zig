@@ -1,5 +1,7 @@
 const std = @import("std");
 const expect = std.testing.expect;
+const expectError = std.testing.expectError;
+
 const zync = @import("../../zap.zig").zync;
 const zuma = @import("../../zap.zig").zuma;
 
@@ -9,7 +11,7 @@ pub const ClockType = enum {
 };
 
 pub const Thread = struct {
-    pub const Handle = zuma.Thread.Handle;
+    pub const Handle = zuma.backend.Thread.Handle;
 
     threadlocal var random_instance = zync.Lazy(createThreadLocalRandom).new();
     fn createThreadLocalRandom() std.rand.DefaultPrng {
@@ -55,11 +57,12 @@ pub const Thread = struct {
         var join_handle: JoinHandle = undefined;
         join_handle.memory = null;
 
-        const stack_stack = getStackSize(function);
+        const stack_size = getStackSize(function);
         if (stack_size > 0) {
             const flags = zuma.PAGE_READ | zuma.PAGE_WRITE | zuma.PAGE_COMMIT;
             join_handle.memory = zuma.map(null, stack_size, flags, null) catch |err| switch (err) {
-                std.os.UnexpectedError, zuma.MemoryError.OutOfMemory => return err,
+                zuma.MemoryError.OutOfMemory => return CreateError.OutOfMemory,
+                zuma.MemoryError.Unexpected => return CreateError.Unexpected,
                 else => unreachable,
             };
         }

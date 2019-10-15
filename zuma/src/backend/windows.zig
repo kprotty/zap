@@ -130,7 +130,7 @@ pub const CpuAffinity = struct {
 };
 
 pub const Thread = struct {
-    handle: windows.HANDLE,
+    pub const Handle = windows.HANDLE;
 
     var frequency = zync.Lazy(getQPCFrequency).new();
     fn getQPCFrequency() u64 {
@@ -163,7 +163,7 @@ pub const Thread = struct {
         return 0; // windows doesnt allow custom thread stacks
     }
 
-    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
+    pub fn create(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.CreateError!Handle {
         const Parameter = @typeOf(parameter);
         const Wrapper = struct {
             extern fn entry(arg: windows.LPVOID) windows.DWORD {
@@ -173,22 +173,23 @@ pub const Thread = struct {
         };
 
         if (stack != null)
-            return zuma.Thread.SpawnError.InvalidStack;
+            return zuma.Thread.CreateError.InvalidStack;
         const param = zuma.transmute(*c_void, parameter);
         const commit_stack_size = std.mem.alignForward(@sizeOf(@Frame(function)), zuma.page_size);
-        if (windows.kernel32.CreateThread(null, commit_stack_size, Wrapper.entry, param, 0, null)) |handle| {
-            return @This(){ .handle = handle };
-        } else {
-            return windows.unexpectedError(windows.kernel32.GetLastError());
-        }
+        const handle = windows.kernel32.CreateThread(null, commit_stack_size, Wrapper.entry, param, 0, null);
+        return handle orelse windows.unexpectedError(windows.kernel32.GetLastError());
     }
 
-    pub fn join(self: *@This(), timeout_ms: ?u32) void {
+    pub fn join(handle: Handle, timeout_ms: ?u32) zuma.Thread.JoinError!void {
         if (self.handle == windows.INVALID_HANDLE_VALUE)
             return;
-        _ = windows.kernel32.WaitForSingleObject(self.handle, timeout_ms orelse windows.INFINITE);
-        _ = windows.kernel32.CloseHandle(self.handle);
-        self.handle = windows.INVALID_HANDLE_VALUE;
+        defer _ = windows.kernel32.CloseHandle(handle);
+        return switch (windows.kernel32.WaitForSingleObject(handle, timeout_ms orelse windows.INFINITE)) {
+            WAIT_OBJECT_0 => {},
+            WAIT_TIMEOUT => zuma.Thread.JoinError.TimedOut,
+            WAIT_ABANDONED, WAIT_FAILED => unreachable,
+            else => unreachable,
+        };
     }
 
     pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
@@ -434,6 +435,11 @@ const TOKEN_PRIVILEGES = extern struct {
     PrivilegeCount: windows.DWORD,
     Privileges: [1]LUID_AND_ATTRIBUTES,
 };
+
+const WAIT_OBJECT_0: windows.DWORD = 0x00;
+const WAIT_TIMEOUT: windows.DWORD = 0x102;
+const WAIT_ABANDONED: windows.DWORD = 0x80;
+const WAIT_FAILED: windows.DWORD = ~windows.DWORD(0);
 
 extern "kernel32" stdcallcc fn LoadLibraryA(
     lpLibFileName: [*c]const u8,

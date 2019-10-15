@@ -200,28 +200,14 @@ test "Futex" {
                 self.inner.notifyOne(&self.value.value);
             }
         }
-
-        // Create a thread for run()
-        pub fn spawn(self: *FutexValue, notify_all: bool) !zuma.Thread {
-            const ptr = @ptrToInt(self) | usize(@bitCast(u1, notify_all));
-            const stack_size = zuma.Thread.getStackSize(run);
-            if (stack_size > 0) {
-                const allocator = std.debug.global_allocator;
-                const stack = try allocator.alignedAlloc(u8, zuma.page_size, stack_size);
-                defer allocator.free(stack);
-                return try zuma.Thread.spawn(stack, run, ptr);
-            } else {
-                return try zuma.Thread.spawn(null, run, ptr);
-            }
-        }
     };
 
     // Spawn threads which update the futex & use both notifyOne() and notifyAll()
-    var notify_all_thread = try FutexNotifier.spawn(&futex, true);
-    defer _ = notify_all_thread.join(100);
-    var notify_one_thread = try FutexNotifier.spawn(&futex, false);
-    defer _ = notify_one_thread.join(100);
+    var notify_all_thread = try zuma.Thread.spawn(run, @ptrToInt(&futex) | 1);
+    var notify_one_thread = try zuma.Thread.spawn(run, @ptrToInt(&futex) | 0);
     while (futex.value.load(.Relaxed) != 2)
         try futex.inner.wait(&futex.value.value, futex.value.get(), 500);
     expect(futex.value.get() == 2);
+    try notify_all_thread.join();
+    try notify_one_thread.join();
 }

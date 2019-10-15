@@ -140,7 +140,7 @@ pub const CpuAffinity = struct {
 };
 
 pub const Thread = if (builtin.link_libc) posix.Thread else struct {
-    id: *i32,
+    pub const Handle = *i32;
 
     pub fn now(is_monotonic: bool) u64 {
         var ts: linux.timespec = undefined;
@@ -171,15 +171,15 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         return computeStackSize(function);
     }
 
-    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.SpawnError!@This() {
+    pub fn create(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) zuma.Thread.CreateError!Handle {
         var tls_offset: usize = 0;
         var tid_offset: usize = 0;
         var stack_offset: usize = 0;
         const stack_size = computeStackSize(function, &tid_offset, &tls_offset, &stack_offset);
 
-        const memory = stack orelse return zuma.Thread.SpawnError.InvalidStack;
+        const memory = stack orelse return zuma.Thread.CreateError.InvalidStack;
         if (memory.len < stack_size)
-            return zuma.Thread.SpawnError.InvalidStack;
+            return zuma.Thread.CreateError.InvalidStack;
 
         var clone_flags: u32 = os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES |
             os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
@@ -199,12 +199,12 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
 
         const arg = zuma.transmute(usize, parameter);
         const stack_ptr = @ptrToInt(&memory[stack_offset]);
-        const id = @ptrCast(*i32, @alignCast(@alignOf(*i32), &memory[tid_offset]));
-        return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, id, tls_offset, id))) {
-            0 => @This(){ .id = id },
+        const tid = @ptrCast(*i32, @alignCast(@alignOf(*i32), &memory[tid_offset]));
+        return switch (os.errno(linux.clone(Wrapper.entry, stack_ptr, clone_flags, arg, tid, tls_offset, tid))) {
+            0 => tid,
             os.EPERM, os.EINVAL, os.ENOSPC, os.EUSERS => unreachable,
-            os.EAGAIN => zuma.Thread.SpawnError.TooManyThreads,
-            os.ENOMEM => zuma.Thread.SpawnError.OutOfMemory,
+            os.EAGAIN => zuma.Thread.CreateError.TooManyThreads,
+            os.ENOMEM => zuma.Thread.CreateError.OutOfMemory,
             else => unreachable,
         };
     }
@@ -233,14 +233,15 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         return size;
     }
 
-    pub fn join(self: *@This(), timeout_ms: ?u32) void {
+    pub fn join(handle: Handle, timeout_ms: ?u32) zuma.Thread.JoinError!void {
         var ts: linux.timespec = if (timeout_ms) |t| toTimespec(t) else undefined;
         const timeout = if (timeout_ms) |_| &ts else null;
-        const value = @atomicLoad(i32, self.id, .Monotonic);
+        const value = @atomicLoad(i32, handle, .Monotonic);
         if (value == 0)
             return;
-        return switch (os.errno(linux.futex_wait(self.id, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, value, timeout))) {
-            0, os.EINTR, os.EAGAIN, os.ETIMEDOUT => {},
+        return switch (os.errno(linux.futex_wait(handle, linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG, value, timeout))) {
+            0, os.EINTR, os.EAGAIN => {},
+            os.ETIMEDOUT => zuma.Thread.JoinError.TimedOut,
             os.EINVAL, os.EPERM, os.ENOSYS, os.EDEADLK => unreachable,
             else => unreachable,
         };

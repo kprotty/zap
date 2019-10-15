@@ -9,7 +9,7 @@ pub const ClockType = enum {
 };
 
 pub const Thread = struct {
-    inner: zuma.backend.Thread,
+    pub const Handle = zuma.Thread.Handle;
 
     threadlocal var random_instance = zync.Lazy(createThreadLocalRandom).new();
     fn createThreadLocalRandom() std.rand.DefaultPrng {
@@ -39,20 +39,55 @@ pub const Thread = struct {
         return zuma.backend.Thread.getStackSize(function);
     }
 
-    pub const SpawnError = std.os.UnexpectedError || error{
+    pub const CreateError = std.os.UnexpectedError || error{
         OutOfMemory,
         InvalidStack,
         TooManyThreads,
     };
 
-    pub fn spawn(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) SpawnError!@This() {
+    pub fn create(stack: ?[]align(zuma.page_size) u8, comptime function: var, parameter: var) CreateError!Handle {
         if (@sizeOf(@typeOf(parameter)) != @sizeOf(usize))
             @compileError("Parameter can only be a pointer sized value");
-        return @This(){ .inner = try zuma.backend.Thread.spawn(stack, function, parameter) };
+        return zuma.backend.Thread.create(stack, function, parameter);
     }
 
-    pub fn join(self: *@This(), timeout_ms: ?u32) void {
-        return self.inner.join(timeout_ms);
+    pub fn spawn(comptime function: var, parameter: var) CreateError!JoinHandle {
+        var join_handle: JoinHandle = undefined;
+        join_handle.memory = null;
+
+        const stack_stack = getStackSize(function);
+        if (stack_size > 0) {
+            const flags = zuma.PAGE_READ | zuma.PAGE_WRITE | zuma.PAGE_COMMIT;
+            join_handle.memory = zuma.map(null, stack_size, flags, null) catch |err| switch (err) {
+                std.os.UnexpectedError, zuma.MemoryError.OutOfMemory => return err,
+                else => unreachable,
+            };
+        }
+
+        join_handle.handle = try create(join_handle.memory, function, parameter);
+        return join_handle;
+    }
+
+    pub const JoinHandle = struct {
+        handle: ?Handle,
+        memory: ?[]align(zuma.page_size) u8,
+
+        pub fn join(self: *@This(), timeout_ms: ?u32) JoinError!void {
+            const handle = self.handle orelse return;
+            try zuma.backend.Thread.join(handle, timeout_ms);
+            if (self.memory) |memory|
+                zuma.unmap(memory, null);
+            self.memory = null;
+            self.handle = null;
+        }
+    };
+
+    pub const JoinError = error {
+        TimedOut,
+    };
+
+    pub fn join(handle: Handle, timeout_ms: ?u32) JoinError!void {
+        return self.inner.join(handle, timeout_ms);
     }
 
     pub const AffinityError = std.os.UnexpectedError || error{
@@ -112,33 +147,36 @@ test "Thread - getAffinity, setAffinity" {
 }
 
 test "Thread - getStackSize, spawn, yield" {
-    const ThreadTest = struct {
-        value: zync.Atomic(usize),
+    const delay_ms = 200;
+    const threshold_ms = 800;
+    const max_delay = delay_ms + threshold_ms;
+    const min_delay = delay_ms - std.math.min(delay_ms, threshold_ms);
 
-        fn update(self: *@This()) void {
-            _ = self.value.fetchAdd(1, .Relaxed);
+    const ThreadTest = struct {
+        pub fn update(item: *zync.Atomic(usize)) void {
+            _ = item.fetchAdd(1, .Relaxed);
         }
 
-        pub fn run(self: *@This(), thread_memory: ?[]align(zuma.page_size) u8) !void {
-            self.value.set(0);
-            expect(self.value.get() == 0);
-            defer expect(self.value.load(.Relaxed) == 1);
-
-            var update_thread = try Thread.spawn(thread_memory, update, self);
-            Thread.yield();
-            update_thread.join(500);
+        pub fn updateDelayed(item: *zync.Atomic(usize)) void {
+            Thread.sleep(delay_ms);
+            update(item);
         }
     };
+    
+    var value = zync.Atomic(usize).new(0);
+    expect(value.get() == 0);
 
-    var thread_test: ThreadTest = undefined;
-    const allocator = std.debug.global_allocator;
-    const stack_size = Thread.getStackSize(ThreadTest.update);
+    // test thread creation + joining
+    var thread = try Thread.spawn(ThreadTest.update, &value);
+    try thread.join(500);
+    expect(value.load(.Relaxed) == 1);
 
-    if (stack_size == 0) {
-        try thread_test.run(null);
-    } else {
-        const stack_memory = try allocator.alignedAlloc(u8, zuma.page_size, stack_size);
-        defer allocator.free(stack_memory);
-        try thread_test.run(stack_memory);
-    }
+    // test thread join timeout + rejoining
+    var delayed_thread = try Thread.spawn(ThreadTest.updateDelayed, &value);
+    const now = Thread.now(.Monotonic);
+    expectError(Thread.JoinError.TimedOut, delayed_thread.join(1));
+    try delayed_thread.join(500);
+    expect(value.load(.Relaxed) == 1);
+    const elapsed = Thread.now(.Monotonic) - now;
+    expect(elapsed > min_delay and elapsed < max_delay);
 }

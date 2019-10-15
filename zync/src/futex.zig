@@ -71,7 +71,7 @@ const Linux = struct {
         const value = @bitCast(i32, expected);
         const addr = @ptrCast(*const i32, ptr);
         const flags = system.FUTEX_WAIT | system.FUTEX_PRIVATE_FLAG;
-        while (true) {
+        while (@atomicLoad(u32, ptr, .Monotonic) == expected) {
             switch (os.errno(system.futex_wait(addr, flags, value, ts_ptr))) {
                 0, os.EAGAIN => return,
                 os.EACCES, os.EFAULT, os.EINVAL, os.ENOSYS => unreachable,

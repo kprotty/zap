@@ -13,6 +13,8 @@ pub fn build(b: *std.build.Builder) void {
     }).step);
 
     const docs_step = b.addExecutable("docs", "docs.zig");
+    if (builtin.os != .windows)
+        docs_step.linkSystemLibrary("c");
     test_step.dependOn(&docs_step.step);
     test_step.dependOn(&docs_step.run().step);
 }

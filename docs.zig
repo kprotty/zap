@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const windows = std.os.windows;
+extern "c" stdcallcc fn system(cmd: [*c]const u8) c_int;
 extern "kernel32" stdcallcc fn CreateProcessA(
     lpApplicationName: ?[*]const u8,
     lpCommandLine: ?[*]const u8,
@@ -26,6 +27,6 @@ pub fn main() void {
         const cmd = c"ROBOCOPY.exe zig-cache/docs docs /move /NFL /NDL /NJH /NJS /nc /ns /np";
         std.debug.assert(CreateProcessA(null, cmd, 0, 0, windows.FALSE, 0, 0, 0, s_ptr, p_ptr) == windows.TRUE);
     } else {
-        @compileError("Move docs to root folder for unix");
+        std.debug.assert(system(c"mv zig-cache/docs/* ./docs/") == 0);
     }
 }

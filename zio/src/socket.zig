@@ -264,13 +264,15 @@ fn testBlockingTcp(comptime AddressType: type, port: u16) !void {
     defer server_client.close();
 
     // send data from the servers client to the connected client
+    // use sendto() to test that the address passed in is ignored for TCP sockets.
     const data = "Hello world";
-    var transferred = try server_client.write(data, 0);
+    var transferred = try server_client.sendto(&incoming.address, data, 0);
     expect(transferred == data.len);
 
     // receive the data from the connected client which was sent by the server client
+    // use recvfrom() to test that the address passed in is ignored for TCP sockets/
     var input_data: [data.len]u8 = undefined;
-    transferred = try client.read(input_data[0..], 0);
+    transferred = try client.recvfrom(&incoming.address, input_data[0..], 0);
     expect(transferred == data.len);
     expect(std.mem.eql(u8, data, input_data[0..]));
 }
@@ -342,7 +344,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             var token = io_token;
             while (self.client_sent < data.len) {
                 const buffer = data[0..(data.len - self.client_sent)];
-                self.client_sent += self.client.write(buffer, token) catch |err| switch (err) {
+                self.client_sent += self.client.send(buffer, token) catch |err| switch (err) {
                     zio.Error.Pending, zio.Error.Closed => return,
                     else => return err,
                 };
@@ -401,7 +403,7 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Then, start receiving data from the server
             // Handle Error.InvalidToken since events could be for writer instead of reader
             while (self.received < data.len) {
-                self.received += self.socket.read(self.buffer[0..], token) catch |err| switch (err) {
+                self.received += self.socket.recv(self.buffer[0..], token) catch |err| switch (err) {
                     zio.Error.Pending => return,
                     else => return err,
                 };

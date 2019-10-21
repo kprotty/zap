@@ -181,15 +181,19 @@ pub const Thread = struct {
     }
 
     pub fn join(handle: Handle, timeout_ms: ?u32) zuma.Thread.JoinError!void {
-        if (self.handle == windows.INVALID_HANDLE_VALUE)
+        if (handle == windows.INVALID_HANDLE_VALUE)
             return;
-        defer _ = windows.kernel32.CloseHandle(handle);
-        return switch (windows.kernel32.WaitForSingleObject(handle, timeout_ms orelse windows.INFINITE)) {
-            WAIT_OBJECT_0 => {},
-            WAIT_TIMEOUT => zuma.Thread.JoinError.TimedOut,
-            WAIT_ABANDONED, WAIT_FAILED => unreachable,
-            else => unreachable,
-        };
+        while (true) {
+            switch (windows.kernel32.WaitForSingleObject(handle, timeout_ms orelse windows.INFINITE)) {
+                WAIT_OBJECT_0, WAIT_FAILED => {
+                    _ = windows.kernel32.CloseHandle(handle);
+                    return;
+                },
+                WAIT_TIMEOUT => return zuma.Thread.JoinError.TimedOut,
+                WAIT_ABANDONED => if (timeout_ms) |_| return,
+                else => unreachable,
+            }
+        }
     }
 
     pub fn setAffinity(cpu_affinity: zuma.CpuAffinity) zuma.Thread.AffinityError!void {
@@ -312,6 +316,7 @@ fn getProtectFlags(flags: u32) windows.DWORD {
     };
 }
 
+// TODO: Expose this as a cross-platform interface
 pub fn DynamicLibrary(comptime dll_name: [*c]const u8, comptime Imports: type) type {
     return struct {
         var instance = zync.Lazy(loadImports).new();

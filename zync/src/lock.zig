@@ -140,7 +140,7 @@ pub const Mutex = struct {
     pub fn release(self: *@This()) void {
         switch (self.state.swap(.Unlocked, .Release)) {
             .Sleeping => self.futex.notifyOne(@ptrCast(*const u32, &self.state)),
-            .Unlocked => @panic("Unlocking an unlocked mutex"),
+            .Unlocked => unreachable,
             .Locked => {},
         }
     }

@@ -39,7 +39,7 @@ pub const Mutex = struct {
     const SpinCpu = 4;
     const SpinThread = 1;
     const SpinCpuCount = 40;
-    
+
     futex: zync.Futex,
     state: zync.Atomic(enum(u32) {
         Unlocked,
@@ -70,13 +70,13 @@ pub const Mutex = struct {
 
         while (true) {
             // try and acquire the lock using cpu spinning on failure
-            for ([SpinCpu]void(undefined)) |_| {
+            for (([SpinCpu]void)(undefined)) |_| {
                 while ((self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return) != .Unlocked) {}
                 zync.yield(SpinCpuCount);
             }
 
             // try and acquire the lock using thread rescheduling on failure
-            for ([SpinThread]void(undefined)) |_| {
+            for (([SpinThread]void)(undefined)) |_| {
                 while ((self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return) != .Unlocked) {}
                 zuma.Thread.yield();
             }
@@ -85,13 +85,13 @@ pub const Mutex = struct {
             if (self.state.swap(.Sleeping, .Acquire) == .Unlocked)
                 return;
             state = .Sleeping;
-            self.futex.wait(@ptrCast(*const u32, &self.state), u32(state), null) catch unreachable;
+            self.futex.wait(@ptrCast(*const u32, &self.state), @enumToInt(state), null) catch unreachable;
         }
     }
 
     pub fn release(self: *@This()) void {
         switch (self.state.swap(.Unlocked, .Release)) {
-            .Sleeping => self.futex.notify(@ptrCast(*const u32, &self.state), 1),
+            .Sleeping => self.futex.notifyOne(@ptrCast(*const u32, &self.state)),
             .Unlocked => @panic("Unlocking an unlocked mutex"),
             .Locked => {},
         }
@@ -124,24 +124,24 @@ fn testLockImplementation(comptime Lock: type) !void {
     };
 
     // test init / deinit
-    var state: LockState = undefined;
-    state.init();
-    defer state.deinit();
+    var self: LockState = undefined;
+    self.init();
+    defer self.deinit();
 
     // test tryAcquire + release
-    expect(lock.tryAcquire() == true);
-    lock.release();
+    expect(self.lock.tryAcquire() == true);
+    self.lock.release();
 
     // test acquire + release
-    lock.acquire();
-    expect(state.value == 0);
-    const thread = try zuma.Thread.spawn(LockState.updateAndRelease, state);
-    defer thread.join() catch unreachable;
-    lock.acquire();
-    expect(state.value == 1);
-    lock.release();
+    self.lock.acquire();
+    expect(self.value == 0);
+    var thread = try zuma.Thread.spawn(LockState.updateAndRelease, &self);
+    defer thread.join(null) catch unreachable;
+    self.lock.acquire();
+    expect(self.value == 1);
+    self.lock.release();
 
     // test tryAcquire + release once more after the acquire + release tests
-    expect(lock.tryAcquire() == true);
-    lock.release();
+    expect(self.lock.tryAcquire() == true);
+    self.lock.release();
 }

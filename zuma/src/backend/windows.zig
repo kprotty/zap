@@ -88,7 +88,7 @@ pub const CpuAffinity = struct {
         const processor_affinity = &processor_info.Value.Processor.GroupMask[0];
         if (only_physical_cpus) {
             const physical_cpu = @ctz(KAFFINITY, processor_affinity.Mask) - 1;
-            processor_affinity.Mask = KAFFINITY(1) << @truncate(zync.shrType(KAFFINITY), physical_cpu);
+            processor_affinity.Mask = KAFFINITY(1) << @truncate(zync.ShrType(KAFFINITY), physical_cpu);
         }
 
         // Update the affinity with the new mask of the current processor_info's GROUP_AFFINITY

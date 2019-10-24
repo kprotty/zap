@@ -42,7 +42,7 @@ test "popCount" {
     expect(popCount(~u64(0)) == @typeInfo(u64).Int.bits);
 }
 
-pub fn intType(comptime is_signed: bool, comptime bits: var) type {
+pub fn IntType(comptime is_signed: bool, comptime bits: var) type {
     return @Type(builtin.TypeInfo{
         .Int = builtin.TypeInfo.Int{
             .bits = bits,
@@ -51,17 +51,24 @@ pub fn intType(comptime is_signed: bool, comptime bits: var) type {
     });
 }
 
-pub fn shrType(comptime Int: type) type {
-    const bits = @typeInfo(Int).Int.bits;
-    const log2_bits = @log2(f32, @intToFloat(f32, bits));
-    return intType(false, @floatToInt(u64, log2_bits));
+test "IntType" {
+    expect(IntType(false, 7) == u7);
+    expect(IntType(true, 32) == i32);
+    expect(IntType(false, 64) == u64);
+    expect(IntType(true, 9) == i9);
 }
 
-test "shrType" {
-    expect(shrType(u8) == u3);
-    expect(shrType(u16) == u4);
-    expect(shrType(u32) == u5);
-    expect(shrType(u64) == u6);
+pub fn ShrType(comptime Int: type) type {
+    const bits = @typeInfo(Int).Int.bits;
+    const log2_bits = @log2(f32, @intToFloat(f32, bits));
+    return IntType(false, @floatToInt(u64, log2_bits));
+}
+
+test "ShrType" {
+    expect(ShrType(u8) == u3);
+    expect(ShrType(u16) == u4);
+    expect(ShrType(u32) == u5);
+    expect(ShrType(u64) == u6);
 }
 
 pub fn nextPowerOfTwo(value: var) @typeOf(value) {
@@ -69,7 +76,7 @@ pub fn nextPowerOfTwo(value: var) @typeOf(value) {
     switch (@typeInfo(T)) {
         .Int => |int| {
             const shift_amount = int.bits - @clz(T, value - 1);
-            return T(1) << @truncate(shrType(T), shift_amount);
+            return T(1) << @truncate(ShrType(T), shift_amount);
         },
         .ComptimeInt => {
             const power_of_two = comptime_int(1) << popCount(value);

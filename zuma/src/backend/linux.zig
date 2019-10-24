@@ -25,14 +25,14 @@ const cpu_set_t = struct {
     pub fn get(self: @This(), index: usize) bool {
         if (index / bits >= self.bitmask.len)
             return false;
-        const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+        const mask = usize(1) << @truncate(zync.ShrType(usize), index % bits);
         return (self.bitmask[index / bits] & mask) != 0;
     }
 
     pub fn set(self: *@This(), index: usize, is_set: bool) void {
         if (index / bits >= self.bitmask.len)
             return;
-        const mask = usize(1) << @truncate(zync.shrType(usize), index % bits);
+        const mask = usize(1) << @truncate(zync.ShrType(usize), index % bits);
         if (is_set) {
             self.bitmask[index / bits] |= mask;
         } else {
@@ -107,7 +107,7 @@ pub const CpuAffinity = struct {
         if (only_physical_cpus) {
             for (cpu_set.bitmask) |word, index| {
                 var bits = word;
-                var pos: zync.shrType(usize) = undefined;
+                var pos: zync.ShrType(usize) = undefined;
                 while (bits != 0) : (bits ^= usize(1) << pos) {
                     pos = @truncate(@typeOf(pos), @ctz(usize, ~bits) - 1);
                     const bit = usize(pos) + (index * @typeInfo(usize).Int.bits);
@@ -322,7 +322,7 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.Me
         var node_mask: [32]c_ulong = undefined;
         const bits = @typeInfo(c_ulong).Int.bits;
         std.mem.set(c_ulong, node_mask[0..], 0);
-        node_mask[node / bits] = c_ulong(1) << @truncate(zync.shrType(c_ulong), node % bits);
+        node_mask[node / bits] = c_ulong(1) << @truncate(zync.ShrType(c_ulong), node % bits);
 
         const result = linux.syscall6(linux.SYS_mbind, addr, bytes, MPOL_PREFERRED, @ptrToInt(node_mask[0..].ptr), node_mask.len, 0);
         switch (linux.getErrno(result)) {

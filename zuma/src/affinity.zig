@@ -10,7 +10,7 @@ pub const CpuType = enum {
 };
 
 pub const CpuAffinity = struct {
-    const Index = zync.shrType(usize);
+    const Index = zync.ShrType(usize);
 
     group: usize,
     mask: usize,

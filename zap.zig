@@ -8,15 +8,16 @@ test "zap" {
 }
 
 pub const zync = struct {
-    pub usingnamespace @import("zync/src/futex.zig");
     pub usingnamespace @import("zync/src/utils.zig");
     pub usingnamespace @import("zync/src/atomic.zig");
+    pub usingnamespace @import("zync/src/futex.zig");
+    pub usingnamespace @import("zync/src/lock.zig");
 };
 
 pub const zuma = struct {
     pub usingnamespace @import("zuma/src/memory.zig");
-    pub usingnamespace @import("zuma/src/thread.zig");
     pub usingnamespace @import("zuma/src/affinity.zig");
+    pub usingnamespace @import("zuma/src/thread.zig");
 
     pub const backend = switch (builtin.os) {
         .linux => @import("zuma/src/backend/linux.zig"),
@@ -28,8 +29,8 @@ pub const zuma = struct {
 pub const zio = struct {
     pub usingnamespace @import("zio/src/io.zig");
     pub usingnamespace @import("zio/src/event.zig");
-    pub usingnamespace @import("zio/src/socket.zig");
     pub usingnamespace @import("zio/src/address.zig");
+    pub usingnamespace @import("zio/src/socket.zig");
 
     pub const backend = switch (builtin.os) {
         .linux => @import("zio/src/backend/linux.zig"),

@@ -14,6 +14,7 @@ pub fn build(b: *std.build.Builder) void {
         "zio",
         "zync",
         "zuma",
+        "zell",
     });
 
     const build_docs = b.addSystemCommand([_][]const u8{

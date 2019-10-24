@@ -1,6 +1,5 @@
 const std = @import("std");
 const expect = std.testing.expect;
-const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
 const zync = @import("../../zap.zig").zync;
 

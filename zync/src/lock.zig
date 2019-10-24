@@ -7,6 +7,52 @@ const zuma = @import("../../zap.zig").zuma;
 const c = std.c;
 const expect = std.testing.expect;
 
+pub const Event = struct {
+    pub const AutoReset = EventImpl(true);
+    pub const ManualReset = EventImpl(false);
+
+    fn EventImpl(comptime auto_reset: bool) type {
+        return struct {
+            futex: zync.Futex,
+            state: zync.Atomic(EventState),
+
+            const EventState = enum(u32) {
+                Empty,
+                Signaled,
+            };
+
+            pub fn init(self: *@This()) void {
+                self.state.set(.Empty);
+                self.futex.init();
+            }
+
+            pub fn deinit(self: *@This()) void {
+                self.futex.deinit();
+            }
+
+            pub fn isSet(self: *const @This()) bool {
+                return self.state.load(.Relaxed) == .Signaled;
+            }
+
+            pub fn set(self: *@This()) void {
+                if (self.state.swap(.Signaled) == .Empty)
+                    self.futex.notifyOne(@ptrCast(*const u32, &self.state));
+            }
+
+            pub fn reset(self: *@This()) void {
+                std.debug.assert(self.state.swap(.Empty) == .Signaled);
+            }
+
+            pub fn wait(self: *@This(), timeout_ms: u32) !void {
+                const expected = @enumToInt(EventState.Empty);
+                try self.futex.wait(@ptrCast(*const u32, &self.state), expected, timeout_ms);
+                if (auto_reset)
+                    self.reset();
+            }
+        };
+    }
+};
+
 pub const Spinlock = struct {
     state: zync.Atomic(bool),
 
@@ -41,11 +87,13 @@ pub const Mutex = struct {
     const SpinCpuCount = 40;
 
     futex: zync.Futex,
-    state: zync.Atomic(enum(u32) {
+    state: zync.Atomic(MutexState),
+
+    const MutexState = enum(u32) {
         Unlocked,
         Sleeping,
         Locked,
-    }),
+    };
 
     pub fn init(self: *@This()) void {
         self.state.set(.Unlocked);

@@ -119,13 +119,17 @@ pub const Mutex = struct {
         while (true) {
             // try and acquire the lock using cpu spinning on failure
             for (([SpinCpu]void)(undefined)) |_| {
-                while ((self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return) != .Unlocked) {}
+                var value = self.state.load(.Relaxed);
+                while (value == .Unlocked)
+                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return;
                 zync.yield(SpinCpuCount);
             }
 
             // try and acquire the lock using thread rescheduling on failure
             for (([SpinThread]void)(undefined)) |_| {
-                while ((self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return) != .Unlocked) {}
+                var value = self.state.load(.Relaxed);
+                while (value == .Unlocked)
+                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return
                 zuma.Thread.yield();
             }
 

@@ -85,9 +85,7 @@ pub const Thread = struct {
         }
     };
 
-    pub const JoinError = error {
-        TimedOut,
-    };
+    pub const JoinError = error{TimedOut};
 
     pub fn join(handle: Handle, timeout_ms: ?u32) JoinError!void {
         return self.inner.join(handle, timeout_ms);
@@ -165,7 +163,7 @@ test "Thread - getStackSize, spawn, yield" {
             update(item);
         }
     };
-    
+
     var value = zync.Atomic(usize).new(0);
     expect(value.get() == 0);
 

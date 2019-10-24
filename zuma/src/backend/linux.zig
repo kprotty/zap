@@ -181,9 +181,8 @@ pub const Thread = if (builtin.link_libc) posix.Thread else struct {
         if (memory.len < stack_size)
             return zuma.Thread.CreateError.InvalidStack;
 
-        var clone_flags: u32 = 
-            os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM | os.CLONE_DETACHED |
-            os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID | 
+        var clone_flags: u32 = os.CLONE_THREAD | os.CLONE_SIGHAND | os.CLONE_SYSVSEM | os.CLONE_DETACHED |
+            os.CLONE_CHILD_CLEARTID | os.CLONE_PARENT_SETTID |
             os.CLONE_VM | os.CLONE_FS | os.CLONE_FILES;
         if (linux.tls.tls_image) |tls_image| {
             clone_flags |= os.CLONE_SETTLS;

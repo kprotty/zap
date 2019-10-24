@@ -9,7 +9,7 @@ pub const Error = struct {
     pub const Pending = Set.Pending;
     pub const InvalidToken = Set.InvalidToken;
 
-    pub const Set = error {
+    pub const Set = error{
         Closed,
         Pending,
         InvalidToken,

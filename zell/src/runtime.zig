@@ -68,7 +68,7 @@ pub const Node = struct {
         var node_offset: usize = undefined;
         var worker_offset: usize = undefined;
         var worker_array_offset: usize = undefined;
-        const size = computeSize(worker_count, &node_offset, &worker_array_offset, &worker_offset);        
+        const size = computeSize(worker_count, &node_offset, &worker_array_offset, &worker_offset);
 
         // allocate all the memory on the numa node and setup the worker array
         const flags = zuma.PAGE_READ | zuma.PAGE_WRITE | zuma.PAGE_COMMIT;
@@ -160,7 +160,7 @@ pub const Thread = struct {
     worker: *Worker,
     event: zync.Event,
     stack: ?[]align(zuma.page_size) u8,
-    
+
     pub const Cache = struct {
         mutex: zync.Mutex,
         max_threads: usize,
@@ -183,7 +183,7 @@ pub const Task = struct {
     frame: anyframe,
 
     pub inline fn new() @This() {
-        return @This() {
+        return @This(){
             .next = null,
             .frame = anyframe,
         };

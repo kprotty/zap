@@ -82,7 +82,7 @@ pub fn Atomic(comptime T: type) type {
             _ = self.swap(value, order);
         }
 
-        pub fn load(self: *@This(), comptime order: Order) T {
+        pub fn load(self: *const @This(), comptime order: Order) T {
             return zuma.transmute(T, @atomicLoad(Type, &self.value, comptime order.toBuiltin()));
         }
 

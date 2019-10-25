@@ -29,7 +29,7 @@ pub const Futex = struct {
     pub const WaitError = error{TimedOut};
 
     pub fn wait(self: *@This(), ptr: *const u32, expected: u32, timeout_ms: ?u32) WaitError!void {
-        if (@atomicLoad(u32, ptr, .Monotonic) != expected)
+        if (@atomicLoad(u32, ptr, .Acquire) != expected)
             return;
         return self.inner.wait(ptr, expected, timeout_ms);
     }
@@ -71,7 +71,7 @@ const Linux = struct {
         const value = @bitCast(i32, expected);
         const addr = @ptrCast(*const i32, ptr);
         const flags = system.FUTEX_WAIT | system.FUTEX_PRIVATE_FLAG;
-        while (@atomicLoad(u32, ptr, .Monotonic) == expected) {
+        while (@atomicLoad(u32, ptr, .Acquire) == expected) {
             switch (os.errno(system.futex_wait(addr, flags, value, ts_ptr))) {
                 0, os.EAGAIN => return,
                 os.EACCES, os.EFAULT, os.EINVAL, os.ENOSYS => unreachable,

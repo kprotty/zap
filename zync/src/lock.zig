@@ -6,6 +6,7 @@ const zuma = @import("../../zap.zig").zuma;
 
 const c = std.c;
 const expect = std.testing.expect;
+const expectError = std.testing.expectError;
 
 pub const Event = struct {
     pub const AutoReset = EventImpl(true);
@@ -35,12 +36,12 @@ pub const Event = struct {
             }
 
             pub fn set(self: *@This()) void {
-                if (self.state.swap(.Signaled) == .Empty)
+                if (self.state.swap(.Signaled, .Release) == .Empty)
                     self.futex.notifyOne(@ptrCast(*const u32, &self.state));
             }
 
             pub fn reset(self: *@This()) void {
-                std.debug.assert(self.state.swap(.Empty) == .Signaled);
+                std.debug.assert(self.state.swap(.Empty, .Release) == .Signaled);
             }
 
             pub fn wait(self: *@This(), timeout_ms: u32) !void {
@@ -52,6 +53,43 @@ pub const Event = struct {
         };
     }
 };
+
+test "Event" {
+    var event: Event.AutoReset = undefined;
+    event.init();
+    defer event.deinit();
+
+    // test .set() and .reset();
+    expect(event.isSet() == false);
+    event.set();
+    expect(event.isSet() == true);
+    event.reset();
+    expect(event.isSet() == false);
+
+    const delay_ms = 100;
+    const threshold_ms = 300;
+    const max_delay = delay_ms + threshold_ms;
+    const min_delay = delay_ms - std.math.min(delay_ms, threshold_ms);
+
+    // test .wait() delay
+    const now = zuma.Thread.now(.Monotonic);
+    expectError(zync.Futex.WaitError.TimedOut, event.wait(delay_ms));
+    const elapsed = zuma.Thread.now(.Monotonic) - now;
+    expect(elapsed > min_delay and elapsed < max_delay);
+
+    const EventNotifier = struct {
+        pub fn notify(self: *Event.AutoReset) void {
+            zuma.Thread.sleep(100);
+            self.set();
+        }
+    };
+
+    // test cross thread notification
+    var thread = try zuma.Thread.spawn(EventNotifier.notify, &event);
+    defer thread.join(null) catch unreachable;
+    try event.wait(500);
+    expect(event.isSet() == false);
+}
 
 pub const Spinlock = struct {
     state: zync.Atomic(bool),
@@ -129,8 +167,7 @@ pub const Mutex = struct {
             for (([SpinThread]void)(undefined)) |_| {
                 var value = self.state.load(.Relaxed);
                 while (value == .Unlocked)
-                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return
-                zuma.Thread.yield();
+                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return zuma.Thread.yield();
             }
 
             // failed to acquire the lock, go to unsleep until woken up by `.release()`

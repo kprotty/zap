@@ -35,8 +35,19 @@ const System = struct {
     active_tasks: zync.Atomic(usize),
 
     pub fn run(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !@typeOf(func).ReturnType {
+        var main_task: *Task = undefined;
+        var result: @typeOf(func).ReturnType = undefined;
+        _ = async Task.create(&main_task, saveResult, &result, func, args);
+        self.active_tasks.set(1);
+
+        // Use a random NUMA node as the main entry point in order to not over-subscribe
+        // nodes if multiple zap applications running on a given system.
+        const main_node = nodes[zuma.Thread.getRandom().uintAtMostBiased(usize, nodes.len)];
         self.nodes = nodes;
-        self.active_tasks.set(0);
+    }
+
+    fn saveResult(result: *@typeOf(func).ReturnType, comptime func: var, args: ...) void {
+        result.* = func(args);
     }
 };
 
@@ -98,8 +109,13 @@ pub const Node = struct {
         };
 
         self.workers = workers;
-        self.idle_workers.set(self.cpu_affinity.mask);
         self.thread_cache.init(max_threads);
+        if (self.workers.len == 64) {
+            self.idle_workers.set(~usize(0));
+        } else {
+            const shift = @intCast(zync.ShrType(usize), self.workers.len);
+            self.idle_workers.set((usize(1) << shift) - 1);
+        }
     }
 
     pub fn deinit(self: *@This()) void {
@@ -165,4 +181,18 @@ pub const Thread = struct {
 pub const Task = struct {
     next: ?*@This(),
     frame: anyframe,
+
+    pub inline fn new() @This() {
+        return @This() {
+            .next = null,
+            .frame = anyframe,
+        };
+    }
+
+    pub fn create(ptr: **@This(), comptime func: var, args: ...) @typeOf(func).ReturnType {
+        var self = new();
+        ptr.* = &self;
+        suspend;
+        return func(args);
+    }
 };

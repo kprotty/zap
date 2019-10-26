@@ -28,16 +28,16 @@ pub const Reactor = struct {
             return error.uname;
         const sep = try std.mem.indexOf(uts.release[2..], ".");
         major.* = try std.fmt.parseInt(usize, uts.release[0..1], 10);
-        minor.* = try std.fmt.parseInt(usize, uts.release[2..2 + sep], 10);
+        minor.* = try std.fmt.parseInt(usize, uts.release[2 .. 2 + sep], 10);
     }
 
     fn initEpoll(self: *@This()) zell.Reactor.InitError!void {
-        self.inner = Backend { .Epoll = undefined };
+        self.inner = Backend{ .Epoll = undefined };
         return self.inner.Epoll.init();
     }
 
     fn initUring(self: *@This()) zell.Reactor.InitError!void {
-        self.inner = Backend { .Uring = undefined };
+        self.inner = Backend{ .Uring = undefined };
         return self.inner.Uring.init();
     }
 
@@ -123,15 +123,15 @@ const EpollReactor = struct {
     inner: zio.Event.Poller,
 
     pub fn init(self: *@This()) zell.Reactor.InitError!void {
-        
+        return self.inner.init();
     }
 
     pub fn deinit(self: *@This()) void {
-        
+        return self.inner.deinit();
     }
 
     pub fn notify(self: *@This()) zell.Reactor.NotifyError!void {
-
+        return self.inner.notify(0);
     }
 
     pub fn open(self: *@This(), path: []const u8, flags: u32) zell.Reactor.OpenError!zio.Handle {
@@ -142,47 +142,27 @@ const EpollReactor = struct {
         @compileError("Unimplemented");
     }
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) zell.Reactor.SocketError!zio.Handle {
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) zell.Reactor.SocketError!zio.Handle {}
 
-    }
+    pub fn close(self: *@This(), handle: zio.Handle, is_socket: bool) void {}
 
-    pub fn close(self: *@This(), handle: zio.Handle, is_socket: bool) void {
+    pub fn connect(self: *@This(), handle: zio.Handle, address: *const zio.Address) zell.Reactor.ConnectError!void {}
 
-    }
+    pub fn accept(self: *@This(), handle: zio.Handle, address: *zio.Address) zell.Reactor.AcceptError!zio.Handle {}
 
-    pub fn connect(self: *@This(), handle: zio.Handle, address: *const zio.Address) zell.Reactor.ConnectError!void {
+    pub fn readv(self: *@This(), address: ?*zio.Address, buffer: []const []u8, offset: ?u64) zell.Reactor.ReadError!usize {}
 
-    }
+    pub fn writev(self: *@This(), address: ?*zio.Address, buffer: []const []const u8, offset: ?u64) zell.Reactor.WriteError!usize {}
 
-    pub fn accept(self: *@This(), handle: zio.Handle, address: *zio.Address) zell.Reactor.AcceptError!zio.Handle {
-
-    }
-
-    pub fn readv(self: *@This(), address: ?*zio.Address, buffer: []const []u8, offset: ?u64) zell.Reactor.ReadError!usize {
-        
-    }
-
-    pub fn writev(self: *@This(), address: ?*zio.Address, buffer: []const []const u8, offset: ?u64) zell.Reactor.WriteError!usize {
-
-    }
-
-    pub fn poll(self: *@This(), timeout_ms: ?u32) zell.Reactor.PollError!Task.List {
-
-    }
+    pub fn poll(self: *@This(), timeout_ms: ?u32) zell.Reactor.PollError!Task.List {}
 };
 
 const UringReactor = struct {
-    pub fn init(self: *@This()) zell.Reactor.InitError!void {
-        
-    }
+    pub fn init(self: *@This()) zell.Reactor.InitError!void {}
 
-    pub fn deinit(self: *@This()) void {
-        
-    }
+    pub fn deinit(self: *@This()) void {}
 
-    pub fn notify(self: *@This()) zell.Reactor.NotifyError!void {
-
-    }
+    pub fn notify(self: *@This()) zell.Reactor.NotifyError!void {}
 
     pub fn open(self: *@This(), path: []const u8, flags: u32) zell.Reactor.OpenError!zio.Handle {
         @compileError("Unimplemented");
@@ -192,39 +172,24 @@ const UringReactor = struct {
         @compileError("Unimplemented");
     }
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) zell.Reactor.SocketError!zio.Handle {
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) zell.Reactor.SocketError!zio.Handle {}
 
-    }
+    pub fn close(self: *@This(), handle: zio.Handle, is_socket: bool) void {}
 
-    pub fn close(self: *@This(), handle: zio.Handle, is_socket: bool) void {
+    pub fn connect(self: *@This(), handle: zio.Handle, address: *const zio.Address) zell.Reactor.ConnectError!void {}
 
-    }
+    pub fn accept(self: *@This(), handle: zio.Handle, address: *zio.Address) zell.Reactor.AcceptError!zio.Handle {}
 
-    pub fn connect(self: *@This(), handle: zio.Handle, address: *const zio.Address) zell.Reactor.ConnectError!void {
+    pub fn readv(self: *@This(), address: ?*zio.Address, buffer: []const []u8, offset: ?u64) zell.Reactor.ReadError!usize {}
 
-    }
+    pub fn writev(self: *@This(), address: ?*zio.Address, buffer: []const []const u8, offset: ?u64) zell.Reactor.WriteError!usize {}
 
-    pub fn accept(self: *@This(), handle: zio.Handle, address: *zio.Address) zell.Reactor.AcceptError!zio.Handle {
-
-    }
-
-    pub fn readv(self: *@This(), address: ?*zio.Address, buffer: []const []u8, offset: ?u64) zell.Reactor.ReadError!usize {
-        
-    }
-
-    pub fn writev(self: *@This(), address: ?*zio.Address, buffer: []const []const u8, offset: ?u64) zell.Reactor.WriteError!usize {
-
-    }
-
-    pub fn poll(self: *@This(), timeout_ms: ?u32) zell.Reactor.PollError!Task.List {
-
-    }
+    pub fn poll(self: *@This(), timeout_ms: ?u32) zell.Reactor.PollError!Task.List {}
 };
 
 ///-----------------------------------------------------------------------------///
 ///                                API Definitions                              ///
 ///-----------------------------------------------------------------------------///
-
 const IORING_SETUP_IOPOLL = 1 << 0;
 const IORING_SETUP_SQPOLL = 1 << 1;
 const IORING_FEAT_SINGLE_MMAP = 1 << 0;
@@ -295,7 +260,7 @@ const io_sqring_offsets = extern struct {
     tail: u32,
     ring_mask: u32,
     ring_entries: u32,
-    flags: u32, 
+    flags: u32,
     dropped: u32,
     array: u32,
     resv1: u32,

@@ -90,7 +90,8 @@ pub const Socket = struct {
         return self.inner.listen(backlog);
     }
 
-    pub const ConnectError = zio.Error.Set || error{
+    pub const ConnectError = zio.Error.Set || RawConnectError;
+    pub const RawConnectError = error{
         TimedOut,
         InvalidState,
         InvalidHandle,
@@ -102,7 +103,8 @@ pub const Socket = struct {
         return self.inner.connect(address, token);
     }
 
-    pub const AcceptError = zio.Error.Set || error{
+    pub const AcceptError = zio.Error.Set || RawAcceptError;
+    pub const RawAcceptError = error{
         InvalidState,
         InvalidHandle,
         InvalidAddress,
@@ -113,7 +115,8 @@ pub const Socket = struct {
         return self.inner.accept(flags, incoming, token);
     }
 
-    pub const DataError = zio.Error.Set || error{
+    pub const DataError = zio.Error.Set || RawDataError;
+    pub const RawDataError = error{
         InvalidState,
         InvalidValue,
         InvalidHandle,

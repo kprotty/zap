@@ -3,7 +3,8 @@ const builtin = @import("builtin");
 
 const Task = @import("runtime.zig").Task;
 const zio = @import("../../zap.zig").zio;
-const zell = @import("../../zap.zig").zell;
+const zync = @import("../../zap.zig").zync;
+const zuma = @import("../../zap.zig").zuma;
 
 const os = std.os;
 const expect = std.testing.expect;
@@ -115,11 +116,22 @@ const CompletionReactor = struct {
 };
 
 const PolledReactor = struct {
-    pub fn init(self: *@This(), allocator: *std.mem.Allocator) !void {}
+    poller: zio.Event.Poller,
+    channel_cache: Channel.Cache,
+    
+    pub fn init(self: *@This(), allocator: *std.mem.Allocator) !void {
+        try self.poller.init();
+        try self.channel_cache.init(allocator);
+    }
 
-    pub fn deinit(self: *@This()) void {}
+    pub fn deinit(self: *@This()) void {
+        self.poller.deinit();
+        self.channel_cache.deinit();
+    }
 
-    pub fn notify(self: *@This()) !void {}
+    pub fn notify(self: *@This()) !void {
+        return self.poller.notify(0);
+    }
 
     pub fn socket(self: *@This(), flags: zio.Socket.Flags) !zio.Handle {}
 
@@ -134,6 +146,64 @@ const PolledReactor = struct {
     pub fn writev(self: *@This(), handle: zio.Handle, address: ?*const zio.Address, buffer: []const []const u8, offset: ?u64) !usize {}
 
     pub fn poll(self: *@This(), timeout_ms: ?u32) !Task.List {}
+
+    const Channel = struct {
+        reader: ?*Task,
+        writer: ?*Task,
+
+        pub fn next(self: @This(), comptime Ptr: type) Ptr {
+            return @ptrCast(Ptr, @alignCast(@alignOf(Ptr), self.reader));
+        }
+
+        pub fn prev(self: @This(), comptime Ptr: type) Ptr {
+            return @ptrCast(Ptr, @alignCast(@alignOf(Ptr), self.writer));
+        }
+
+        pub const Cache = struct {
+            mutex: zync.Mutex,
+            top_chunk: ?*Chunk,
+            free_list: ?*Channel,
+            allocator: *std.mem.Allocator,
+
+            pub fn init(self: *@This, allocator: *std.mem.Allocator) {
+                self.mutex.init();
+                self.top_chunk = null;
+                self.free_list = null;
+                self.allocator = allocator;
+            }
+
+            pub fn deinit(self: *@This()) void {
+                self.mutex.acquire();
+                defer self.mutex.release();
+                defer self.mutex.deinit();
+
+                while (self.top_chunk) |chunk| {
+                    self.top_chunk = chunk.prev().*;
+                    self.allocator.destroy(chunk);
+                }
+            }
+
+            pub fn alloc(self: *@This()) ?*Channel {
+                self.mutex.acquire();
+                defer self.mutex.release();
+
+                if (self.free_list) |channel| {
+                    self.free_list = channel.next(?*Channel);
+                    return channel;
+                }
+            }
+
+            pub fn free(self: *@This(), channel: *Channel) {
+
+            }
+        };
+
+        const Chunk = struct {
+            channels: [zuma.page_size / @sizeOf(Channel)]Channel align(zuma.page_size),
+
+            pub fn 
+        };
+    };
 };
 
 const UringReactor = struct {

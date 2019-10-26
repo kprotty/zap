@@ -179,14 +179,11 @@ pub const Thread = struct {
 };
 
 pub const Task = struct {
-    next: ?*@This(),
     frame: anyframe,
+    next: ?*@This() = null,
 
     pub inline fn new() @This() {
-        return @This(){
-            .next = null,
-            .frame = anyframe,
-        };
+        return @This(){ .frame = @frame() };
     }
 
     pub fn create(ptr: **@This(), comptime func: var, args: ...) @typeOf(func).ReturnType {
@@ -195,4 +192,19 @@ pub const Task = struct {
         suspend;
         return func(args);
     }
+
+    pub const List = struct {
+        head: ?*Task = null,
+        tail: ?*Task = null,
+        size: usize = 0,
+
+        pub fn push(self: *@This(), task: *Task) void {
+            if (self.head == null)
+                self.head = task;
+            if (self.tail) |tail|
+                tail.next = task;
+            tail = task;
+            self.size += 1;
+        }
+    };
 };

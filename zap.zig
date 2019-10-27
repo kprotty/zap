@@ -41,6 +41,12 @@ pub const zio = struct {
 };
 
 pub const zell = struct {
-    pub usingnamespace @import("zell/src/reactor.zig");
     pub const runtime = @import("zell/src/runtime.zig");
+
+    pub usingnamespace switch (builtin.os) {
+        .linux => @import("zell/src/backend/linux.zig"),
+        .windows => @import("zell/src/backend/windows.zig"),
+        .macosx, .freebsd, .netbsd, .openbsd, .dragonfly => @import("zell/src/backend/posix.zig"),
+        else => @compileError("Only linux, windows and some *BSD variants are supported"),
+    };
 };

@@ -20,7 +20,7 @@ Abstractions over the systems thread blocking interfaces and provides both synch
 
 - [x] Lazy (rust's lazy_static)
 - [x] C11 Atomics (supports Unions, Enums, and arbitrary bit-width numbers)
-- [ ] Crossbeam utils (spin hint, backoff, cache padded)
+- [x] Crossbeam utils (spin hint, backoff, cache padded)
 - [ ] System sychnronization (mutex, condition_variable, rwlock, semaphore)
 - [ ] Multi/Single-Producer Multi/Single-Consumer queues and stacks
 

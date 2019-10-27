@@ -7,13 +7,13 @@ const zuma = @import("../../zap.zig").zuma;
 pub const Socket = struct {
     inner: zio.backend.Socket,
 
-    pub const Flags = u8;
-    pub const Raw: Flags = 1 << 0;
-    pub const Tcp: Flags = 1 << 1;
-    pub const Udp: Flags = 1 << 2;
-    pub const Ipv4: Flags = 1 << 3;
-    pub const Ipv6: Flags = 1 << 4;
-    pub const Nonblock: Flags = 1 << 5;
+    pub const Flags = zio.Flags;
+    pub const Nonblock = zio.Nonblock;
+    pub const Raw: zio.Flags = 1 << 1;
+    pub const Tcp: zio.Flags = 1 << 2;
+    pub const Udp: zio.Flags = 1 << 3;
+    pub const Ipv4: zio.Flags = 1 << 4;
+    pub const Ipv6: zio.Flags = 1 << 5;
 
     pub const Error = error{
         InvalidValue,

@@ -4,6 +4,9 @@ const zio = @import("../../zap.zig").zio;
 
 pub const Handle = zio.backend.Handle;
 
+pub const Flags = u32;
+pub const Nonblock = 1 << 0;
+
 pub const Error = struct {
     pub const Closed = Set.Closed;
     pub const Pending = Set.Pending;

@@ -179,17 +179,15 @@ pub const Thread = struct {
 };
 
 pub const Task = struct {
-    frame: anyframe,
     next: ?*@This() = null,
-
-    pub inline fn new() @This() {
-        return @This(){ .frame = @frame() };
-    }
+    frame: anyframe = undefined,
 
     pub fn create(ptr: **@This(), comptime func: var, args: ...) @typeOf(func).ReturnType {
-        var self = new();
+        var self = @This(){};
         ptr.* = &self;
-        suspend;
+        suspend {
+            self.frame = @frame();
+        }
         return func(args);
     }
 

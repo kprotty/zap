@@ -210,6 +210,13 @@ pub const Socket = struct {
             return zio.Socket.Error.InvalidState;
     }
 
+    pub fn getTokenMask(self: *const @This(), comptime event_flags: zio.Event.Flags) usize {
+        return switch (event_flags & zio.Event.Readable) {
+            0 => @ptrToInt(&self.writer),
+            else => @ptrToInt(&self.reader),
+        };
+    }
+
     pub const Linger = extern struct {
         l_onoff: c_ushort,
         l_linger: c_ushort,

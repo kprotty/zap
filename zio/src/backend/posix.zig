@@ -243,6 +243,10 @@ pub const Socket = struct {
         return self.handle;
     }
 
+    pub fn getTokenMask(self: *const @This(), comptime event_flags: zio.Event.Flags) usize {
+        return event_flags;
+    }
+
     pub const Linger = extern struct {
         l_onoff: c_int,
         l_linger: c_int,

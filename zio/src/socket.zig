@@ -38,6 +38,11 @@ pub const Socket = struct {
         return self.inner.getHandle();
     }
 
+    pub inline fn getTokenMask(self: *const @This(), comptime event_flags: zio.Event.Flags) usize {
+        comptime std.debug.assert((event_flags & (zio.Event.Readable | zio.Event.Writeable)) != 0);
+        return self.inner.getTokenMask(event_flags);
+    }
+
     const Linger = zio.backend.Socket.Linger;
     pub const Option = union(enum) {
         Debug: bool, // SO_DEBUG
@@ -322,6 +327,10 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
         }
 
         pub fn handle_server(self: *@This(), token: usize, poller: *zio.Event.Poller) !void {
+            // ensure the token is correct semantic-wise
+            const token_mask = self.server.getTokenMask(zio.Event.Readable);
+            std.debug.assert(token == 0 or token & token_mask == token_mask);
+
             // Accept the incoming client
             _ = self.server.accept(flags, &self.incoming, token) catch |err| switch (err) {
                 zio.Error.Pending => return,
@@ -346,6 +355,10 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Keep sending data until its all received on the client side
             var token = io_token;
             while (self.client_sent < data.len) {
+                // ensure the token is correct semantic-wise
+                const token_mask = self.client.getTokenMask(zio.Event.Writeable);
+                std.debug.assert(token == 0 or token & token_mask == token_mask);
+
                 const buffer = data[0..(data.len - self.client_sent)];
                 self.client_sent += self.client.send(buffer, token) catch |err| switch (err) {
                     zio.Error.Pending, zio.Error.Closed => return,
@@ -406,6 +419,10 @@ fn testNonBlockingTcp(comptime AddressType: type, port: u16) !void {
             // Then, start receiving data from the server
             // Handle Error.InvalidToken since events could be for writer instead of reader
             while (self.received < data.len) {
+                // ensure the token is correct semantic-wise
+                const token_mask = self.socket.getTokenMask(zio.Event.Readable);
+                std.debug.assert(token == 0 or token & token_mask == token_mask);
+
                 self.received += self.socket.recv(self.buffer[0..], token) catch |err| switch (err) {
                     zio.Error.Pending => return,
                     else => return err,

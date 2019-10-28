@@ -40,9 +40,10 @@ pub const DefaultReactor = struct {
     }
 
     pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
+        const Self = @This();
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
                 _ = sock.accept(flags, &incoming, token) catch |err| return err;
                 address.* = incoming.address;
                 const client_sock = incoming.getSocket(zio.Socket.Nonblock);
@@ -53,8 +54,9 @@ pub const DefaultReactor = struct {
     }
 
     pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {
+        const Self = @This();
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: *const zio.Address) !void {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, address: *const zio.Address) !void {
                 return sock.connect(address, token);
             }
         }, true, typed_handle, address);
@@ -62,8 +64,9 @@ pub const DefaultReactor = struct {
 
     pub fn read(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {
         // TODO: add file support using `offset`
+        const Self = @This();
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: ?*zio.Address, buffers: []const []u8) !void {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, address: ?*zio.Address, buffers: []const []u8) !void {
                 return sock.recvmsg(address, buffers, token);
             }
         }, false, typed_handle, address);
@@ -71,8 +74,9 @@ pub const DefaultReactor = struct {
 
     pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
         // TODO: add file support using `offset`
+        const Self = @This();
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: ?*const zio.Address, buffers: []const []const u8) !void {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, address: ?*const zio.Address, buffers: []const []const u8) !void {
                 return sock.sendmsg(address, buffers, token);
             }
         }, true, typed_handle, address);
@@ -94,7 +98,7 @@ pub const DefaultReactor = struct {
             // If the old request token is 1, then the request is suspended and its task should be resumed.
             if (@intToPtr(?*Descriptor, event.readData(&self.inner))) |descriptor| {
                 const token = event.getToken();
-                inline for ([_]*zync.Atomic(?*Descriptor.Request){
+                for ([_]*zync.Atomic(?*Descriptor.Request){
                     &descriptor.writer,
                     &descriptor.reader,
                 }) |request_ref| {
@@ -102,7 +106,7 @@ pub const DefaultReactor = struct {
                     if (token & request.token_mask != request.token_mask)
                         continue;
                     if (request.token.swap(token, .Acquire) == 1)
-                        list.push(&request.task);
+                        task_list.push(&request.task);
                 }
             }
         }
@@ -120,8 +124,14 @@ pub const DefaultReactor = struct {
     }
 
     /// Execute an IO operation, automatically suspending and resuming as needed.
-    fn performAsync(self: *@This(), comptime is_writer: bool, comptime IO: type, typed_handle: Reactor.TypedHandle, args: ...) @typeOf(IO.run).ReturnType {
-        const HandleType = @typeInfo(@typeInfo(IO.run).Fn.args[1].arg_type.?).Pointer.child;
+    fn performAsync(
+        self: *@This(),
+        comptime IO: type,
+        comptime is_writer: bool,
+        typed_handle: Reactor.TypedHandle,
+        args: ...
+    ) @typeOf(IO.run).ReturnType {
+        const HandleType = @typeInfo(@typeInfo(@typeOf(IO.run)).Fn.args[1].arg_type.?).Pointer.child;
         const descriptor = @intToPtr(*Descriptor, typed_handle.getValue());
         var instance = HandleType.fromHandle(descriptor.handle, zio.Nonblock);
         var request = Descriptor.Request{
@@ -134,7 +144,7 @@ pub const DefaultReactor = struct {
         request_ptr.store(&request, .Release);
         defer request_ptr.store(null, .Relaxed);
 
-        return IO.run(self, &instance, 0, args) catch |err| switch (err) {
+        return IO.run(self, &instance, 0, args) catch |e| switch (e) {
             zio.Error.Closed => return error.Closed,
             zio.Error.InvalidToken => unreachable,
             zio.Error.Pending => {
@@ -147,10 +157,10 @@ pub const DefaultReactor = struct {
                     zio.Error.Closed => return error.Closed,
                     zio.Error.InvalidToken => unreachable,
                     zio.Error.Pending => unreachable,
-                    else => |err| return err,
+                    else => |raw_err| return raw_err,
                 };
             },
-            else => |err| return err,
+            else => |raw_err| return raw_err,
         };
     }
 

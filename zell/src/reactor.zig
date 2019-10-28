@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Task = @import("runtime.zig").Task;
 const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
-const Task = @import("../runtime.zig").Task;
 
 const expect = std.testing.expect;
 
@@ -172,4 +172,34 @@ test "Reactor - Socket" {
     var address = zio.Address.fromIpv4(try zio.Address.parseIpv4("localhost"), port);
     try reactor.bind(server_handle, &address);
     try reactor.listen(server_handle, 1);
+
+    const client_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
+    defer reactor.close(client_handle);
+    _ = try (try resolveAsync(&reactor, Reactor.connect, &reactor, client_handle, &address));
+}
+
+fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeOf(func).ReturnType {
+    const Resolver = struct {
+        fn resolve(comptime func2: var, output: *?@typeOf(func2).ReturnType, args2: ...) void {
+            output.* = func2(args2);
+        }
+    };
+
+    // perform the async function, poll for tasks, and receive its continuation frame
+    var result: ?@typeOf(func).ReturnType = null;
+    var frame = async Resolver.resolve(func, &result, args);
+    const tasks = try reactor.poll(500);
+    expect(tasks.size == 1);
+    const frame_ref = tasks.head.?.frame;
+    
+    // make sure its the actual frame that was received
+    const frame_ptr = @ptrToInt(frame_ref);
+    const frame_begin = @ptrToInt(&frame);
+    const frame_end = frame_begin + @sizeOf(@typeOf(frame));
+    expect(frame_ptr >= frame_begin and frame_ptr < frame_end);
+
+    // resume the frame and return the result
+    resume frame_ref;
+    expect(result != null);
+    return result.?;
 }

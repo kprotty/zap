@@ -1,123 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("../../zap.zig").zio;
-const zync = @import("../../zap.zig").zync;
-const zuma = @import("../../zap.zig").zuma;
+const zio = @import("../../../zap.zig").zio;
+const zync = @import("../../../zap.zig").zync;
+const zuma = @import("../../../zap.zig").zuma;
 const Task = @import("../runtime.zig").Task;
+const Reactor = @import("../reactor.zig").Reactor;
 
-pub const Poller = struct {
-    pub const Handle = union(enum) {
-        Socket: usize,
-
-        pub fn getValue(self: @This()) usize {
-            return switch (self) {
-                .Socket => |value| value,
-            };
-        }
-    };
-
-    inner: Inner,
-    const Inner = union(enum) {
-        Default: DefaultPoller,
-        Uring: if (builtin.os == .linux) UringPoller else void,
-    };
-
-    pub const Error = zio.Event.Poller.Error;
-
-    pub fn init(self: *@This(), allocator: *std.mem.Allocator) Error!void {
-        // TODO: Uring implementation
-        if (false and builtin.os == .linux and UringPoller.isSupported()) {
-            self.inner = Inner{ .Uring = undefined };
-            return self.inner.Uring.init(allocator);
-        } else {
-            self.inner = Inner{ .Default = undefined };
-            return self.inner.Default.init(allocator);
-        }
-    }
-
-    pub fn deinit(self: *@This()) void {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.deinit(),
-            .Default => |*default| default.deinit(),
-        };
-    }
-
-    pub const SocketError = zio.Socket.Error || zio.Event.Poller.RegisterError;
-
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) SocketError!Handle {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.socket(flags),
-            .Default => |*default| default.socket(flags),
-        };
-    }
-
-    pub fn close(self: *@This(), handle: Handle) void {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.close(typed_handle),
-            .Default => |*default| default.close(typed_handle),
-        };
-    }
-
-    pub const AcceptError = zio.Socket.RawAcceptError || error{Closed} || zio.Event.Poller.RegisterError;
-
-    pub fn accept(self: *@This(), handle: Handle, address: *zio.Address) AcceptError!Handle {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.accept(handle, address),
-            .Default => |*default| default.accept(handle, address),
-        };
-    }
-
-    pub const ConnectError = zio.Socket.RawConnectError || error{Closed};
-
-    pub fn connect(self: *@This(), handle: Handle, address: *const zio.Address) ConnectError!void {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.connect(handle, address),
-            .Default => |*default| default.connect(handle, address),
-        };
-    }
-
-    pub const ReadError = zio.Socket.RawDataError || error{Closed};
-
-    pub fn read(self: *@This(), handle: Handle, address: ?*zio.Address, buffer: []const []u8, offset: ?u64) ReadError!usize {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.read(handle, address, buffer, offset),
-            .Default => |*default| default.read(handle, address, buffer, offset),
-        };
-    }
-
-    pub const WriteError = zio.Socket.RawDataError || error{Closed};
-
-    pub fn write(self: *@This(), handle: Handle, address: ?*const zio.Address, buffer: []const []const u8, offset: ?u64) WriteError!usize {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.write(handle, address, buffer, offset),
-            .Default => |*default| default.write(handle, address, buffer, offset),
-        };
-    }
-
-    pub const NotifyError = zio.Event.Poller.NotifyError;
-
-    pub fn notify(self: *@This()) NotifyError!void {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.notify(),
-            .Default => |*default| default.notify(),
-        };
-    }
-
-    pub const PollError = zio.Event.Poller.PollError;
-
-    pub fn poll(self: *@This(), timeout_ms: ?u32) PollError!Task.List {
-        return switch (self.inner) {
-            .Uring => |*uring| uring.poll(timeout_ms),
-            .Default => |*default| default.poll(timeout_ms),
-        };
-    }
-};
-
-const DefaultPoller = struct {
+pub const DefaultReactor = struct {
     inner: zio.Event.Poller,
     cache: Descriptor.Cache,
 
-    pub fn init(self: *@This(), allocator: *std.mem.Allocator) Poller.Error!void {
+    pub fn init(self: *@This(), allocator: *std.mem.Allocator) Reactor.Error!void {
         try self.inner.init();
         self.cache.init(allocator);
     }
@@ -127,13 +20,13 @@ const DefaultPoller = struct {
         self.inner.close();
     }
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Poller.SocketError!Poller.Handle {
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.Handle {
         const sock = try zio.Socket.new(flags | zio.Socket.Nonblock);
         const handle = try self.register(sock.getHandle());
-        return Poller.Handle{ .Socket = handle };
+        return Reactor.Handle{ .Socket = handle };
     }
 
-    pub fn close(self: *@This(), handle: Poller.Handle) void {
+    pub fn close(self: *@This(), handle: Reactor.Handle) void {
         const descriptor = @intToPtr(*Descriptor, handle.getValue());
         switch (handle) {
             .Socket => zio.Socket.fromHandle(descriptor.handle, zio.Socket.Nonblock).close(),
@@ -141,20 +34,20 @@ const DefaultPoller = struct {
         self.cache.free(descriptor);
     }
 
-    pub fn accept(self: *@This(), handle: Poller.Handle, address: *zio.Address) Poller.AcceptError!Poller.Handle {
+    pub fn accept(self: *@This(), handle: Reactor.Handle, address: *zio.Address) Reactor.AcceptError!Reactor.Handle {
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Poller.Handle {
+            fn run(this: var, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.Handle {
                 _ = sock.accept(flags, &incoming, token) catch |err| return err;
                 address.* = incoming.address;
                 const sock = incoming.getSocket(zio.Socket.Nonblock);
                 const handle = try this.register(sock.getHandle());
-                return Poller.Handle{ .Socket = handle };
+                return Reactor.Handle{ .Socket = handle };
             }
         }, false, handle, address, &incoming_client);
     }
 
-    pub fn connect(self: *@This(), handle: Poller.Handle, address: *const zio.Address) Poller.ConnectError!void {
+    pub fn connect(self: *@This(), handle: Reactor.Handle, address: *const zio.Address) Reactor.ConnectError!void {
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: *const zio.Address) !void {
                 return sock.connect(address, token);
@@ -162,7 +55,7 @@ const DefaultPoller = struct {
         }, true, handle, address);
     }
 
-    pub fn read(self: *@This(), handle: Poller.Handle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Poller.ReadError!usize {
+    pub fn read(self: *@This(), handle: Reactor.Handle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {
         // TODO: add file support using `offset`
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: ?*zio.Address, buffers: []const []u8) !void {
@@ -171,7 +64,7 @@ const DefaultPoller = struct {
         }, true, handle, address);
     }
 
-    pub fn write(self: *@This(), handle: Poller.Handle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Poller.WriteError!usize {
+    pub fn write(self: *@This(), handle: Reactor.Handle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
         // TODO: add file support using `offset`
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: ?*const zio.Address, buffers: []const []const u8) !void {
@@ -180,11 +73,11 @@ const DefaultPoller = struct {
         }, true, handle, address);
     }
 
-    pub fn notify(self: *@This()) Poller.NotifyError!void {
+    pub fn notify(self: *@This()) Reactor.NotifyError!void {
         return self.inner.notify(0);
     }
 
-    pub fn poll(self: *@This(), timeout_ms: ?u32) Poller.PollError!Task.List {
+    pub fn poll(self: *@This(), timeout_ms: ?u32) Reactor.PollError!Task.List {
         // Iterate ready'd descriptors and create a list of task represents those which should be executed.
         var task_list = Task.List{};
         var events: [64]zio.Event = undefined;
@@ -219,7 +112,7 @@ const DefaultPoller = struct {
     }
 
     /// Execute an IO operation, automatically suspending and resuming as needed.
-    fn performAsync(self: *@This(), comptime is_writer: bool, comptime IO: type, handle: Poller.Handle, args: ...) @typeOf(IO.run).ReturnType {
+    fn performAsync(self: *@This(), comptime is_writer: bool, comptime IO: type, handle: Reactor.Handle, args: ...) @typeOf(IO.run).ReturnType {
         const HandleType = @typeInfo(@typeInfo(IO.run).Fn.args[1].arg_type.?).Pointer.child;
         const descriptor = @intToPtr(*Descriptor, handle.getValue());
         var instance = HandleType.fromHandle(descriptor.handle, zio.Nonblock);
@@ -346,106 +239,5 @@ const DefaultPoller = struct {
                 }
             };
         };
-    };
-};
-
-const UringPoller = struct {
-    const linux = std.os.linux;
-
-    pub fn init(self: *@This(), allocator: *std.mem.Allocator) Poller.Error!void {}
-
-    pub fn deinit(self: *@This()) void {}
-
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Poller.SocketError!Poller.Handle {}
-
-    pub fn close(self: *@This(), typed_handle: TypedHandle) void {}
-
-    pub fn accept(self: *@This(), handle: Poller.Handle, address: *zio.Address) Poller.AcceptError!Poller.Handle {}
-
-    pub fn connect(self: *@This(), handle: Poller.Handle, address: *const zio.Address) Poller.ConnectError!void {}
-
-    pub fn read(self: *@This(), handle: Poller.Handle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Poller.ReadError!usize {}
-
-    pub fn write(self: *@This(), handle: Poller.Handle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Poller.WriteError!usize {}
-
-    pub fn notify(self: *@This()) Poller.NotifyError!void {}
-
-    pub fn poll(self: *@This(), timeout_ms: ?u32) Poller.PollError!Task.List {}
-
-    const IORING_SETUP_IOPOLL = 1 << 0;
-    const IORING_SETUP_SQPOLL = 1 << 1;
-    const IORING_FEAT_SINGLE_MMAP = 1 << 0;
-
-    const IORING_ENTER_GETEVENTS = 1 << 0;
-    const IORING_ENTER_SQ_WAKEUP = 1 << 1;
-    const IORING_SQ_NEED_WAKEUP = 1 << 0;
-
-    const IORING_OFF_SQ_RING = 0;
-    const IORING_OFF_CQ_RING = 0x8000000;
-    const IORING_OFF_SQES = 0x10000000;
-
-    const IORING_OP_NOP = 0;
-    const IORING_OP_READV = 1;
-    const IORING_OP_WRITEV = 2;
-    const IORING_OP_FSYNC = 3;
-    const IORING_OP_READ_FIXED = 4;
-    const IORING_OP_WRITE_FIXED = 5;
-    const IORING_OP_POLL_ADD = 6;
-    const IORING_OP_POLL_REMOVE = 7;
-    const IORING_OP_SENDMSG = 9;
-    const IORING_OP_RECVMSG = 10;
-    const IORING_OP_ACCEPT = 13;
-
-    const io_uring_cqe = extern struct {
-        user_data: u64,
-        res: i32,
-        flags: u32,
-    };
-
-    const io_uring_sqe = extern struct {
-        opcode: u8,
-        flags: u8,
-        ioprio: u16,
-        fd: i32,
-        off_addr: u64,
-        addr: u64,
-        len: u32,
-        op_flags: u32,
-        user_data: u64,
-        padding: [3]u64,
-    };
-
-    const io_uring_params = extern struct {
-        sq_entries: u32,
-        cq_entries: u32,
-        flags: u32,
-        sq_thread_cpu: u32,
-        sq_thread_idle: u32,
-        features: u32,
-        resv: [4]u32,
-        sq_off: io_sqring_offsets,
-        cq_off: io_cqring_offsets,
-    };
-
-    const io_cqring_offsets = extern struct {
-        head: u32,
-        tail: u32,
-        ring_mask: u32,
-        ring_entries: u32,
-        overflow: u32,
-        cqes: u32,
-        resv: [2]u64,
-    };
-
-    const io_sqring_offsets = extern struct {
-        head: u32,
-        tail: u32,
-        ring_mask: u32,
-        ring_entries: u32,
-        flags: u32,
-        dropped: u32,
-        array: u32,
-        resv1: u32,
-        resv2: u64,
     };
 };

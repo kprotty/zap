@@ -42,5 +42,5 @@ pub const zio = struct {
 
 pub const zell = struct {
     pub const runtime = @import("zell/src/runtime.zig");
-    pub usingnamespace @import("zell/src/poller.zig");
+    pub usingnamespace @import("zell/src/reactor.zig");
 };

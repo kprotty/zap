@@ -18,7 +18,9 @@ pub const UringReactor = struct {
 
     pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.TypedHandle {}
 
-    pub fn close(self: *@This(), typed_handle: TypedHandle) void {}
+    pub fn close(self: *@This(), typed_handle: Reactor.TypedHandle) void {}
+
+    pub fn getHandle(self: *@This(), typed_handle: Reactor.TypedHandle) zio.Handle {}
 
     pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {}
 

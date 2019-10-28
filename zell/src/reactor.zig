@@ -7,7 +7,11 @@ pub const Reactor = struct {
     usingnamespace @import("./reactor/default.zig");
     usingnamespace @import("./reactor/uring.zig");
 
-    pub const TypedTypedHandle = union(enum) {
+    pub const HandleType = enum {
+        Socket,
+    };
+
+    pub const TypedHandle = union(HandleType) {
         Socket: usize,
 
         pub fn getValue(self: @This()) usize {
@@ -56,6 +60,41 @@ pub const Reactor = struct {
             .Uring => |*uring| uring.close(typed_handle),
             .Default => |*default| default.close(typed_handle),
         };
+    }
+
+    pub fn getHandle(self: *@This(), typed_handle: TypedHandle) zio.Handle {
+        return switch (self.inner) {
+            .Uring => |*uring| uring.getHandle(typed_handle),
+            .Default => |*default| default.getHandle(typed_handle),
+        };
+    }
+
+    pub fn setsockopt(self: *@This(), typed_handle: TypedHandle, option: zio.Socket.Option) zio.Socket.OptionError!void {
+        if (HandleType(typed_handle) != .Socket)
+            return zio.Socket.OptionError.InvalidHandle;
+        var sock = zio.Socket.fromHandle(self.getHandle(typed_handle), zio.Socket.Nonblock);
+        return sock.setOption(option);
+    }
+
+    pub fn getsockopt(self: *@This(), typed_handle: TypedHandle, option: *zio.Socket.Option) zio.Socket.OptionError!void {
+        if (HandleType(typed_handle) != .Socket)
+            return zio.Socket.OptionError.InvalidHandle;
+        var sock = zio.Socket.fromHandle(self.getHandle(typed_handle), zio.Socket.Nonblock);
+        return sock.getOption(option);
+    }
+
+    pub fn bind(self: *@This(), typed_handle: TypedHandle, address: *const zio.Address) zio.Socket.BindError!void {
+        if (HandleType(typed_handle) != .Socket)
+            return zio.Socket.OptionError.InvalidHandle;
+        var sock = zio.Socket.fromHandle(self.getHandle(typed_handle), zio.Socket.Nonblock);
+        return sock.bind(address);
+    }
+
+    pub fn listen(self: *@This(), typed_handle: TypedHandle, backlog: c_uint) zio.Socket.ListenError!void {
+        if (HandleType(typed_handle) != .Socket)
+            return zio.Socket.OptionError.InvalidHandle;
+        var sock = zio.Socket.fromHandle(self.getHandle(typed_handle), zio.Socket.Nonblock);
+        return sock.listen(address);
     }
 
     pub const AcceptError = zio.Socket.RawAcceptError || error{Closed} || zio.Event.Poller.RegisterError;

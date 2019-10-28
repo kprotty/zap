@@ -34,6 +34,11 @@ pub const DefaultReactor = struct {
         self.cache.free(descriptor);
     }
 
+    pub fn getHandle(self: *@This(), typed_handle: Reactor.TypedHandle) zio.Handle {
+        const descriptor = @intToPtr(*Descriptor, typed_handle.getValue());
+        return descriptor.handle;
+    }
+
     pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {

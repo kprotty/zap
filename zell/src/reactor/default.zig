@@ -89,8 +89,11 @@ pub const DefaultReactor = struct {
             // If the old request token is 1, then the request is suspended and its task should be resumed.
             if (@intToPtr(?*Descriptor, event.readData(&self.inner))) |descriptor| {
                 const token = event.getToken();
-                inline for ([_]?*Descriptor.Request{ descriptor.writer, descriptor.reader }) |request_ref| {
-                    const request = request_ref orelse continue;
+                inline for ([_]*zync.Atomic(?*Descriptor.Request){
+                    &descriptor.writer,
+                    &descriptor.reader,
+                }) |request_ref| {
+                    const request = request_ref.load(.Relaxed) orelse continue;
                     if (token & request.token_mask != request.token_mask)
                         continue;
                     if (request.token.swap(token, .Acquire) == 1)
@@ -123,8 +126,8 @@ pub const DefaultReactor = struct {
         };
 
         const request_ptr = if (is_writer) &descriptor.writer else &descriptor.reader;
-        request_ptr.* = &request;
-        defer request_ptr.* = null;
+        request_ptr.store(&request, .Release);
+        defer request_ptr.store(null, .Relaxed);
 
         return IO.run(self, &instance, 0, args) catch |err| switch (err) {
             zio.Error.Closed => return error.Closed,
@@ -148,8 +151,8 @@ pub const DefaultReactor = struct {
 
     const Descriptor = struct {
         reserved: usize,
-        writer: ?*Request,
-        reader: ?*Request,
+        writer: zync.Atomic(?*Request),
+        reader: zync.Atomic(?*Request),
         handle: zio.Handle align(@alignOf(usize)),
 
         pub fn next(self: *const @This()) *?*@This() {

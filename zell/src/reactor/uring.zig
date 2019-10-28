@@ -7,6 +7,11 @@ const Reactor = @import("../reactor.zig").Reactor;
 pub const UringReactor = struct {
     const linux = std.os.linux;
 
+    pub fn isSupported() bool {
+        // TODO: Check kernel for 5.1 >=
+        return false;
+    }
+
     pub fn init(self: *@This(), allocator: *std.mem.Allocator) Reactor.Error!void {}
 
     pub fn deinit(self: *@This()) void {}

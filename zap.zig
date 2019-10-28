@@ -5,6 +5,7 @@ test "zap" {
     _ = zync;
     _ = zuma;
     _ = zio;
+    _ = zell;
 }
 
 pub const zync = struct {

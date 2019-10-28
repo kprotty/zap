@@ -20,7 +20,7 @@ pub const Reactor = struct {
     inner: Inner,
     const Inner = union(enum) {
         Default: DefaultReactor,
-        Uring: if (builtin.os == .linux) UringReactor else void,
+        Uring: if (builtin.os == .linux) UringReactor else DefaultReactor,
     };
 
     pub const Error = zio.Event.Poller.Error;
@@ -112,3 +112,9 @@ pub const Reactor = struct {
         };
     }
 };
+
+test "Reactor" {
+    var reactor: Reactor = undefined;
+    try reactor.init(std.debug.global_allocator);
+    defer reactor.deinit();
+}

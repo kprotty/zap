@@ -11,7 +11,7 @@ pub const DefaultReactor = struct {
     cache: Descriptor.Cache,
 
     pub fn init(self: *@This(), allocator: *std.mem.Allocator) Reactor.Error!void {
-        try self.inner.init();
+        self.inner = try zio.Event.Poller.new();
         self.cache.init(allocator);
     }
 

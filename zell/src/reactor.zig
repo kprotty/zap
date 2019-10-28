@@ -4,6 +4,8 @@ const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
 const Task = @import("../runtime.zig").Task;
 
+const expect = std.testing.expect;
+
 pub const Reactor = struct {
     usingnamespace @import("./reactor/default.zig");
     usingnamespace @import("./reactor/uring.zig");
@@ -95,7 +97,7 @@ pub const Reactor = struct {
         if (HandleType(typed_handle) != .Socket)
             return zio.Socket.OptionError.InvalidHandle;
         var sock = zio.Socket.fromHandle(self.getHandle(typed_handle), zio.Socket.Nonblock);
-        return sock.listen(address);
+        return sock.listen(backlog);
     }
 
     pub const AcceptError = zio.Socket.RawAcceptError || error{Closed} || zio.Event.Poller.RegisterError;
@@ -158,7 +160,16 @@ test "Reactor - Socket" {
     try reactor.init(std.debug.global_allocator);
     defer reactor.deinit();
 
-    const port = zuma.Thread.getRandom().intRangeLessThanBiased(u16, 1024, 65535);
     const server_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
     defer reactor.close(server_handle);
+
+    try reactor.setsockopt(server_handle, zio.Socket.Option{ .Reuseaddr = true });
+    var option = zio.Socket.Option{ .Reuseaddr = false };
+    try reactor.getsockopt(server_handle, &option);
+    expect(option.Reuseaddr == true);
+
+    const port = zuma.Thread.getRandom().intRangeLessThanBiased(u16, 1024, 65535);
+    var address = zio.Address.fromIpv4(try zio.Address.parseIpv4("localhost"), port);
+    try reactor.bind(server_handle, &address);
+    try reactor.listen(server_handle, 1);
 }

@@ -230,7 +230,7 @@ pub const DefaultReactor = struct {
                 for (chunk.descriptors[1..]) |*descriptor, index| {
                     descriptor.next().* = null;
                     if (index != size - 2)
-                        descriptor.next().* = @ptrCast(*Descriptor, &chunk.descriptors[index + 2 ..]);
+                        descriptor.next().* = @ptrCast(*Descriptor, &chunk.descriptors[index + 2]);
                 }
                 self.free_list = &chunk.descriptors[2];
                 return &chunk.descriptors[1];

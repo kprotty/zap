@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("../../zap.zig").zio;
+const zuma = @import("../../zap.zig").zuma;
 const Task = @import("../runtime.zig").Task;
 
 pub const Reactor = struct {
@@ -156,4 +157,8 @@ test "Reactor - Socket" {
     var reactor: Reactor = undefined;
     try reactor.init(std.debug.global_allocator);
     defer reactor.deinit();
+
+    const port = zuma.Thread.getRandom().intRangeLessThanBiased(u16, 1024, 65535);
+    const server_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
+    defer reactor.close(server_handle);
 }

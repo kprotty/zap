@@ -155,12 +155,11 @@ pub const DefaultReactor = struct {
     }
 
     const Descriptor = struct {
-        reserved: usize,
         writer: zync.Atomic(?*Request),
         reader: zync.Atomic(?*Request),
         handle: zio.Handle align(@alignOf(usize)),
 
-        pub fn next(self: *const @This()) *?*@This() {
+        pub fn next(self: *@This()) *?*@This() {
             return @ptrCast(*?*@This(), &self.reader);
         }
 
@@ -196,16 +195,17 @@ pub const DefaultReactor = struct {
                 defer self.mutex.deinit();
 
                 while (self.top_chunk) |chunk| {
-                    self.top_chunk = chunk.prev().*;
+                    const prev_chunk = chunk.prev().*;
                     self.allocator.destroy(chunk);
+                    self.top_chunk = prev_chunk;
                 }
             }
 
             pub fn alloc(self: *@This(), handle: zio.Handle) ?*Descriptor {
                 const descriptor = self.allocDescriptor() orelse return null;
+                descriptor.reader.set(null);
+                descriptor.writer.set(null);
                 descriptor.handle = handle;
-                descriptor.reader = null;
-                descriptor.writer = null;
                 return descriptor;
             }
 
@@ -224,7 +224,8 @@ pub const DefaultReactor = struct {
 
                 const size = chunk.descriptors.len;
                 for (chunk.descriptors[1..]) |*descriptor, index|
-                    descriptor.next().* = if (index == size - 1) null else &chunk.descriptors[index + 2 ..];
+                    descriptor.next().* =
+                        if (index == size - 1) null else @ptrCast(*Descriptor, &chunk.descriptors[index + 2 ..]);
                 self.free_list = &chunk.descriptors[2];
                 return &chunk.descriptors[1];
             }

@@ -117,21 +117,14 @@ pub const DefaultReactor = struct {
     /// Use zio.Event.EdgeTrigger to save on calling `.reregister()`
     /// and to support wait-free based notification as seen in in `poll`.
     fn register(self: *@This(), handle: zio.Handle) !*Descriptor {
-        const descriptor = self.cache.alloc(handle) orelse return error.OutOfResources;
+        const descriptor = try self.cache.alloc(handle);
         const event_flags = zio.Event.Readable | zio.Event.Writeable | zio.Event.EdgeTrigger;
         try self.inner.register(descriptor.handle, event_flags, @ptrToInt(descriptor));
         return descriptor;
     }
 
     /// Execute an IO operation, automatically suspending and resuming as needed.
-    fn performAsync(
-        self: *@This(),
-        comptime IO: type,
-        comptime is_writer: bool,
-        typed_handle: Reactor.TypedHandle,
-        comptime func_context: var,
-        args: ...
-    ) @typeOf(func_context).ReturnType {
+    fn performAsync(self: *@This(), comptime IO: type, comptime is_writer: bool, typed_handle: Reactor.TypedHandle, comptime func_context: var, args: ...) @typeOf(func_context).ReturnType {
         const HandleType = @typeInfo(@typeInfo(@typeOf(IO.run)).Fn.args[1].arg_type.?).Pointer.child;
         const descriptor = @intToPtr(*Descriptor, typed_handle.getValue());
         var instance = HandleType.fromHandle(descriptor.handle, zio.Nonblock);
@@ -212,15 +205,15 @@ pub const DefaultReactor = struct {
                 }
             }
 
-            pub fn alloc(self: *@This(), handle: zio.Handle) ?*Descriptor {
-                const descriptor = self.allocDescriptor() orelse return null;
+            pub fn alloc(self: *@This(), handle: zio.Handle) !*Descriptor {
+                const descriptor = try self.allocDescriptor();
                 descriptor.reader.set(null);
                 descriptor.writer.set(null);
                 descriptor.handle = handle;
                 return descriptor;
             }
 
-            fn allocDescriptor(self: *@This()) ?*Descriptor {
+            fn allocDescriptor(self: *@This()) !*Descriptor {
                 self.mutex.acquire();
                 defer self.mutex.release();
 
@@ -229,14 +222,16 @@ pub const DefaultReactor = struct {
                     return descriptor;
                 }
 
-                const chunk = self.allocator.create(Chunk) catch return null;
+                const chunk = self.allocator.create(Chunk) catch |_| return error.OutOfResources;
                 chunk.prev().* = self.top_chunk;
                 self.top_chunk = chunk;
 
                 const size = chunk.descriptors.len;
-                for (chunk.descriptors[1..]) |*descriptor, index|
-                    descriptor.next().* =
-                        if (index == size - 1) null else @ptrCast(*Descriptor, &chunk.descriptors[index + 2 ..]);
+                for (chunk.descriptors[1..]) |*descriptor, index| {
+                    descriptor.next().* = null;
+                    if (index != size - 2)
+                        descriptor.next().* = @ptrCast(*Descriptor, &chunk.descriptors[index + 2 ..]);
+                }
                 self.free_list = &chunk.descriptors[2];
                 return &chunk.descriptors[1];
             }

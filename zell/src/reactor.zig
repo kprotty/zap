@@ -157,41 +157,48 @@ pub const Reactor = struct {
 
 test "Reactor - Socket" {
     var reactor: Reactor = undefined;
-    try reactor.init(std.debug.global_allocator);
+    try reactor.init(std.heap.direct_allocator);
     defer reactor.deinit();
 
+    // create the server socket
     const server_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
     defer reactor.close(server_handle);
 
+    // set ReuseAddr on the server socket
     try reactor.setsockopt(server_handle, zio.Socket.Option{ .Reuseaddr = true });
     var option = zio.Socket.Option{ .Reuseaddr = false };
     try reactor.getsockopt(server_handle, &option);
     expect(option.Reuseaddr == true);
 
+    // Bind the server to a local port
     const port = zuma.Thread.getRandom().intRangeLessThanBiased(u16, 1024, 65535);
     var address = zio.Address.fromIpv4(try zio.Address.parseIpv4("localhost"), port);
     try reactor.bind(server_handle, &address);
     try reactor.listen(server_handle, 1);
 
+    // Create a client and try to connect to the server
     const client_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
     defer reactor.close(client_handle);
-    _ = try (try resolveAsync(&reactor, Reactor.connect, &reactor, client_handle, &address));
+    _ = try resolveAsync(&reactor, Reactor.connect, &reactor, client_handle, &address);
 }
 
-fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeOf(func).ReturnType {
+fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {
     const Resolver = struct {
         fn resolve(comptime func2: var, output: *?@typeOf(func2).ReturnType, args2: ...) void {
-            output.* = func2(args2);
+            var frame = async func2(args2);
+            output.* = await frame;
         }
     };
 
     // perform the async function, poll for tasks, and receive its continuation frame
     var result: ?@typeOf(func).ReturnType = null;
     var frame = async Resolver.resolve(func, &result, args);
+    if (result != null) // exit early if immediately completed
+        return try result.?;
     const tasks = try reactor.poll(500);
     expect(tasks.size == 1);
     const frame_ref = tasks.head.?.frame;
-    
+
     // make sure its the actual frame that was received
     const frame_ptr = @ptrToInt(frame_ref);
     const frame_begin = @ptrToInt(&frame);
@@ -201,5 +208,5 @@ fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeOf(func)
     // resume the frame and return the result
     resume frame_ref;
     expect(result != null);
-    return result.?;
+    return try result.?;
 }

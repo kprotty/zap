@@ -16,23 +16,39 @@ pub const UringReactor = struct {
 
     pub fn deinit(self: *@This()) void {}
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.TypedHandle {}
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.TypedHandle {
+        return Reactor.SocketError.OutOfResources;
+    }
 
     pub fn close(self: *@This(), typed_handle: Reactor.TypedHandle) void {}
 
-    pub fn getHandle(self: *@This(), typed_handle: Reactor.TypedHandle) zio.Handle {}
+    pub fn getHandle(self: *@This(), typed_handle: Reactor.TypedHandle) zio.Handle {
+        return zio.Handle(undefined);
+    }
 
-    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {}
+    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
+        return Reactor.AcceptError.InvalidHandle;
+    }
 
-    pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {}
+    pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {
+        return Reactor.ConnectError.InvalidHandle;
+    }
 
-    pub fn read(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {}
+    pub fn read(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {
+        return Reactor.ReadError.InvalidHandle;
+    }
 
-    pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {}
+    pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
+        return Reactor.WriteError.InvalidHandle;
+    }
 
-    pub fn notify(self: *@This()) Reactor.NotifyError!void {}
+    pub fn notify(self: *@This()) Reactor.NotifyError!void {
+        return Reactor.NotifyError.InvalidHandle;
+    }
 
-    pub fn poll(self: *@This(), timeout_ms: ?u32) Reactor.PollError!Task.List {}
+    pub fn poll(self: *@This(), timeout_ms: ?u32) Reactor.PollError!Task.List {
+        return Reactor.PollError.InvalidHandle;
+    }
 
     const IORING_SETUP_IOPOLL = 1 << 0;
     const IORING_SETUP_SQPOLL = 1 << 1;

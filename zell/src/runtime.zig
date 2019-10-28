@@ -201,7 +201,7 @@ pub const Task = struct {
                 self.head = task;
             if (self.tail) |tail|
                 tail.next = task;
-            tail = task;
+            self.tail = task;
             self.size += 1;
         }
     };

@@ -33,7 +33,7 @@ pub const Reactor = struct {
     pub const Error = zio.Event.Poller.Error;
 
     pub fn init(self: *@This(), allocator: *std.mem.Allocator) Error!void {
-        if (builtin.os == .linux and UringPoller.isSupported()) {
+        if (builtin.os == .linux and UringReactor.isSupported()) {
             self.inner = Inner{ .Uring = undefined };
             return self.inner.Uring.init(allocator);
         } else {

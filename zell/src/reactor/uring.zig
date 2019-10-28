@@ -16,17 +16,17 @@ pub const UringReactor = struct {
 
     pub fn deinit(self: *@This()) void {}
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.Handle {}
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.TypedHandle {}
 
     pub fn close(self: *@This(), typed_handle: TypedHandle) void {}
 
-    pub fn accept(self: *@This(), handle: Reactor.Handle, address: *zio.Address) Reactor.AcceptError!Reactor.Handle {}
+    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {}
 
-    pub fn connect(self: *@This(), handle: Reactor.Handle, address: *const zio.Address) Reactor.ConnectError!void {}
+    pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {}
 
-    pub fn read(self: *@This(), handle: Reactor.Handle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {}
+    pub fn read(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {}
 
-    pub fn write(self: *@This(), handle: Reactor.Handle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {}
+    pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {}
 
     pub fn notify(self: *@This()) Reactor.NotifyError!void {}
 

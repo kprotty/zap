@@ -7,7 +7,7 @@ pub const Reactor = struct {
     usingnamespace @import("./reactor/default.zig");
     usingnamespace @import("./reactor/uring.zig");
 
-    pub const Handle = union(enum) {
+    pub const TypedTypedHandle = union(enum) {
         Socket: usize,
 
         pub fn getValue(self: @This()) usize {
@@ -44,14 +44,14 @@ pub const Reactor = struct {
 
     pub const SocketError = zio.Socket.Error || zio.Event.Poller.RegisterError;
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) SocketError!Handle {
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) SocketError!TypedHandle {
         return switch (self.inner) {
             .Uring => |*uring| uring.socket(flags),
             .Default => |*default| default.socket(flags),
         };
     }
 
-    pub fn close(self: *@This(), handle: Handle) void {
+    pub fn close(self: *@This(), typed_handle: TypedHandle) void {
         return switch (self.inner) {
             .Uring => |*uring| uring.close(typed_handle),
             .Default => |*default| default.close(typed_handle),
@@ -60,37 +60,37 @@ pub const Reactor = struct {
 
     pub const AcceptError = zio.Socket.RawAcceptError || error{Closed} || zio.Event.Poller.RegisterError;
 
-    pub fn accept(self: *@This(), handle: Handle, address: *zio.Address) AcceptError!Handle {
+    pub fn accept(self: *@This(), typed_handle: TypedHandle, address: *zio.Address) AcceptError!TypedHandle {
         return switch (self.inner) {
-            .Uring => |*uring| uring.accept(handle, address),
-            .Default => |*default| default.accept(handle, address),
+            .Uring => |*uring| uring.accept(typed_handle, address),
+            .Default => |*default| default.accept(typed_handle, address),
         };
     }
 
     pub const ConnectError = zio.Socket.RawConnectError || error{Closed};
 
-    pub fn connect(self: *@This(), handle: Handle, address: *const zio.Address) ConnectError!void {
+    pub fn connect(self: *@This(), typed_handle: TypedHandle, address: *const zio.Address) ConnectError!void {
         return switch (self.inner) {
-            .Uring => |*uring| uring.connect(handle, address),
-            .Default => |*default| default.connect(handle, address),
+            .Uring => |*uring| uring.connect(typed_handle, address),
+            .Default => |*default| default.connect(typed_handle, address),
         };
     }
 
     pub const ReadError = zio.Socket.RawDataError || error{Closed};
 
-    pub fn read(self: *@This(), handle: Handle, address: ?*zio.Address, buffer: []const []u8, offset: ?u64) ReadError!usize {
+    pub fn read(self: *@This(), typed_handle: TypedHandle, address: ?*zio.Address, buffer: []const []u8, offset: ?u64) ReadError!usize {
         return switch (self.inner) {
-            .Uring => |*uring| uring.read(handle, address, buffer, offset),
-            .Default => |*default| default.read(handle, address, buffer, offset),
+            .Uring => |*uring| uring.read(typed_handle, address, buffer, offset),
+            .Default => |*default| default.read(typed_handle, address, buffer, offset),
         };
     }
 
     pub const WriteError = zio.Socket.RawDataError || error{Closed};
 
-    pub fn write(self: *@This(), handle: Handle, address: ?*const zio.Address, buffer: []const []const u8, offset: ?u64) WriteError!usize {
+    pub fn write(self: *@This(), typed_handle: TypedHandle, address: ?*const zio.Address, buffer: []const []const u8, offset: ?u64) WriteError!usize {
         return switch (self.inner) {
-            .Uring => |*uring| uring.write(handle, address, buffer, offset),
-            .Default => |*default| default.write(handle, address, buffer, offset),
+            .Uring => |*uring| uring.write(typed_handle, address, buffer, offset),
+            .Default => |*default| default.write(typed_handle, address, buffer, offset),
         };
     }
 
@@ -113,7 +113,7 @@ pub const Reactor = struct {
     }
 };
 
-test "Reactor" {
+test "Reactor - Socket" {
     var reactor: Reactor = undefined;
     try reactor.init(std.debug.global_allocator);
     defer reactor.deinit();

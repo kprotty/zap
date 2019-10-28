@@ -20,57 +20,57 @@ pub const DefaultReactor = struct {
         self.inner.close();
     }
 
-    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.Handle {
+    pub fn socket(self: *@This(), flags: zio.Socket.Flags) Reactor.SocketError!Reactor.TypedHandle {
         const sock = try zio.Socket.new(flags | zio.Socket.Nonblock);
-        const handle = try self.register(sock.getHandle());
-        return Reactor.Handle{ .Socket = handle };
+        const descriptor = try self.register(sock.getHandle());
+        return Reactor.TypedHandle{ .Socket = @ptrToInt(descriptor) };
     }
 
-    pub fn close(self: *@This(), handle: Reactor.Handle) void {
-        const descriptor = @intToPtr(*Descriptor, handle.getValue());
-        switch (handle) {
+    pub fn close(self: *@This(), typed_handle: Reactor.TypedHandle) void {
+        const descriptor = @intToPtr(*Descriptor, typed_handle.getValue());
+        switch (typed_handle) {
             .Socket => zio.Socket.fromHandle(descriptor.handle, zio.Socket.Nonblock).close(),
         }
         self.cache.free(descriptor);
     }
 
-    pub fn accept(self: *@This(), handle: Reactor.Handle, address: *zio.Address) Reactor.AcceptError!Reactor.Handle {
+    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {
-            fn run(this: var, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.Handle {
+            fn run(this: var, sock: *zio.Socket, token: usize, address: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
                 _ = sock.accept(flags, &incoming, token) catch |err| return err;
                 address.* = incoming.address;
-                const sock = incoming.getSocket(zio.Socket.Nonblock);
-                const handle = try this.register(sock.getHandle());
-                return Reactor.Handle{ .Socket = handle };
+                const client_sock = incoming.getSocket(zio.Socket.Nonblock);
+                const descriptor = try this.register(client_sock.getHandle());
+                return Reactor.TypedHandle{ .Socket = @ptrToInt(descriptor) };
             }
-        }, false, handle, address, &incoming_client);
+        }, false, typed_handle, address, &incoming_client);
     }
 
-    pub fn connect(self: *@This(), handle: Reactor.Handle, address: *const zio.Address) Reactor.ConnectError!void {
+    pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: *const zio.Address) !void {
                 return sock.connect(address, token);
             }
-        }, true, handle, address);
+        }, true, typed_handle, address);
     }
 
-    pub fn read(self: *@This(), handle: Reactor.Handle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {
+    pub fn read(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*zio.Address, buffers: []const []u8, offset: ?u64) Reactor.ReadError!usize {
         // TODO: add file support using `offset`
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: ?*zio.Address, buffers: []const []u8) !void {
                 return sock.recvmsg(address, buffers, token);
             }
-        }, true, handle, address);
+        }, false, typed_handle, address);
     }
 
-    pub fn write(self: *@This(), handle: Reactor.Handle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
+    pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
         // TODO: add file support using `offset`
         return self.performAsync(struct {
             fn run(this: var, sock: *zio.Socket, token: usize, address: ?*const zio.Address, buffers: []const []const u8) !void {
                 return sock.sendmsg(address, buffers, token);
             }
-        }, true, handle, address);
+        }, true, typed_handle, address);
     }
 
     pub fn notify(self: *@This()) Reactor.NotifyError!void {
@@ -104,17 +104,17 @@ pub const DefaultReactor = struct {
     /// Allocate a Descriptor struct for a handle.
     /// Use zio.Event.EdgeTrigger to save on calling `.reregister()`
     /// and to support wait-free based notification as seen in in `poll`.
-    fn register(self: *@This(), handle: zio.Handle) !usize {
+    fn register(self: *@This(), handle: zio.Handle) !*Descriptor {
         const descriptor = self.cache.alloc(handle) orelse return error.OutOfResources;
         const event_flags = zio.Event.Readable | zio.Event.Writeable | zio.Event.EdgeTrigger;
         try self.inner.register(descriptor.handle, event_flags, @ptrToInt(descriptor));
-        return @ptrToInt(descriptor);
+        return descriptor;
     }
 
     /// Execute an IO operation, automatically suspending and resuming as needed.
-    fn performAsync(self: *@This(), comptime is_writer: bool, comptime IO: type, handle: Reactor.Handle, args: ...) @typeOf(IO.run).ReturnType {
+    fn performAsync(self: *@This(), comptime is_writer: bool, comptime IO: type, typed_handle: Reactor.TypedHandle, args: ...) @typeOf(IO.run).ReturnType {
         const HandleType = @typeInfo(@typeInfo(IO.run).Fn.args[1].arg_type.?).Pointer.child;
-        const descriptor = @intToPtr(*Descriptor, handle.getValue());
+        const descriptor = @intToPtr(*Descriptor, typed_handle.getValue());
         var instance = HandleType.fromHandle(descriptor.handle, zio.Nonblock);
         var request = Descriptor.Request{
             .task = Task{},

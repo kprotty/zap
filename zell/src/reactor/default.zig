@@ -66,20 +66,20 @@ pub const DefaultReactor = struct {
         // TODO: add file support using `offset`
         const Self = @This();
         return self.performAsync(struct {
-            fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*zio.Address, buf: []const []u8) !void {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*zio.Address, buf: []const []u8, offs: ?u64) !usize {
                 return sock.recvmsg(add, buf, token);
             }
-        }, false, typed_handle, read, address);
+        }, false, typed_handle, read, address, buffers, offset);
     }
 
     pub fn write(self: *@This(), typed_handle: Reactor.TypedHandle, address: ?*const zio.Address, buffers: []const []const u8, offset: ?u64) Reactor.WriteError!usize {
         // TODO: add file support using `offset`
         const Self = @This();
         return self.performAsync(struct {
-            fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*const zio.Address, buf: []const []const u8) !void {
+            fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*const zio.Address, buf: []const []const u8, offs: ?u64) !usize {
                 return sock.sendmsg(addr, buf, token);
             }
-        }, true, typed_handle, write, address);
+        }, true, typed_handle, write, address, buffers, offset);
     }
 
     pub fn notify(self: *@This()) Reactor.NotifyError!void {

@@ -179,7 +179,7 @@ pub const Socket = struct {
     }
 
     /// Alias for `sendmsg()` using one buffer
-    pub fn sendto(self: *@This(), address: *zio.Address, buffer: []const u8, token: usize) DataError!usize {
+    pub fn sendto(self: *@This(), address: *const zio.Address, buffer: []const u8, token: usize) DataError!usize {
         var buffers = [_][]const u8{buffer};
         return self.sendmsg(address, buffers[0..], token);
     }
@@ -198,7 +198,7 @@ pub const Socket = struct {
     /// The token represents a contiuation for non blocking IO which can be retrieved
     /// from `zio.Event.getToken()` after polling for events using `zio.Event.Poller.poll()`.
     /// If the token is 0, the read request is performed synchronously and blocks until completion.
-    pub fn sendmsg(self: *@This(), address: ?*zio.Address, buffers: []const []const u8, token: usize) DataError!usize {
+    pub fn sendmsg(self: *@This(), address: ?*const zio.Address, buffers: []const []const u8, token: usize) DataError!usize {
         return self.inner.sendmsg(address, toBackendBuffers(buffers), token);
     }
 };

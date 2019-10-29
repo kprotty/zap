@@ -191,6 +191,18 @@ test "Reactor - Socket" {
     expect(address.isIpv4());
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
+
+    var i: usize = 0;
+    const data = "a" ** (64 * 1024);
+    var server_client_sent: usize = 0;
+    while (server_client_sent < data.len and i < 5) : (i += 1) {
+        const offset: ?u64 = null;
+        const addr: ?*const zio.Address = null;
+        const buffer = [_][]const u8{data[server_client_sent..]};
+        const sent = try resolveAsync(&reactor, Reactor.write, &reactor, server_client_handle, addr, buffer, offset);
+        std.debug.warn("\nDATA: {}\n", sent);
+        server_client_sent += sent;
+    }
 }
 
 fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {

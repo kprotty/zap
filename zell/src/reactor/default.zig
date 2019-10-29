@@ -44,7 +44,7 @@ pub const DefaultReactor = struct {
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {
             fn run(this: *Self, sock: *zio.Socket, token: usize, addr: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
-                _ = sock.accept(flags, &incoming, token) catch |err| return err;
+                _ = sock.accept(zio.Socket.Nonblock, incoming, token) catch |err| return err;
                 addr.* = incoming.address;
                 const client_sock = incoming.getSocket(zio.Socket.Nonblock);
                 const descriptor = try this.register(client_sock.getHandle());
@@ -217,23 +217,27 @@ pub const DefaultReactor = struct {
                 self.mutex.acquire();
                 defer self.mutex.release();
 
-                if (self.free_list) |descriptor| {
+                // check the free list first (fast path)
+                if (self.free_list) |free_descriptor| {
+                    const descriptor = free_descriptor;
                     self.free_list = descriptor.next().*;
                     return descriptor;
                 }
 
+                // out of descriptors, allocate a new chunk and build a list from the descriptors
                 const chunk = self.allocator.create(Chunk) catch |_| return error.OutOfResources;
+                for (chunk.descriptors) |*descriptor, index| {
+                    descriptor.next().* = null;
+                    if (index != chunk.descriptors.len - 1)
+                        descriptor.next().* = @ptrCast(*Descriptor, &chunk.descriptors[index + 1]);
+                }
+                const descriptor = &chunk.descriptors[1];
+                self.free_list = &chunk.descriptors[2];
+
+                // push the chunk to track for deinit() & return the newly allocated descriptor
                 chunk.prev().* = self.top_chunk;
                 self.top_chunk = chunk;
-
-                const size = chunk.descriptors.len;
-                for (chunk.descriptors[1..]) |*descriptor, index| {
-                    descriptor.next().* = null;
-                    if (index != size - 2)
-                        descriptor.next().* = @ptrCast(*Descriptor, &chunk.descriptors[index + 2]);
-                }
-                self.free_list = &chunk.descriptors[2];
-                return &chunk.descriptors[1];
+                return descriptor;
             }
 
             pub fn free(self: *@This(), descriptor: *Descriptor) void {
@@ -244,8 +248,8 @@ pub const DefaultReactor = struct {
             }
 
             const Chunk = struct {
-                pub const PageSize = std.math.max(64 * 1024, zuma.page_size);
-                descriptors: [PageSize / @sizeOf(Descriptor)]Descriptor align(PageSize),
+                pub const BlockSize = zuma.page_size;
+                descriptors: [BlockSize / @sizeOf(Descriptor)]Descriptor align(BlockSize),
 
                 /// Using the first descriptor to store meta-data (3 usize's reserved)
                 /// Returns the previous chunk allocated by the cache for use in chaining.

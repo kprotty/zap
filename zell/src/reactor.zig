@@ -179,7 +179,18 @@ test "Reactor - Socket" {
     // Create a client and try to connect to the server
     const client_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
     defer reactor.close(client_handle);
+    try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendTimeout = 1000 });
+    try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvTimeout = 1000 });
+    try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
+    try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
     _ = try resolveAsync(&reactor, Reactor.connect, &reactor, client_handle, &address);
+
+    // Accept the incoming client from the server
+    const server_client_handle = try resolveAsync(&reactor, Reactor.accept, &reactor, server_handle, &address);
+    defer reactor.close(server_client_handle);
+    expect(address.isIpv4());
+    try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
+    try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
 }
 
 fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {

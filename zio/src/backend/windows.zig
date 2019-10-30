@@ -133,7 +133,6 @@ pub const Event = struct {
 
 pub const Socket = struct {
     handle: Handle,
-    flags: windows.DWORD,
     reader: windows.OVERLAPPED,
     writer: windows.OVERLAPPED,
 
@@ -255,10 +254,10 @@ pub const Socket = struct {
         if (Winsock2.get().?.bind(self.getHandle(), @ptrCast(*const SOCKADDR, &address.sockaddr), address.length) == 0)
             return;
         return switch (Winsock2.get().?.WSAGetLastError()) {
-            WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS => zio.Socket.BindError.InvalidState,
-            WSAEADDRNOTAVAIL, WSAEFAULT => zio.Socket.BindError.InvalidAddress,
+            WSAENOTINITIALIZED, WSAENETDOWN, WSAENOBUFS, WSAEINPROGRESS => zio.Socket.BindError.InvalidState,
+            WSAEADDRNOTAVAIL, WSAEACCES, WSAEFAULT => zio.Socket.BindError.InvalidAddress,
+            WSAENOTSOCK, WSAEINVAL => zio.Socket.BindError.InvalidHandle,
             WSAEADDRINUSE => zio.Socket.BindError.AddressInUse,
-            WSAENOTSOCK => zio.Socket.BindError.InvalidHandle,
             else => unreachable,
         };
     }
@@ -307,10 +306,10 @@ pub const Socket = struct {
             0 => unreachable,
             WSAENOTINITIALIZED, WSAENETDOWN, WSAENETUNREACH, WSAENOBUFS => zio.Socket.ConnectError.InvalidState,
             WSAEAFNOTSUPPORT, WSAENOTSOCK => zio.Socket.ConnectError.InvalidHandle,
+            WSAEWOULDBLOCK, WSA_IO_PENDING, WSA_IO_INCOMPLETE => zio.Error.Pending,
             WSAEADDRNOTAVAIL, WSAEINVAL => zio.Socket.ConnectError.InvalidAddress,
             WSAEADDRINUSE, WSAECONNREFUSED, WSAEHOSTUNREACH => zio.Error.Closed,
             WSAEALREADY, WSAEISCONN => zio.Socket.ConnectError.AlreadyConnected,
-            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.Error.Pending,
             WSAETIMEDOUT => zio.Socket.ConnectError.TimedOut,
             else => unreachable,
         };
@@ -341,10 +340,10 @@ pub const Socket = struct {
                         incoming.handle = createSocket(flags);
                         if (incoming.handle == INVALID_SOCKET)
                             return zio.Socket.AcceptError.OutOfResources;
-                        self.flags = 0;
+                        var received: windows.DWORD = 0;
                         const addr_len = incoming.address.length;
                         const addr = @ptrCast(windows.PVOID, &incoming.address.sockaddr);
-                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &self.flags, ov) == windows.TRUE)
+                        if ((AcceptEx.?)(handle, incoming.handle, addr, 0, 0, addr_len + IncomingPadding, &received, ov) == windows.TRUE)
                             return finishAccept(&handle, incoming);
                     } else {
                         const addr = @ptrCast(*SOCKADDR, &incoming.address.sockaddr);
@@ -364,8 +363,8 @@ pub const Socket = struct {
             },
             WSAENOTINITIALIZED, WSAEINTR, WSAEINPROGRESS, WSAENETDOWN => zio.Socket.AcceptError.InvalidState,
             WSAEINVAL, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.AcceptError.InvalidHandle,
+            WSAEWOULDBLOCK, WSA_IO_PENDING, WSA_IO_INCOMPLETE => zio.Error.Pending,
             WSAEMFILE, WSAENOBUFS => zio.Socket.AcceptError.OutOfResources,
-            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.Error.Pending,
             WSAEFAULT => zio.Socket.AcceptError.InvalidAddress,
             else => unreachable,
         };
@@ -377,14 +376,14 @@ pub const Socket = struct {
                 .Completed => |transferred| return transferred,
                 .Error => |code| break :error_code code,
                 .Retry => |overlapped| {
-                    self.flags = 0;
+                    var flags: windows.DWORD = 0;
                     var transferred: windows.DWORD = 0;
                     const result = Winsock2.get().?.WSARecvFrom(
                         self.getHandle(),
                         @ptrCast([*]WSABUF, buffers.ptr),
                         @intCast(windows.DWORD, buffers.len),
-                        &transferred,
-                        &self.flags,
+                        if (overlapped != null) null else &transferred,
+                        &flags,
                         if (address) |addr| @ptrCast(*SOCKADDR, &addr.sockaddr) else null,
                         if (address) |addr| &addr.length else null,
                         overlapped,
@@ -400,7 +399,7 @@ pub const Socket = struct {
             WSAEDISCON, WSAECONNRESET, WSAENETRESET, WSA_OPERATION_ABORTED, WSAECONNABORTED, WSAETIMEDOUT => zio.Error.Closed,
             WSAEINPROGRESS, WSAEINTR, WSAENETDOWN, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
             WSAEINVAL, WSAENOTCONN, WSAENOTSOCK, WSAEOPNOTSUPP => zio.Socket.DataError.InvalidHandle,
-            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.Error.Pending,
+            WSAEWOULDBLOCK, WSA_IO_PENDING, WSA_IO_INCOMPLETE => zio.Error.Pending,
             WSAEMSGSIZE => zio.Socket.DataError.BufferTooLarge,
             WSAENOBUFS => zio.Socket.DataError.OutOfResources,
             WSAEFAULT => zio.Socket.DataError.InvalidValue,
@@ -437,7 +436,7 @@ pub const Socket = struct {
             WSAECONNRESET, WSAECONNABORTED, WSAETIMEDOUT, WSAENETRESET, WSAENETUNREACH, WSA_OPERATION_ABORTED => zio.Error.Closed,
             WSAEACCES, WSAEADDRNOTAVAIL, WSAEDESTADDRREQ, WSAEFAULT, WSAEHOSTUNREACH => zio.Socket.DataError.InvalidValue,
             WSAEINPROGRESS, WSAEINTR, WSAENOTINITIALIZED => zio.Socket.DataError.InvalidState,
-            WSAEWOULDBLOCK, WSA_IO_PENDING => zio.Error.Pending,
+            WSAEWOULDBLOCK, WSA_IO_PENDING, WSA_IO_INCOMPLETE => zio.Error.Pending,
             WSAEMSGSIZE => zio.Socket.DataError.BufferTooLarge,
             WSAENOBUFS => zio.Socket.DataError.OutOfResources,
             else => unreachable,
@@ -452,9 +451,11 @@ pub const Socket = struct {
 
     fn getOverlappedResult(self: *@This(), overlapped: *windows.OVERLAPPED, token: usize) zio.Error.Set!OverlappedResult {
         if (token == @ptrToInt(overlapped)) {
-            if (overlapped.Internal == STATUS_SUCCESS)
-                return OverlappedResult{ .Completed = overlapped.InternalHigh };
-            return OverlappedResult{ .Error = @intCast(c_int, overlapped.Internal) };
+            var flags: windows.DWORD = 0;
+            var transferred: windows.DWORD = 0;
+            if (Winsock2.get().?.WSAGetOverlappedResult(self.getHandle(), overlapped, &transferred, windows.FALSE, &flags) == windows.TRUE)
+                return OverlappedResult{ .Completed = transferred };
+            return OverlappedResult{ .Error = Winsock2.get().?.WSAGetLastError() };
         } else if (token != 0) {
             return zio.Error.InvalidToken;
         }
@@ -501,13 +502,14 @@ const SOCK_STREAM: windows.DWORD = 1;
 const SOCK_DGRAM: windows.DWORD = 2;
 const SOCK_RAW: windows.DWORD = 3;
 
-const SOCKET_ERROR = -1;
+const SOCKET_ERROR = c_int(-1);
 const STATUS_SUCCESS = 0;
 const WAIT_TIMEOUT: windows.DWORD = 258;
 const ERROR_IO_PENDING: windows.DWORD = 997;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: windows.DWORD = 0xc8000006;
 
 const WSA_OPERATION_ABORTED: windows.DWORD = 995;
+const WSA_IO_INCOMPLETE: windows.DWORD = 996;
 const WSA_IO_PENDING: windows.DWORD = 997;
 const WSA_INVALID_HANDLE: windows.DWORD = 6;
 const WSA_FLAG_OVERLAPPED: windows.DWORD = 0x01;
@@ -728,6 +730,14 @@ const Winsock2 = zuma.backend.DynamicLibrary(c"ws2_32", struct {
         wVersionRequested: windows.WORD,
         lpWSAData: *WSAData,
     ) c_int,
+
+    WSAGetOverlappedResult: extern fn (
+        socket: SOCKET,
+        lpOverlapped: *windows.OVERLAPPED,
+        lpcbTransfer: *windows.DWORD,
+        fWait: windows.BOOL,
+        lpdwFlags: *windows.DWORD,
+    ) windows.BOOL,
 
     WSAIoctl: extern fn (
         socket: SOCKET,

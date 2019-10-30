@@ -67,7 +67,7 @@ pub const DefaultReactor = struct {
         const Self = @This();
         return self.performAsync(struct {
             fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*zio.Address, buf: []const []u8, offs: ?u64) !usize {
-                return sock.recvmsg(add, buf, token);
+                return sock.recvmsg(addr, buf, token);
             }
         }, false, typed_handle, read, address, buffers, offset);
     }

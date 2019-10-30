@@ -192,6 +192,34 @@ test "Reactor - Socket" {
     expect(address.isIpv4());
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
+
+    const Stream = struct {
+        fn push(self: *Reactor, handle: Reactor.TypedHandle, data: []const u8) Reactor.WriteError!void {
+            var transferred: usize = 0;
+            while (transferred < data.len)
+                transferred += try self.write(handle, null, [_][]const u8 { data[transferred..] }, null);
+        }
+        fn poll(self: *Reactor, handle: Reactor.TypedHandle, data: []const u8) Reactor.ReadError!void {
+            var transferred: usize = 0;
+            var buffer: [4096]u8 = undefined;
+            while (transferred < data.len)
+                transferred += try self.read(handle, null, [_][]u8 { buffer[0..transferred] }, null);
+        }
+    };
+
+    // Pipe data from the server_client to the client asynchronously
+    const data = "a" ** (64 * 1024);
+    var read_result: ?Reactor.ReadError!void = null;
+    var write_result: ?Reactor.WriteError!void = null;
+    var reader = async Task.withResult(Stream.poll, &read_result, &reactor, client_handle, data);
+    var writer = async Task.withResult(Stream.push, &write_result, &reactor, server_client_handle, data);
+    while (read_result == null and write_result == null) {
+        var tasks = (try reactor.poll(500)).iter();
+        while (tasks.next()) |task|
+            resume task.frame;
+    }
+    try read_result.?;
+    try write_result.?;
 }
 
 fn resolve(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {

@@ -102,10 +102,10 @@ pub const Reactor = struct {
 
     pub const AcceptError = zio.Socket.RawAcceptError || error{Closed} || zio.Event.Poller.RegisterError;
 
-    pub fn accept(self: *@This(), typed_handle: TypedHandle, address: *zio.Address) AcceptError!TypedHandle {
+    pub fn accept(self: *@This(), typed_handle: TypedHandle, flags: zio.Socket.Flags, address: *zio.Address) AcceptError!TypedHandle {
         return switch (self.inner) {
-            .Uring => |*uring| uring.accept(typed_handle, address),
-            .Default => |*default| default.accept(typed_handle, address),
+            .Uring => |*uring| uring.accept(typed_handle, flags, address),
+            .Default => |*default| default.accept(typed_handle, flags, address),
         };
     }
 
@@ -161,7 +161,8 @@ test "Reactor - Socket" {
     defer reactor.deinit();
 
     // create the server socket
-    const server_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
+    const sock_flags = zio.Socket.Ipv4 | zio.Socket.Tcp;
+    const server_handle = try reactor.socket(sock_flags);
     defer reactor.close(server_handle);
 
     // set ReuseAddr on the server socket
@@ -177,59 +178,34 @@ test "Reactor - Socket" {
     try reactor.listen(server_handle, 1);
 
     // Create a client and try to connect to the server
-    const client_handle = try reactor.socket(zio.Socket.Ipv4 | zio.Socket.Tcp);
+    const client_handle = try reactor.socket(sock_flags);
     defer reactor.close(client_handle);
     try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendTimeout = 1000 });
     try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvTimeout = 1000 });
     try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
     try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
-    _ = try resolveAsync(&reactor, Reactor.connect, &reactor, client_handle, &address);
+    _ = try resolve(&reactor, Reactor.connect, &reactor, client_handle, &address);
 
     // Accept the incoming client from the server
-    const server_client_handle = try resolveAsync(&reactor, Reactor.accept, &reactor, server_handle, &address);
+    const server_client_handle = try resolve(&reactor, Reactor.accept, &reactor, server_handle, sock_flags, &address);
     defer reactor.close(server_client_handle);
     expect(address.isIpv4());
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
-
-    var i: usize = 0;
-    const data = "a" ** (64 * 1024);
-    var server_client_sent: usize = 0;
-    while (server_client_sent < data.len and i < 5) : (i += 1) {
-        const offset: ?u64 = null;
-        const addr: ?*const zio.Address = null;
-        const buffer = [_][]const u8{data[server_client_sent..]};
-        const sent = try resolveAsync(&reactor, Reactor.write, &reactor, server_client_handle, addr, buffer, offset);
-        std.debug.warn("\nDATA: {}\n", sent);
-        server_client_sent += sent;
-    }
 }
 
-fn resolveAsync(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {
-    const Resolver = struct {
-        fn resolve(comptime func2: var, output: *?@typeOf(func2).ReturnType, args2: ...) void {
-            var frame = async func2(args2);
-            output.* = await frame;
-        }
-    };
-
-    // perform the async function, poll for tasks, and receive its continuation frame
+fn resolve(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {
     var result: ?@typeOf(func).ReturnType = null;
-    var frame = async Resolver.resolve(func, &result, args);
-    if (result != null) // exit early if immediately completed
-        return try result.?;
-    const tasks = try reactor.poll(500);
-    expect(tasks.size == 1);
-    const frame_ref = tasks.head.?.frame;
+    var frame = async Task.withResult(func, &result, args);
+    if (result != null)
+        return (try result.?);
 
-    // make sure its the actual frame that was received
-    const frame_ptr = @ptrToInt(frame_ref);
-    const frame_begin = @ptrToInt(&frame);
-    const frame_end = frame_begin + @sizeOf(@typeOf(frame));
-    expect(frame_ptr >= frame_begin and frame_ptr < frame_end);
+    const task_list = try reactor.poll(500);
+    expect(task_list.size > 0);
+    var tasks = task_list.iter();
+    while (tasks.next()) |task|
+        resume task.frame;
 
-    // resume the frame and return the result
-    resume frame_ref;
     expect(result != null);
-    return try result.?;
+    return (try result.?);
 }

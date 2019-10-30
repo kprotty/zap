@@ -39,18 +39,18 @@ pub const DefaultReactor = struct {
         return descriptor.handle;
     }
 
-    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
+    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, flags: zio.Socket.Flags, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
         const Self = @This();
         var incoming_client = zio.Address.Incoming.new(address.*);
         return self.performAsync(struct {
-            fn run(this: *Self, sock: *zio.Socket, token: usize, addr: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
-                _ = sock.accept(zio.Socket.Nonblock, incoming, token) catch |err| return err;
+            fn run(this: *Self, sock: *zio.Socket, token: usize, sflags: zio.Socket.Flags, addr: *zio.Address, incoming: *zio.Address.Incoming) !Reactor.TypedHandle {
+                _ = sock.accept(sflags | zio.Socket.Nonblock, incoming, token) catch |err| return err;
                 addr.* = incoming.address;
-                const client_sock = incoming.getSocket(zio.Socket.Nonblock);
+                const client_sock = incoming.getSocket(sflags | zio.Socket.Nonblock);
                 const descriptor = try this.register(client_sock.getHandle());
                 return Reactor.TypedHandle{ .Socket = @ptrToInt(descriptor) };
             }
-        }, false, typed_handle, accept, address, &incoming_client);
+        }, false, typed_handle, accept, flags, address, &incoming_client);
     }
 
     pub fn connect(self: *@This(), typed_handle: Reactor.TypedHandle, address: *const zio.Address) Reactor.ConnectError!void {

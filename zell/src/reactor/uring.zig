@@ -26,7 +26,7 @@ pub const UringReactor = struct {
         return zio.Handle(undefined);
     }
 
-    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
+    pub fn accept(self: *@This(), typed_handle: Reactor.TypedHandle, flags: zio.Socket.Flags, address: *zio.Address) Reactor.AcceptError!Reactor.TypedHandle {
         return Reactor.AcceptError.InvalidHandle;
     }
 

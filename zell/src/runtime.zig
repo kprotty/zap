@@ -182,6 +182,12 @@ pub const Task = struct {
     next: ?*@This() = null,
     frame: anyframe = undefined,
 
+    pub fn withResult(comptime func: var, result: *?@typeOf(func).ReturnType, args: ...) void {
+        result.* = null;
+        const value = func(args);
+        result.* = value;
+    }
+
     pub fn create(ptr: **@This(), comptime func: var, args: ...) @typeOf(func).ReturnType {
         var self = @This(){};
         ptr.* = &self;
@@ -204,5 +210,20 @@ pub const Task = struct {
             self.tail = task;
             self.size += 1;
         }
+
+        pub fn iter(self: @This()) Iterator {
+            return Iterator{ .task = self.head };
+        }
+
+        pub const Iterator = struct {
+            task: ?*Task,
+
+            pub fn next(self: *@This()) ?*Task {
+                const current = self.task;
+                if (self.task) |task|
+                    self.task = task.next;
+                return current;
+            }
+        };
     };
 };

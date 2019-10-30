@@ -67,7 +67,9 @@ pub const DefaultReactor = struct {
         const Self = @This();
         return self.performAsync(struct {
             fn run(this: *Self, sock: *zio.Socket, token: usize, addr: ?*zio.Address, buf: []const []u8, offs: ?u64) !usize {
-                return sock.recvmsg(addr, buf, token);
+                const x = try sock.recvmsg(addr, buf, token);
+                std.debug.warn("\nREAD: {} token=0x{x} reader=0x{x}\n", x, token, @ptrToInt(&sock.inner.reader));
+                return x;
             }
         }, false, typed_handle, read, address, buffers, offset);
     }
@@ -138,15 +140,18 @@ pub const DefaultReactor = struct {
         request_ptr.store(&request, .Release);
         defer request_ptr.store(null, .Relaxed);
 
+        std.debug.warn("\nRun once {}\n", descriptor.handle);
         return IO.run(self, &instance, 0, args) catch |e| switch (e) {
             zio.Error.Closed => return error.Closed,
             zio.Error.InvalidToken => unreachable,
             zio.Error.Pending => {
+                std.debug.warn("\nSuspend {}\n", descriptor.handle);
                 suspend {
                     request.task.frame = @frame();
                     if (request.token.swap(1, .Release) != 0)
                         resume request.task.frame;
                 }
+                std.debug.warn("\nResume {} token=0x{x}\n", descriptor.handle, request.token.load(.Relaxed));
                 return IO.run(self, &instance, request.token.load(.Relaxed), args) catch |err| switch (err) {
                     zio.Error.Closed => return error.Closed,
                     zio.Error.InvalidToken => unreachable,

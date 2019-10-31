@@ -498,7 +498,7 @@ pub const Socket = struct {
         };
 
         while (true) {
-            const transferred = Transfer(handle, &message_header, MSG_NOSIGNAL);
+            const transferred = Transfer(handle, &message_header, MSG_NOSIGNAL | MSG_DONTWAIT);
             switch (errno(transferred)) {
                 0 => return transferred,
                 os.EOPNOTSUPP, os.EINVAL, os.EFAULT, os.EISCONN, os.ENOTCONN => return zio.Socket.DataError.InvalidValue,
@@ -534,6 +534,7 @@ const Options = struct {
     pub const SO_SNDTIMEO = os.SO_SNDTIMEO;
 };
 
+const MSG_DONTWAIT = 0x40;
 const MSG_NOSIGNAL = 0x4000;
 const msghdr = extern struct {
     msg_name: usize,

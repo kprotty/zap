@@ -180,9 +180,6 @@ test "Reactor - Socket" {
     // Create a client and try to connect to the server
     const client_handle = try reactor.socket(sock_flags);
     defer reactor.close(client_handle);
-    try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendTimeout = 1000 });
-    try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvTimeout = 1000 });
-    try reactor.setsockopt(client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
     try reactor.setsockopt(client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
     _ = try resolve(&reactor, Reactor.connect, &reactor, client_handle, &address);
 
@@ -191,7 +188,45 @@ test "Reactor - Socket" {
     defer reactor.close(server_client_handle);
     expect(address.isIpv4());
     try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .SendBufMax = 2048 });
-    try reactor.setsockopt(server_client_handle, zio.Socket.Option{ .RecvBufMax = 2048 });
+
+    const data = "a" ** (64 * 1024);
+    const Stream = struct {
+        pub fn push(r: *Reactor, handle: Reactor.TypedHandle) Reactor.WriteError!void {
+            var transferred: usize = 0;
+            while (transferred < data.len) {
+                const buffer = [_][]const u8{data[transferred..]};
+                const sent = try r.write(handle, null, buffer, null);
+                expect(sent > 0);
+                transferred += sent;
+            }
+        }
+
+        pub fn poll(r: *Reactor, handle: Reactor.TypedHandle) Reactor.ReadError!void {
+            var transferred: usize = 0;
+            var buffer: [data.len]u8 = undefined;
+            while (transferred < data.len) {
+                const recieved = try r.read(handle, null, [_][]u8{buffer[0..]}, null);
+                expect(recieved > 0);
+                transferred += recieved;
+            }
+        }
+    };
+
+    var poll_result: ?Reactor.ReadError!void = null;
+    var push_result: ?Reactor.WriteError!void = null;
+    var poll_frame = async Task.withResult(Stream.poll, &poll_result, &reactor, client_handle);
+    var push_frame = async Task.withResult(Stream.push, &push_result, &reactor, server_client_handle);
+
+    while (poll_result == null or push_result == null) {
+        const tasks_polled = try reactor.poll(500);
+        expect(tasks_polled.size > 0);
+        var task_iterator = tasks_polled.iter();
+        while (task_iterator.next()) |task|
+            resume task.frame;
+    }
+
+    try poll_result.?;
+    try push_result.?;
 }
 
 fn resolve(reactor: *Reactor, comptime func: var, args: ...) !@typeInfo(@typeOf(func).ReturnType).ErrorUnion.payload {

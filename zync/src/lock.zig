@@ -44,7 +44,7 @@ pub const Event = struct {
                 std.debug.assert(self.state.swap(.Empty, .Release) == .Signaled);
             }
 
-            pub fn wait(self: *@This(), timeout_ms: u32) !void {
+            pub fn wait(self: *@This(), timeout_ms: u32) zync.Futex.WaitError!void {
                 const expected = @enumToInt(EventState.Empty);
                 try self.futex.wait(@ptrCast(*const u32, &self.state), expected, timeout_ms);
                 if (auto_reset)
@@ -233,4 +233,69 @@ fn testLockImplementation(comptime Lock: type) !void {
     // test tryAcquire + release once more after the acquire + release tests
     expect(self.lock.tryAcquire() == true);
     self.lock.release();
+}
+
+pub const Barrier = struct {
+    futex: zync.Futex,
+    signals: zync.Atomic(u32),
+
+    pub fn init(self: *@This(), signals_needed: u32) void {
+        self.futex.init();
+        self.signals.set(signals_needed);
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.futex.deinit();
+    }
+
+    pub fn signal(self: *@This()) void {
+        if (self.signals.load(.Relaxed) == 0)
+            return;
+        if (self.signals.fetchSub(1, .Relaxed) == 1)
+            self.futex.notifyOne(@ptrCast(*const u32, &self.signals));
+    }
+
+    pub fn wait(self: *@This(), timeout_ms: ?u32) zync.Futex.WaitError!void {
+        var timeout = timeout_ms;
+        const now = if (timeout != null) zuma.Thread.now(.Monotonic) else 0;
+        var signals = self.signals.load(.Relaxed);
+        while (signals > 0) {
+            try self.futex.wait(@ptrCast(*const u32, &self.signals), signals, timeout);
+            if (timeout) |t| {
+                const elapsed_ms = zuma.Thread.now(.Monotonic) - t;
+                if (elapsed_ms > t)
+                    return zync.Futex.WaitError.TimedOut;
+                timeout = t - @intCast(@typeOf(t), elapsed_ms);
+            }
+            signals = self.signals.load(.Relaxed);
+        }
+    }
+};
+
+test "Barrier" {
+    try struct {
+        barrier: Barrier,
+
+        pub fn signal(self: *@This()) void {
+            self.barrier.signal();
+        }
+
+        pub fn run() !void {
+            // create the barrier
+            const signals_needed = 3;
+            var self: @This() = undefined;
+            self.barrier.init(signals_needed);
+            defer self.barrier.deinit();
+
+            // spawn signalers (+ 1 to test .signal() call overflow)
+            var signalers: [signals_needed + 1]zuma.Thread.JoinHandle = undefined;
+            for (signalers) |*signaler|
+                signaler.* = try zuma.Thread.spawn(signal, &self, null);
+
+            // wait for signalers to complete on the barrier + clean up signaler threads
+            try self.barrier.wait(1000);
+            for (signalers) |*signaler|
+                try signaler.join(100);
+        }
+    }.run();
 }

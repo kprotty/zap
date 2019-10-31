@@ -499,6 +499,8 @@ pub const Socket = struct {
 
         while (true) {
             const transferred = Transfer(handle, &message_header, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (transferred == 0)
+                return zio.Error.Closed;
             switch (errno(transferred)) {
                 0 => return transferred,
                 os.EOPNOTSUPP, os.EINVAL, os.EFAULT, os.EISCONN, os.ENOTCONN => return zio.Socket.DataError.InvalidValue,

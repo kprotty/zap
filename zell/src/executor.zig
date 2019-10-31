@@ -4,6 +4,11 @@ const zuma = @import("../../zap.zig").zuma;
 const zync = @import("../../zap.zig").zync;
 const zell = @import("../../zap.zig").zell;
 
+/// Representation of a general purpose task scheduler.
+/// The design borrows heavily, and pays respects to:
+/// - Golangs current scheduler implementation (https://github.com/golang/go/blob/master/src/runtime/proc.go)
+/// - Rust Tokio's contributions to said scheduler (https://tokio.rs/blog/2019-10-scheduler/)
+/// - Dmitry Vyukov's NUMA-aware scheduler proposal for Golang (https://docs.google.com/document/d/1d3iI2QWURgDIsSR6G2275vMeQ_X7w-qxM2Vp7iGwwuM/pub)
 pub const Executor = struct {
     /// Run the given function using the arguments on an executor.
     /// The implementation is free to choose which methods it deems most efficient to do so.
@@ -27,15 +32,21 @@ pub const Executor = struct {
     /// Run the given function using the arguments on the executor.
     /// Unlike `runSequential` this optimizes for multicore systems.
     pub fn runParallel(self: *@This(), comptime func: var, args: ...) !@typeOf(func).ReturnType {
-        var node_array = [_]*Node{@intToPtr(*Node, 1)} ** Node.MAX;
+        // Store the array of node pointers on the stack.
+        // This is mostly to save an unnecessary heap allocation.
         const num_nodes = zuma.CpuAffinity.getNodeCount();
+        var node_array = [_]?*Node{null} ** Node.MAX;
         const nodes = node_array[0..num_nodes];
-        for (nodes) |*node, numa_node|
-            node.* = try Node.alloc(self, numa_node);
-        defer for (nodes) |node|
-            if (@ptrToInt(node) != 1)
+        
+        // Setup the defer to free the nodes first.
+        // This is to ensure previously allocated nodes are cleaned up in case of error in the alloc loop.
+        defer for (nodes) |node_ref|
+            if (node_ref) |node|
                 node.free();
-        return self.runWithNodes(nodes, func, args);
+        for (nodes) |*node_ref, numa_node|
+            node_ref.* = try Node.alloc(self, numa_node);
+        const real_nodes = @ptrCast([*]*Node, nodes.ptr)[0..nodes.len];
+        return self.runWithNodes(real_nodes, func, args);
     }
 
     fn runWithNodes(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !@typeOf(func).ReturnType {
@@ -47,7 +58,16 @@ pub const Node = struct {
     /// Maximum number of nodes running concurrently on the system.
     pub const MAX = 64;
 
-    pub fn init(self: *@This(), executor: *Executor, numa_node: u32, workers: []Worker) !void {}
+    executor: *Executor,
+    numa_node: u32,
+    workers: []Worker,
+    reactor: zell.Reactor,
+
+    pub fn init(self: *@This(), executor: *Executor, numa_node: u32, workers: []Worker) !void {
+        self.workers = workers;
+        self.executor = executor;
+        self.numa_node = numa_node;
+    }
 
     pub fn deinit(self: *@This()) void {}
 

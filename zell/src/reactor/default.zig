@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const zio = @import("../../../zap.zig").zio;
 const zync = @import("../../../zap.zig").zync;
 const zuma = @import("../../../zap.zig").zuma;
-const Task = @import("../runtime.zig").Task;
+const Task = @import("../executor.zig").Task;
 const Reactor = @import("../reactor.zig").Reactor;
 
 pub const DefaultReactor = struct {

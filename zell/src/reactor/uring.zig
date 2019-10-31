@@ -1,14 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("../../../zap.zig").zio;
-const Task = @import("../runtime.zig").Task;
+const Task = @import("../executor.zig").Task;
 const Reactor = @import("../reactor.zig").Reactor;
 
 pub const UringReactor = struct {
     const linux = std.os.linux;
 
     pub fn isSupported() bool {
-        // TODO: Check kernel for 5.1 >=
+        // TODO: Check for kernel 5.1 >=
         return false;
     }
 

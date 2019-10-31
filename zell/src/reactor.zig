@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Task = @import("runtime.zig").Task;
+const Task = @import("executor.zig").Task;
 const zio = @import("../../zap.zig").zio;
 const zuma = @import("../../zap.zig").zuma;
 

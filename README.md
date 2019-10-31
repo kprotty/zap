@@ -5,7 +5,7 @@ A collection of zig libraries which provide interfaces over the system for writi
 Abstractions over the system's IO operations for both blocking and non-blocking IO. Uses a completion based polling scheme rather than a readyness based one found in other libraries to support a true zero-cost abstraction over non-blocking IO. Goals include minimal syscalls, no heap allocation and having a BSD-esque interface as close as possible. (Inspired by golang's netpoller and rust's mio)
 
 - [x] Event Polling (Linux: epoll, Windows: IOCP, BSD: kqueue)
-- [ ] Sockets (WIP)
+- [x] Sockets
 - [ ] Files
 - [ ] Pipes / TTY
 

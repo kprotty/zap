@@ -8,14 +8,14 @@ var current_process = zync.Lazy(GetCurrentProcess).new();
 threadlocal var current_thread = zync.Lazy(GetCurrentThread).new();
 
 pub const CpuAffinity = struct {
-    pub fn getNodeCount() usize {
+    pub fn getNodeCount() u32 {
         var node: windows.ULONG = 0;
         if (GetNumaHighestNodeNumber(&node) == windows.TRUE)
-            return @intCast(usize, node) + 1;
+            return node + 1;
         return 1;
     }
 
-    pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
+    pub fn getCpuCount(numa_node: ?u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
         if (numa_node) |node| {
             var affinity: GROUP_AFFINITY = undefined;
             try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
@@ -26,7 +26,7 @@ pub const CpuAffinity = struct {
         return cpu_count;
     }
 
-    pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
+    pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         var affinity: GROUP_AFFINITY = undefined;
         if (numa_node) |node| {
             try getNumaGroupAffinity(&affinity, node, only_physical_cpus);
@@ -40,7 +40,7 @@ pub const CpuAffinity = struct {
 
     /// Find the GROUP_AFFINITY of a NUMA node.
     /// If it only needs logical cpus, calls GetNumaNodeProcessorMaskEx instead to save on allocation
-    fn getNumaGroupAffinity(affinity: *GROUP_AFFINITY, numa_node: usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
+    fn getNumaGroupAffinity(affinity: *GROUP_AFFINITY, numa_node: u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         if (only_physical_cpus) {
             try iterateProcessorInfo(RelationNumaNode, findNumaGroupAffinity, numa_node, affinity);
         } else if (GetNumaNodeProcessorMaskEx(@truncate(USHORT, numa_node), affinity) == windows.FALSE) {
@@ -50,7 +50,7 @@ pub const CpuAffinity = struct {
 
     fn findNumaGroupAffinity(
         processor_info: *SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-        numa_node: usize,
+        numa_node: u32,
         affinity: *GROUP_AFFINITY,
     ) bool {
         if (processor_info.Relationship != RelationNumaNode)
@@ -243,31 +243,31 @@ pub fn getHugePageSize() ?usize {
     return GetLargePageMinimum();
 }
 
-pub fn getNodeSize(numa_node: usize) zuma.NumaError!usize {
+pub fn getNodeSize(numa_node: u32) zuma.NumaError!usize {
     var byte_size: windows.ULONGLONG = undefined;
     if (GetNumaAvailableMemoryNodeEx(@truncate(USHORT, numa_node), &byte_size) == windows.TRUE)
         return @intCast(usize, byte_size);
     return zuma.NumaError.InvalidNode;
 }
 
-pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MemoryError![]align(zuma.page_size) u8 {
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?u32) zuma.MemoryError![]align(zuma.page_size) u8 {
     const protect_flags = getProtectFlags(flags);
     const addr_ptr = @ptrCast(?windows.LPVOID, address);
     const alloc_type = windows.MEM_RESERVE | getAllocType(flags);
     const addr = if (numa_node) |node|
-        VirtualAllocExNuma(current_process.get(), addr_ptr, bytes, alloc_type, protect_flags, @intCast(windows.DWORD, node))
+        VirtualAllocExNuma(current_process.get(), addr_ptr, bytes, alloc_type, protect_flags, node)
     else
         windows.kernel32.VirtualAlloc(addr_ptr, bytes, alloc_type, protect_flags);
     const mem_addr = addr orelse return windows.unexpectedError(windows.kernel32.GetLastError());
     return @ptrCast([*]align(zuma.page_size) u8, @alignCast(zuma.page_size, mem_addr))[0..bytes];
 }
 
-pub fn unmap(memory: []u8, numa_node: ?usize) void {
+pub fn unmap(memory: []u8, numa_node: ?u32) void {
     const addr_ptr = @ptrCast(windows.LPVOID, memory.ptr);
     std.debug.assert(windows.kernel32.VirtualFree(addr_ptr, 0, windows.MEM_RELEASE) == windows.TRUE);
 }
 
-pub fn modify(memory: []u8, flags: u32, numa_node: ?usize) zuma.MemoryError!void {
+pub fn modify(memory: []u8, flags: u32, numa_node: ?u32) zuma.MemoryError!void {
     const addr_ptr = @ptrCast(windows.LPVOID, memory.ptr);
     switch (flags & (zuma.PAGE_COMMIT | zuma.PAGE_DECOMMIT)) {
         zuma.PAGE_COMMIT | zuma.PAGE_DECOMMIT => {
@@ -277,7 +277,7 @@ pub fn modify(memory: []u8, flags: u32, numa_node: ?usize) zuma.MemoryError!void
             const alloc_type = getAllocType(flags);
             const protect_flags = getProtectFlags(flags);
             const addr = if (numa_node) |node|
-                VirtualAllocExNuma(current_process.get(), addr_ptr, memory.len, alloc_type, protect_flags, @intCast(windows.DWORD, node))
+                VirtualAllocExNuma(current_process.get(), addr_ptr, memory.len, alloc_type, protect_flags, node)
             else
                 windows.kernel32.VirtualAlloc(addr_ptr, memory.len, alloc_type, protect_flags);
             if (addr == null)

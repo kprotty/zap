@@ -62,28 +62,28 @@ const cpu_set_t = struct {
 };
 
 pub const CpuAffinity = struct {
-    pub fn getNodeCount() usize {
+    pub fn getNodeCount() u32 {
         // data in the format of many? "{node_start}-{node_end}"
         var data = readFile(c"/sys/devices/system/node/online") catch return 1;
         var node_count: usize = 0;
         while (readInt(&data)) |start|
             node_count += ((readInt(&data) orelse start) + 1) - start;
-        return node_count;
+        return @intCast(u32, node_count);
     }
 
-    pub fn getCpuCount(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
+    pub fn getCpuCount(numa_node: ?u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!usize {
         // get the linux cpu set and count the number of bits
         const cpu_set = try getCpuSet(numa_node, only_physical_cpus);
         return cpu_set.count();
     }
 
-    pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
+    pub fn getCpus(self: *zuma.CpuAffinity, numa_node: ?u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!void {
         // get the linux cpu set and find the first word with set bits
         const cpu_set = try getCpuSet(numa_node, only_physical_cpus);
         self.* = cpu_set.toCpuAffinity();
     }
 
-    fn getCpuSet(numa_node: ?usize, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!cpu_set_t {
+    fn getCpuSet(numa_node: ?u32, only_physical_cpus: bool) zuma.CpuAffinity.TopologyError!cpu_set_t {
         var cpu_set: cpu_set_t = undefined;
         std.mem.set(usize, cpu_set.bitmask[0..], 0);
 
@@ -127,7 +127,7 @@ pub const CpuAffinity = struct {
         return false;
     }
 
-    fn getNumaCpuSet(numa_node: usize, cpu_set: *cpu_set_t) !void {
+    fn getNumaCpuSet(numa_node: u32, cpu_set: *cpu_set_t) !void {
         // data is in the format of many? "{cpu_start}-{cpu_end}"
         var data = try readFile(c"/sys/devices/system/node/node{}/cpulist", numa_node);
         while (readInt(&data)) |start| {
@@ -303,7 +303,7 @@ const MPOL_BIND = 2;
 const MPOL_DEFAULT = 0;
 const MPOL_PREFERRED = 1;
 
-pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.MemoryError![]align(zuma.page_size) u8 {
+pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?u32) zuma.MemoryError![]align(zuma.page_size) u8 {
     // map the memory into the address space
     var map_flags: u32 = linux.MAP_PRIVATE | linux.MAP_ANONYMOUS;
     if ((flags & zuma.PAGE_HUGE) != 0)
@@ -337,11 +337,11 @@ pub fn map(address: ?[*]u8, bytes: usize, flags: u32, numa_node: ?usize) zuma.Me
     return @intToPtr([*]align(zuma.page_size) u8, addr)[0..bytes];
 }
 
-pub fn unmap(memory: []u8, node: ?usize) void {
+pub fn unmap(memory: []u8, node: ?u32) void {
     _ = linux.munmap(memory.ptr, memory.len);
 }
 
-pub fn modify(memory: []u8, flags: u32, node: ?usize) zuma.MemoryError!void {
+pub fn modify(memory: []u8, flags: u32, node: ?u32) zuma.MemoryError!void {
     const protect_flags = getProtectFlags(flags);
     if (protect_flags != 0) {
         switch (linux.getErrno(linux.mprotect(memory.ptr, memory.len, protect_flags))) {

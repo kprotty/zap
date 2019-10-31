@@ -85,7 +85,7 @@ test "Event" {
     };
 
     // test cross thread notification
-    var thread = try zuma.Thread.spawn(EventNotifier.notify, &event);
+    var thread = try zuma.Thread.spawn(EventNotifier.notify, &event, null);
     defer thread.join(null) catch unreachable;
     try event.wait(500);
     expect(event.isSet() == false);
@@ -224,7 +224,7 @@ fn testLockImplementation(comptime Lock: type) !void {
     // test acquire + release
     self.lock.acquire();
     expect(self.value == 0);
-    var thread = try zuma.Thread.spawn(LockState.updateAndRelease, &self);
+    var thread = try zuma.Thread.spawn(LockState.updateAndRelease, &self, null);
     defer thread.join(null) catch unreachable;
     self.lock.acquire();
     expect(self.value == 1);

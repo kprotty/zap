@@ -38,15 +38,15 @@ pub const CpuAffinity = struct {
 
     pub const TopologyError = zuma.NumaError;
 
-    pub fn getNodeCount() usize {
+    pub fn getNodeCount() u32 {
         return zuma.backend.CpuAffinity.getNodeCount();
     }
 
-    pub fn getCpuCount(numa_node: ?usize, cpu_type: CpuType) TopologyError!usize {
+    pub fn getCpuCount(numa_node: ?u32, cpu_type: CpuType) TopologyError!usize {
         return zuma.backend.CpuAffinity.getCpuCount(numa_node, cpu_type == .Physical);
     }
 
-    pub fn getCpus(self: *@This(), numa_node: ?usize, cpu_type: CpuType) TopologyError!void {
+    pub fn getCpus(self: *@This(), numa_node: ?u32, cpu_type: CpuType) TopologyError!void {
         return zuma.backend.CpuAffinity.getCpus(self, numa_node, cpu_type == .Physical);
     }
 };

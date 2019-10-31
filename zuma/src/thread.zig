@@ -53,14 +53,14 @@ pub const Thread = struct {
         return zuma.backend.Thread.create(stack, function, parameter);
     }
 
-    pub fn spawn(comptime function: var, parameter: var) CreateError!JoinHandle {
+    pub fn spawn(comptime function: var, parameter: var, numa_node: ?u32) CreateError!JoinHandle {
         var join_handle: JoinHandle = undefined;
         join_handle.memory = null;
 
         const stack_size = getStackSize(function);
         if (stack_size > 0) {
             const flags = zuma.PAGE_READ | zuma.PAGE_WRITE | zuma.PAGE_COMMIT;
-            join_handle.memory = zuma.map(null, stack_size, flags, null) catch |err| switch (err) {
+            join_handle.memory = zuma.map(null, stack_size, flags, numa_node) catch |err| switch (err) {
                 zuma.MemoryError.OutOfMemory => return CreateError.OutOfMemory,
                 zuma.MemoryError.Unexpected => return CreateError.Unexpected,
                 else => unreachable,
@@ -168,12 +168,12 @@ test "Thread - getStackSize, spawn, yield" {
     expect(value.get() == 0);
 
     // test thread creation + joining
-    var thread = try Thread.spawn(ThreadTest.update, &value);
+    var thread = try Thread.spawn(ThreadTest.update, &value, null);
     try thread.join(500);
     expect(value.load(.Relaxed) == 1);
 
     // test thread join timeout + rejoining
-    var delayed_thread = try Thread.spawn(ThreadTest.updateDelayed, &value);
+    var delayed_thread = try Thread.spawn(ThreadTest.updateDelayed, &value, null);
     const now = Thread.now(.Monotonic);
     expectError(Thread.JoinError.TimedOut, delayed_thread.join(1));
     try delayed_thread.join(500);

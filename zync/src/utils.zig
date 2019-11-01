@@ -14,19 +14,19 @@ pub fn CachePadded(comptime T: type) type {
 
 pub fn zeroed(comptime T: type) T {
     var value: T = undefined;
-    std.mem.set(u8, @ptrCast([*]u8, &value)[0..@sizeOf(T)]);
+    std.mem.set(u8, @ptrCast([*]u8, &value)[0..@sizeOf(T)], 0);
     return value;
 }
 
 test "zeroed" {
     const t = zeroed(struct {
         ptr: ?*u32,
-        array: [3]i8,
+        array: [3]u8,
     });
 
     expect(t.ptr == null);
     expect(zeroed(u32) == u32(0));
-    expect(std.mem.eql(u8, [_]u8{0, 0, 0}, t.array));
+    expect(std.mem.eql(u8, [_]u8{ 0, 0, 0 }, t.array[0..]));
 }
 
 test "cache padding" {

@@ -1,5 +1,5 @@
 # zap
-A collection of zig libraries which provide interfaces over the system for writing high performance applications. Current plans are to support x86_64, i386, arm32 and aarch64 for Linux, Windows, and BSD systems. Only requires libc for BSD platforms at the moment.
+A collection of zig libraries which provide interfaces over the system for writing high performance applications. Current plans are to support x86_64, i386, arm32 and aarch64 for Linux, Windows, and BSD systems. Only requires libc for BSD platforms at the moment. Link to [Documentation](https://kprotty.github.io/zap/#root)
 
 ## zio
 Abstractions over the system's IO operations for both blocking and non-blocking IO. Uses a completion based polling scheme rather than a readyness based one found in other libraries to support a true zero-cost abstraction over non-blocking IO. Goals include minimal syscalls, no heap allocation and having a BSD-esque interface as close as possible. (Inspired by golang's netpoller and rust's mio)

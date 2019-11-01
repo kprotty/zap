@@ -119,73 +119,78 @@ test "Spinlock" {
     try testLockImplementation(Spinlock);
 }
 
-pub const Mutex = struct {
-    const SpinCpu = 4;
-    const SpinThread = 1;
-    const SpinCpuCount = 40;
+pub const Mutex = RawMutex(zync.Futex.ThreadParker);
+pub fn RawMutex(comptime ThreadParker: type) type {
+    return struct {
+        const SpinCpu = 4;
+        const SpinThread = 1;
+        const SpinCpuCount = 40;
 
-    futex: zync.Futex,
-    state: zync.Atomic(MutexState),
+        parker: ThreadParker,
+        state: zync.Atomic(MutexState),
 
-    const MutexState = enum(u32) {
-        Unlocked,
-        Sleeping,
-        Locked,
-    };
+        const MutexState = enum(u32) {
+            Unlocked,
+            Sleeping,
+            Locked,
+        };
 
-    pub fn init(self: *@This()) void {
-        self.state.set(.Unlocked);
-        self.futex.init();
-    }
+        pub fn init(self: *@This(), args: ...) @typeOf(ThreadParker.init).ReturnType {
+            self.state.set(.Unlocked);
+            return self.parker.init(@ptrCast(*const u32, &self.state));
+        }
 
-    pub fn deinit(self: *@This()) void {
-        self.futex.deinit();
-    }
+        pub fn deinit(self: *@This()) @typeOf(ThreadParker.deinit).ReturnType {
+            return self.parker.deinit();
+        }
 
-    pub fn tryAcquire(self: *@This()) bool {
-        return self.state.compareSwap(.Unlocked, .Locked, .Acquire, .Relaxed) == null;
-    }
+        pub fn tryAcquire(self: *@This()) bool {
+            return self.state.compareSwap(.Unlocked, .Locked, .Acquire, .Relaxed) == null;
+        }
 
-    pub fn acquire(self: *@This()) void {
-        // Speculatively grab the lock.
-        // If it fails, state is either .Locked or .Sleeping
-        // depending on if theres a thread stuck sleeping below.
-        var state = self.state.swap(.Locked, .Acquire);
-        if (state == .Unlocked)
-            return;
-
-        while (true) {
-            // try and acquire the lock using cpu spinning on failure
-            for (([SpinCpu]void)(undefined)) |_| {
-                var value = self.state.load(.Relaxed);
-                while (value == .Unlocked)
-                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return;
-                zync.yield(SpinCpuCount);
-            }
-
-            // try and acquire the lock using thread rescheduling on failure
-            for (([SpinThread]void)(undefined)) |_| {
-                var value = self.state.load(.Relaxed);
-                while (value == .Unlocked)
-                    value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return zuma.Thread.yield();
-            }
-
-            // failed to acquire the lock, go to unsleep until woken up by `.release()`
-            if (self.state.swap(.Sleeping, .Acquire) == .Unlocked)
+        pub fn acquire(self: *@This()) void {
+            // Speculatively grab the lock.
+            // If it fails, state is either .Locked or .Sleeping
+            // depending on if theres a thread stuck sleeping below.
+            var state = self.state.swap(.Locked, .Acquire);
+            if (state == .Unlocked)
                 return;
-            state = .Sleeping;
-            self.futex.wait(@ptrCast(*const u32, &self.state), @enumToInt(state), null) catch unreachable;
-        }
-    }
 
-    pub fn release(self: *@This()) void {
-        switch (self.state.swap(.Unlocked, .Release)) {
-            .Sleeping => self.futex.notifyOne(@ptrCast(*const u32, &self.state)),
-            .Unlocked => unreachable,
-            .Locked => {},
+            while (true) {
+                // try and acquire the lock using cpu spinning on failure
+                for (([SpinCpu]void)(undefined)) |_| {
+                    var value = self.state.load(.Relaxed);
+                    while (value == .Unlocked)
+                        value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return;
+                    zync.yield(SpinCpuCount);
+                }
+
+                // try and acquire the lock using thread rescheduling on failure
+                for (([SpinThread]void)(undefined)) |_| {
+                    var value = self.state.load(.Relaxed);
+                    while (value == .Unlocked)
+                        value = self.state.compareSwap(.Unlocked, state, .Acquire, .Relaxed) orelse return zuma.Thread.yield();
+                }
+
+                // failed to acquire the lock, go to unsleep until woken up by `.release()`
+                if (self.state.swap(.Sleeping, .Acquire) == .Unlocked)
+                    return;
+                state = .Sleeping;
+                _ = self.parker.park(@ptrCast(*const u32, &self.state), @enumToInt(state));
+            }
         }
-    }
-};
+
+        pub fn release(self: *@This()) void {
+            switch (self.state.swap(.Unlocked, .Release)) {
+                .Sleeping => {
+                    _ = self.parker.wake(@ptrCast(*const u32, &self.state));
+                },
+                .Unlocked => unreachable,
+                .Locked => {},
+            }
+        }
+    };
+}
 
 test "Mutex" {
     try testLockImplementation(Mutex);

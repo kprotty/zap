@@ -41,6 +41,26 @@ pub const Futex = struct {
     pub fn notifyAll(self: *@This(), ptr: *const u32) void {
         self.inner.notify(ptr, std.math.maxInt(i32));
     }
+
+    pub const ThreadParker = struct {
+        futex: Futex,
+
+        pub fn init(self: *@This(), ptr: *const u32) void {
+            self.futex.init();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.futex.deinit();
+        }
+
+        pub fn park(self: *@This(), ptr: *const u32, expected: u32) void {
+            self.futex.wait(ptr, expected, null) catch unreachable;
+        }
+
+        pub fn wake(self: *@This(), ptr: *const u32) void {
+            self.futex.notifyOne(ptr);
+        }
+    };
 };
 
 const Linux = struct {

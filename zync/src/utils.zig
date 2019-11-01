@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zync = @import("../../zap.zig").zync;
 
+const expect = std.testing.expect;
+
 pub const cache_line = 64;
 pub fn CachePadded(comptime T: type) type {
     return packed struct {
@@ -10,7 +12,23 @@ pub fn CachePadded(comptime T: type) type {
     };
 }
 
-const expect = std.testing.expect;
+pub fn zeroed(comptime T: type) T {
+    var value: T = undefined;
+    std.mem.set(u8, @ptrCast([*]u8, &value)[0..@sizeOf(T)]);
+    return value;
+}
+
+test "zeroed" {
+    const t = zeroed(struct {
+        ptr: ?*u32,
+        array: [3]i8,
+    });
+
+    expect(t.ptr == null);
+    expect(zeroed(u32) == u32(0));
+    expect(std.mem.eql(u8, [_]u8{0, 0, 0}, t.array));
+}
+
 test "cache padding" {
     expect(@sizeOf(CachePadded(u9)) == cache_line);
     expect(@sizeOf(CachePadded(u64)) == cache_line);

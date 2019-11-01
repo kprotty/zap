@@ -25,9 +25,9 @@ pub const Executor = struct {
     pub fn runSequential(self: *@This(), comptime func: var, args: ...) !@typeOf(func).ReturnType {
         var main_node = Node{
             .executor = self,
-            .workers = [_]Worker { undefined },
+            .workers = [_]Worker{undefined},
             .allocator = std.heap.direct_allocator, // TODO: better allocator
-            .affinity = zuma.CpuAffinity {
+            .affinity = zuma.CpuAffinity{
                 .group = 0,
                 .mask = 0,
             },
@@ -110,9 +110,7 @@ pub const Thread = struct {
             return error.Todo;
         }
 
-        pub fn deinit(self: *@This()) void {
-
-        }
+        pub fn deinit(self: *@This()) void {}
     };
 };
 
@@ -133,7 +131,6 @@ pub const Task = struct {
 
         pub fn push(self: *@This(), task: *Task) void {
             self.size += 1;
-            task.next = null;
             if (self.tail) |tail|
                 tail.next = task;
             self.tail = task;

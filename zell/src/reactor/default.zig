@@ -248,7 +248,7 @@ pub const DefaultReactor = struct {
             }
 
             const Chunk = struct {
-                pub const BlockSize = zuma.page_size;
+                pub const BlockSize = std.math.max(zuma.page_size, 256 * 1024);
                 descriptors: [BlockSize / @sizeOf(Descriptor)]Descriptor align(BlockSize),
 
                 /// Using the first descriptor to store meta-data (3 usize's reserved)

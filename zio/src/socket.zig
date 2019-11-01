@@ -221,7 +221,7 @@ const Ipv6Address = struct {
 
     pub fn new(port: u16) !zio.Address {
         const host = try zio.Address.parseIpv6("::1");
-        return zio.Address.fromIpv6(host, port, 0);
+        return zio.Address.fromIpv6(host, port, 0, 0);
     }
 
     pub fn validate(address: zio.Address) bool {

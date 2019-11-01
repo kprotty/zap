@@ -38,10 +38,10 @@ pub const Address = extern struct {
         };
     }
 
-    pub fn fromIpv6(address: std.net.Ip6Addr, port: u16, flowinfo: u32) @This() {
+    pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope_id: u32) @This() {
         return @This(){
             .length = @sizeOf(zio.backend.SockAddr.Ipv6),
-            .sockaddr = zio.backend.SockAddr.fromIpv6(@bitCast(u128, address.addr), port, flowinfo, address.scope_id),
+            .sockaddr = zio.backend.SockAddr.fromIpv6(address, port, flowinfo, scope_id),
         };
     }
 
@@ -49,15 +49,25 @@ pub const Address = extern struct {
         if (input.len == 0)
             return u32(0);
         if (std.mem.eql(u8, input, "localhost"))
-            return std.net.parseIp4("127.0.0.1");
-        return std.net.parseIp4(input);
+            return parse4("127.0.0.1");
+        return parse4(input);
     }
 
-    pub fn parseIpv6(input: []const u8) !std.net.Ip6Addr {
+    fn parse4(input: []const u8) !u32 {
+        const address = try std.net.IpAddress.parse(input, 0);
+        return address.in.addr;
+    }
+
+    pub fn parseIpv6(input: []const u8) !u128 {
         if (input.len == 0)
-            return std.net.Ip6Addr{ .scope_id = 0, .addr = [_]u8{0} ** 16 };
+            return u128(0);
         if (std.mem.eql(u8, input, "::1"))
-            return std.net.parseIp6("0:0:0:0:0:0:0:1");
-        return std.net.parseIp6(input);
+            return parse6("0:0:0:0:0:0:0:1");
+        return parse6(input);
+    }
+
+    fn parse6(input: []const u8) !u128 {
+        const address = try std.net.IpAddress.parse(input, 0);
+        return @bitCast(u128, address.in6.addr);
     }
 };

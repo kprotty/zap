@@ -30,11 +30,15 @@ pub const SockAddr = extern struct {
     pub const Ipv4 = os.sockaddr_in;
     pub const Ipv6 = os.sockaddr_in6;
 
-    inner: os.sockaddr,
+    inner: sockaddr,
+    const sockaddr = extern union {
+        in: Ipv4,
+        in6: Ipv6,
+    };
 
     pub fn fromIpv4(address: u32, port: u16) @This() {
         return @This(){
-            .inner = os.sockaddr{
+            .inner = sockaddr{
                 .in = Ipv4{
                     .addr = address,
                     .family = os.AF_INET,
@@ -47,7 +51,7 @@ pub const SockAddr = extern struct {
 
     pub fn fromIpv6(address: u128, port: u16, flowinfo: u32, scope: u32) @This() {
         return @This(){
-            .inner = os.sockaddr{
+            .inner = sockaddr{
                 .in6 = Ipv6{
                     .scope_id = scope,
                     .flowinfo = flowinfo,

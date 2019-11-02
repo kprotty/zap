@@ -289,7 +289,7 @@ pub const Socket = struct {
                     if (overlapped) |ov| {
                         var bind_address = switch (address.length) {
                             @sizeOf(SockAddr.Ipv4) => zio.Address.fromIpv4(0, 0),
-                            @sizeOf(SockAddr.Ipv6) => zio.Address.fromIpv6(zio.Address.parseIpv6("") catch unreachable, 0, 0),
+                            @sizeOf(SockAddr.Ipv6) => zio.Address.fromIpv6(0, 0, 0, 0),
                             else => return zio.Socket.ConnectError.InvalidAddress,
                         };
                         self.bind(&bind_address) catch return zio.Socket.ConnectError.InvalidHandle;

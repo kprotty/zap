@@ -267,7 +267,7 @@ pub const Barrier = struct {
         while (signals > 0) {
             try self.futex.wait(@ptrCast(*const u32, &self.signals), signals, timeout);
             if (timeout) |t| {
-                const elapsed_ms = zuma.Thread.now(.Monotonic) - t;
+                const elapsed_ms = zuma.Thread.now(.Monotonic) - now;
                 if (elapsed_ms > t)
                     return zync.Futex.WaitError.TimedOut;
                 timeout = t - @intCast(@typeOf(t), elapsed_ms);

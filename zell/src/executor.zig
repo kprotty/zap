@@ -7,7 +7,7 @@ const zell = @import("../../zap.zig").zell;
 /// Representation of a general purpose task scheduler.
 /// The design borrows heavily, and pays respects to:
 /// - Golangs current scheduler implementation (https://github.com/golang/go/blob/master/src/runtime/proc.go)
-/// - Rust Tokio's contributions to said scheduler (https://tokio.rs/blog/2019-10-scheduler/)
+/// - Rust Tokio's contributions/observations to said scheduler (https://tokio.rs/blog/2019-10-scheduler/)
 /// - Dmitry Vyukov's NUMA-aware scheduler proposal for Golang (https://docs.google.com/document/d/1d3iI2QWURgDIsSR6G2275vMeQ_X7w-qxM2Vp7iGwwuM/pub)
 pub const Executor = struct {
     /// Run the given function using the arguments on an executor.
@@ -26,7 +26,6 @@ pub const Executor = struct {
         var main_node = Node{
             .executor = self,
             .workers = [_]Worker{undefined},
-            .allocator = std.heap.direct_allocator, // TODO: better allocator
             .affinity = zuma.CpuAffinity{
                 .group = 0,
                 .mask = 0,
@@ -58,7 +57,7 @@ pub const Executor = struct {
         return self.runWithNodes(real_nodes, func, args);
     }
 
-    pub fn runUsing(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !@typeOf(func).ReturnType {
+    pub fn runWithNodes(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !@typeOf(func).ReturnType {
         return error.Todo;
     }
 };
@@ -69,8 +68,6 @@ pub const Node = struct {
 
     executor: *Executor,
     affinity: zuma.CpuAffinity,
-    allocator: *std.mem.Allocator,
-    reactor: zell.Reactor = undefined,
 
     workers: []Worker,
     thread_pool: Thread.Pool = undefined,
@@ -103,15 +100,7 @@ pub const Thread = struct {
     /// Maximum number of Operating System Threads running concurrently in one Node
     pub const MAX = 10 * 1000;
 
-    pub threadlocal var current: ?*@This() = null;
-
-    pub const Pool = struct {
-        pub fn init(self: *@This(), allocator: *std.mem.Allocator) !void {
-            return error.Todo;
-        }
-
-        pub fn deinit(self: *@This()) void {}
-    };
+    pub threadlocal var current = @This(){};
 };
 
 pub const Task = struct {

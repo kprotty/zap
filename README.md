@@ -13,7 +13,7 @@ Abstractions over the system's IO operations for both blocking and non-blocking 
 Abstractions over the system's threading, memory, and topology operations. Zuma extends upon the zig stdlib to provide more control. Goals include first class NUMA node support along with more customizable memory + thread features such as smaller thread stacks, setting/getting/querying thread cpu topology, and unified virtual memory interface. (Inspired by pthread and libnuma).
 
 - [ ] Threading (WIP)
-- [ ] Virutal Memory
+- [ ] Virtual Memory
 
 ## zync
 Abstractions over the systems thread blocking interfaces and provides both synchronization primitives as well as other useful functions. Goals include exposing customizable building blocks for creation high performance concurrent data structures while not assuming underlying platform as much as possible. (Inspired by rust's crossbeam)
@@ -21,7 +21,7 @@ Abstractions over the systems thread blocking interfaces and provides both synch
 - [x] Lazy (rust's lazy_static)
 - [x] C11 Atomics (supports Unions, Enums, and arbitrary bit-width numbers)
 - [x] Crossbeam utils (spin hint, backoff, cache padded)
-- [ ] System sychnronization (mutex, condition_variable, rwlock, semaphore)
+- [ ] System synchronization (mutex, condition_variable, rwlock, semaphore)
 - [ ] Multi/Single-Producer Multi/Single-Consumer queues and stacks
 
 ## zell

@@ -9,12 +9,9 @@ pub fn build(b: *std.build.Builder) void {
     test_zap.setBuildMode(build_mode);
 
     const format_code = b.addFmt([_][]const u8{
+        "src",
         "zap.zig",
         "build.zig",
-        "zio",
-        "zync",
-        "zuma",
-        "zell",
     });
 
     const build_docs = b.addSystemCommand([_][]const u8{

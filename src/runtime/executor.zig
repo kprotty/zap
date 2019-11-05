@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const thread = @import("./thread.zig");
+const system = @import("../../zap.zig").runtime.system;
 
 pub const Executor = struct {
     nodes: []*Node,
+    idle_nodes: usize,
+    pending_tasks: usize,
 
     pub fn run(comptime func: var, args: ...) !void {
         var self: @This() = undefined;
@@ -28,8 +30,8 @@ pub const Executor = struct {
         // store the array of node pointers on the stack.
         // since its on the stack, limit the maximum amount of numa nodes.
         // also perform the `defer` first to make sure all nodes are freed in case of error
-        var node_array: [_]?*Node{null} ** 64;
-        const array = node_array[0..thread.getNumaNodeCount()];
+        var node_array: [_]?*Node{null} ** @typeInfo(usize).Int.bits;
+        const array = node_array[0..system.Thread.getNumaNodeCount()];
         defer for (array) |ptr| {
             if (ptr) |node|
                 node.free();
@@ -44,12 +46,21 @@ pub const Executor = struct {
 
     pub fn runUsing(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !void {
         self.nodes = nodes;
+        self.pending_tasks = 0;
+        self.idle_nodes = if (nodes.len == @typeInfo)
+        _ = async func(args);
+        
+        // start with a random numa node in order to not over-subscribe on a single
+        // one if theres multiple numa applications running on the system.
+        const start_node = &nodes[system.getRandom().uintAtMost(usize, nodes.len)];
+        start_node.run();
     }
 };
 
 pub const Node = struct {
     executor: *Executor,
     workers: []*Worker,
+    idle_workers: usize,
 
     pub fn init(executor: *Executor, workers: []*Worker) !@This() {
 

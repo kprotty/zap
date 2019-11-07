@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const system = @import("../../zap.zig").runtime.system;
 
 pub const Executor = struct {
     nodes: []*Node,

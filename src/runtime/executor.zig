@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const sync = @import("./sync.zig");
 
 pub const Executor = struct {
-    nodes: []*Node,
-    idle_nodes: usize,
     pending_tasks: usize,
+    nodes: []*Node,
+    idle_nodes: sync.BitSet(usize),
 
     pub fn run(comptime func: var, args: ...) !void {
         var self: @This() = undefined;
@@ -46,7 +47,7 @@ pub const Executor = struct {
     pub fn runUsing(self: *@This(), nodes: []*Node, comptime func: var, args: ...) !void {
         self.nodes = nodes;
         self.pending_tasks = 0;
-        self.idle_nodes = if (nodes.len == @typeInfo)
+        self.idle_nodes = sync.BitSet(usize).init(node.len);
         _ = async func(args);
         
         // start with a random numa node in order to not over-subscribe on a single
@@ -83,11 +84,16 @@ pub const Worker = struct {
     run_queue: LocalQueue,
 
     const GlobalQueue = struct {
-
+        mutex: sync.Mutex = sync.Mutex.init(),
+        tasks: Task.List = Task.List{},
     };
 
     const LocalQueue = struct {
+        head: u32 = 0,
+        tail: u32 = 0,
+        tasks: [256]*Task = undefined,
 
+        fn p
     };
 };
 
@@ -106,5 +112,13 @@ const Task = struct {
         head: ?*Task = null,
         tail: ?*Task = null,
         
+        fn push(self: *@This(), list: @This()) void {
+            if (self.tail) |tail|
+                tail.next = list.head;
+            self.tail = list.tail;
+            if (self.head == null)
+                self.head = list.head;
+            self.size += list.size;
+        }
     };
 };

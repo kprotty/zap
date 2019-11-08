@@ -68,33 +68,3 @@ pub const Barrier = struct {
         }
     }
 };
-
-pub fn Lazy(comptime initializer: var) type {
-    return struct {
-        value: Type,
-        mutex: std.Mutex,
-        is_initialized: u8,
-
-        pub const Type = @typeOf(initializer).ReturnType;
-
-        pub fn init() @This() {
-            return @This(){
-                .value = null,
-                .is_initialized = 0,
-                .mutex = std.Mutex.init(),
-            };
-        }
-
-        pub fn get(self: *@This()) Type {
-            if (@atomicLoad(u8, &self.is_initialized, .Acquire) == 0) {
-                const held = self.mutex.acquire();
-                defer held.release();
-                if (@atomicLoad(u8, &self.is_initialized, .Monotonic) != 0)
-                    return self.value;
-                self.value = initializer();
-                atomicStore(&self.is_initialized, 1, .Release);
-            }
-            return self.value;
-        }
-    };
-}

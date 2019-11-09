@@ -27,7 +27,7 @@ pub const Executor = struct {
         var workers = [_]*Worker{ &main_worker };
 
         // setup the node on the stack
-        var main_node = try Node.init(self, 0, 1, workers[0..]);
+        var main_node = try Node.init(self, 0, workers[0..]);
         defer main_node.deinit();
         var nodes = [_]*Node{ &main_node };
         return self.runUsing(nodes, func, args);
@@ -42,7 +42,7 @@ pub const Executor = struct {
         defer for (array) |ptr| {
             if (ptr) |node|
                 node.free();
-        }
+        };
 
         // Allocate each node on its corresponding numa node for locality
         for (array) |*node, index|
@@ -70,31 +70,35 @@ pub const Executor = struct {
             .parker = std.ThreadParker.init(),
         };
 
-        Worker.current = main_worker;
-        _ = async func(args);
-        var main_stack: [Worker.STACK_SIZE]u8 align(Worker.STACK_ALIGN) = undefined;
-        main_worker.stack = main_stack[0..];
-        main_thread.run();
-
-        self.active_workers.wait();
-        for (nodes) |node| {
+        // ensure all the idle threads get signaled to stop
+        defer for (nodes) |*node| {
             while (node.thread_pool.pop()) |thread| {
                 thread.wakeWith(null);
             }
-        }
+        };
+
+        // run the func() on the main worker then wait for all workers to complete.
+        Worker.current = main_worker;
+        _ = async func(args);
+        try main_thread.run();
+        self.active_workers.wait();
     }
 };
 
 pub const Node = struct {
     numa_node: u16,
     executor: *Executor,
-    monitor: Thread.Monitor,
     
     workers: []*Worker,
     idle_workers: sync.BitSet,
     thread_pool: Thread.Pool,
+    monitor: Thread.Monitor,
 
-    pub fn init(executor: *Executor, numa_node: u16, max_threads: usize, workers: []*Worker) !Node {
+    pub fn init(
+        executor: *Executor,
+        numa_node: u16,
+        workers: []*Worker,
+    ) !Node {
 
     }
 
@@ -109,6 +113,7 @@ pub const Node = struct {
     pub fn free(self: *Node) void {
 
     }
+
 };
 
 const Thread = struct {
@@ -143,14 +148,20 @@ const Thread = struct {
 
         while (self.worker) |worker| {
             worker.thread = self;
-            @newStackCall(worker.stack, Worker.run, worker);
+            if (worker.stack.len != 0) {
+                @newStackCall(worker.stack, Worker.run, worker);
+            } else {
+                worker.run();
+            }
 
             // a task requested to block, go through the whole process
             // and try to continue running on the worker if possible.
+            // Also handle the case when the monitor thread cant be spun
+            // up (e.g. builtin.single_threaded) by re-queing the task.
             if (worker.blocking_task) |blocking_task| {
-                self.node.monitor.block(worker, self);
+                const is_blocking = self.node.monitor.block(worker, self);
                 resume blocking_task.getFrame();
-                if (self.node.monitor.unblock(worker, self)) {
+                if (!is_blocking or (is_blocking and self.node.monitor.unblock(worker, self))) {
                     worker.submit(blocking_task);
                     continue;
                 }
@@ -224,24 +235,26 @@ const Thread = struct {
         node: *Node,
         blocking_workers: u32,
         parker: std.ThreadParker,
-        is_running: std.lazyInit(void),
-
+        is_running: @typeOf(std.lazyInit(void)),
+        
         const IS_BLOCKED = 1;
         const WORKER = @intToPtr(*Worker, 1);
         const MAX_BLOCK_NS = 1 * std.time.millisecond;
 
         /// Mark the worker as blocking under the given thread
-        /// then start the monitor thread if its sleeping. 
-        fn block(self: *Monitor, worker: *Worker, thread: *Thread) !void {
+        /// then start the monitor thread if its sleeping.
+        /// Returns whether or not theres a monitor thread that can unblock this thread.
+        fn block(self: *Monitor, worker: *Worker, thread: *Thread) bool {
             worker.thread = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
             if (@atomicRmw(u32, &self.blocking_workers, .Add, 1, .Release) == 0)
                 self.parker.unpark(&self.blocking_workers);
-            try self.ensureRunning();
+            _ = self.ensureRunning() catch return false;
+            return true;
         }
         
         /// Worker is done blocking on the thread.
         /// Try and reclaim the worker and keep running.
-        /// If this fails, then the monitor thread stole our worker.
+        /// Returns false if the monitor thread stole our worker.
         fn unblock(self: *Monitor, worker: *Worker, thread: *Thread) bool {
             const blocked = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
             var current = @atomicLoad(?*Thread, &worker.thread, .Monotonic);
@@ -409,7 +422,7 @@ pub const Task = struct {
     pub fn init(frame: anyframe, comptime priority: Priority) Task {
         return Task{
             .next = null,
-            .frame = @intToPtr(anyframe, @ptrToInt(frame) | @enumToInt(priority));
+            .frame = @intToPtr(anyframe, @ptrToInt(frame) | @enumToInt(priority)),
         };
     }
 

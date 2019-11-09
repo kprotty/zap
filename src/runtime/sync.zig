@@ -20,7 +20,7 @@ pub const BitSet = struct {
 
     pub fn init(size: usize) @This() {
         return @This(){
-            .mask = if (size >= MAX) ~Word(0) else (Word(1) << @truncate(Index, size)) - 1;
+            .mask = if (size >= MAX) ~Word(0) else (Word(1) << @truncate(Index, size)) - 1,
         };
     }
 

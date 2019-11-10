@@ -13,6 +13,7 @@ pub const Executor = struct {
     idle_nodes: sync.BitSet,
     pending_tasks: usize,
     active_workers: sync.Barrier,
+    distribute_index: usize,
 
     pub fn run(comptime func: var, args: ...) !void {
         var self: Executor = undefined;
@@ -57,6 +58,7 @@ pub const Executor = struct {
             .idle_nodes = sync.BitSet.init(nodes.len),
             .pending_tasks = 0,
             .active_workers = sync.Barrier.init(1),
+            .distribute_index = 0,
         };
         
         // start with a random numa node in order to not over-subscribe on a single
@@ -88,11 +90,11 @@ pub const Executor = struct {
 pub const Node = struct {
     numa_node: u16,
     executor: *Executor,
-    
     workers: []*Worker,
+    run_queue: Worker.GlobalQueue,
     idle_workers: sync.BitSet,
     thread_pool: Thread.Pool,
-    monitor: Thread.Monitor,
+    thread_monitor: Thread.Monitor,
 
     pub fn init(executor: *Executor, numa_node: u16, workers: []*Worker, max_threads: usize) !Node {
 
@@ -117,33 +119,32 @@ const Thread = struct {
     link: ?*Thread,
     worker: ?*Worker,
     parker: std.ThreadParker,
-    is_running: bool align(@alignOf(u32)),
 
-    fn wakeWith(self: *Thread, worker: ?*Worker) void {
-        if (@atomicRmw(?*Worker, &self.worker, .Xchg, worker, .Release) == null)
-            self.parker.unpark(@ptrCast(*const u32, &self.worker));
+    fn getStack(self: *Thread, stack_size: usize) []align(Worker.STACK_ALIGN) u8 {
+        const ptr = std.mem.alignForward(@ptrToInt(self), Worker.STACK_ALIGN);
+        return @intToPtr([*]align(Worker.STACK_ALIGN), ptr)[0..stack_size];
     }
 
-    fn entry(spawn_info: *Pool.SpawnInfo) noreturn {
+    fn entry(spawn_info: *Pool.SpawnInfo) void {
         var self = Thread{
-            .node = spawn_info.pool.node,
-            .link = undefined,
-            .worker = undefined,
+            .node = @fieldParentPtr(Node, "thread_pool", spawn_info.pool),
+            .link = null,
+            .worker = null,
             .parker = std.ThreadParker.init(),
-            .is_running = true,
         };
-        sync.atomicStore(&spawn_info.pool.thread, &self);
-        self.parker.park(@ptrCast(*const u32, &self.worker), 0);
-
-        if (self.worker == Monitor.WORKER) {
-            Monitor.run(&self.node.monitor);
-        } else {
-            self.run();
-        }
-        return system.Thread.exit();
+        sync.atomicStore(&spawn_info.thread, &self, .Release);
+        spawn_info.parker.unpark(@ptrCast(*const u32, &spawn_info.thread));
+        self.run();
+        self.node.thread_pool.put(self);
     }
 
     fn run(self: *Thread) void {
+        // wait to receive a worker
+        self.parker.park(@ptrCast(*const u32, &self.worker), 0);
+        if (self.worker == Monitor.WORKER)
+            return Monitor.run(&self.node.thread_monitor);
+
+        // run the worker as long as there is one
         while (self.worker) |worker| {
             worker.thread = self;
             if (worker.stack.len != 0) {
@@ -152,171 +153,137 @@ const Thread = struct {
                 worker.run();
             }
 
-            // a task requested to block, go through the whole process
-            // and try to continue running on the worker if possible.
-            // Re-queue the task if the monitor thread isnt able to be started up.
-            if (worker.blocking_task) |blocking_task| {
-                const task = blocking_task;
-                worker.blocking_task = null;
-                const is_blocking = self.node.monitor.block(worker, self);
-                resume task.getFrame();
-                if (!is_blocking or (is_blocking and self.node.monitor.unblock(worker, self))) {
-                    worker.submit(task);
-                    continue;
-                }
+            // a worker exiting without a blocking thread means theres no more work.
+            if (!worker.is_blocking)
+                return;
+            worker.is_blocking = false;
+            const blocking_task = worker.next_task orelse return;
+
+            // only consume the blocking task if actually allowed to block.
+            // if able to reclaim worker, then go back to running the blocking task on the worker.
+            if (!self.node.thread_monitor.block(worker, self))
+                continue;
+            worker.next_task = null;
+            resume blocking_task.getFrame();
+            if (self.node.thread_monitor.unblock(worker, self)) {
+                worker.next_task = blocking_task;
+                continue;
             }
 
-            // our worker was stolen since we blocked too long.
-            // try and become reusable in the thread-pool or
-            // exit if the pool is full to save memory.
+            // not able to reclaim the current worker, try and find a new one
+            if (self.node.idle_workers.get()) |idle_worker_index| {
+                const idle_worker = &self.node.workers[idle_worker_index];
+                idle_worker.next_task = blocking_task;
+                self.worker = idle_worker;
+                continue;
+            }
+
+            // no free workers. stop the thread until were signaled with one
             self.worker = null;
-            if (!self.node.thread_pool.put(self))
-                return;
+            self.node.thread_pool.put(self);
             self.parker.park(@ptrCast(*const u32, &self.worker), 0);
         }
     }
 
     const Pool = struct {
-        node: *Node,
         mutex: std.Mutex,
-        free_list: FreeList,
-        
-        /// Mark the thread as idle by trying to put it in the free list
-        /// Returns false if the free_list is full and the thread should exist instead. 
-        fn put(self: *Pool, thread: *Thread) bool {
-            const held = self.mutex.acquire();
-            defer held.release();
+        free_list: ?*Thread,
+        free_count: usize,
+        stack_ptr: usize,
+        stack_size: usize,
+        stack_list: ?*Thread,
+        stack: []align(Worker.STACK_ALIGN) u8,
+        exit_mutex: std.Mutex,
+        exit_stack: [@sizeOf(@Frame(Thread.exit))]u8 align(16),
 
-            // TODO
+        fn exit(self: *Pool, thread: *Thread, exit_held: std.Mutex.Held) void {
+            thread.parker.deinit();
+            system.decommit(thread.getStack());
+            exit_held.release();
+            system.Thread.exit(); // MUST be thread-safe since the exit lock is released.
         }
 
-        /// Get a free thread to run a worker on.
-        /// First check the free_list then try to allocate/create a new one.
+        fn put(self: *Pool, thread: *Thread) void {
+            const held = self.mutex.acquire();
+            const node = @fieldParentPtr(Node, "thread_pool", self);
+
+            // if theres enough threads to service blocking workers,
+            // this one should not be cached and exit to save memory.
+            if (self.free_count > node.workers.len) {
+                thread.link = self.stack_list;
+                self.stack_list = thread;
+                held.release();
+                if (self.stack_size > 0) {
+                    const exit_held = self.exit_mutex.acquire();
+                    @newStackCall(self.exit_stack, Thread.exit, self, thread, exit_held);
+                }
+            }
+
+            // the free_list is a bit empty to add it there
+            thread.link = self.free_list;
+            self.free_list = thread;
+            self.free_count += 1;
+            held.release();
+        }
+
+        const SpawnInfo = struct {
+            pool: *Pool,
+            thread: ?*Thread,
+            parker: std.ThreadParker,
+        };
+
         fn get(self: *Pool) ?*Thread {
             const held = self.mutex.acquire();
             defer held.release();
 
-            // TODO
+            // first, try and pop from the free list
+            if (self.free_list) |thread| {
+                const free_thread = thread;
+                self.free_list = thread.link;
+                self.free_count -= 1;
+                return free_thread;
+            }
+
+            // new thread needed, try and allocate stack space for it.
+            // check the free stack_list first, then try to raw alloc if empty.
+            var stack: []align(Worker.STACK_ALIGN) u8 = undefined;
+            var is_new_stack = false;
+            if (self.stack_size > 0) {
+                if (self.stack_list) |free_stack_thread| {
+                    stack = free_stack_thread.getStack();
+                    self.stack_list = free_stack_thread.link;
+                } else {
+                    const new_ptr = self.stack_ptr - self.stack_size;
+                    if (new_ptr < @ptrToInt(self.stack.ptr))
+                        return null;
+                    is_new_stack = true;
+                    stack = @intToPtr([*]align(Worker.STACK_ALIGN) u8, new_ptr)[0..self.stack_size];
+                }
+            }
+
+            // then spawn the thread, wait to get its *Thread pointer and return it.
+            var spawn_info = SpawnInfo{
+                .pool = self,
+                .thread = null,
+                .parker = std.ThreadParker.init(),
+            };
+            defer spawn_info.parker.deinit();
+            system.Thread.spawn(stack, &spawn_info, Thread.entry) catch return null;
+            spawn_info.parker.park(@ptrCast(*const u32, &spawn_info.thread), 0);
+            if (is_new_stack) // commit stack alloc only if successful in spawning the thread
+                self.stack_ptr = @ptrToInt(stack.ptr);
+            return spawn_info.thread;
         }
     };
-
+    
     const Monitor = struct {
-        node: *Node,
-        timer: std.Timer,
-        blocking_workers: u32,
-        parker: std.ThreadParker,
-        is_running: @typeOf(std.lazyStatic(bool)),
         
-        const IS_BLOCKED = 1;
-        const WORKER = @intToPtr(*Worker, 1);
-        const MAX_BLOCK_NS = 10 * std.time.millisecond;
-
-        fn ensureRunning(self: *Monitor) bool {
-            // guard initialization & assume is_running is false on error
-            if (self.is_running.get()) |is_running_ptr|
-                return is_running_ptr.*;
-            defer self.is_running.resolve();
-            self.is_running.data = false;
-
-            // grab a thread for monitoring, start the timer, and set is_running.
-            const monitor_thread = self.node.thread_pool.get() orelse return false;
-            self.timer = std.Timer.start() orelse return false;
-            monitor_thread.wakeWith(Monitor.WORKER);
-            self.is_running.data = true;
-            return true;
-        }
-
-        /// Mark the worker as blocking under the given thread
-        /// then start the monitor thread if its sleeping.
-        /// Returns whether or not theres a monitor thread that can unblock this thread.
         fn block(self: *Monitor, worker: *Worker, thread: *Thread) bool {
-            if (!self.ensureRunning())
-                return false;
 
-            const expires = @truncate(usize, self.timer.read() + MAX_BLOCK_NS);
-            sync.atomicStore(&worker.monitor_expire, expires, .Monotonic);
-            const blocked = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
-            sync.atomicStore(&worker.thread, blocked, .Monotonic);
-
-            if (@atomicRmw(u32, &self.blocking_workers, .Add, 1, .Release) == 0)
-                self.parker.unpark(&self.blocking_workers);
-            return true;
         }
-        
-        /// Worker is done blocking on the thread.
-        /// Try and reclaim the worker and keep running.
-        /// Returns false if the monitor thread stole our worker.
+
         fn unblock(self: *Monitor, worker: *Worker, thread: *Thread) bool {
-            // assume non-null because should have been resolved by a call to block() first.
-            // test this first to avoid the cmpxchg (write) below.
-            if (!self.is_running.get().?.*)
-                return true;
 
-            var spin = std.SpinLock.Backoff.new();
-            var current = @atomicLoad(?*Thread, &worker.thread, .Monotonic);
-            const blocked = @intToPtr(*Thread, @ptrToInt(current) | IS_BLOCKED);
-            while (current == blocked) : (spin.yield()) {
-                current = @cmpxchgWeak(?*Thread, &worker.thread, blocked, thread, .Release, .Monotonic) orelse {
-                    sync.atomicStore(&worker.monitor_expire, 0, .Monotonic);
-                    return true;
-                };
-            }
-            return false;
-        }
-
-        fn run(self: *Monitor) void {
-            while (@atomicLoad(usize, &self.node.executor.pending_tasks, .Monotonic) == 0) {
-                const now = timer.read();
-                var wait_time: u64 = MAX_BLOCK_NS * 2;
-
-                // iterate all running workers with the goal of migrating them if theyre blocked on threads too long
-                for (self.node.workers) |*worker| {
-                    const thread = @atomicLoad(?*Thread, &worker.thread, .Monotonic);
-                    if ((@ptrToInt(thread) & IS_BLOCKED) != 0) {
-                        const expires = @atomicLoad(usize, &worker.monitor_expire, .Monotonic);
-
-                        // worker isnt blocking
-                        if (expires == 0)
-                            continue;
-                        
-                        // worker is blocking, but not over max block time
-                        if (expires > now) {
-                            wait_time = std.math.min(wait_time, expires - now);
-                            continue;
-                        }
-
-                        // worker is blocking and over the max block time so try and steal it. only steal if:
-                        // - theres another task to be processed
-                        // - theres an extra thread to process that task on
-                        // - the blocking thread didnt take back ownership of the worker (cmpxchg)
-                        const idle_task = worker.getTask(false) orelse continue;
-                        var stole_worker = false;
-                        defer if (!stole_worker) {
-                            worker.submit(idle_task);
-                        };
-                        const idle_thread = self.node.thread_pool.get() orelse continue;
-                        if (@cmpxchgWeak(?*Thread, &worker.thread, thread, null, .Acquire, .Monotonic) == null) {
-                            worker.blocking_workers = idle_task;
-                            idle_thread.wakeWith(worker);
-                            stole_worker = true;
-                        } else if (!self.node.thread_pool.put(idle_thread)) {
-                            idle_thread.wakeWith(null);
-                        }
-                    }
-                }
-
-                // - reiterate if theres new incoming blocked workers
-                // - sleep for a calculated amount of time if theres blocked workers about to expire
-                // - if no worker is blocked, sleep indefinitely until one does to start tracking it.
-                if (@atomicRmw(u32, &self.blocking_workers, .Xchg, 0, .Acquire) > 0) {
-                    continue;
-                } else if (wait_time < max_block_ns * 2) {
-                    std.time.sleep(wait_time);
-                    continue;
-                } else {
-                    self.parker.park(&self.blocking_workers, 0);
-                }
-            }
         }
     };
 };
@@ -336,21 +303,26 @@ pub const Worker = struct {
 
     node: *Node,
     thread: ?*Thread,
-    monitor_expire: usize,
-    blocking_task: ?*Task,
-
+    stack: []align(STACK_ALIGN) u8,
+    
+    next_task: ?*Task,
+    is_blocking: bool,
     run_tick: u32,
     run_queue: LocalQueue,
-    stack: []align(STACK_ALIGN) u8,
-
+    
     pub fn init(node: *Node, stack: []align(STACK_ALIGN) u8) Worker {
         return Worker{
             .node = node,
             .thread = null,
-            .blocking_task = null,
-            .run_tick = 0,
-            .run_queue = LocalQueue{},
             .stack = stack,
+            .next_task = null,
+            .is_blocking = false,
+            .run_tick = 0,
+            .run_queue = LocalQueue{
+                .head = 0,
+                .tail = 0,
+                .tasks = undefined,
+            },
         };
     }
 
@@ -363,29 +335,66 @@ pub const Worker = struct {
         if (builtin.single_threaded or self.node.workers.len == 1)
             return func(args);
         
-        // wait to transition to a thread it can block on
-        var task = Task.init(@frame(), .Override);
-        suspend self.blocking_task = &task;
+        // wait for the async function to get into a blocking context
+        var task = Task.init(@frame(), .High);
+        self.submit(task);
+        suspend self.is_blocking = true;
 
-        // perform the blocking operation then wait to
-        // transition back to a non-blocking context.
+        // perform the blocking function,
+        // wait to get back into a non-blocking context,
+        // then return the result of the blocking operation.
         const result = func(args);
-        suspend task.setFrame(@frame());
+        suspend task = Task.init(@frame(), .Local);
         return result;
     }
 
+    fn tryDistribute(node: *Node, task: *Task) bool {
+        const idle_worker_index = node.idle_workers.get() orelse return false;
+        const idle_thread = node.thread_pool.get() orelse {
+            node.idle_workers.set(idle_worker_index);
+            return false;
+        };
+        const idle_worker = &node.worers[idle_worker_index];
+        idle_worker.next_task = task;
+        idle_thread.wakeWith(idle_worker);
+        return true;
+    }
+
     pub fn submit(self: *Worker, task: *Task) void {
-        // TODO: take into account task priority for scheduling it
+        // first, try and distribute it to other Workers on the current node
+        if (tryDistribute(self.node, task))
+            return;
+        
+        // then try and distribute the task according to its priority
+        switch (task.getPriority()) {
+            .Low => {
+                self.run_queue.pushBack(task);
+            },
+            .High => {
+                const old_next = self.next_task;
+                self.next_task = task;
+                if (old_next) |next_task|
+                    self.run_queue.pushFront(next_task);
+            },
+            .Local => {
+                self.node.run_queue.put(task);
+            },
+            .Global => {
+                const node_index = @atomicRmw(usize, &self.node.executor.distribute_index, .Add, 1, .Monotonic);
+                const next_node = self.node.executor.nodes[node_index % self.node.executor.nodes.len];
+                if (!tryDistribute(next_node, task))
+                    next_node.run_queue.put(task);
+            },
+        }
     }
 
     fn run(self: *Worker) void {
         while (@atomicLoad(usize, &self.node.executor.pending_tasks, .Monotonic) > 0) {
-            const next_task = self.blocking_task;
-            self.blocking_task = null;
-            if (next_task orelse self.getTask(true)) |task|
-                resume task.getFrame();
-            _ = @atomicRmw(usize, &self.node.executor.pending_tasks, .Sub, 1, .Acquire);
-            if (self.blocking_task != null)
+            const task = self.getTask(true) orelse return;
+            resume task.getFrame();
+            if (self.is_blocking)
+                return;
+            if (@atomicRmw(usize, &self.node.executor.pending_tasks, .Sub, 1, .Release) == 1)
                 return;
         }
     }
@@ -395,33 +404,52 @@ pub const Worker = struct {
     }
 
     const GlobalQueue = struct {
-        mutex: std.Mutex = std.Mutex.init(),
-        tasks: Task.List = Task.List{},
+        mutex: std.Mutex,
+        tasks: Task.List,
     };
 
     const LocalQueue = struct {
-        head: u32 = 0,
-        tail: u32 = 0,
+        head: u32,
+        tail: u32,
         tasks: [256]*Task = undefined,
 
-        
+        // for Task.Priority.High
+        fn pushFront(self: *LocalQueue, task: *Task) void {
+
+        }
+
+        // for Task.Priority.low
+        fn pushBack(self: *LocalQueue, task: *Task) void {
+
+        }
+
+        fn popFront(self: *LocalQueue) ?*Task {
+
+        }
+
+        fn popBack(self: *LocalQueue) ?*Task {
+
+        }
+
+        fn steal(noalias self: *LocalQueue, noalias other: *LocalQueue) ?*Task {
+
+        }
     };
 };
 
 pub const Task = struct {
-    next: ?*Task = null,
-    frame: anyframe = undefined,
+    next: ?*Task,
+    frame: anyframe,
     
     pub const Priority = enum(u2) {
         /// Schedule to end of the local queue on the current node
         Low,
         /// Schedule to the front of the local queue on the current node
         High,
-        /// Distribute to other workers or nodes
-        Root,
-        /// Should immediately be run next (over all priorities)
-        /// TODO: re-evaluate this
-        Override,
+        /// Schedule into the global or local queue on the current node
+        Local,
+        /// Schedule into the global or local queue on any node in the executor
+        Global,
     };
 
     pub fn init(frame: anyframe, comptime priority: Priority) Task {
@@ -450,9 +478,9 @@ pub const Task = struct {
     }
 
     pub const List = struct {
-        size: usize = 0,
-        head: ?*Task = null,
-        tail: ?*Task = null,
+        size: usize,
+        head: ?*Task,
+        tail: ?*Task,
         
         pub fn push(self: *List, list: List) void {
             if (self.tail) |tail|

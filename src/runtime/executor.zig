@@ -154,9 +154,9 @@ const Thread = struct {
             }
 
             // a worker exiting without a blocking thread means theres no more work.
-            if (!worker.is_blocking)
+            if (!worker.will_block)
                 return;
-            worker.is_blocking = false;
+            worker.will_block = false;
             const blocking_task = worker.next_task orelse return;
 
             // only consume the blocking task if actually allowed to block.
@@ -277,13 +277,124 @@ const Thread = struct {
     };
     
     const Monitor = struct {
+        timer: std.time.Timer,
+        parker: std.ThreadParker,
+        is_running: @typeOf(std.lazyInit(bool)),
+        has_blocking: bool align(@alignOf(u32)),
         
-        fn block(self: *Monitor, worker: *Worker, thread: *Thread) bool {
+        const IS_BLOCKED: usize = 0x1;
+        const WORKER = @intToPtr(*Worker, 0x1);
+        const MAX_BLOCK_NS = 2 * std.time.millisecond;
 
+        fn block(self: *Monitor, worker: *Worker, thread: *Thread) bool {
+            // should only block if theres a monitor thread running to potentially unblock us.
+            if (!self.ensureMonitoring())
+                return false;
+
+            // setup the worker into a blocking state
+            const expires = @truncate(usize, self.timer.read());
+            const blocked = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
+            sync.atomicStore(&worker.thread, blocked, .Monotonic);
+            sync.atomicStore(&worker.monitor_expires, expires + MAX_BLOCK_NS, .Monotonic);
+
+            // notify the monitor thread that theres a new blocking worker
+            const has_blocking_ptr = @ptrCast(*u32, &self.has_blocking);
+            if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(true), .Release) == @boolToInt(false))
+                self.parker.unpark(has_blocking_ptr);
+            return true;
         }
 
         fn unblock(self: *Monitor, worker: *Worker, thread: *Thread) bool {
+            // try and take back our worker after blocking.
+            // if we fail, the monitor thread stole our worker.
+            // if so, wait for the monitor thread to complete the steal and return whether it was successfull.
+            const blocked = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
+            if (@cmpxchgWeak(?*Thread, &worker.thread, blocked, thread, .Monotonic, .Monotonic) != null) {
+                thread.parker.park(@ptrCast(*const u32, &worker.thread), 0);
+                return @atomicLoad(?*Thread, &worker.thread, .Acquire) == thread;
+            }
 
+            // we managed to take back our worker, so continue running.
+            sync.atomicStore(&worker.monitor_expires, 0, .Monotonic);
+            return true;
+        }
+
+        fn ensureMonitoring(self: *Monitor) bool {
+            // globally once-init the is_running flag.
+            // assume false until successfully initialized.
+            if (self.is_running.get()) |is_running_ptr|
+                return is_running_ptr.*;
+            defer self.is_running.resolve();
+            self.is_running.data = false;
+            
+            // begin the timer & start up a monitor thread
+            self.timer = std.time.Timer.start() catch return false;
+            const node = @fieldParentPtr(Node, "thread_monitor", self);
+            const monitor_thread = node.thread_pool.get() orelse return false;
+            monitor_thread.wakeWith(Monitor.WORKER);
+        }
+
+        fn run(self: *Monitor) void {
+            // keep running while the executor is up.
+            // the goal of each iteration is to steal workers who are blocked on a thread
+            const node = @fieldParentPtr(Node, "thread_monitor", self);
+            while (@atomicLoad(usize, &self.node.executor.pending_tasks, .Monotonic) > 0) {
+                const now = self.timer.read();
+                var wait_time = ~@as(usize, 0);
+
+                // iterate through all the workers that are blocked
+                for (nodes.workers) |*worker| {
+                    const thread = @atomicLoad(?*Thread, &worker.thread, .Monotonic);
+                    if ((@ptrToInt(thread) & IS_BLOCKED) != 0) {
+                        const expires = @atomicLoad(usize, &worker.monitor_expires, .Monotonic);
+
+                        // worker is not blocked
+                        if (expires == 0)
+                            continue;
+
+                        // worker is blocked, but not over max block time
+                        if (expires < now) {
+                            wait_time = std.math.min(wait_time, expires);
+                            continue;
+                        }
+
+                        // Worker is blocked AND over max block time so try and steal it from the blocking thread.
+                        // Once done trying to steal, notify the blocked thread of the attempt.
+                        // a `worker.thread` of the blocked thread means the steal was unsuccessful.
+                        if (@cmpxchgWeak(?*Thread, &worker.thread, thread, null, .Monotonic, .Monotonic) != null)
+                            continue;
+                        sync.atomicStore(&worker.monitor_expires, 0, .Monotonic);
+                        var next_thread = @intToPtr(?*Thread, @ptrToInt(thread) & ~IS_BLOCKED);
+                        defer {
+                            sync.atomicStore(&worker.thread, next_thread, .Release);
+                            thread.parker.unpark(@ptrCast(*const u32, &worker.thread));
+                        };
+
+                        // Only migrate the worker from the thread if:
+                        // - theres a task that needs to be processed on the worker
+                        // - theres a free thread for the worker to process that task.
+                        const idle_task = worker.getTask(false) orelse continue;
+                        const idle_thread = node.thread_pool.get() orelse continue;
+                        worker.next_task = idle_task;
+                        next_thread = idle_thread;
+                        idle_thread.wakeWith(worker);
+                    }
+                }
+
+                // re-scan the workers if a new one has started blocking
+                const has_blocking_ptr = @ptrCast(*u32, &self.has_blocking);
+                if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(false), .Release) == @boolToInt(true))
+                    continue;
+                
+                // sleep until a blocking worker's max block time expires
+                if (wait_time != ~@as(usize, 0)) {
+                    std.time.sleep(wait_time);
+                    continue;
+                }
+
+                // no blocking workers, wait until there is one
+                self.parker.park(has_blocking_ptr, @boolToInt(false));
+            }
         }
     };
 };
@@ -306,7 +417,8 @@ pub const Worker = struct {
     stack: []align(STACK_ALIGN) u8,
     
     next_task: ?*Task,
-    is_blocking: bool,
+    will_block: bool,
+    monitor_expires: usize,
     run_tick: u32,
     run_queue: LocalQueue,
     
@@ -316,7 +428,8 @@ pub const Worker = struct {
             .thread = null,
             .stack = stack,
             .next_task = null,
-            .is_blocking = false,
+            .will_block = false,
+            .monitor_expires = 0,
             .run_tick = 0,
             .run_queue = LocalQueue{
                 .head = 0,
@@ -338,7 +451,7 @@ pub const Worker = struct {
         // wait for the async function to get into a blocking context
         var task = Task.init(@frame(), .High);
         self.submit(task);
-        suspend self.is_blocking = true;
+        suspend self.will_block = true;
 
         // perform the blocking function,
         // wait to get back into a non-blocking context,
@@ -392,7 +505,7 @@ pub const Worker = struct {
         while (@atomicLoad(usize, &self.node.executor.pending_tasks, .Monotonic) > 0) {
             const task = self.getTask(true) orelse return;
             resume task.getFrame();
-            if (self.is_blocking)
+            if (self.will_block)
                 return;
             if (@atomicRmw(usize, &self.node.executor.pending_tasks, .Sub, 1, .Release) == 1)
                 return;

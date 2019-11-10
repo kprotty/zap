@@ -7,9 +7,9 @@ pub fn atomicStore(ptr: var, value: var, comptime order: builtin.AtomicOrder) vo
 }
 
 pub const BitSet = struct {
-    const Word = usize;
-    const Max = @typeOf(Word).Int.bits;
-    const Index = @Type(builtin.TypeInfo{
+    pub const Word = usize;
+    pub const Max = @typeOf(Word).Int.bits;
+    pub const Index = @Type(builtin.TypeInfo{
         .Int = builtin.TypeInfo.Int{
             .is_signed = false,
             .bits = @ctz(u16, Max),
@@ -20,7 +20,10 @@ pub const BitSet = struct {
 
     pub fn init(size: usize) @This() {
         return @This(){
-            .mask = if (size >= MAX) ~Word(0) else (Word(1) << @truncate(Index, size)) - 1,
+            .mask = if (size >= MAX) 
+                ~@as(Word, 0)
+            else 
+                (@as(Word, 1) << @truncate(Index, size)) - 1,
         };
     }
 
@@ -30,11 +33,11 @@ pub const BitSet = struct {
 
     pub fn get(self: *@This()) ?Index {
         var mask = @atomicLoad(Word, &self.mask, .Monotonic);
-        while (mask != ~Word(0)) : (std.SpinLock.yield(1)) {
+        while (mask != ~@as(Word, 0)) {
             const index = @truncate(Index, @ctz(Word, ~mask));
-            const updated = mask & ~(Word(1) << index);
-            mask = @cmpxchgWeak(Word, &self.mask, mask, updated, .Acquire, .Monotonic)
-                orelse return index;
+            const updated = mask & ~(@as(Word, 1) << index);
+            mask = @cmpxchgWeak(Word, &self.mask, mask, updated, .Acquire, .Monotonic) orelse return index;
+            std.SpinLock.yield(1);
         }
         return null;
     }

@@ -10,7 +10,6 @@ const system = switch (builtin.os) {
 
 pub const Executor = struct {
     nodes: []*Node,
-    idle_nodes: sync.BitSet,
     pending_tasks: usize,
     active_workers: sync.Barrier,
     distribute_index: usize,
@@ -25,8 +24,7 @@ pub const Executor = struct {
     pub fn runSequential(self: *Executor, comptime func: var, args: ...) !void {
         // setup the worker and node on the stack
         var workers = [1]Worker{ undefined };
-        const empty_stack = @as([*]align(Worker.STACK_ALIGN) u8, undefined)[0..0];
-        var main_node = try Node.init(self, 0, workers[0..], empty_stack);
+        var main_node = try Node.init(self, 0, workers[0..], null, null, null);
         defer main_node.deinit();
 
         var nodes = [_]*Node{ &main_node };
@@ -66,7 +64,6 @@ pub const Executor = struct {
     pub fn runUsing(self: *Executor, nodes: []*Node, comptime func: var, args: ...) !void {
         self.* = Executor{
             .nodes = nodes,
-            .idle_nodes = sync.BitSet.init(nodes.len),
             .pending_tasks = 0,
             .active_workers = sync.Barrier.init(1),
             .distribute_index = 0,
@@ -83,12 +80,6 @@ pub const Executor = struct {
             .parker = std.ThreadParker.init(),
         };
 
-        // ensure all the idle threads get signaled to stop
-        defer for (nodes) |*node| {
-            node.thread_monitor.deinit();
-            node.thread_pool.deinit();
-        };
-
         // run the func() on the main worker then wait for all workers to complete.
         Worker.current = main_worker;
         _ = async func(args);
@@ -98,33 +89,112 @@ pub const Executor = struct {
 };
 
 pub const Node = struct {
-    numa_node: u16,
     executor: *Executor,
+    reactor: system.Reactor,
     workers: []Worker,
-    run_queue: Worker.GlobalQueue,
+    affinity: system.CpuAffinity,
     idle_workers: sync.BitSet,
-    thread_pool: Thread.Pool,
+    run_queue: Worker.GlobalQueue,
     thread_monitor: Thread.Monitor,
+    thread_pool: Thread.Pool,
 
-    pub fn init(executor: *Executor, numa_node: u16, workers: []Worker, stack: []align(Worker.STACK_ALIGN) u8) !Node {
-
+    pub fn init(
+        executor: *Executor,
+        numa_node: u16,
+        workers: []Worker,
+        affinity: ?system.CpuAffinity,
+        stack_size: ?usize,
+        thread_stacks: ?[]align(Worker.STACK_ALIGN) u8,
+    ) !Node {
+        const stack = thread_stacks orelse @as([*]align(Worker.STACK_ALIGN) u8, undefined)[0..0];
+        return Node{
+            .executor = executor,
+            .reactor = try system.Reactor.init(numa_node),
+            .workers = workers,
+            .affinity = affinity orelse try system.CpuAffinity.get(numa_node),
+            .idle_workers = sync.BitSet.init(workers.len),
+            .run_queue = Worker.GlobalQueue{
+                .mutex = std.Mutex.init(),
+                .tasks = Task.List{
+                    .head = null,
+                    .tail = null,
+                    .size = 0,
+                },
+            },
+            .thread_monitor = Thread.Monitor{
+                .timer = undefined,
+                .parker = std.ThreadParker.deinit(),
+                .has_blocking = false,
+                .thread = std.lazyInit(?*Thread),
+            },
+            .thread_pool = Thread.Pool{
+                .mutex = std.Mutex.init(),
+                .free_list = null,
+                .free_count = 0,
+                .stack_ptr = @ptrToInt(stack.ptr) + stack.len,
+                .stack_size = stack_size orelse Thread.STACK_SIZE,
+                .stack_list = null,
+                .stack = stack,
+                .exit_mutex = std.Mutex.init(),
+                .exit_stack = undefined,
+            },
+        };
     }
 
     pub fn deinit(self: *Node) void {
-
+        self.thread_monitor.deinit();
+        self.thread_pool.deinit();
+        self.reactor.deinit();
     }
 
     pub fn alloc(executor: *Executor, numa_node: u16, max_threads: usize, max_workers: ?usize) !*Node {
+        var size: usize = @sizeOf(Node);
+        const affinity = try system.CpuAffinity.get(numa_node);
+        const stack_size = system.Thread.getStackSize(Thread.STACK_SIZE);
+        const num_workers = std.math.min(affinity.getCount(), max_workers orelse ~@as(usize, 0));
 
+        size = std.mem.alignForward(size, @alignOf(Worker));
+        const worker_offset = size;
+        size += num_workers * @sizeOf(Worker);
+
+        size = std.mem.alignForward(size, Worker.STACK_ALIGN);
+        const worker_stack_offset = size;
+        size += num_workers * Worker.STACK_SIZE;
+
+        size = std.mem.alignForward(size, Worker.STACK_ALIGN);
+        const thread_stack_offset = size;
+        size += max_threads * stack_size;
+
+        const memory = try system.map(numa_node, size);
+        errdefer system.unmap(memory);
+        const ptr = @ptrToInt(memory.ptr);
+
+        const self = @intToPtr(*Node, ptr);
+        const workers = @intToPtr([*]Worker, ptr + worker_offset)[0..num_workers];
+        for (workers) |*worker, index|
+            worker.stack = @intToPtr([*]align(Worker.STACK_ALIGN) u8, ptr + worker_stack_offset * i)[0..Worker.STACK_SIZE];
+        const stack = @intToPtr([*]align(Worker.STACK_ALIGN) u8, ptr + thread_stack_offset)[0..max_threads * stack_size];
+        self.* = try Node.init(executor, numa_node, workers, affinity, stack);
+        return self;
     }
 
     pub fn free(self: *Node) void {
-
+        self.deinit();
+        const ptr_begin = @ptrToInt(self);
+        const ptr_end = @ptrToInt(self.thread_pool.stack) + self.thread_pool.stack.len;
+        system.unmap(@intToPtr([*]align(std.mem.page_size) u8, ptr_begin)[0..ptr_end - ptr_begin]);
     }
 };
 
 const Thread = struct {
     const DEFAULT_MAX = 10 * 1000;
+    const PTHREAD_STACK_MIN = 16 * 1024;
+    const STACK_SIZE = if (builtin.os == .windows)
+        0
+    else if (builtin.link_libc)
+        PTHREAD_STACK_MIN
+    else
+        std.mem.alignForward(std.mem.page_size + @sizeOf(@Frame(Thread.entry)), std.mem.page_size);
 
     node: *Node,
     link: ?*Thread,
@@ -152,6 +222,7 @@ const Thread = struct {
         };
         sync.atomicStore(&spawn_info.thread, &self, .Release);
         spawn_info.parker.unpark(@ptrCast(*const u32, &spawn_info.thread));
+        system.Thread.setAffinity(self.node.affinity);
         self.run();
         if (!self.should_exit)
             self.node.thread_pool.put(self);
@@ -214,20 +285,6 @@ const Thread = struct {
         stack: []align(Worker.STACK_ALIGN) u8,
         exit_mutex: std.Mutex,
         exit_stack: [@sizeOf(@Frame(Thread.exit))]u8 align(16),
-
-        fn init(stack: []align(Worker.STACK_ALIGN) u8, stack_size: usize) Pool {
-            return Pool{
-                .mutex = std.Mutex.init(),
-                .free_list = null,
-                .free_count = 0,
-                .stack_ptr = @ptrToInt(stack.ptr) + stack.len,
-                .stack_size = stack_size,
-                .stack_list = null,
-                .stack = stack,
-                .exit_mutex = std.Mutex.init(),
-                .exit_stack = undefined,
-            };
-        }
 
         fn deinit(self: *Pool) void {
             const held = self.mutex.acquire();
@@ -334,15 +391,6 @@ const Thread = struct {
         const IS_BLOCKED: usize = 0x1;
         const WORKER = @intToPtr(*Worker, 0x1);
         const MAX_BLOCK_NS = 2 * std.time.millisecond;
-
-        fn init() Monitor {
-            return Monitor{
-                .timer = undefined,
-                .parker = std.ThreadParker.deinit(),
-                .has_blocking = false,
-                .thread = std.lazyInit(?*Thread),
-            };
-        }
 
         fn deinit(self: *Monitor) void {
             if (self.thread.get()) |thread_ptr| {
@@ -588,7 +636,48 @@ pub const Worker = struct {
     }
 
     fn getTask(self: *Worker, blocking: bool) ?*Task {
+        const LOW_PRIORITY_TICK = 7;
+        const LOCAL_PRIORITY_TICK = 61;
+        self.run_tick +%= 1;
 
+        // check our node's global_queue once in a while
+        if ((self.run_tick % LOCAL_PRIORITY_TICK) == 0) {
+            if (self.node.run_queue.get(&self.run_queue)) |task|
+                return task;
+
+        // pop from the back once in a while to ensure fairness (FIFO)
+        } else if ((self.run_tick % LOW_PRIORITY_TICK) == 0) {
+            if (self.run_queue.popBack()) |task|
+                return task;
+
+        // check the next_task slot if its set
+        } else if (self.next_task) |next_task| {
+            const task = next_task;
+            self.next_task = null;
+            return task;
+
+        // most common: pop from the front (LIFO)
+        } else if (self.run_queue.popFront()) |task| {
+            return task;
+
+        // local queue is empty, check our node's global queue
+        } else if (self.node.run_queue.get(&self.run_queue)) |task| {
+            return task;
+
+        // our node's global queue is empty. try polling the reactor for some tasks
+        } else if (self.pollReactor()) |task| {
+            return task;
+        }
+
+        // now we should try to steal from other workers in the other of:
+        // - the run_queue of the workers on our local node
+        // - our local node's run_queue
+        // - the run_queue of the workers on other nodes
+        // - other node's run_queue
+        // - finally, our local node again
+
+        // if not `blocking`, return null here 
+        // then block on pollReactor() or set the worker to idle & release the thread
     }
 
     const GlobalQueue = struct {

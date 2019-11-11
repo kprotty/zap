@@ -23,13 +23,12 @@ pub const Executor = struct {
     }
 
     pub fn runSequential(self: *Executor, comptime func: var, args: ...) !void {
-        // setup the worker on the stack
-        var main_worker: Worker = undefined;
-        var workers = [_]*Worker{ &main_worker };
-
-        // setup the node on the stack
-        var main_node = try Node.init(self, 0, workers[0..], 0);
+        // setup the worker and node on the stack
+        var workers = [1]Worker{ undefined };
+        const empty_stack = @as([*]align(Worker.STACK_ALIGN) u8, undefined)[0..0];
+        var main_node = try Node.init(self, 0, workers[0..], empty_stack);
         defer main_node.deinit();
+
         var nodes = [_]*Node{ &main_node };
         return self.runUsing(nodes, func, args);
     }
@@ -47,9 +46,21 @@ pub const Executor = struct {
 
         // Allocate each node on its corresponding numa node for locality
         for (array) |*node, index|
-            node.* = try Node.alloc(self, index, 1024);
+            node.* = try Node.alloc(self, index, Thread.DEFAULT_MAX, null);
         const nodes = @ptrCast([*]Node, array.ptr)[0..array.len];
         return self.runUsing(nodes, func, args);
+    }
+
+    pub fn runSMP(self: *Executor, comptime func: var, args: ..., max_workers: usize, max_threads: usize) !void {
+        // max_threads limits max_workers
+        const num_threads = std.math.min(Thread.DEFAULT_MAX, std.math.max(1, max_threads)) - 1;
+        const num_workers = std.math.min(num_threads + 1, std.math.max(1, max_workers));
+
+        // allocate the node on the first NUMA node by default
+        const node = try Node.alloc(self, 0, num_threads, num_workers);
+        defer node.free();
+        var nodes = [_]*Node{ &node };
+        return self.runUsing(nodes[0..], func, args);
     }
 
     pub fn runUsing(self: *Executor, nodes: []*Node, comptime func: var, args: ...) !void {
@@ -74,9 +85,7 @@ pub const Executor = struct {
 
         // ensure all the idle threads get signaled to stop
         defer for (nodes) |*node| {
-            const has_blocking_ptr = @ptrCast(*u32, &node.thread_monitor.has_blocking);
-            if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(true), .Release) == @boolToInt(false))
-                node.thread_monitor.parker.unpark(has_blocking_ptr);
+            node.thread_monitor.deinit();
             node.thread_pool.deinit();
         };
 
@@ -91,13 +100,13 @@ pub const Executor = struct {
 pub const Node = struct {
     numa_node: u16,
     executor: *Executor,
-    workers: []*Worker,
+    workers: []Worker,
     run_queue: Worker.GlobalQueue,
     idle_workers: sync.BitSet,
     thread_pool: Thread.Pool,
     thread_monitor: Thread.Monitor,
 
-    pub fn init(executor: *Executor, numa_node: u16, workers: []*Worker, max_threads: usize) !Node {
+    pub fn init(executor: *Executor, numa_node: u16, workers: []Worker, stack: []align(Worker.STACK_ALIGN) u8) !Node {
 
     }
 
@@ -105,17 +114,18 @@ pub const Node = struct {
 
     }
 
-    pub fn alloc(executor: *Executor, numa_node: u16, max_threads: usize) !*Node {
+    pub fn alloc(executor: *Executor, numa_node: u16, max_threads: usize, max_workers: ?usize) !*Node {
 
     }
 
     pub fn free(self: *Node) void {
 
     }
-
 };
 
 const Thread = struct {
+    const DEFAULT_MAX = 10 * 1000;
+
     node: *Node,
     link: ?*Thread,
     worker: ?*Worker,

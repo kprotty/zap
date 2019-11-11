@@ -74,9 +74,10 @@ pub const Executor = struct {
 
         // ensure all the idle threads get signaled to stop
         defer for (nodes) |*node| {
-            while (node.thread_pool.pop()) |thread| {
-                thread.wakeWith(null);
-            }
+            const has_blocking_ptr = @ptrCast(*u32, &node.thread_monitor.has_blocking);
+            if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(true), .Release) == @boolToInt(false))
+                node.thread_monitor.parker.unpark(has_blocking_ptr);
+            node.thread_pool.deinit();
         };
 
         // run the func() on the main worker then wait for all workers to complete.
@@ -118,6 +119,7 @@ const Thread = struct {
     node: *Node,
     link: ?*Thread,
     worker: ?*Worker,
+    should_exit: bool,
     parker: std.ThreadParker,
 
     fn getStack(self: *Thread, stack_size: usize) []align(Worker.STACK_ALIGN) u8 {
@@ -125,24 +127,31 @@ const Thread = struct {
         return @intToPtr([*]align(Worker.STACK_ALIGN), ptr)[0..stack_size];
     }
 
+    fn wakeWith(self: *Thread, worker: ?*Worker) void {
+        if (@atomicRmw(?*Worker, &self.worker, .Xchg, worker, .Release) == null)
+            self.parker.unpark(@ptrCast(*const u32, &self.worker));
+    }
+
     fn entry(spawn_info: *Pool.SpawnInfo) void {
         var self = Thread{
             .node = @fieldParentPtr(Node, "thread_pool", spawn_info.pool),
             .link = null,
             .worker = null,
+            .should_exit = false,
             .parker = std.ThreadParker.init(),
         };
         sync.atomicStore(&spawn_info.thread, &self, .Release);
         spawn_info.parker.unpark(@ptrCast(*const u32, &spawn_info.thread));
         self.run();
-        self.node.thread_pool.put(self);
+        if (!self.should_exit)
+            self.node.thread_pool.put(self);
     }
 
     fn run(self: *Thread) void {
         // wait to receive a worker
         self.parker.park(@ptrCast(*const u32, &self.worker), 0);
         if (self.worker == Monitor.WORKER)
-            return Monitor.run(&self.node.thread_monitor);
+            return Monitor.run(&self.node.thread_monitor, self);
 
         // run the worker as long as there is one
         while (self.worker) |worker| {
@@ -179,9 +188,9 @@ const Thread = struct {
             }
 
             // no free workers. stop the thread until were signaled with one
-            self.worker = null;
+            self.worker = @intToPtr(*Worker, 2);
             self.node.thread_pool.put(self);
-            self.parker.park(@ptrCast(*const u32, &self.worker), 0);
+            self.parker.park(@ptrCast(*const u32, &self.worker), 2);
         }
     }
 
@@ -195,6 +204,36 @@ const Thread = struct {
         stack: []align(Worker.STACK_ALIGN) u8,
         exit_mutex: std.Mutex,
         exit_stack: [@sizeOf(@Frame(Thread.exit))]u8 align(16),
+
+        fn init(stack: []align(Worker.STACK_ALIGN) u8, stack_size: usize) Pool {
+            return Pool{
+                .mutex = std.Mutex.init(),
+                .free_list = null,
+                .free_count = 0,
+                .stack_ptr = @ptrToInt(stack.ptr) + stack.len,
+                .stack_size = stack_size,
+                .stack_list = null,
+                .stack = stack,
+                .exit_mutex = std.Mutex.init(),
+                .exit_stack = undefined,
+            };
+        }
+
+        fn deinit(self: *Pool) void {
+            const held = self.mutex.acquire();
+            defer held.release();
+            defer self.mutex.deinit();
+
+            const exit_held = self.exit_mutex.acquire();
+            defer exit_held.release();
+            defer self.exit_mutex.deinit();
+
+            while (self.free_list) |free_thread| {
+                defer self.free_list = free_thread.link;
+                free_thread.should_exit = true;
+                free_thread.wakeWith(null);
+            }
+        }
 
         fn exit(self: *Pool, thread: *Thread, exit_held: std.Mutex.Held) void {
             thread.parker.deinit();
@@ -279,12 +318,38 @@ const Thread = struct {
     const Monitor = struct {
         timer: std.time.Timer,
         parker: std.ThreadParker,
-        is_running: @typeOf(std.lazyInit(bool)),
         has_blocking: bool align(@alignOf(u32)),
+        thread: @typeOf(std.lazyInit(?*Thread)),
         
         const IS_BLOCKED: usize = 0x1;
         const WORKER = @intToPtr(*Worker, 0x1);
         const MAX_BLOCK_NS = 2 * std.time.millisecond;
+
+        fn init() Monitor {
+            return Monitor{
+                .timer = undefined,
+                .parker = std.ThreadParker.deinit(),
+                .has_blocking = false,
+                .thread = std.lazyInit(?*Thread),
+            };
+        }
+
+        fn deinit(self: *Monitor) void {
+            if (self.thread.get()) |thread_ptr| {
+                const monitor_thread = thread_ptr.* orelse return;
+                monitor_thread.should_exit = true;
+                self.notifyBlocking();
+            } else {
+                self.thread.data = null;
+                self.thread.resolve();
+            }
+        }
+
+        fn notifyBlocking(self: *Monitor) void {
+            const has_blocking_ptr = @ptrCast(*u32, &self.has_blocking);
+            if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(true), .Release) == @boolToInt(false))
+                self.parker.unpark(has_blocking_ptr);
+        }
 
         fn block(self: *Monitor, worker: *Worker, thread: *Thread) bool {
             // should only block if theres a monitor thread running to potentially unblock us.
@@ -298,9 +363,7 @@ const Thread = struct {
             sync.atomicStore(&worker.monitor_expires, expires + MAX_BLOCK_NS, .Monotonic);
 
             // notify the monitor thread that theres a new blocking worker
-            const has_blocking_ptr = @ptrCast(*u32, &self.has_blocking);
-            if (@atomicRmw(u32, has_blocking_ptr, .Xchg, @boolToInt(true), .Release) == @boolToInt(false))
-                self.parker.unpark(has_blocking_ptr);
+            self.notifyBlocking();
             return true;
         }
 
@@ -309,7 +372,7 @@ const Thread = struct {
             // if we fail, the monitor thread stole our worker.
             // if so, wait for the monitor thread to complete the steal and return whether it was successfull.
             const blocked = @intToPtr(*Thread, @ptrToInt(thread) | IS_BLOCKED);
-            if (@cmpxchgWeak(?*Thread, &worker.thread, blocked, thread, .Monotonic, .Monotonic) != null) {
+            if (@cmpxchgWeak(?*Thread, &worker.thread, blocked, thread, .Acquire, .Monotonic) != null) {
                 thread.parker.park(@ptrCast(*const u32, &worker.thread), 0);
                 return @atomicLoad(?*Thread, &worker.thread, .Acquire) == thread;
             }
@@ -320,25 +383,27 @@ const Thread = struct {
         }
 
         fn ensureMonitoring(self: *Monitor) bool {
-            // globally once-init the is_running flag.
-            // assume false until successfully initialized.
-            if (self.is_running.get()) |is_running_ptr|
-                return is_running_ptr.*;
-            defer self.is_running.resolve();
-            self.is_running.data = false;
+            // globally once-init the monitor thread.
+            // assume null until successfully initialized.
+            if (self.thread.get()) |thread_ptr|
+                return thread_ptr.* != null;
+            defer self.thread.resolve();
+            self.thread.data = null;
             
             // begin the timer & start up a monitor thread
             self.timer = std.time.Timer.start() catch return false;
             const node = @fieldParentPtr(Node, "thread_monitor", self);
             const monitor_thread = node.thread_pool.get() orelse return false;
+            self.thread.data = monitor_thread;
             monitor_thread.wakeWith(Monitor.WORKER);
+            return true;
         }
 
-        fn run(self: *Monitor) void {
+        fn run(self: *Monitor, thread: *Thread) void {
             // keep running while the executor is up.
             // the goal of each iteration is to steal workers who are blocked on a thread
             const node = @fieldParentPtr(Node, "thread_monitor", self);
-            while (@atomicLoad(usize, &self.node.executor.pending_tasks, .Monotonic) > 0) {
+            while (!thread.should_exit) {
                 const now = self.timer.read();
                 var wait_time = ~@as(usize, 0);
 
@@ -361,7 +426,7 @@ const Thread = struct {
                         // Worker is blocked AND over max block time so try and steal it from the blocking thread.
                         // Once done trying to steal, notify the blocked thread of the attempt.
                         // a `worker.thread` of the blocked thread means the steal was unsuccessful.
-                        if (@cmpxchgWeak(?*Thread, &worker.thread, thread, null, .Monotonic, .Monotonic) != null)
+                        if (@cmpxchgWeak(?*Thread, &worker.thread, thread, null, .Acquire, .Monotonic) != null)
                             continue;
                         sync.atomicStore(&worker.monitor_expires, 0, .Monotonic);
                         var next_thread = @intToPtr(?*Thread, @ptrToInt(thread) & ~IS_BLOCKED);

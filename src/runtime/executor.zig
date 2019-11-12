@@ -36,7 +36,7 @@ pub const Executor = struct {
         // since its on the stack, limit the maximum amount of numa nodes.
         // also perform the `defer` first to make sure all nodes are freed in case of error
         var node_array = [_]?*Node{null} ** BitSet.Max;
-        const array = node_array[0..system.getNumaNodeCount()];
+        const array = node_array[0..system.CpuAffinity.getNodeCount()];
         defer for (array) |ptr| {
             if (ptr) |node|
                 node.free();
@@ -153,22 +153,27 @@ pub const Node = struct {
         const stack_size = system.Thread.getStackSize(Thread.STACK_SIZE);
         const num_workers = std.math.min(affinity.getCount(), max_workers orelse ~@as(usize, 0));
 
+        // compute the offset for the workers
         size = std.mem.alignForward(size, @alignOf(Worker));
         const worker_offset = size;
         size += num_workers * @sizeOf(Worker);
 
+        // compute the offset for the worker stacks
         size = std.mem.alignForward(size, Worker.STACK_ALIGN);
         const worker_stack_offset = size;
         size += num_workers * Worker.STACK_SIZE;
 
+        // compute the offset for the thread stacks
         size = std.mem.alignForward(size, Worker.STACK_ALIGN);
         const thread_stack_offset = size;
         size += max_threads * stack_size;
 
+        // allocate all the memory on the local NUMA node
         const memory = try system.map(numa_node, size);
         errdefer system.unmap(memory);
         const ptr = @ptrToInt(memory.ptr);
 
+        // create all the slices and initialized the Node
         const self = @intToPtr(*Node, ptr);
         const workers = @intToPtr([*]Worker, ptr + worker_offset)[0..num_workers];
         for (workers) |*worker, index|

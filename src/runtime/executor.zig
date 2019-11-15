@@ -2,69 +2,59 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Executor = struct {
-    threadlocal var node_array: [64]?*Node = undefined;
-
     nodes: []*Node,
     next_node: u32,
     active_workers: u32,
     active_tasks: usize,
 
-    pub fn init() !Executor {
-        if (builtin.single_threaded) {
-            return initSequential();
-        } else {
-            return initParallel();
-        }
+    pub fn runSequential(comptime entry: var, args: ...) !void {
+        if (builtin.single_threaded)
+            return runSequential(entry, args);
+        return runParallel(entry, args);
     }
 
-    pub fn initSequential() !Executor {
+    pub fn runSequential(comptime entry: var, args: ...) !void {
         var workers = [_]Worker{undefined};
         var node = Node.init(workers[0..], null);
+        defer node.deinit();
         var nodes = [_]*Node{ &node };
-        return initUsing(nodes[0..]);
+        return runUsing(nodes[0..], entry, args);
     }
 
-    pub fn initParallel() !Executor {
+    pub fn runParallel(comptime entry: var, args: ...) !void {
         if (builtin.single_threaded)
             @compileError("--single-threaded doesn't support parallel execution");
-            
+        
+        var node_array = [_]?*Node{null} ** 64;
         const node_count = std.math.min(system.getNodeCount(), node_array.len);
         const nodes = @ptrCast([*]*Node, &node_array[0])[0..node_count];
-        const node_slice = node_array[0..node_count];
-        
-        for (node_slice) |*ptr| {
-            ptr.* = null;
-        }
-        errdefer for (node_slice) |*ptr| {
-            if (ptr.*) |node| {
+
+        defer for (node_array[0..node_count]) |*node_ptr| {
+            if (node_ptr.*) |node|
                 node.free();
-            }
         }
-        for (node_slice) |*ptr, index| {
-            ptr.* = try Node.alloc(index, null, null);
-        }
-
-        return initUsing(nodes);
+        for (nodes) |*node_ptr, index|
+            node_ptr.* = try Node.alloc(index, null, null);
+        return runUsing(nodes, entry, args);
     }
 
-    pub fn initSMP(max_workers: usize, max_threads: usize) !Executor {
+    pub fn runSMP(max_workers: usize, max_threads: usize, comptime entry: var, args: ...) !void {
         const node = try Node.alloc(0, max_workers, max_threads);
-        errdefer node.free();
+        defer node.free();
         var nodes = [_]*Node{ node };
-        return initUsing(nodes[0..]);
+        return runUsing(nodes[0..], entry, args);
     }
 
-    pub fn initUsing(nodes: []*Node) !Executor {
-        
-    }
+    pub fn runUsing(nodes: []*Node, comptime entry: var, args: ...) !void {
+        var executor = Executor{
+            .nodes = nodes,
+            .next_node = 0,
+            .active_workers = 0,
+            .active_tasks = 0,
+        };
 
-    pub fn deinit(self: *Executor) void {
-
-    }
-
-    pub fn run(self: *Executor) void {
-        for (self.nodes) |node|
-            node.executor = self;
+        for (nodes) |node|
+            node.executor = &executor;
     }
 };
 

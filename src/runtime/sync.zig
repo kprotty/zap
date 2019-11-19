@@ -1,6 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// The assumed cache-line of the current system.
+/// On modern intel architectures, spatial prefetcher
+/// works with pairs of cache lines hence the doubled value.
+/// NOTE: Changing this value means re-organizing all other structures!
+pub const CACHE_LINE = switch (builtin.os) {
+    .x86_64 => 128,
+    else => 64,
+}
+
 pub const BitSet = struct {
     const Word = usize;
     const MAX = @typeInfo(Word).Int.bits;
@@ -36,21 +45,5 @@ pub const BitSet = struct {
                 orelse return index;
         }
         return null;
-    }
-};
-
-pub const Mutex = struct {
-    state: usize,
-
-    pub fn init() Mutex {
-        return Mutex{ .state = 0 };
-    }
-
-    pub fn acquire(self: *Mutex) void {
-        
-    }
-
-    pub fn release(self: *Mutex) void {
-
     }
 };

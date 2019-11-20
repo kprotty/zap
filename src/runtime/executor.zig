@@ -2,12 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const sync = @import("./sync.zig");
-usingnamespace @import("./reactor.zig");
-const system = switch (builtin.os) {
-    .windows => @import("./system/windows.zig"),
-    .linux => @import("./system/linux.zig"),
-    else => @import("./system/posix.zig"),
-};
+const system = @import("./system.zig");
 
 pub const Executor = struct {
     nodes: []*Node,
@@ -40,7 +35,7 @@ pub const Executor = struct {
         defer for (node_array[0..node_count]) |*node_ptr| {
             if (node_ptr.*) |node|
                 node.free();
-        }
+        };
         for (nodes) |*node_ptr, index|
             node_ptr.* = try Node.alloc(index, null, null);
         return runUsing(nodes, entry, args);
@@ -113,7 +108,7 @@ const Thread = struct {
 
     next: ?*Thread,
     node: *Node,
-    stack_ptr: usize,
+    stack_ptr: ?[*]align(STACK_ALIGN) u8,
     worker: ?*Worker,
     inner: system.Thread,
 
@@ -186,8 +181,8 @@ const Thread = struct {
             
             // exit the thread if theres too many active ones
             if (self.active_threads >= self.max_active) {
-                if (thread.stack_ptr != 0) {
-                    const ptr = @intToPtr(?*?*usize, thread.stack_ptr + Thread.STACK_SIZE - @sizeOf(usize));
+                if (thread.stack_ptr) |s| {
+                    const ptr = @ptrCast(?*?*usize, &s[Thread.STACK_SIZE - @sizeOf(usize)]);
                     ptr.* = self.free_stack;
                     self.free_stack = ptr;
                 }
@@ -272,7 +267,7 @@ const Thread = struct {
                     .instance = Thread{
                         .next = null,
                         .node = node,
-                        .stack_ptr = if (stack) |s| @ptrToInt(s.ptr) else 0,
+                        .stack_ptr = if (stack) |s| s.ptr else null,
                         .worker = null,
                         .inner = undefined,
                     },
@@ -294,9 +289,7 @@ const Thread = struct {
                 // try and get the thread by spinning
                 var spin_count: usize = 0;
                 while (spin_count < 10) : (spin_count += 1) {
-                    if (spin_count == 0) {
-                        continue;
-                    } else if (spin_count <= 3) {
+                    if (spin_count > 0 and spin_count <= 3) {
                         std.SpinLock.yield(@as(usize, 1) << @truncate(u2, spin_count));
                     } else {
                         std.os.sched_yield() catch {};
@@ -313,20 +306,27 @@ const Thread = struct {
     };
 };
 
-const Worker = struct {
+pub const Worker = struct {
     const STACK_ALIGN = 64 * 1024;
     const STACK_SIZE = 1 * 1024 * 1024;
 
-    node: *Node,
-    stack_offset: u32,
+    runq_head: usize,
+    runq_tail: usize,
+    runq: [256]*Task align(sync.CACHE_LINE),
 
-    fn getStack(self: Worker) []align(STACK_ALIGN) u8 {
-        const ptr = @ptrToInt(self.node) + self.stack_offset;
-        return @intToPtr([*]align(STACK_ALIGN) u8, ptr)[0..STACK_SIZE];
-    }
+    lowq_mutex: std.Mutex,
+    lowq_size: usize align(sync.CACHE_LINE),
+    lowq_tail: ?*Task,
+    lowq_head: ?*Task,
+
+    node: *Node,
+    runq_tick: usize,
+    monitor_tick: usize,
+    stack_ptr: ?[*]align(STACK_ALIGN) u8,
 
     fn submit(self: *Worker, task: *Task) void {
         _ = @atomicRmw(usize, self.node.executor.active_tasks, .Add, 1, .Monotonic);
+        // TODO: 
     }
 
     fn run(self: *Worker) void {
@@ -352,8 +352,20 @@ const Task = struct {
         };
     }
 
-    fn getPriority(self: *const Task) Priority {
-        return 
+    fn getPriority(self: Task) Priority {
+        return @intToEnum(Priority, @truncate(@TagType(Priority), self.frame));
+    }
+
+    fn getFrame(self: Task) anyframe {
+        return @intToPtr(anyframe, self.frame & ~@as(usize, ~@as(@TagType(Priority), 0)));
+    }
+
+    fn setPriority(self: *Task, priority: Priority) void {
+        self.frame = @ptrToInt(self.getFrame()) | @enumToInt(priority);
+    }
+
+    fn setFrame(self: *Task, frame: anyframe) void {
+        self.frame = @ptrToInt(frame) | @enumToInt(self.getPriority());
     }
 
     fn prepare(self: *Task, comptime func: var, args: ...) @typeOf(func).ReturnType {

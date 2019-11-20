@@ -5,10 +5,10 @@ const builtin = @import("builtin");
 /// On modern intel architectures, spatial prefetcher
 /// works with pairs of cache lines hence the doubled value.
 /// NOTE: Changing this value means re-organizing all other structures!
-pub const CACHE_LINE = switch (builtin.os) {
+pub const CACHE_LINE = switch (builtin.arch) {
     .x86_64 => 128,
     else => 64,
-}
+};
 
 pub const BitSet = struct {
     const Word = usize;

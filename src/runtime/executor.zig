@@ -111,11 +111,11 @@ const Thread = struct {
     const STACK_SIZE = 16 * 1024; // PTHREAD_STACK_MIN
     const MAX_STACKS = @as(comptime_int, ~@as(u16, 0));
 
-    node: *Node,
-    stack: usize,
     next: ?*Thread,
+    node: *Node,
+    stack_ptr: usize,
     worker: ?*Worker,
-    handle: system.ThreadHandle,
+    inner: system.Thread,
 
     const EXIT_WORKER = @intToPtr(*Worker, 0x1);
     const MONITOR_WORKER = @intToPtr(*Worker, 0x2);
@@ -124,54 +124,11 @@ const Thread = struct {
         // TODO
     }
 
-    fn entry(spawn_info: *SpawnInfo) void {
-        var self = spawn_info.initThread();
-        spawn_info.setThread(&self);
+    fn entry(spawner: *Pool.Spawner) void {
+        var self = spawner.instance;
+        spawner.setThread(&self);
         // TODO
     }
-
-    const SpawnInfo = struct {
-        node: *Node,
-        stack: usize,
-        thread: ?*Thread,
-        worker: ?*Worker,
-        handle: system.ThreadHandle,
-
-        fn init(worker: ?*Worker) SpawnInfo {
-            return SpawnInfo{
-                .node = undefined,
-                .stack = 0,
-                .thread = null,
-                .worker = worker,
-                .handle = undefined,
-            };
-        }
-
-        fn initThread(self: SpawnInfo) Thread {
-            return Thread{
-                .node = self.node,
-                .stack = self.stack,
-                .next = null,
-                .worker = self.worker,
-                .handle = self.handle,
-            };
-        }
-
-        fn deinit(self: *SpawnInfo) void {
-            self.* = undefined;
-            // TODO: Maybe use std.ThreadParker instead of sched_yield loop?
-        }
-
-        fn setThread(self: *SpawnInfo, thread: *Thread) void {
-            @atomicStore(?*Thread, &self.thread, thread, .Release);
-        }
-
-        fn getThread(self: *const SpawnInfo) *Thread {
-            while (true) : (std.os.sched_yield() catch {}) {
-                return @atomicLoad(?*Thread, &self.thread, .Acquire) orelse continue;
-            }
-        }
-    };
 
     const Pool = struct {
         stack_ptr: usize,
@@ -189,7 +146,10 @@ const Thread = struct {
         fn init(stacks: []align(Thread.STACK_ALIGN) u8, max_active: u16) Error!Pool {
             if (stacks.len % Thread.STACK_SIZE != 0)
                 return Error.InvalidThreadStack;
-            const num_stacks = @truncate(u16, std.math.min(MAX_STACKS, stacks.len / Thread.STACK_SIZE));
+            if (stacks.len / Thread.STACK_SIZE > MAX_STACKS)
+                return Error.InvalidThreadStack;
+
+            const num_stacks = @truncate(u16, stacks.len / Thread.STACK_SIZE);
             return Pool{
                 .stack_ptr = @ptrToInt(stacks.ptr),
                 .stack_top = num_stacks,
@@ -208,9 +168,15 @@ const Thread = struct {
             defer mutex.deinit();
             self.* = undefined;
 
-            while (self.free_thread) |t| {
-                t.wakeWith(Thread.EXIT_WORKER);
-                system.joinThread(t.handle);
+            // send all idle threads the exit signal and wait for them to exit
+            var free_list = self.free_thread;
+            while (free_list) |thread| {
+                thread.wakeWith(Thread.EXIT_WORKER);
+                free_list = thread.next;
+            }
+            while (self.free_thread) |thread| {
+                thread.inner.join();
+                self.free_thread = thread.next;
             }
         }
 
@@ -218,16 +184,16 @@ const Thread = struct {
             const node = @fieldParentPtr(Node, "thread_pool", self);
             const held = node.thread_mutex.acquire();
             
-            // destroy the thread if theres too many active ones
+            // exit the thread if theres too many active ones
             if (self.active_threads >= self.max_active) {
-                if (thread.stack != 0) {
-                    const ptr = @intToPtr(?*?*usize, thread.stack + Thread.STACK_SIZE - @sizeOf(usize));
+                if (thread.stack_ptr != 0) {
+                    const ptr = @intToPtr(?*?*usize, thread.stack_ptr + Thread.STACK_SIZE - @sizeOf(usize));
                     ptr.* = self.free_stack;
                     self.free_stack = ptr;
                 }
                 self.active_threads -= 1;
                 held.release();
-                return system.exitThread(thread.handle);
+                return thread.inner.exit();
             }
 
             // can have more active threads so append it to the thread free list
@@ -236,62 +202,114 @@ const Thread = struct {
             return held.release();
         }
 
-        const SpawnError = error {
-            OutOfStack,
-        };
-
-        fn get(self: *Pool, spawn_info: *SpawnInfo) !void {
-            spawn_info.node = @fieldParentPtr(Node, "thread_pool", self);
-            const held = spawn_info.node.thread_mutex.acquire();
-            defer held.release();
-
-            // try popping from the thread free list
-            if (self.free_thread) |t| {
-                spawn_info.thread = t;
-                self.free_thread = t.next;
-                return;
+        fn get(self: *Pool) ?*Thread {
+            const node = @fieldParentPtr(Node, "thread_pool", self);
+            const held = node.thread_mutex.acquire();
+            
+            // try and pop an idle thread from the free list
+            if (self.free_thread) |free_thread| {
+                const thread = free_thread;
+                self.free_thread = thread.next;
+                held.release();
+                return thread;
             }
 
-            // need to create a new thread, try and get a stack for it
-            var is_new_stack = false;
+            // no idle thread, need to create one.
+            // try and allocate a stack for the thread to create.
+            var is_fresh_stack = false;
             var stack: ?[]align(Thread.STACK_ALIGN) u8 = null;
-
-            // allocate a stack if custom thread stacks are supported 
-            if (system.SUPPORTS_CUSTOM_THREAD_STACKS and self.num_stacks > 0) {
-                // try popping from the stack free list
-                if (self.free_stack) |s| {
-                    const ptr = @ptrToInt(s) - Thread.STACK_SIZE + @sizeOf(usize);
+            if (system.Thread.USES_CUSTOM_STACKS and self.num_stacks > 0) {
+                // check if theres a free stack in the free list
+                if (self.free_stack) |free_stack| {
+                    const ptr = @ptrToInt(free_stack) - (Thread.STACK_SIZE - @sizeOf(usize));
                     stack = @intToPtr([*]align(Thread.STACK_ALIGN) u8, ptr)[0..Thread.STACK_SIZE];
-                    self.free_stack = s.*;
-                // bump allocate a new stack chunk
+                    self.free_stack = free_stack.*;
+                // if not, bump allocate a new stack segment
                 } else if (self.stack_top != 0) {
-                    is_new_stack = true;
                     self.stack_top -= 1;
+                    is_fresh_stack = true;
                     const ptr = self.stack_ptr + (self.stack_top * Thread.STACK_SIZE);
                     stack = @intToPtr([*]align(Thread.STACK_ALIGN) u8, ptr)[0..Thread.STACK_SIZE];
-                // requires custom stack but none available
+                // thread spawning requires custom stack but no stack space available
                 } else {
-                    return SpawnError.OutOfStack;
+                    held.release();
+                    return null;
                 }
             }
 
-            // restore then newly allocated stack if we failed to create a thread with it
-            errdefer if (stack) |s| {
-                if (is_new_stack) {
-                    self.stack_top += 1;
-                } else {
-                    const ptr = @ptrCast(?*?*usize, &s[Thread.STACK_SIZE - @sizeOf(usize)]);
-                    ptr.* = self.free_stack;
-                    self.free_stack = ptr;
+            // spawn the thread using the given stack
+            var spawner = Spawner.init(node, stack);
+            defer spawner.deinit();
+            spawner.instance.inner = system.Thread.spawn(stack, Thread.STACK_SIZE, &spawner, Thread.entry) catch {
+                // restore back the allocated stack if the thread failed to spawn
+                if (stack) |s| {
+                    if (is_fresh_stack) {
+                        self.stack_top += 1;
+                    } else {
+                        const ptr = @ptrCast(?*?*usize, &s[Thread.STACK_SIZE - @sizeOf(usize)]);
+                        ptr.* = self.free_stack;
+                        self.free_stack = ptr;
+                    }
                 }
-            }
+                held.release();
+                return null;
+            };
 
-            // spawn the thread using the spawn_info
-            spawn_info.thread = null;
-            spawn_info.stack = if (stack) |s| @ptrToInt(s.ptr) else 0;
-            spawn_info.handle = try system.spawnThread(stack, Thread.STACK_SIZE, spawn_info, Thread.entry);
+            // thread created, return its pointer once it's set.
             self.active_threads += 1;
+            held.release();
+            return spawner.getThread();
         }
+
+        const Spawner = struct {
+            instance: Thread,
+            thread: ?*Thread,
+            parker: std.ThreadParker,
+            const PARKED = @intToPtr(*Thread, 0x1);
+
+            fn init(node: *Node, stack: ?[]align(Thread.STACK_ALIGN) u8) Spawner {
+                return Spawner{
+                    .instance = Thread{
+                        .next = null,
+                        .node = node,
+                        .stack_ptr = if (stack) |s| @ptrToInt(s.ptr) else 0,
+                        .worker = null,
+                        .inner = undefined,
+                    },
+                    .thread = null,
+                    .parker = std.ThreadParker.init(),
+                };
+            }
+
+            fn deinit(self: *Spawner) void {
+                self.parker.deinit();
+            }
+
+            fn setThread(self: *Spawner, thread: *Thread) void {
+                if (@atomicRmw(?*Thread, &self.thread, .Xchg, thread, .Release) == PARKED)
+                    self.parker.unpark(@ptrCast(*const u32, &self.thread));
+            }
+
+            fn getThread(self: *Spawner) *Thread {
+                // try and get the thread by spinning
+                var spin_count: usize = 0;
+                while (spin_count < 10) : (spin_count += 1) {
+                    if (spin_count == 0) {
+                        continue;
+                    } else if (spin_count <= 3) {
+                        std.SpinLock.yield(@as(usize, 1) << @truncate(u2, spin_count));
+                    } else {
+                        std.os.sched_yield() catch {};
+                    }
+                    return @atomicLoad(?*Thread, &self.thread, .Monotonic) orelse continue;
+                }
+
+                // park until the thread is set
+                if (@atomicRmw(?*Thread, &self.thread, .Xchg, PARKED, .Acquire) != null)
+                    self.parker.park(@ptrCast(*const u32, &self.thread), @ptrCast(*const u32, PARKED).*);
+                return @atomicLoad(?*Thread, &self.thread, .Monotonic) orelse unreachable;
+            }
+        };
     };
 };
 

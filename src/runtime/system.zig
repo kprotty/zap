@@ -11,6 +11,14 @@ pub fn nanotime() u64 {
     return backend.nanotime();
 }
 
+pub fn map(numa_node: u32, bytes: usize) MapError![]align(std.mem.page_size) u8 {
+    return backend.map(numa_node, bytes);
+}
+
+pub fn unmap(memory: []align(std.mem.page_size) u8) void {
+    return backend.unmap(memory);
+}
+
 threadlocal var random_instance = std.lazyInit(std.rand.DefaultPrng);
 
 pub fn getRandom() *std.rand.Random {
@@ -29,6 +37,10 @@ pub const Affinity = struct {
     pub const Error = error{
 
     };
+
+    pub fn count(self: Affinity) usize {
+        return @popCount(usize, self.mask);
+    }
 
     pub fn fromNode(numa_node: u32) Error!Affinity {
         return backend.Affinity.getNodeAffinity(numa_node);
@@ -51,6 +63,18 @@ pub const Thread = struct {
     pub fn exit(self: Thread) void {
         return self.inner.exit();
     }
+
+    pub const AffinityError = error{
+
+    };
+
+    pub fn setAffinity(self: Thread, affinity: Affinity) AffinityError!void {
+        return self.inner.setAffinity(affinity.group, affinity.mask);
+    }
+    
+    pub const SpawnError = error{
+
+    };
 
     pub fn spawn(stack: ?[]u8, size_hint: usize, param: var, comptime entry: var) SpawnError!Thread {
         return Thread{ .inner = try backend.Thread.spawn(stack, size_hint, param, entry) };

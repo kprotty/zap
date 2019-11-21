@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const min = std.math.min;
+const max = std.math.max;
 
 const sync = @import("./sync.zig");
 const system = @import("./system.zig");
@@ -28,14 +30,18 @@ pub const Executor = struct {
         if (builtin.single_threaded)
             @compileError("--single-threaded doesn't support parallel execution");
         
+        // store the node array on the stack to avoid generic heap alloc
         var node_array = [_]?*Node{null} ** 64;
-        const node_count = std.math.min(system.getNodeCount(), node_array.len);
+        const node_count = min(system.getNodeCount(), node_array.len);
         const nodes = @ptrCast([*]*Node, &node_array[0])[0..node_count];
 
+        // have the defer before the alloc to free previous nodes on error
         defer for (node_array[0..node_count]) |*node_ptr| {
             if (node_ptr.*) |node|
                 node.free();
         };
+
+        // allocate the nodes on their designated NUMA nodes
         for (nodes) |*node_ptr, index|
             node_ptr.* = try Node.alloc(index, null, null);
         return runUsing(nodes, entry, args);
@@ -61,6 +67,8 @@ pub const Executor = struct {
         var main_task: Task = undefined;
         _ = async Task.prepare(&main_task, entry, args);
         
+        // use a random node as main in order to avoid over-subscription
+        // on one NUMA node in case theres multiple zap programs running on the system.
         const main_node = nodes[system.getRandom().uintAtMost(usize, nodes.len)];
         const main_worker = &main_node.workers[main_node.idle_workers.get().?];
         main_worker.submit(&main_task);
@@ -75,7 +83,7 @@ pub const Node = struct {
     thread_pool: Thread.Pool,
     thread_mutex: std.Mutex align(sync.CACHE_LINE),
     
-    pub fn init(workers: []Worker, stacks: []align(Thread.STACK_ALIGN) u8) !Node {
+    pub fn init(workers: []Worker, stacks: ?[]align(Thread.STACK_ALIGN) u8) !Node {
         return Node{
             .executor = undefined,
             .workers = workers,
@@ -91,11 +99,70 @@ pub const Node = struct {
     }
 
     pub fn alloc(numa_node: u32, max_workers: ?usize, max_threads: ?usize) !*Node {
+        const affinity = try system.Affinity.fromNode(numa_node);
+        const num_threads = max(1, max_threads orelse Thread.DEFAULT_THREADS);
+        const num_workers = max(1, min(num_threads, max_workers orelse affinity.count()));
+
+        // get the node offset
+        var size: usize = 0;
+        const node_offset = size;
+        size += @sizeOf(Node);
+
+        // get the worker array offset
+        size = std.mem.alignForward(size, @alignOf(Worker));
+        const worker_offset = size;
+        size += @sizeOf(Worker) * num_workers;
+
+        // get the worker stack offset
+        size = std.mem.alignForward(size, Worker.STACK_ALIGN);
+        const worker_stack_offset = size;
+        size += Worker.STACK_SIZE * num_workers;
+
+        // get the thread stack offset if custom thread stacks are supported
+        var thread_stack_offset: ?usize = null;
+        if (system.Thread.USES_CUSTOM_STACKS) {
+            size = std.mem.alignForward(size, Thread.STACK_ALIGN);
+            thread_stack_offset = size;
+            size += Thread.STACK_SIZE * num_threads;
+        }
+
+        // allocate the memory on the given NUMA node
+        const memory = try system.map(numa_node, size);
+        errdefer system.umap(memory);
+        const ptr = @ptrToInt(memory.ptr);
         
+        // compute the node, worker, and worker stacks from the memory
+        const self = @intToPtr(*Node, ptr + node_offset);
+        const workers = @intToPtr([*]Worker, ptr + worker_offset)[0..num_workers];
+        for (workers) |*worker, index| {
+            const stack_ptr = ptr + worker_stack_offset + (index * Worker.STACK_SIZE);
+            worker.stack_ptr = @intToPtr([*]align(Worker.STACK_ALIGN) u8, stack_ptr);
+        }
+
+        // compute the thread stacks from the memory
+        var stacks: ?[]align(Thread.STACK_ALIGN) u8 = null;
+        if (thread_stack_offset) |offset| {
+            const stacks_size = Thread.STACK_SIZE * num_threads;
+            stacks = @intToPtr([*]align(Thread.STACK_ALIGN), ptr + offset)[0..stacks_size];
+        }
+
+        // initialize the Node using the allocated memory
+        self.* = try Node.init(workers, stacks);
+        return self;
     }
 
     pub fn free(self: *Node) void {
+        // compute the end pointer of the Node's mapped memory
+        var end_ptr = @ptrToInt(self.workers[self.workers.len-1].stack_ptr) + Worker.STACK_SIZE;
+        const thread_stack_offset = Thread.STACK_SIZE * self.thread_pool.num_stacks;
+        if (system.USES_CUSTOM_STACKS and thread_stack_offset > 0)
+            end_ptr = self.thread_pool.stack_ptr + thread_stack_offset;
+
+        // deinit the node and free it
         self.deinit();
+        const memory_size = end_ptr - @ptrToInt(self);
+        const memory = @ptrCast([*]align(std.mem.page_size) u8, self)[0..memory_size];
+        system.unmap(memory);
     }
 };
 
@@ -105,6 +172,7 @@ const Thread = struct {
     const STACK_ALIGN = std.mem.page_size;
     const STACK_SIZE = 16 * 1024; // PTHREAD_STACK_MIN
     const MAX_STACKS = @as(comptime_int, ~@as(u16, 0));
+    const DEFAULT_THREADS = 10 * 1000; // the default in rust tokio & golang
 
     next: ?*Thread,
     node: *Node,
@@ -138,7 +206,8 @@ const Thread = struct {
             InvalidThreadStack,
         };
 
-        fn init(stacks: []align(Thread.STACK_ALIGN) u8, max_active: u16) Error!Pool {
+        fn init(thread_stacks: ?[]align(Thread.STACK_ALIGN) u8, max_active: u16) Error!Pool {
+            const stacks = thread_stacks orelse @as([*]align(Thread.STACK_ALIGN) u8, undefined)[0..0];
             if (stacks.len % Thread.STACK_SIZE != 0)
                 return Error.InvalidThreadStack;
             if (stacks.len / Thread.STACK_SIZE > MAX_STACKS)
@@ -310,10 +379,12 @@ pub const Worker = struct {
     const STACK_ALIGN = 64 * 1024;
     const STACK_SIZE = 1 * 1024 * 1024;
 
+    // keep the head and tail on their own cache line
     runq_head: usize,
     runq_tail: usize,
     runq: [256]*Task align(sync.CACHE_LINE),
 
+    // keep the mutex on its own cache line
     lowq_mutex: std.Mutex,
     lowq_size: usize align(sync.CACHE_LINE),
     lowq_tail: ?*Task,

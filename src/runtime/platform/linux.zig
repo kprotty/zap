@@ -41,7 +41,10 @@ pub const Thread = struct {
             tls_offset = stack_size;
             stack_size += tls_image.alloc_size;
         }
-        stack_size = std.mem.alignForward(stack_size + DEFAULT_STACK_SIZE, std.mem.page_size);
+        const old_stack_size = stack_size;
+        stack_size = std.mem.alignForward(stack_size, DEFAULT_STACK_SIZE);
+        if (stack_size - old_stack_size < DEFAULT_STACK_SIZE / 2)
+            stack_size += DEFAULT_STACK_SIZE;
 
         // allocate the stack space & set the memory permissiosn
         const stack = std.os.mmap(null, stack_size, linux.PROT_NONE, linux.MAP_PRIVATE | linux.MAP_ANONYMOUS, -1, 0) catch |err| switch (err) {

@@ -39,7 +39,6 @@ pub const Executor = struct {
     }
 
     pub fn initSingleThreaded(self: *Executor) !void {
-        // use a global worker instead of heap allocating
         return self.initUsing(@as([*]Worker, undefined)[0..0], 1, null);
     }
 
@@ -153,6 +152,30 @@ pub const Executor = struct {
             return err;
         };
     }
+
+    pub fn yield() void {
+        const thread = Thread.current orelse return;
+        return thread.worker.yield();
+    }
+
+    pub fn blocking(self: *Executor, comptime func: var, args: ...) @typeOf(func).ReturnType {
+        const thread = Thread.current orelse return func(args);
+        return thread.worker.blocking(func, args);
+    }
+
+    fn hasPendingTasks(self: *const Executor) bool {
+        if (builtin.single_threaded)
+            return self.active_tasks > 0;
+        return @atomicLoad(usize, &self.active_tasks, .Acquire) > 0;
+    }
+
+    fn finishTask(self: *Executor) bool {
+        if (!builtin.single_threaded)
+            return @atomicRmw(usize, &self.active_tasks, .Sub, 1, .Release) == 1;
+        const previous = self.active_tasks;
+        self.active_tasks -= 1;
+        return previous == 1;
+    }
 };
 
 const Thread = struct {
@@ -166,7 +189,12 @@ const Thread = struct {
     const EXIT_WORKER = @intToPtr(*Worker, 0x1);
     const MONITOR_WORKER = @intToPtr(*Worker, 0x2);
 
-    fn entry(worker: *Worker) void {
+    fn wakeWith(self: *Thread, worker: *Worker) void {
+        self.worker = worker;
+        _ = self.worker_event.set(true);
+    }
+
+    fn run(worker: *Worker) void {
         var self = Thread{
             .next = null,
             .worker = worker,
@@ -175,6 +203,7 @@ const Thread = struct {
         };
         self.handle.getCurrent();
         defer self.worker_event.deinit();
+        Thread.current = &self;
 
         while (self.worker != EXIT_WORKER) {
             if (self.worker == MONITOR_WORKER)
@@ -197,6 +226,7 @@ const Worker = struct {
     runq_tail: u32,
     runq: [256]*Task,
     runq_tick: usize,
+    runq_next: ?*Task,
 
     next: ?*Worker,
     thread: ?*Thread,
@@ -208,6 +238,7 @@ const Worker = struct {
             .runq_tail = 0,
             .runq = undefined,
             .runq_tick = 0,
+            .runq_next = null,
             .next = self.idle_workers,
             .thread = null,
             .monitor_tick = 0,
@@ -217,26 +248,88 @@ const Worker = struct {
     fn run(self: *Worker, thread: *Thread) void {
         self.thread = thread;
         const executor = Executor.instance;
-        while (@atomicLoad(usize, executor.active_tasks, .Acquire) > 0) {
+
+        while (executor.hasPendingTasks()) {
             resume self.getTask().getFrame();
-
-            // TODO: blocking tasks
-
-            if (@atomicRmw(usize, executor.active_tasks, .Sub, 1, .Release) == 1) {
+            if (executor.finishTask()) {
                 _ = executor.stop_event.set(false);
                 return;
             }
         }
     }
+
+    fn getTask(self: *Worker) *Task {
+        self.runq_tick +%= 1;
+        const executor = &Executor.current;
+        
+        // check the global queue once in a while
+        if (self.runq_tick % 61 == 0 and @atomicLoad(usize, &executor.runq_size, .Monotonic) > 0) {
+            if (executor.getTasks(self, 1)) |task|
+                return task;
+        }
+
+        // try pop from the local queue (pop from the back once in a while for fairness)
+        if (self.pop()) |task| {
+            return task;
+        }
+
+        // local queue is empty, try and pop from the global queue
+        if (@atomicLoad(usize, &executor.runq_size, .Monotonic) > 0) {
+            if (executor.getTasks(self, null)) |task|
+                return task;
+        }
+
+
+    }
+
+    fn pop(self: *Worker) ?*Task {        
+        while (true) : (std.SpinLock.yield(1)) {
+            const head = @atomicLoad(u32, &self.runq_head, .Acquire);
+            const tail = self.runq_tail;
+            if (tail == head)
+                return null;
+            const task = self.runq[head % self.runq.len];
+            _ = @cmpxchgWeak(u32, &self.runq_head, head, head +% 1, .Release, .Monotonic) orelse return task;
+        }
+    }
+
+    fn steal(self: *Worker, other: *Worker, steal_next: bool) u32 {
+        while (true) : (std.SpinLock.yield(1)) {
+            const head = @atomicLoad(u32, &other.runq_head, .Acquire);
+            const tail = @atomicLoad(u32, &other.runq_tail, .Acquire);
+            var size = tail -% head;
+            size = size - (size / 2);
+            
+            if (size == 0) {
+                if (!steal_next)
+                    return 0;
+                const next = @atomicLoad(?*Task, &other.runq_next, .Monotonic) orelse return 0;
+            }
+        }
+    }
 };
 
-const Task = struct {
+pub const Task = struct {
     next: ?*Task,
-    frame: anyframe,
+    frame: usize,
 
-    // TODO: priorities
+    pub const Priority = enum(u1) {
+        Low,
+        High,
+    };
+
+    pub fn init(frame: anyframe, comptime priority: Priority) Task {
+        return Task{
+            .next = null,
+            .frame = @ptrToInt(frame) | @enumToInt(priority);
+        };
+    }
 
     pub fn getFrame(self: Task) anyframe {
-        return self.frame;
+        return @intToPtr(frame, self.frame & ~@as(usize, ~@as(@TagType(Priority), 0)));
+    }
+
+    pub fn getPriority(self: Task) Priority {
+        return @intToEnum(Priority, @as(@TagType(Priority), self.frame & ~FRAME_MASK));
     }
 };

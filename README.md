@@ -1,6 +1,9 @@
 # zap
 A collection of zig libraries which provide interfaces over the system for writing high performance applications. Current plans are to support x86_64, i386, arm32 and aarch64 for Linux, Windows, and BSD systems. Only requires libc for BSD platforms at the moment. Link to [Documentation](https://kprotty.github.io/zap/#root)
 
+## UPDATE 9-27-19:
+Most of the effort now is aimed at [slowly](https://github.com/ziglang/zig/pull/3585) [merging](https://github.com/ziglang/zig/pull/3751) some of the ideas in this repo into the zig standard library along with playing around with [zell](#zell)'s implement in the [smp](https://github.com/kprotty/zap/tree/smp) branch. If you're interested in the activity, I suggest checking those links.
+
 ## zio
 Abstractions over the system's IO operations for both blocking and non-blocking IO. Uses a completion based polling scheme rather than a readyness based one found in other libraries to support a true zero-cost abstraction over non-blocking IO. Goals include minimal syscalls, no heap allocation and having a BSD-esque interface as close as possible. (Inspired by golang's netpoller and rust's mio)
 
@@ -13,7 +16,7 @@ Abstractions over the system's IO operations for both blocking and non-blocking 
 Abstractions over the system's threading, memory, and topology operations. Zuma extends upon the zig stdlib to provide more control. Goals include first class NUMA node support along with more customizable memory + thread features such as smaller thread stacks, setting/getting/querying thread cpu topology, and unified virtual memory interface. (Inspired by pthread and libnuma).
 
 - [ ] Threading (WIP)
-- [ ] Virtual Memory
+- [x] Virtual Memory
 
 ## zync
 Abstractions over the systems thread blocking interfaces and provides both synchronization primitives as well as other useful functions. Goals include exposing customizable building blocks for creation high performance concurrent data structures while not assuming underlying platform as much as possible. (Inspired by rust's crossbeam)
@@ -32,4 +35,4 @@ Abstractions over the systems thread blocking interfaces and provides both synch
 ## zimalloc
 **Eventual** port of microsoft's mimalloc to zig. Will serve as the default allocator in [zell](#zell). Goals include to only provide the building blocks instead of assuming allocator access and platform.
 
-**TODO**
+*TODO*

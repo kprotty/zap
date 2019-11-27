@@ -1,7 +1,10 @@
 const std = @import("std");
 const linux = std.os.linux;
+const posix = @import("./posix.zig");
 
-pub const Thread = struct {
+pub fn nanotime = posix.nanotime;
+
+pub const Thread = if (builtin.link_libc) posix.Thread else struct {
     tid: i32,
 
     pub fn getCurrent(self: *Thread) void {
@@ -41,12 +44,14 @@ pub const Thread = struct {
             tls_offset = stack_size;
             stack_size += tls_image.alloc_size;
         }
+
+        // only alloc in sizes multiple of DEFAULT_STACK_SIZE to avoid VMA space fragmentation
         const old_stack_size = stack_size;
         stack_size = std.mem.alignForward(stack_size, DEFAULT_STACK_SIZE);
         if (stack_size - old_stack_size < DEFAULT_STACK_SIZE / 2)
             stack_size += DEFAULT_STACK_SIZE;
 
-        // allocate the stack space & set the memory permissiosn
+        // allocate the stack space
         const stack = std.os.mmap(null, stack_size, linux.PROT_NONE, linux.MAP_PRIVATE | linux.MAP_ANONYMOUS, -1, 0) catch |err| switch (err) {
             std.os.MMapError.MemoryMappingNotSupported => unreachable,
             std.os.MMapError.PermissionDenied => unreachable,
@@ -54,6 +59,8 @@ pub const Thread = struct {
             else => |e| return e,
         };
         errdefer std.os.munmap(stack);
+
+        // make all except the guard page usable
         std.os.mprotect(stack[guard_offset..], linux.PROT_READ | linux.PROT_WRITE) catch |err| switch (err) {
             std.os.MProtectError.AccessDenied => unreachable,
             else => |e| return e,

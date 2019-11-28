@@ -4,14 +4,14 @@ const posix = @import("./posix.zig");
 
 pub fn nanotime = posix.nanotime;
 
-pub const Thread = if (builtin.link_libc) posix.Thread else struct {
+pub const OsThread = if (builtin.link_libc) posix.OsThread else struct {
     tid: i32,
 
-    pub fn getCurrent(self: *Thread) void {
+    pub fn getCurrent(self: *OsThread) void {
         _ = linux.syscall1(linux.SYS_set_tid_address, @ptrToInt(&self.tid));
     }
 
-    pub fn join(self: *Thread) void {
+    pub fn join(self: *OsThread) void {
         while (true) {
             const tid = @atomicLoad(i32, &self.tid, .Acquire);
             if (tid == 0) return;

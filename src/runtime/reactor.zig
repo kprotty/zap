@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const os = std.os;
 const net = std.net;
+const Task = @import("executor.zig").Task;
 
 const backend = switch (builtin.os) {
     .windows => @import("reactor/windows.zig"),
@@ -18,6 +19,7 @@ pub const Descriptor = struct {
 };
 
 pub const Reactor = struct {
+    lock: u32,
     inner: backend.Reactor,
 
     pub const Error = error{
@@ -98,5 +100,23 @@ pub const Reactor = struct {
 
     pub fn fwrite(self: *Reactor, descriptor: *Descriptor, data: []const os.iovec_const, offset: ?u64) FileWriteError!usize {
         return self.inner.fwrite(&descriptor.inner, data, offset);
+    }
+
+    pub const PollError = error{
+
+    };
+
+    pub fn poll(self: *Reactor, blocking: bool) PollError!Task.List {
+        // acquire a lock in order to reduce event poller contention
+        if (@atomicRmw(@typeOf(self.lock), &self.lock, .Xchg, 1, .Acquire) == 0) {
+            defer @atomicStore(@typeOf(self.lock), &self.lock, 0, .Release);
+            return self.inner.poll(blocking);
+        }
+
+        return Task.List{
+            .head = null,
+            .tail = null,
+            .size = 0,
+        };
     }
 };

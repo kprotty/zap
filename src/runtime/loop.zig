@@ -55,14 +55,14 @@ pub const Loop = struct {
     /// deallocate the list of workers passed in. If the worker list size is 0, then
     /// a default, single worker will be allocated on the stack when calling `run()`.
     pub fn initUsing(self: *Loop, max_threads: usize, workers: []Worker, allocator: ?*std.mem.Allocator) !void {
-        defer for (workers) |*worker| {
-            worker.* = Worker.init(self);
+        defer for (workers) |*worker, index| {
+            worker.* = Worker.init(self, index);
             worker.next = self.idle_workers;
             self.idle_workers = worker;
         };
 
         self.* = Loop{
-            .coprime = computeCoprime(std.math.max(1, workes.len)),
+            .coprime = computeCoprime(std.math.max(1, workers.len)),
             .pending_tasks = 0,
             .stop_event = std.ResetEvent.init(),
             .allocator = allocator,
@@ -96,12 +96,18 @@ pub const Loop = struct {
         if (self.workers.len != 0)
             return self.runTasks();
 
-        self.workers = ([_]Worker{ Worker.init() })[0..];
+        self.workers = ([_]Worker{ Worker.init(self, 0) })[0..];
         self.idle_workers = &self.workers[0];
         return self.runTasks();
     }
 
+    pub fn yield(self: *Loop) void {
+        var task = Task.init(@frame(), .Low);
+        suspend self.submit(&task);
+    }
+
     pub fn submit(self: *Loop, task: *Task) void {
+        self.beginTask();
         if (Thread.current) |thread|
             return thread.worker.submit(task);
 
@@ -115,9 +121,9 @@ pub const Loop = struct {
             .size = 1,
         };
         switch (task.getPriority()) {
-            .Low => self.run_queue.push(task_list, true),
-            .High => self.run_queue.pushFront(task_list, true),
-        };
+            .Low => self.run_queue.push(task_list),
+            .High => self.run_queue.pushFront(task_list),
+        }
     }
 
     fn hasPendingTasks(self: *const Loop) bool {
@@ -127,9 +133,11 @@ pub const Loop = struct {
     }
 
     fn beginTask(self: *Loop) void {
-        if (!builtin.single_threaded)
-            return _ = @atomicRmw(usize, &self.pending_tasks, .Add, 1, .Monotonic);
-        self.pending_tasks += 1;
+        if (!builtin.single_threaded) {
+            _ = @atomicRmw(usize, &self.pending_tasks, .Add, 1, .Monotonic);
+        } else {
+            self.pending_tasks += 1;
+        }
     }
 
     fn finishTask(self: *Loop) bool {
@@ -155,7 +163,7 @@ pub const Loop = struct {
         self.idle_workers = main_worker.next;
         self.free_threads -= 1;
         Thread.start(main_worker);
-        _ = self.stop_event.wait(null);
+        _ = self.stop_event.wait(null) catch unreachable;
 
         // stop all the threads
         const held = self.lock.acquire();
@@ -183,7 +191,8 @@ pub const Loop = struct {
             const thread = idle_thread;
             self.idle_threads = thread.next;
             thread.worker = worker;
-            return _ = thread.worker_event.set(false);
+            _ = thread.worker_event.set(false);
+            return;
         }
         
         // try and spawn a new thread using the worker
@@ -229,10 +238,6 @@ const Thread = struct {
         Thread.current = &self;
 
         while (true) {
-            // exit if theres no more work to do
-            if (!loop.hasPendingTasks() or loop.stop_event.isSet())
-                return;
-
             // dispatch based on the worker type
             const worker = @atomicLoad(*Worker, &self.worker, .Monotonic);
             if ((@ptrToInt(worker) & MONITOR_WORKER) == MONITOR_WORKER)
@@ -240,8 +245,13 @@ const Thread = struct {
             if (@ptrToInt(worker) == EXIT_WORKER)
                 return;
 
+            // exit if theres no more work to do
+            const loop = worker.loop;
+            if (!loop.hasPendingTasks() or loop.stop_event.isSet())
+                return;
+
             // start running tasks using the worker
-            worker.setThreadAndStatus(self, .Running);
+            worker.setThreadAndStatus(&self, .Running);
             while (worker.findRunnableTask()) |task| {
                 resume task.getFrame();
                 if (loop.finishTask())
@@ -251,23 +261,22 @@ const Thread = struct {
                 // stolen from us by the monitor thread 
                 if (self.is_blocking) {
                     self.is_blocking = false;
-                    const loop = worker.loop;
                     const held = loop.lock.acquire();
 
                     // try and grab an idle worker
-                    if (loop.idle_worker) |worker| {
-                        self.worker = worker;
-                        loop.idle_worker = worker.next;
+                    if (loop.idle_workers) |idle_worker| {
+                        self.worker = idle_worker;
+                        loop.idle_workers = idle_worker.next;
                         held.release();
                         break;
                     }
 
                     // no idle worker, add ourselves to the idle thread list
                     // and wait to be woken up with a new worker
-                    self.next = loop.idle_thread;
-                    loop.idle_thread = self;
+                    self.next = loop.idle_threads;
+                    loop.idle_threads = &self;
                     held.release();
-                    _ = self.worker_event.wait(null);
+                    _ = self.worker_event.wait(null) catch unreachable;
                     break;
                 }
             }
@@ -313,10 +322,7 @@ const Thread = struct {
         // the monitor thread stole our worker from us.
         // move the current task to the global queue
         var task = Task.init(@frame(), .Low);
-        loop.beginTask();
-        suspend {
-            loop.submit(&task);
-        }
+        suspend loop.submit(&task);
     }
 
     fn getMonitorThread(loop: *Loop) ?*Thread {
@@ -402,7 +408,7 @@ const Thread = struct {
     }
 };
 
-const Worker = extern struct {
+const Worker = struct {
     loop: *Loop,
     next: ?*Worker,
     thread: ThreadPtr,
@@ -498,7 +504,7 @@ const Worker = extern struct {
         grab = std.math.min(grab, size);
         if (max != 0)
             grab = std.math.min(grab, max);
-        grab = std.maht.min(grab, self.run_queue.tasks.len);
+        grab = std.math.min(grab, self.run_queue.tasks.len);
         @atomicStore(usize, &loop.run_queue.size, size - grab, .Release);
 
         // return the first task
@@ -519,6 +525,7 @@ const Worker = extern struct {
                 loop.run_queue.tail = null;
             self.submit(t);
         }
+        return task;
     }
 
     fn submit(self: *Worker, task: *Task) void {
@@ -578,10 +585,10 @@ const Worker = extern struct {
                 // iterate the worker list in a random other to try and decrease steal contention
                 var i: usize = 0;
                 while (i < N) : (i += 1) {
-                    const worker = &loop.workers[(i * coprime) + offset) % N];
+                    const worker = &loop.workers[((i * coprime) + offset) % N];
                     if (worker == self)
                         continue;
-                    if (self.steal(worker)) |task| {
+                    if (self.run_queue.steal(&worker.run_queue)) |task| {
                         found_task = true;
                         return task;
                     }
@@ -612,7 +619,7 @@ const Worker = extern struct {
         }
 
         // wait until we're woken up with a new worker
-        _ = thread.worker_event.wait(null);
+        _ = thread.worker_event.wait(null) catch unreachable;
         return null;
     }
 
@@ -655,7 +662,7 @@ const Worker = extern struct {
                 // local queue isn't full, try and push to the front
                 if (tail -% head < SIZE) {
                     self.tasks[(head -% 1) & MASK] = task;
-                    @cmpxchgWeak(u32, &self.head, head, head -% 1, .Release, .Monotonic) orelse return;
+                    _ = @cmpxchgWeak(u32, &self.head, head, head -% 1, .Release, .Monotonic) orelse return;
                     continue;
                 }
 
@@ -772,7 +779,7 @@ pub const Task = struct {
         tail: ?*Task,
         size: usize,
 
-        pub fn push(self: *List, list: List, comptime atomically: bool) void {
+        pub fn push(self: *List, list: List) void {
             if (self.head == null)
                 self.head = list.head;
             if (self.tail) |tail|
@@ -781,7 +788,7 @@ pub const Task = struct {
             self.updateSize(self.size + list.size);
         }
 
-        pub fn pushFront(self: *List, list: List, comptime atomically: bool) void {
+        pub fn pushFront(self: *List, list: List,) void {
             if (self.tail == null)
                 self.tail = list.tail;
             if (list.tail) |tail|
@@ -791,10 +798,10 @@ pub const Task = struct {
         }
 
         inline fn updateSize(self: *List, new_size: usize) void {
-            if (!builtin.single_threaded and atomically) {
-                @atomicStore(usize, &self.size, new_size, .Monotonic);
-            } else {
+            if (builtin.single_threaded) {
                 self.size = new_size;
+            } else {
+                @atomicStore(usize, &self.size, new_size, .Monotonic);
             }
         }
     };
@@ -822,7 +829,7 @@ fn TaggedPtr(comptime Ptr: type, comptime Tag: type) type {
         }
 
         pub fn getTag(self: Self) Tag {
-            return @intToEnum(Tag, @truncate(@TypeTag(Tag), self.value));
+            return @intToEnum(Tag, @truncate(@TagType(Tag), self.value));
         }
 
         pub fn setPtr(self: *Self, ptr: Ptr) void {

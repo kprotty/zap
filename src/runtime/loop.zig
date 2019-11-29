@@ -522,6 +522,9 @@ const Worker = extern struct {
     }
 
     fn submit(self: *Worker, task: *Task) void {
+        // TODO: spawn worker if no one is spinning
+        // same for tasks submitted after a reactor poll
+        
         switch (task.getPriority()) {
             .Low => self.run_queue.push(task),
             .High => self.run_queue.pushFront(task),

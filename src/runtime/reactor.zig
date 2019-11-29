@@ -10,17 +10,16 @@ const backend = switch (builtin.os) {
     else => @import("reactor/bsd.zig"),
 };
 
-pub const Descriptor = struct {
-    inner: backend.Descriptor,
-
-    pub fn getHandle(self: Descriptor) os.fd_t {
-        return self.inner.getHandle();
-    }
-};
-
 pub const Reactor = struct {
-    lock: u32,
     inner: backend.Reactor,
+
+    pub const Descriptor = struct {
+        inner: backend.Reactor.Descriptor,
+
+        pub fn getHandle(self: Descriptor) os.fd_t {
+            return self.inner.getHandle();
+        }
+    };
 
     pub const Error = error{
 
@@ -107,16 +106,6 @@ pub const Reactor = struct {
     };
 
     pub fn poll(self: *Reactor, blocking: bool) PollError!Task.List {
-        // acquire a lock in order to reduce event poller contention
-        if (@atomicRmw(@typeOf(self.lock), &self.lock, .Xchg, 1, .Acquire) == 0) {
-            defer @atomicStore(@typeOf(self.lock), &self.lock, 0, .Release);
-            return self.inner.poll(blocking);
-        }
-
-        return Task.List{
-            .head = null,
-            .tail = null,
-            .size = 0,
-        };
+        return self.inner.poll(blocking);
     }
 };

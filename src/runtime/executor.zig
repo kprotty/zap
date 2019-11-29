@@ -16,8 +16,10 @@ pub const Executor = struct {
     // general executor fields
     active_tasks: usize,
     stop_event: std.ResetEvent,
-    allocator: ?*std.mem.Allocator,
+    reactor_lock: u32,
     reactor: Reactor,
+    allocator: ?*std.mem.Allocator,
+    
 
     // thread fields
     thread_lock: std.Mutex,
@@ -29,10 +31,11 @@ pub const Executor = struct {
     // worker fields
     runq_lock: std.Mutex,
     runq: Task.List,
-    workers: []Worker,
-    idle_workers: ?*Worker,
-    searching_workers: usize,
     coprime: usize,
+    workers: []Worker,
+    searching_workers: usize,
+    idle_workers: ?*Worker,
+    idle_worker_lock: std.Mutex,    
 
     pub fn init(self: *Executor) !void {
         if (builtin.single_threaded)
@@ -61,10 +64,11 @@ pub const Executor = struct {
 
     pub fn initUsing(self: *Executor, workers: []Worker, max_threads: usize, allocator: ?*std.mem.Allocator) !void {
         self.* = Executor{
-            .allocator = allocator,
             .active_tasks = 0,
             .stop_event = std.ResetEvent.init(),
             .reactor = try Reactor.init(),
+            .reactor_lock = 0,
+            .allocator = allocator,
             .thread_lock = std.Mutex.init(),
             .idle_threads = null,
             .free_threads = max_threads,
@@ -76,10 +80,11 @@ pub const Executor = struct {
                 .tail = null,
                 .size = 0,
             },
-            .workers = workers,
-            .idle_workers = null,
-            .searching_workers = 0,
             .coprime = computeCoprime(workers.len),
+            .workers = workers,
+            .searching_workers = 0,
+            .idle_workers = null,
+            .idle_worker_lock = std.Mutex.init(),         
         };
         for (workers) |*worker| {
             worker.* = Worker.init();
@@ -92,6 +97,7 @@ pub const Executor = struct {
         self.stop_event.deinit();
         self.runq_lock.deinit();
         self.thread_lock.deinit();
+        self.idle_worker_lock.deinit();
         if (self.allocator) |allocator| {
             allocator.free(self.workers);
         }
@@ -134,36 +140,6 @@ pub const Executor = struct {
         }
     }
 
-    fn setIdleThread(self: *Executor, thread: *Thread) void {
-        const held = self.thread_lock.acquire();
-        defer held.release();
-
-        thread.next = self.idle_threads;
-        self.idle_threads = thread;
-    }
-
-    fn spawnThread(self: *Executor, worker: *Worker) std.Thread.SpawnError!void {
-        const held = self.thread_lock.acquire();
-        defer held.release();
-
-        // try using a thread in the free list
-        if (self.idle_threads) |idle_thread| {
-            const thread = idle_thread;
-            self.idle_threads = thread.next;
-            thread.wakeWith(worker);
-            return;
-        }
-
-        // free list is empty, try and spawn a new thread
-        if (self.free_threads == 0)
-            return std.Thread.SpawnError.ThreadQuotaExceeded;
-        self.free_threads -= 1;
-        platform.Thread.spawn(worker, Thread.run) catch |err| {
-            self.free_threads = 0; // assume hit thread limit on error
-            return err;
-        };
-    }
-
     pub fn yield() void {
         const thread = Thread.current orelse return;
         return thread.worker.yield();
@@ -188,15 +164,45 @@ pub const Executor = struct {
         return previous == 1;
     }
 
-    pub fn pushTasks(self: *Executor, list: Task.List) void {
+    /// Pushes tasks into the global queue and starts up idle worker threads to execute them.
+    pub fn submitTasks(self: *Executor, list: Task.List) void {
+        if (list.size == 0) return;
+        self.pushTasks(list);
+
+        const held = self.idle_worker_lock.acquire();
+        defer held.release();
+
+        var i = list.size;
+        while (i != 0) : (i -= 1) {
+            const worker = self.idle_workers orelse return;
+            self.spawnThread(worker) catch return;
+            self.idle_workers = worker.next;
+        }
+    }
+
+    fn pollReactorTasks(self: *Executor, blocking: bool) ?*Task {
+        if (@atomicRmw(u32, &self.reactor_lock, .Xchg, 1, .Acquire) != 0)
+            return null;
+        var tasks = self.reactor.poll(blocking);
+        @atomicStore(u32, &self.reactor_lock, 0, .Release);
+
+        const task = tasks.pop() orelse return null;
+        tasks.size -= 1;
+        self.submitTasks(tasks);
+        return task;
+    }
+
+    fn pushTasks(self: *Executor, list: Task.List) void {
         const held = self.runq_lock.acquire();
         defer held.release();
 
-        // use an atomic store on multiple threads for the optimizaiton below
-        self.runq.push(list);
-        if (!builtin.single_threaded)
-            return @atomicStore(usize, &self.runq.size, self.runq.size + list.size, .Monotonic);
-        self.runq.size += list.size;
+        // use an atomic store for the optimization below
+        defer self.runq.push(list);
+        if (builtin.single_threaded) {
+            self.runq.size += list.size;
+        } else {
+            @atomicStore(usize, &self.runq.size, self.runq.size + list.size, .Monotonic);
+        }
     }
 
     fn popTasks(self: *Executor, worker: *Worker, max: ?usize) ?*Task {
@@ -240,7 +246,8 @@ pub const Executor = struct {
 
     /// A thread is transitioning into the searching state after having not
     /// found any tasks in its local queue, the global queue and the reactor.
-    /// limit the amount of search threads to half the executors workers to decrease contention:
+    /// Once in a searching state, the thread tries to steal work from other workers.
+    /// Limit the amount of search threads to half the executors workers to decrease contention:
     /// https://tokio.rs/blog/2019-10-scheduler/#throttle-stealing
     fn startSearching(self: *Executor) bool {
         const searching = @atomicRmw(usize, &self.searching_workers, .Add, 1, .Monotonic);
@@ -253,20 +260,60 @@ pub const Executor = struct {
         };
     }
 
+    fn setIdleWorker(self: *Executor, worker: *Worker) void {
+        const held = self.idle_worker_lock.acquire();
+        defer held.release();
+
+        worker.next = self.idle_workers;
+        self.idle_workers = worker;
+    }
+
+    fn setIdleThread(self: *Executor, thread: *Thread) void {
+        const held = self.thread_lock.acquire();
+        defer held.release();
+
+        thread.next = self.idle_threads;
+        self.idle_threads = thread;
+    }
+
+    fn spawnThread(self: *Executor, worker: *Worker) std.Thread.SpawnError!void {
+        const held = self.thread_lock.acquire();
+        defer held.release();
+
+        // try using a thread in the free list
+        if (self.idle_threads) |idle_thread| {
+            const thread = idle_thread;
+            self.idle_threads = thread.next;
+            thread.wakeWith(worker);
+            return;
+        }
+
+        // free list is empty, try and spawn a new thread
+        if (self.free_threads == 0)
+            return std.Thread.SpawnError.ThreadQuotaExceeded;
+        self.free_threads -= 1;
+        platform.Thread.spawn(worker, Thread.run) catch |err| {
+            self.free_threads = 0; // assume hit thread limit on error
+            return err;
+        };
+    }
+
     fn monitor(self: *Executor, thread: *Thread) void {
-        
+        // TODO: monitor blocking threads
     }
 
     /// Compute the coprime of an array size used for traversing it randomly:
     /// https://lemire.me/blog/2017/09/18/visiting-all-values-in-an-array-exactly-once-in-random-order/
     fn computeCoprime(n: usize) usize {
         var i = n - 1;
+        var coprime: usize = 0;
         while (i >= n / 2) : (i -= 1) {
             if (gcd(i, n) == 1) {
-                return i;
+                coprime = i;
+                break;
             }
         }
-        unreachable;
+        return coprime;
     }
 
     /// Fast way to compute GCD:
@@ -399,32 +446,23 @@ const Worker = struct {
 
         // mostly pop from local queue LIFO (front) but do FIFO (back) occasionally for fairness
         if (switch (self.runq_tick % 31 == 0) {
-            true => self.popBack(),
-            else => self.popFront(),
+            true => self.popBackTask(),
+            else => self.popFrontTask(),
         }) |task| {
             return task;
         }
 
         // try and poll on the network (non-blocking)
-        var tasks = executor.reactor.poll(false);
-        if (tasks.size > 0) {
-            const task = tasks.pop();
-            tasks.size -= 1;
-            if (tasks.size > 0) {
-                executor.pushTasks(tasks);
-            }
+        if (executor.pollReactorTasks(false)) |task| {
             return task;
         }
 
+        // start spinning for new tasks
         while (true) {
-            // no worker in the local/global queues and the reactor, move the thread into a "searching" state.
-            // when a task becomes runnable, a new thread is started up if theres no searching threads.
-            // to maximize the workers, the last thread which stops searching after having found a task unblocks another searching thread.
-            // https://github.com/golang/go/blob/master/src/runtime/proc.go#L54
-            // limit the amount of searching threads to half the amount of workers:
-            // https://tokio.rs/blog/2019-10-scheduler/#throttle-stealing
-            if (executor.startSearching()) {
+            if (!executor.hasPendingTasks())
+                return null;
 
+            if (executor.startSearching()) {
                 // try and steal work for other workers, iterating them in a random order
                 var attempts: usize = 0;
                 const coprime = executor.coprime;
@@ -448,18 +486,19 @@ const Worker = struct {
                 }
             }
 
-            // no task present in the system, set this worker to idle
+            // stop searching and try to poll the network indefinitely
             executor.stopSearching(false);
-            self.next = @atomicLoad(?*Worker, &executor.idle_workers, .Monotonic);
-            while (true) : (std.SpinLock.yield(1)) {
-                self.next = @cmpxchgWeak(?*Worker, &executor.idle_workers, self.next, self, .Acquire, .Monotonic) orelse break;
+            if (executor.pollReactorTasks(true)) |task| {
+                return task;
             }
 
-            // TODO: blocking poll for network
+            // someone else is polling the network.
+            // set ourselves to idle, give up our thread and wait to be woken up.
+            //  
         }
     }
 
-    fn push(self: *Worker, task: *Task) void {
+    fn pushTask(self: *Worker, task: *Task) void {
         while (true) : (std.SpinLock.yield(1)) {
             const tail = self.runq_tail;
             const head = @atomicLoad(Index, &self.runq_head, .Acquire);
@@ -495,7 +534,7 @@ const Worker = struct {
         }
     }
 
-    fn popBack(self: *LocalQueue) ?*Task {
+    fn popBackTask(self: *LocalQueue) ?*Task {
         while (true) : (std.SpinLock.yield(1)) {
             const tail = self.runq_tail;
             const head = @atomicLoad(Index, &self.runq_head, .Acquire);
@@ -508,7 +547,7 @@ const Worker = struct {
         }
     }
 
-    fn popFront(self: *LocalQueue) ?*Task {
+    fn popFrontTask(self: *LocalQueue) ?*Task {
         while (true) : (std.SpinLock.yield(1)) {
             const tail = self.runq_tail;
             const head = @atomicLoad(Index, &self.runq_head, .Acquire);

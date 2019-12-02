@@ -5,6 +5,7 @@ const assert = std.debug.assert;
 
 pub const Loop = struct {
     lock: std.Mutex,
+    coprime: usize,
     pending_tasks: usize,
     stop_event: std.ResetEvent,
     allocator: ?*std.mem.Allocator,
@@ -13,7 +14,7 @@ pub const Loop = struct {
     idle_worker: ?*Worker,
     active_workers: usize,
     spinning_workers: usize,
-    run_queue: Worker.GlobalQueue,
+    run_queue: Task.List,
 
     free_threads: usize,
     idle_thread: ?*Thread,
@@ -36,9 +37,10 @@ pub const Loop = struct {
         return self.initUsing(cpu_count, thread_count);
     }
 
-    pub fn initUsing(self: *Loop, max_workers: usize, max_threads: usize) void {
+    pub fn initUsing(self: *Loop, max_workers: usize, max_threads: usize) !void {
         self.* = Loop{
             .lock = std.Mutex.init(),
+            .coprime = undefined,
             .pending_tasks = 0,
             .stop_event = std.ResetEvent.init(),
             .allocator = null,
@@ -90,9 +92,10 @@ pub const Loop = struct {
 
     fn runLoop(self: *Loop) void {
         // run the main worker on the main thread & wait for stop_event
+        self.coprime = RandomIterator.getCoprime(self.workers.len);
         const main_worker = self.getIdleWorker().?;
         self.free_threads -= 1;
-        Thread.start(tagged(main_worker, Worker.Event.Run));
+        Thread.start(tagged(main_worker, Thread.Action.Run));
         _ = self.stop_event.wait(null) catch unreachable;
 
         // stop all threads
@@ -138,7 +141,7 @@ pub const Loop = struct {
     /// Let the event loop try and schedule another task
     pub fn yield(self: *Loop) void {
         var task = Task.init(@frame(), .Low);
-        return self.suspended(submit, self, &task);
+        self.suspended(Loop.submit, self, &task);
     }
 
     fn submit(self: *Loop, task: *Task) void {
@@ -160,7 +163,7 @@ pub const Loop = struct {
         });
 
         // if theres threads actively spinning for work, let one of them take it
-        if (atomicLoad(&self.spinning_workers, .AcqRel) != 0)
+        if (atomicLoad(&self.spinning_workers, .SeqCst) != 0)
             return;
 
         // try and spawn a new worker to handle this task.
@@ -170,13 +173,13 @@ pub const Loop = struct {
     fn setIdleWorker(self: *Loop, worker: *Worker) void {
         worker.next = self.idle_worker;
         self.idle_worker = worker;
-        assert(atomicRmw(&self.active_workers, .Sub, 1, .Release) <= loop.workers.len);
+        assert(atomicRmw(&self.active_workers, .Sub, 1, .Release) <= self.workers.len);
     }
 
     fn getIdleWorker(self: *Loop) ?*Worker {
         const worker = self.idle_worker orelse return null;
         self.idle_worker = worker.next;
-        assert(atomicRmw(&self.active_workers, .Add, 1, .Release) <= loop.workers.len);
+        assert(atomicRmw(&self.active_workers, .Add, 1, .Release) <= self.workers.len);
         return worker;
     }
 
@@ -184,21 +187,21 @@ pub const Loop = struct {
         const worker = self.idle_worker orelse return;
         if (!cmpxchg(.Strong, &self.spinning_workers, 0, 1, .Acquire))
             return;
-        if (self.spawnThread(tagged(worker, Thread.Action.Spin)) {
+        if (self.spawnThread(tagged(worker, Thread.Action.Spin)))
             assert(self.getIdleWorker() != null);
     }
 
     fn setIdleThread(self: *Loop, thread: *Thread) void {
         thread.next = self.idle_thread;
         self.idle_thread = thread;
-        atomicStore(&thread.status, .Idle, .Monotonic);
+        thread.setStatus(.Idle, .Monotonic);
     }
 
     fn spawnThread(self: *Loop, worker: *Worker) bool {
         // if the worker was spawned spinning & no thread could be spawned,
         // then its OK to undo the increment and give up
         var spawned_thread = false;
-        const is_spinning = getTag(Thread.Action, worker);
+        const is_spinning = getTag(Thread.Action, worker) == .Spin;
         defer if (!spawned_thread and is_spinning) {
             assert(atomicRmw(&self.spinning_workers, .Sub, 1, .Release) == 1);
         };
@@ -209,7 +212,7 @@ pub const Loop = struct {
             self.idle_thread = thread.next;
             if (is_spinning)
                 assert(getPtr(Thread.Action, worker).hasRunnableTasks());
-            assert(atomicLoad(&thread.status, .Unordered) == .Idle);
+            assert(thread.getStatus(.Unordered) == .Idle);
             assert(thread.worker_event.set(false));
             spawned_thread = true;
 
@@ -230,8 +233,8 @@ const Thread = struct {
 
     next: ?*Thread,
     handle: usize,
-    status: Status,
     worker: ?*Worker,
+    status: Status align(@alignOf(usize)),
     worker_event: std.ResetEvent,
 
     const Action = enum(u2) {
@@ -247,14 +250,22 @@ const Thread = struct {
         Blocking,
     };
 
+    inline fn getStatus(self: *const Thread, comptime order: builtin.AtomicOrder) Status {
+        return @intToEnum(Status, @intCast(@TagType(Status), atomicLoad(@ptrCast(*const usize, &self.status), order)));
+    }
+
+    inline fn setStatus(self: *Thread, status: Status, comptime order: builtin.AtomicOrder) void {
+        return atomicStore(@ptrCast(*usize, &self.status), @as(usize, @enumToInt(status)), order);
+    }
+
     fn start(worker: *Worker) void {
         var self = Thread{
             .next = null,
             .handle = undefined,
-            .status = .Running,
             .worker = worker,
-            .worker_event = std.ResetEvent.init();
-        }
+            .status = .Running,
+            .worker_event = std.ResetEvent.init(),
+        };
         defer self.worker_event.deinit();
         
         // set the thread handle
@@ -325,11 +336,11 @@ const Thread = struct {
                 },
                 .Run => {
                     loop = worker.loop;
-                    atomicStore(&self.status, .Running, .Monotonic);
+                    self.setStatus(.Running, .Monotonic);
                 },
                 .Spin => {
                     loop = worker.loop;
-                    atomicStore(&self.status, .Spinning, .Monotonic);
+                    self.setStatus(.Spinning, .Monotonic);
                 },
             }
 
@@ -339,7 +350,7 @@ const Thread = struct {
                 if (atomicRmw(&loop.pending_tasks, .Sub, 1, .Release) == 1) {
                     _ = loop.stop_event.set(false);
                     return;
-                } else if (atomicLoad(&self.status, .Monotonic) == .Blocking) {
+                } else if (self.getStatus(.Monotonic) == .Blocking) {
                     break;
                 }
             }
@@ -397,12 +408,12 @@ const Worker = struct {
     }
 
     fn findRunnableTask(loop: *Loop, thread: *Thread, runnable_worker: *Worker) ?*Task {
-        var worker = runnable_worker;
+        var worker: ?*Worker = runnable_worker;
         const num_workers = loop.workers.len;
 
         // this thread may be returning a runnable task so we need to stop spinning.
-        defer if (atomicLoad(&thread.status, .Unordered) == .Spinning) {
-            atomicStore(&thread.status, .Running, .Monotonic);
+        defer if (thread.getStatus(.Unordered) == .Spinning) {
+            thread.setStatus(.Running, .Monotonic);
             const spinning = atomicRmw(&loop.spinning_workers, .Sub, 1, .Release);
             assert(spinning <= loop.workers.len);
 
@@ -410,7 +421,7 @@ const Worker = struct {
             // try to wake up another worker to guarantee eventual max cpu utilization
             if (spinning == 1)
                 loop.spawnWorker();
-        }
+        };
 
         lookForWork: while (true) {
             const self = worker orelse return null;
@@ -439,15 +450,15 @@ const Worker = struct {
                 return task;
 
             // check the reactor (block if the only worker, non-blocking otherwise)
-            if (sef.pollReactor(loop, null, builtin.single_threaded or loop.workers.len == 1)) |task|
+            if (self.pollReactor(loop, null, builtin.single_threaded or loop.workers.len == 1)) |task|
                 return task;
 
             // try and start spinning, looking for tasks in other worker queues.
             // sloppy limit: only spin if less than half the active workers are spinning to decrease contention.
             const active = atomicLoad(&loop.active_workers, .Monotonic);
             const spinning = atomicLoad(&loop.spinning_workers, .Monotonic);
-            if (atomicLoad(&thread.status, .Unordered) != .Spinning and spinning < active / 2) {
-                atomicStore(&thread.status, .Spinning, .Monotonic);
+            if (thread.getStatus(.Unordered) != .Spinning and spinning < active / 2) {
+                thread.setStatus(.Spinning, .Monotonic);
                 _ = atomicRmw(&loop.spinning_workers, .Add, 1, .Release);
 
                 // iterate the other workers in the event loop a few times
@@ -477,6 +488,7 @@ const Worker = struct {
                 // if still nothing, give up our worker
                 assert(!self.hasRunnableTasks());
                 loop.setIdleWorker(self);
+                worker = null;
             }
 
             // thread is transitioning from spinning -> idling.
@@ -485,16 +497,16 @@ const Worker = struct {
             // If done the other way around, a thread could submit tasks after
             // we checked all of the queues but before spinning in decremented
             // meaning no one would wake up a thread to run that that task.
-            const was_spinning = atomicLoad(&thread.status, .Unordered) == .Spinning;
-            atomicStore(&thread.status, .Idle, .Monotonic);
+            const was_spinning = thread.getStatus(.Unordered) == .Spinning;
+            thread.setStatus(.Idle, .Monotonic);
             if (was_spinning)
                 assert(atomicRmw(&loop.spinning_workers, .Add, 1, .AcqRel) <= num_workers);
 
             // look for an idle worker with runnable tasks
-            for (loop.workers) |*worker| {
-                if (worker == self)
+            for (loop.workers) |*other_worker| {
+                if (other_worker == self)
                     continue;
-                if (!worker.hasRunnableTasks())
+                if (!other_worker.hasRunnableTasks())
                     continue;
                 const held = loop.lock.acquire();
                 const idle_worker = loop.getIdleWorker();
@@ -503,12 +515,12 @@ const Worker = struct {
                 // we discovered a worker with tasks to be run,
                 // store the spinning_workers count as a signal for the defer up-top
                 // to try and get another thread spinning this new worker might have steal-able tasks.
-                self = idle_worker orelse break;
+                worker = idle_worker orelse break;
                 if (was_spinning) {
-                    atomicStore(&thread.status, .Spinning, .Monotonic);
+                    thread.setStatus(.Spinning, .Monotonic);
                     atomicRmw(&loop.spinning_workers, .Add, 1, .Release);
                 } else {
-                    atomicStore(&thread.status, .Running, .Monotonic);
+                    thread.setStatus(.Running, .Monotonic);
                 }
                 continue :lookForWork;
             }
@@ -523,13 +535,14 @@ const Worker = struct {
         return null;
     }
 
-    fn pollReactor(self: *Worker, loop: *Loop, thread: ?*Thread, comptime block: bool) ?*Task {
+    fn pollReactor(self: *Worker, loop: *Loop, thread: ?*Thread, block: bool) ?*Task {
         // TODO
         return null;
     }
 
     fn pollGlobalQueue(self: *Worker, loop: *Loop, max: usize, comptime lock: bool) ?*Task {
-
+        // TODO
+        return null;
     }
 
     const LocalQueue = struct {
@@ -667,7 +680,7 @@ pub const Task = struct {
     next: ?*Task,
     frame: anyframe,
 
-    pub const Priority = enum(u1) {
+    pub const Priority = enum(u2) {
         Low,
         Medium,
         High,
@@ -758,7 +771,7 @@ fn cmpxchg(comptime strength: CmpxchgType, ptr: var, cmp: @typeOf(ptr.*), xchg: 
     if (!builtin.single_threaded) {
         return switch (strength) {
             .Weak => @cmpxchgWeak(@typeOf(ptr.*), ptr, cmp, xchg, order, .Monotonic) == null,
-            .Strong => @cmpxchgStrong(@typeOf(ptr.*), ptr, cmp, xchg, order, Monotonic) == null, 
+            .Strong => @cmpxchgStrong(@typeOf(ptr.*), ptr, cmp, xchg, order, .Monotonic) == null, 
         };
     }
     if (ptr.* != cmp)

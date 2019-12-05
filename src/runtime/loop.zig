@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const DEBUG = true;
 
 pub const Loop = struct {
     lock: std.Mutex,
@@ -95,11 +96,15 @@ pub const Loop = struct {
             self.coprime = RandomIterator.getCoprime(self.workers.len);
         
         // run the main worker on the main thread & wait for stop_event
+        if (!self.hasPendingTasks()) return;
         const main_worker = self.getIdleWorker() orelse return;
         self.free_threads -= 1;
         Thread.start(tagged(main_worker, Thread.Action.Run));
+
+        if (DEBUG) std.debug.warn("{} waiting for stop event\n", std.Thread.getCurrentId());
         if (!builtin.single_threaded)
             _ = self.stop_event.wait(null) catch unreachable;
+        if (DEBUG) std.debug.warn("{} finished\n", std.Thread.getCurrentId());
     }
 
     fn stopLoop(self: *Loop) void {
@@ -170,14 +175,11 @@ pub const Loop = struct {
         // push to local run queue if theres a running worker thread. if not, push to global run queue
         const thread = Thread.current orelse return self.push(task);
         const worker = getPtr(Thread.Action, thread.worker) orelse return self.push(task);
+        if (DEBUG) std.debug.warn("{} got worker 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(worker));
         worker.run_queue.push(task);
 
         // if this task is the only one alive, no need to spawn new threads
         if (!worker.hasRunnableTasks())
-            return;
-
-        // if theres threads actively spinning for work, let one of them take it
-        if (atomicLoad(&self.spinning_workers, .SeqCst) != 0)
             return;
 
         // try and spawn a new worker to handle this task.
@@ -190,9 +192,6 @@ pub const Loop = struct {
     }
 
     fn getIdleWorker(self: *Loop) ?*Worker {
-        if (!self.hasPendingTasks())
-            return null;
-
         const worker = self.idle_worker orelse return null;
         defer self.idle_worker = worker.next;
         return worker;
@@ -201,6 +200,10 @@ pub const Loop = struct {
     fn spawnWorker(self: *Loop) void {
         // single threaded loops cant spawn workers
         if (builtin.single_threaded or self.workers.len == 1)
+            return;
+
+        // only spawn a worker if theres tasks in the system
+        if (!self.hasPendingTasks())
             return;
 
         // no worker should be spinning when spawning a new one
@@ -223,12 +226,7 @@ pub const Loop = struct {
     }
 
     fn spawnThread(self: *Loop, worker: *Worker) bool {
-        // if the worker was spawned spinning & no thread could be spawned,
-        // then its OK to undo the increment and give up
         var spawned_thread = false;
-        defer if (!spawned_thread and getTag(Thread.Action, worker) == .Spin) {
-            assert(atomicRmw(&self.spinning_workers, .Sub, 1, .Release) == 1);
-        };
 
         // check the thread free list
         if (self.idle_thread) |thread| {
@@ -247,7 +245,14 @@ pub const Loop = struct {
                 // make sure to free handles on windows since threads will exit on their own
                 if (comptime std.Target.current.isWindows())
                     std.os.windows.CloseHandle(os_thread.handle());
-            } else |_| {}
+
+            // signal the worker as not spinning if theres no thread to run it 
+            } else |_| {
+                if (getTag(Thread.Action, worker) == .Spin) {
+                    const spinning = atomicRmw(&self.spinning_workers, .Sub, 1, .Release);
+                    assert(spinning != 0 and spinning < self.workers.len);
+                }
+            }
         }
 
         return spawned_thread;
@@ -317,10 +322,6 @@ const Thread = struct {
 
             // dispatch the worker based on the thread action
             switch (action) {
-                .Monitor => {
-                    loop = @ptrCast(*Loop, worker);
-                    return self.monitor(loop);
-                },
                 .Run => {
                     loop = worker.loop;
                     self.setStatus(.Running, .Monotonic);
@@ -329,11 +330,15 @@ const Thread = struct {
                     loop = worker.loop;
                     self.setStatus(.Spinning, .Monotonic);
                 },
+                .Monitor => {
+                    loop = @ptrCast(*Loop, worker);
+                    return self.monitor(loop);
+                },
             }
 
             // run tasks using the given worker
             while (Worker.findRunnableTask(loop, self, worker)) |task| {
-                // std.debug.warn("{} running task 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(task));
+                if (DEBUG) std.debug.warn("{} running task 0x{x} on 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(task), @ptrToInt(worker));
                 resume task.getFrame();
                 if (atomicRmw(&loop.pending_tasks, .Sub, 1, .Release) == 1)
                     return loop.stopLoop();
@@ -349,6 +354,7 @@ const Thread = struct {
             const held = loop.lock.acquire();
             loop.setIdleThread(self);
             held.release();
+            if (DEBUG) std.debug.warn("{} is sleeping for work\n", std.Thread.getCurrentId());
             _ = self.worker_event.wait(null) catch unreachable;
             assert(self.worker_event.reset());
         }
@@ -401,24 +407,12 @@ const Worker = struct {
         var worker: ?*Worker = runnable_worker;
         const num_workers = loop.workers.len;
 
-        // this thread may be returning a runnable task so we need to stop spinning.
-        defer if (thread.getStatus(.Monotonic) == .Spinning) {
-            thread.setStatus(.Running, .Monotonic);
-            const spinning = atomicRmw(&loop.spinning_workers, .Sub, 1, .Release);
-            assert(spinning <= num_workers);
-
-            // if we're the last thread to come out of spinning with work,
-            // try to wake up another worker to guarantee eventual max cpu utilization
-            if (spinning == 1)
-                loop.spawnWorker();
-        };
-
         lookForWork: while (true) {
             const self = worker orelse return null;
             self.run_tick +%= 1;
 
             // make sure theres tasks alive in the system
-            // std.debug.warn("{} checking active task\n", std.Thread.getCurrentId());
+            if (DEBUG) std.debug.warn("{} checking active task\n", std.Thread.getCurrentId());
             if (!loop.hasPendingTasks())
                 return null;
             
@@ -428,18 +422,18 @@ const Worker = struct {
 
             // check the global queue once in a while
             if (self.run_tick % RUN_TICK_GLOBAL == 0) {
-                // std.debug.warn("{} checking global queue\n", std.Thread.getCurrentId());
+                if (DEBUG) std.debug.warn("{} checking global queue\n", std.Thread.getCurrentId());
                 if (self.pollGlobalQueue(loop, 1, true)) |task|
                     return task;
             }
 
             // check the local queue
-            // std.debug.warn("{} checking local queue\n", std.Thread.getCurrentId());
+            if (DEBUG) std.debug.warn("{} checking local queue\n", std.Thread.getCurrentId());
             if (self.run_queue.pop()) |task|
                 return task;
 
             // check the global queue
-            // std.debug.warn("{} checking global queue\n", std.Thread.getCurrentId());
+            if (DEBUG) std.debug.warn("{} checking global queue\n", std.Thread.getCurrentId());
             if (self.pollGlobalQueue(loop, 0, true)) |task|
                 return task;
 
@@ -447,37 +441,10 @@ const Worker = struct {
             if (pollReactor(loop, null, builtin.single_threaded or loop.workers.len == 1)) |task|
                 return task;
 
-            // try and spin (looking for tasks to steal from other workers)
-            {
-                // if we're the last thread to come out of spinning with work,
-                // try to wake up another worker to guarantee eventual max cpu utilization
-                const spinning = atomicRmw(&loop.spinning_workers, .Add, 1, .AcqRel);
-                defer if (atomicRmw(&loop.spinning_workers, .Sub, 1, .Monotonic) == 1) {
-                    loop.spawnWorker();
-                };
-
-                // sloppy limit: only spin if less than half the active workers are spinning to decrease contention.
-                if (spinning <= num_workers) {
-                    thread.setStatus(.Spinning, .Monotonic);
-                    defer thread.setStatus(.Running, .Monotonic);
-
-                    // iterate the other workers in the event loop a few times
-                    // in a random order and try to steal half of thier tasks
-                    var attempt: usize = 0;
-                    const rand_seed = loop.monitor_timer.read() ^ @as(u64, @ptrToInt(loop));
-                    while (attempt < STEAL_ATTEMPTS) : (attempt += 1) {
-                        var rand_iter = RandomIterator.init(loop.coprime, rand_seed, num_workers);
-                        while (rand_iter.next()) |index| {
-                            const victim = &loop.workers[index];
-                            if (victim == self)
-                                continue;
-                            if (self.run_queue.steal(&victim.run_queue)) |task|
-                                return task;
-                            // TODO: steal timers?
-                        }
-                    }
-                }
-            }
+            // try and check the queues of other workers (work-stealing)
+            if (self.pollWorkerQueues(loop, thread, num_workers)) |task|
+                return task;
+            if (DEBUG) std.debug.warn("{} isnt spinning with 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(self));
 
             // check the global queue once more
             {
@@ -486,27 +453,17 @@ const Worker = struct {
                 const held = loop.lock.acquire();
                 defer held.release();
 
-                // std.debug.warn("{} checking global queue last time\n", std.Thread.getCurrentId());
+                if (DEBUG) std.debug.warn("{} checking global queue last time\n", std.Thread.getCurrentId());
                 if (self.pollGlobalQueue(loop, 0, false)) |task|
                     return task;
 
                 // if still nothing, give up our worker
-                // std.debug.warn("{} no global queue\n", std.Thread.getCurrentId());
+                if (DEBUG) std.debug.warn("{} no global queue\n", std.Thread.getCurrentId());
+                thread.setStatus(.Idle, .Monotonic);
                 assert(!self.hasRunnableTasks());
                 loop.setIdleWorker(self);
                 worker = null;
             }
-
-            // thread is transitioning from spinning -> idling.
-            // decrement the spinning count first using an AcquireRelease barrier
-            // in between before re-checking all the worker queues for tasks.
-            // If done the other way around, a thread could submit tasks after
-            // we checked all of the queues but before spinning in decremented
-            // meaning no one would wake up a thread to run that that task.
-            const was_spinning = thread.getStatus(.Monotonic) == .Spinning;
-            thread.setStatus(.Idle, .Monotonic);
-            if (was_spinning)
-                assert(atomicRmw(&loop.spinning_workers, .Sub, 1, .AcqRel) <= num_workers);
 
             // look for an idle worker with runnable tasks
             for (loop.workers) |*other_worker| {
@@ -515,22 +472,17 @@ const Worker = struct {
                 if (!other_worker.hasRunnableTasks())
                     continue;
                 
-                // std.debug.warn("{} maybe idle worker\n", std.Thread.getCurrentId());
+                if (DEBUG) std.debug.warn("{} maybe idle worker\n", std.Thread.getCurrentId());
                 const held = loop.lock.acquire();
-                const idle_worker = loop.getIdleWorker();
+                const idle_worker = if (!loop.hasPendingTasks()) null else loop.getIdleWorker();
                 held.release();
 
                 // we discovered a worker with tasks to be run,
                 // store the spinning_workers count as a signal for the defer up-top
                 // to try and get another thread spinning this new worker might have steal-able tasks.
                 worker = idle_worker orelse break;
-                // std.debug.warn("{} found idle worker\n", std.Thread.getCurrentId());
-                if (was_spinning) {
-                    thread.setStatus(.Spinning, .Monotonic);
-                    _ = atomicRmw(&loop.spinning_workers, .Add, 1, .Release);
-                } else {
-                    thread.setStatus(.Running, .Monotonic);
-                }
+                if (DEBUG) std.debug.warn("{} found idle worker\n", std.Thread.getCurrentId());
+                thread.setStatus(.Running, .Monotonic);
                 continue :lookForWork;
             }
 
@@ -579,6 +531,62 @@ const Worker = struct {
         if (loop.run_queue.head == null)
             loop.run_queue.tail = null;
         return task;
+    }
+
+    fn pollWorkerQueues(self: *Worker, loop: *Loop, thread: *Thread, num_workers: usize) ?*Task {
+        // there are no other workers to poll
+        if (builtin.single_threaded or num_workers < 2)
+            return null;
+
+        // sloppy limit: only spin if less than half the active workers are spinning to decrease contention.
+        if (thread.getStatus(.Monotonic) != .Spinning) {
+            if (DEBUG) std.debug.warn("{} is trying to spin using 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(self));
+            while (true) : (std.SpinLock.yield(1)) {
+                const spinning = atomicLoad(&loop.spinning_workers, .Monotonic);
+                if (DEBUG) std.debug.warn("{} try spin on 0x{x} observed: {}>{}\n", std.Thread.getCurrentId(), @ptrToInt(self), spinning, num_workers / 2);
+                assert(spinning < num_workers);
+                if (spinning > num_workers / 2)
+                    return null;
+                if (cmpxchg(.Weak, &loop.spinning_workers, spinning, spinning + 1, .Acquire)) {
+                    thread.setStatus(.Spinning, .Monotonic);
+                    break;
+                }
+            }
+        }
+
+        // the thread is officially spinning for tasks.
+        // if we're the last thread to come out of spinning with a task,
+        // try to wake up another worker who will spin to guarantee eventual max cpu utilization
+        if (DEBUG) std.debug.warn("{} is spinning using 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(self));
+        defer {
+            thread.setStatus(.Running, .Monotonic);
+            const spinning = atomicRmw(&loop.spinning_workers, .Sub, 1, .Release);
+            assert(spinning < num_workers);
+            if (DEBUG) std.debug.warn("{} stopped spinning 0x{x} with {}\n", std.Thread.getCurrentId(), @ptrToInt(self), spinning);
+            if (spinning == 1)
+                loop.spawnWorker();
+        }
+
+        // iterate the other workers in the event loop a few times
+        // in a random order and try to steal half of thier tasks
+        var attempt: usize = 0;
+        const rand_seed = loop.monitor_timer.read() ^ @as(u64, @ptrToInt(loop));
+        while (attempt < STEAL_ATTEMPTS) : (attempt += 1) {
+            var rand_iter = RandomIterator.init(loop.coprime, rand_seed, num_workers);
+            while (rand_iter.next()) |index| {
+                const victim = &loop.workers[index];
+                if (victim == self)
+                    continue;
+                if (self.run_queue.steal(&victim.run_queue)) |task| {
+                    if (DEBUG) std.debug.warn("{} 0x{x} stole tasks from 0x{x}\n", std.Thread.getCurrentId(), @ptrToInt(self), @ptrToInt(victim));
+                    return task;
+                }
+                // TODO: steal timers?
+            }
+        }
+
+        // other workers didnt have any tasks either
+        return null;
     }
 
     const LocalQueue = struct {

@@ -1,10 +1,10 @@
 const std = @import("std");
+const system = @import("./system.zig");
 
 pub const Scheduler = struct {
     pub const Config = struct {
-        max_workers: usize = 0,
-        max_threads: usize = 0,
-        allocator: ?*std.mem.Allocator = null,
+        cluster: Node.Cluster = Node.Cluster{},
+        main_node: *Node = undefined,
     };
 
     pub fn runAsync(config: Config, comptime func: var, args: var) !@TypeOf(func).ReturnType {
@@ -25,519 +25,307 @@ pub const Scheduler = struct {
     }
 
     pub fn run(config: Config, runnable: *Runnable) !void {
-        var max_threads = config.max_threads;
-        var max_workers = config.max_workers;
+        if (config.cluster.len != 0)
+            return runNuma(config.cluster, config.main_node, runnable);
 
-        if (std.builtin.single_threaded)
-            max_threads = std.math.min(1, max_threads);
-        if (max_workers == 0)
-            max_workers = std.Thread.cpuCount() catch 1;
-        if (max_threads == 0)
-            max_threads = max_workers + 64;
-        if (max_workers > max_threads)
-            max_workers = max_threads;
+        var main_node: *Node = undefined;
+        const numa_nodes = system.Node.getTopology();
+        const main_index = system.nanotime() % nodes.len;
 
-        if (std.builtin.single_threaded or max_workers == 1) {
-            var workers = [_]Worker{undefined};
-            var threads = [0]?*std.Thread{};
-            return runUsing(workers[0..], threads[0..], runnable);
+        var cluster = Node.Cluster{};
+        defer for (cluster.iter()) |node| {
+            const begin_ptr = @ptrToInt(node);
+            const end_ptr = @ptrToInt(node.workers.ptr + node.workers.len);
+            const memory = @intToPtr([*]align(std.mem.page_size) u8, begin_ptr)[0..(end_ptr - begin_ptr)];
+            node.numa_node.unmap(memory);
         }
 
-        const allocator = config.allocator orelse
-            if (std.builtin.link_libc) std.heap.c_allocator
-            else std.heap.page_allocator;
+        for (numa_nodes) |*numa_node, index| {
+            const num_workers = numa_node.affinity.count();
+            const worker_offset = std.mem.alignForward(@sizeOf(Node), @alignOf(Worker));
+            const memory = try numa_node.map(worker_offset + (@sizeOf(Worker) * num_workers));
 
-        const memory = try allocator.alloc(usize, max_workers + (max_threads - 1));
-        defer allocator.free(memory);
-        const workers = @ptrCast([*]Worker, memory.ptr)[0..max_workers];
-        const threads = @ptrCast([*]?*std.Thread, memory.ptr + max_workers)[0..(max_threads - 1)];
-        return runUsing(workers, threads, runnable);
+            const node = @ptrCast(*Node, @alignCast(@alignOf(Node), memory.ptr));
+            const workers = @ptrCast([*]Worker, @alignCast(@alignOf(Worker), &memory[worker_offset]))[0..num_workers];
+            node.init(workers);
+
+            cluster.push(node);
+            if (index == main_index)
+                main_node = node;
+        }
+
+        return runNuma(cluster, main_node, runnable);
     }
 
-    const Mutex = std.Mutex;
+    fn runNuma(cluster: Node.Cluster, main_node: *Node, runnable: *Runnable) !void {
+        var active_nodes: usize = 0;
+        defer std.debug.assert(@atomicLoad(usize, &active_nodes, .SeqCst) == 0);
 
-    lock: Mutex,
-    runq: Runnable.Batch,
-    runq_size: usize,
+        var nodes = cluster.iter();
+        while (nodes.next()) |node|
+            node.active_nodes_ptr = &active_nodes;
 
-    threads: []?*std.Thread,
-    idle_threads: ?*Thread,
-    active_threads: usize,
-    free_threads: usize,
-    
-    workers: []Worker,
-    idle_workers: ?*Worker,
-    active_workers: usize,
-    searching_workers: usize,
+        main_node.push(Runnable.Batch.from(runnable));
+        _ = main_node.tryResumeThread();
 
-    pub fn runUsing(workers: []Worker, threads: []?*std.Thread, runnable: *Runnable) !void {
-        if (workers.len == 0 or threads.len == 0)
-            return;
-
-        var self = Scheduler{
-            .lock = Mutex.init(),
-            .runq = Runnable.Batch.from(runnable),
-            .runq_size = 1,
-            .threads = threads,
-            .idle_threads = null,
-            .active_threads = 0,
-            .free_threads = threads.len,
-            .workers = workers,
-            .idle_workers = null,
-            .active_workers = 0,
-            .searching_workers = 0,
-        };
-
-        for (threads) |*thread|
-            thread.* = null;
-        for (workers) |*worker| {
-            worker.* = @ptrToInt(self.idle_workers) | 1;
-            self.idle_workers = worker;
-        }
-
-        self.resumeThread(null);
-        for (threads) |thread| {
-            (thread orelse continue).wait();
-        }
-
-        const held = self.lock.tryAcquire() orelse unreachable;
-        defer {
-            held.release();
-            self.lock.deinit();
-        }
-
-        std.debug.assert(self.runq_size == 0);
-        std.debug.assert(self.idle_threads == null);
-        std.debug.assert(self.active_threads == 0);
-        std.debug.assert(self.free_threads == threads.len);
-        std.debug.assert(self.active_workers == 0);
-        std.debug.assert(self.searching_workers == 0);
-    }
-
-    fn schedule(self: *Scheduler, batch: Runnable.Batch) void {
-        if (batch.len == 0)
-            return;
-
-        const held = self.lock.acquire();
-        self.runq.pushBatch(batch);
-        @atomicStore(usize, &self.runq_size, self.runq_size + batch.len, .Release);
-
-        if (@atomicLoad(usize, &self.searching_workers, .Monotonic) == 0) {
-            self.resumeThread(held);
-        } else {
-            held.release();
-        }
-    }
-
-    fn resumeThread(self: *Scheduler, current_held: ?Mutex.Held) void {
-        if (@cmpxchgStrong(usize, &self.searching_workers, 0, 1, .AcqRel, .Monotonic) != null) {
-            if (current_held) |held|
-                held.release();
-            return;
-        }
-
-        const held = current_held orelse self.lock.acquire();
-
-        if (self.idle_workers) |idle_worker| {
-            const worker = idle_worker;
-            self.idle_workers = @intToPtr(?*Worker, worker.* & ~@as(usize, 1));
-            self.active_threads += 1;
-            @atomicStore(usize, &self.active_workers, self.active_workers + 1, .Release);
-
-            if (self.idle_threads) |idle_thread| {
-                const thread = idle_thread;
-                self.idle_threads = thread.next;
-                held.release();
-                thread.worker = worker;
-                thread.is_searching = true;
-                return thread.event.set();
-            }
-
-            @atomicStore(Worker, worker, @ptrToInt(self) | 1, .Monotonic);
-            if (self.active_threads == 1) {
-                held.release();
-                return Thread.run(@ptrToInt(worker) | 1);
-            }
-
-            if (self.free_threads != 0) {
-                if (std.Thread.spawn(@ptrToInt(worker), Thread.run)) |thread_handle| {
-                    self.threads[self.threads.len - self.free_threads] = thread_handle;
-                    self.free_threads -= 1;
-                    return held.release();
-                } else |_| {}
-            }
-
-            @atomicStore(Worker, worker, @ptrToInt(self.idle_workers) | 1, .Monotonic);
-            self.idle_workers = worker;
-            self.active_threads -= 1;
-            @atomicStore(usize, &self.active_workers, self.active_workers - 1, .Release);
-        }
-
-        _ = @atomicRmw(usize, &self.searching_workers, .Sub, 1, .Release);
-        return held.release();
+        var nodes = cluster.iter();
+        while (nodes.next()) |node|
+            node.deinit();
     }
 };
 
-pub const Worker = usize;
+const CACHE_LINE = switch (std.builtin.arch) {
+    .x86_64 => 64 * 2,
+    else => 64,
+};
+
+pub const Node = extern struct {
+    pub const Cluster = struct {
+        head: ?*Node = null,
+        tail: ?*Node = null,
+        len: usize = 0,
+
+        pub fn iter(self: Cluster) Iter {
+            return Iter.init(self.head);
+        }
+
+        pub fn push(self: *Cluster, node: *Node) void {
+            if (self.head == null)
+                self.head = node;
+            if (self.tail) |tail|
+                tail.next = node;
+            node.next = node;
+            self.len += 1;
+        }
+
+        pub fn pop(self: *Cluster) ?*Node {
+            const node = self.head orelse return null;
+            self.head = node.next;
+            if (self.head == node) {
+                self.head = null;
+                self.tail = null;
+            }
+            node.next = node;
+            self.len -= 1;
+            return node;
+        }
+    };
+
+    pub const Iter = struct {
+        start: *Node,
+        node: ?*Node,
+
+        pub fn init(node: ?*Node) Iter {
+            return Iter{
+                .start = node orelse undefined,
+                .node = node, 
+            };
+        }
+
+        pub fn next(self: *Iter) ?*Node {
+            const node = self.node orelse return null;
+            self.node = node.next;
+            if (self.node == self.start)
+                self.node = null;
+            return node;
+        }
+    };
+
+    const AtomicUsize = switch (std.builtin.arch) {
+        .i386, .x86_64 => extern struct {
+            value: usize align(@alignOf(DoubleWord)),
+            aba_tag: usize = 0,
+
+            const DoubleWord = @Type(std.builtin.TypeInfo{
+                .Int = std.builtin.TypeInfo.Int{
+                    .is_signed = false,
+                    .bits = @typeInfo(usize).Int.bits * 2,
+                },
+            });
+
+            fn load(
+                self: *const AtomicUsize,
+                comptime ordering: std.builtin.AtomicOrder,
+            ) AtomicUsize {
+                return AtomicUsize{
+                    .value = @atomicLoad(usize, &self.value, ordering),
+                    .aba_tag = @atomicLoad(usize, &self.aba_tag, .SeqCst),
+                };
+            }
+
+            fn cmpxchgWeak(
+                self: *AtomicUsize,
+                compare: AtomicUsize,
+                exchange: usize,
+                comptime success: std.builtin.AtomicOrder,
+                comptime failure: std.builtin.AtomicOrder,
+            ) ?AtomicUsize {
+                const double_word = @cmpxchgWeak(
+                    DoubleWord,
+                    @ptrCast(*DoubleWord, self),
+                    @bitCast(DoubleWord, compare),
+                    @bitCast(DoubleWord, AtomicUsize{
+                        .value = exchange,
+                        .aba_tag = compare.aba_tag +% 1,
+                    }),
+                    success,
+                    failure,
+                ) orelse return null;
+                return @bitCast(AtomicUsize, double_word);
+            }
+        },
+        else => extern struct {
+            value: usize,
+
+            fn load(
+                self: *const AtomicUsize,
+                comptime ordering: std.builtin.AtomicOrder,
+            ) AtomicUsize {
+                const value = @atomicLoad(usize, &self.value, ordering);
+                return AtomicUsize{ .value = value };
+            }
+
+            fn cmpxchgWeak(
+                self: *AtomicUsize,
+                compare: AtomicUsize,
+                exchange: usize,
+                comptime success: std.builtin.AtomicOrder,
+                comptime failure: std.builtin.AtomicOrder,
+            ) ?AtomicUsize {
+                const value = @cmpxchgWeak(
+                    usize,
+                    &self.value,
+                    compare.value,
+                    exchange,
+                    success,
+                    failure,
+                ) orelse return null;
+                return AtomicUsize{ .value = value };
+            }
+        },
+    };
+
+    active_workers: usize align(CACHE_LINE),
+    idle_workers: AtomicUsize align(CACHE_LINE),
+    runq_head: *Runnable align(CACHE_LINE),
+    runq_locked: bool,
+    runq_tail: *Runnable,
+    runq_stub: ?*Runable,
+    next: *Node align(CACHE_LINE),
+    workers_ptr: [*]Worker,
+    workers_len: usize,
+    numa_node: *system.Node,
+    stack_size: usize,
+    active_nodes_ptr: *usize,
+
+    pub fn init(
+        self: *Node,
+        workers: []Worker,
+        numa_node: *system.Node,
+        thread_stack_size: usize,
+    ) void {
+        const runq_stub = @fieldParentPtr(Runnable, "next", &self.runq_stub);
+        self.* = Node{
+            .active_workers = 0,
+            .idle_workers = AtomicUsize{ .value = 0 | WORKER_TAG_WORKER },
+            .runq_head = runq_stub,
+            .runq_locked = false,
+            .runq_tail = runq_stub,
+            .runq_stub = null,
+            .next = self,
+            .workers_ptr = workers.ptr,
+            .workers_len = workers.len,
+            .numa_node = numa_node,
+            .stack_size = std.mem.alignForward(std.math.max(8 * 1024, thread_stack_size), std.mem.page_size),
+            .active_nodes_ptr = undefined,
+        };
+
+        for (workers) |*worker| {
+            worker.* = Worker.encode(self.idle_workers.value, .worker);
+            self.idle_workers = AtomicUsize{ .value = @ptrToInt(worker) };
+        }
+    }
+
+    fn deinit(self: *Node) void {
+        defer self.* = undefined;
+
+        std.debug.assert(self.idle_workers.load(.SeqCst).value == IDLE_STOPPED);
+        std.debug.assert(@atomicLoad(usize, &self.active_workers, .SeqCst) == 0);
+
+        const runq_stub = @fieldParentPtr(Runnable, "next", &self.runq_stub);
+        std.debug.assert(@atomicLoad(*Runnable, &self.runq_head, .SeqCst) == runq_stub);
+        std.debug.assert(!@atomicLoad(bool, &self.runq_locked, .SeqCst));
+        std.debug.assert(self.runq_tail == runq_stub);
+
+        for (self.workers) |*worker_ptr| {
+            
+        }
+    }
+
+    pub fn iter(self: *Node) Iter {
+        return Iter.init(self);
+    }
+
+    fn resumeThread(self: *Node) void {
+        var nodes = self.iter();
+        while (nodes.next()) |node| {
+            if (node.tryResumeThread())
+                break;
+        }
+    }
+
+    fn tryResumeThread(self: *Node) bool {
+        
+    }
+
+    fn suspendThread(
+        noalias self: *Node,
+        noalias thread: *Thread,
+        noalias worker: *Worker,
+    ) void {
+        
+    }
+};
+
+pub const Worker = extern struct {
+    ptr: usize align(8),
+
+    const Tag = enum(u2) {
+        node,
+        thread,
+        handle,
+        worker,
+    };
+
+    fn encode(ptr: usize, tag: Tag) Worker {
+        return Worker{ .ptr = ptr | @enumToInt(tag) };
+    }
+
+    fn decodePtr(self: Worker) usize {
+        return self.ptr & ~@as(usize, ~@as(@TagType(Tag), 0));
+    }
+
+    fn decodeTag(self: Worker) Tag {
+        return @intToEnum(Tag, @truncate(@TagType(Tag), self.ptr));
+    }
+};
 
 pub const Thread = struct {
     pub threadlocal var current: ?*Thread = null;
 
-    next: ?*Thread,
-    worker: ?*Worker,
-    scheduler: *Scheduler,
-    event: std.ResetEvent,
-    is_searching: bool,
-    runq_next: ?*Runnable,
-    runq_head: usize,
-    runq_tail: usize,
-    runq_buffer: [256]*Runnable,
+    const State = enum {
+        running,
+        waking,
+        stopped,
+    };
 
-    fn run(worker_ptr: usize) void {
-        const is_main_thread = worker_ptr & 1 != 0;
-        const starting_worker = @intToPtr(*Worker, worker_ptr & ~@as(usize, 1));
-        const scheduler = @intToPtr(*Scheduler, starting_worker.* & ~@as(usize, 1));
-        var self = Thread{
-            .next = undefined,
-            .worker = starting_worker,
-            .scheduler = scheduler,
-            .event = std.ResetEvent.init(),
-            .is_searching = true,
-            .runq_next = null,
-            .runq_head = 0,
-            .runq_tail = 0,
-            .runq_buffer = undefined,
-        };
+    next: usize,
+    state: State,
+    event: system.Event,
+    handle: ?*system.Thread,
 
-        Thread.current = &self;
-        defer {
-            self.event.deinit();
-            std.debug.assert(!self.is_searching);
-            std.debug.assert(self.isQueueEmpty());
-            if (!is_main_thread)
-                _ = @atomicRmw(usize, &scheduler.free_threads, .Add, 1, .Release);
-        }
+    fn run(handle: ?*system.Thread, worker: *Worker) void {
 
-        var tick: u8 = 0;
-        var rng = @truncate(u32, @ptrToInt(&self) ^ @ptrToInt(starting_worker));
-        
-        while (true) {
-            const worker = self.worker orelse break;
-            @atomicStore(Worker, worker, @ptrToInt(&self), .Release);
-
-            while (true) {
-                const runnable = self.poll(scheduler, &rng, tick) orelse break;
-                
-                if (self.is_searching) {
-                    self.is_searching = false;
-                    if (@atomicRmw(usize, &scheduler.searching_workers, .Sub, 1, .Release) == 1)
-                        scheduler.resumeThread(null);
-                }
-
-                tick +%= 1;
-                (runnable.callback)(runnable);
-            }
-        }
-    }
-
-    fn poll(
-        noalias self: *Thread,
-        noalias scheduler: *Scheduler,
-        noalias rng_ptr: *u32,
-        tick: u8,
-    ) ?*Runnable {
-        if (tick % 61 == 0) {
-            if (self.pollGlobal(scheduler, null)) |runnable|
-                return runnable;
-        }
-
-        if (self.pollLocal()) |runnable|
-            return runnable;
-
-        if (self.pollGlobal(scheduler, null)) |runnable|
-            return runnable;
-
-        if (!self.is_searching) {
-            const searching_workers = @atomicLoad(usize, &scheduler.searching_workers, .Acquire);
-            const active_workers = @atomicLoad(usize, &scheduler.active_workers, .Monotonic);
-            if (searching_workers * 2 >= active_workers) {
-                self.is_searching = true;
-                _ = @atomicRmw(usize, &scheduler.searching_workers, .Add, 1, .AcqRel);
-            }
-        }
-
-        if (self.is_searching) {
-            const num_workers = scheduler.workers.len;
-            var attempts: u3 = 4;
-            while (attempts != 0) : (attempts -= 1) {
-                const steal_next = attempts < 2;
-
-                var index = blk: {
-                    var x = rng_ptr.*;
-                    x ^= x << 13;
-                    x ^= x >> 17;
-                    x ^= x << 5;
-                    rng_ptr.* = x;
-                    break :blk x % num_workers;
-                };
-
-                var iter = num_workers;
-                while (iter != 0) : (iter -= 1) {
-                    const thread_ptr = @atomicLoad(Worker, &scheduler.workers[index], .Acquire);
-                    if (thread_ptr & 1 == 0) {
-                        if (@intToPtr(?*Thread, thread_ptr & ~@as(usize, 1))) |thread| {
-                            if (self.pollSteal(thread, steal_next)) |runnable|
-                                return runnable;
-                        }
-                    }
-
-                    index += 1;
-                    if (index == num_workers)
-                        index = 0;
-                }
-            }
-        }
-
-        {
-            const held = scheduler.lock.acquire();
-            defer held.release();
-            if (self.pollGlobal(scheduler, held)) |runnable|
-                return runnable;
-
-            const worker = self.worker.?;
-            @atomicStore(usize, &scheduler.active_workers, scheduler.active_workers - 1, .Monotonic);
-            @atomicStore(Worker, worker, @ptrToInt(scheduler.idle_workers) | 1, .Monotonic);
-            scheduler.idle_workers = worker;
-            self.worker = null;
-        }
-
-        const was_searching = self.is_searching;
-        if (was_searching) {
-            self.is_searching = false;
-            _ = @atomicRmw(usize, &scheduler.searching_workers, .Sub, 1, .AcqRel);
-        }
-
-        for (scheduler.workers) |*worker| {
-            const thread_ptr = @atomicLoad(usize, worker, .Acquire);
-            if (thread_ptr & 1 != 0)
-                continue;
-            const thread = @intToPtr(?*Thread, thread_ptr) orelse continue;
-            if (thread.isQueueEmpty())
-                continue;
-
-            self.worker = blk: {
-                const held = scheduler.lock.acquire();
-                defer held.release();
-                const idle_worker = scheduler.idle_workers orelse break :blk null;
-                scheduler.idle_workers = @intToPtr(?*Worker, idle_worker.* & ~@as(usize, 1));
-                break :blk idle_worker;
-            };
-
-            _ = self.worker orelse break;
-            self.is_searching = was_searching;
-            if (was_searching)
-                _ = @atomicRmw(usize, &scheduler.searching_workers, .Add, 1, .Acquire);
-            return null;
-        }
-
-        const held = scheduler.lock.acquire();
-        var idle_threads = scheduler.idle_threads;
-        scheduler.active_threads -= 1;
-
-        if (scheduler.active_threads == 0) {
-            scheduler.idle_threads = null;
-            held.release();
-            while (idle_threads) |idle_thread| {
-                const thread = idle_thread;
-                idle_threads = thread.next;
-                thread.worker = null;
-                @fence(.Release);
-                thread.event.set();
-            }
-
-        } else {
-            self.next = idle_threads;
-            scheduler.idle_threads = self;
-            held.release();
-            self.event.wait();
-            self.event.reset();
-            @fence(.Acquire);
-        }
-
-        return null;
-    }
-
-    fn isQueueEmpty(self: *const Thread) bool {
-        while (true) {
-            const head = @atomicLoad(usize, &self.runq_tail, .Acquire);
-            const tail = @atomicLoad(usize, &self.runq_head, .Acquire);
-            const next = @atomicLoad(?*Runnable, &self.runq_next, .Acquire);
-            if (tail == @atomicLoad(usize, &self.runq_tail, .Monotonic))
-                return (tail == head) and (next == null);
-        }
-    }
-
-    fn pollGlobal(
-        noalias self: *Thread,
-        noalias scheduler: *Scheduler,
-        current_held: ?Scheduler.Mutex.Held,
-    ) ?*Runnable {
-        var is_local_held = false;
-        const held = current_held orelse blk: {
-            if (@atomicLoad(usize, &scheduler.runq_size, .Monotonic) == 0)
-                return null;
-            is_local_held = true;
-            break :blk scheduler.lock.acquire();
-        };
-        defer if (is_local_held)
-            held.release();
-
-        const runnable = scheduler.runq.pop() orelse return null;
-        var runq_size = scheduler.runq_size - 1;
-
-        var tail = self.runq_tail;
-        const head = @atomicLoad(usize, &self.runq_head, .Monotonic);
-        while (tail -% head < self.runq_buffer.len) {
-            const next_runnable = scheduler.runq.pop() orelse break;
-            self.runq_buffer[tail % self.runq_buffer.len] = next_runnable;
-            runq_size -= 1;
-            tail +%= 1;
-        }
-
-        if (tail != self.runq_tail)
-            @atomicStore(usize, &self.runq_tail, tail, .Release);
-        @atomicStore(usize, &scheduler.runq_size, runq_size, .Release);
-        return runnable;
-    }
-
-    fn pollLocal(self: *Thread) ?*Runnable {
-        var next = @atomicLoad(?*Runnable, &self.runq_next, .Monotonic);
-        while (next) |runnable| {
-            next = @cmpxchgWeak(
-                ?*Runnable,
-                &self.runq_next,
-                next,
-                null,
-                .Monotonic,
-                .Monotonic,
-            ) orelse return runnable;
-        }
-
-        const tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
-        while (tail != head) {
-            head = @cmpxchgWeak(
-                usize,
-                &self.runq_head,
-                head,
-                head +% 1,
-                .Monotonic,
-                .Monotonic,
-            ) orelse return self.runq_buffer[head % self.runq_buffer.len];
-        }
-
-        return null;
-    }
-
-    fn pollSteal(
-        noalias self: *Thread,
-        noalias target: *Thread,
-        steal_next: bool,
-    ) ?*Runnable {
-        var target_head = @atomicLoad(usize, &target.runq_head, .Acquire);
-        while (true) {
-            const target_tail = @atomicLoad(usize, &target.runq_tail, .Acquire);
-
-            var steal = target_tail -% target_head;
-            steal = steal - (steal / 2);
-            if (steal == 0)
-                return null;
-
-            const runnable = target.runq_buffer[target_head % target.runq_buffer.len];
-            var new_target_head = target_head +% 1;
-            steal -= 1;
-
-            var tail = self.runq_tail;
-            while (steal != 0) : (steal -= 1) {
-                const next_runnable = target.runq_buffer[new_target_head % target.runq_buffer.len];
-                self.runq_buffer[tail % self.runq_buffer.len] = next_runnable;
-                new_target_head +%= 1;
-                tail +%= 1;
-            }
-
-            target_head = @cmpxchgWeak(
-                usize,
-                &target.runq_head,
-                target_head,
-                new_target_head,
-                .AcqRel,
-                .Acquire,
-            ) orelse {
-                @atomicStore(usize, &self.runq_tail, tail, .Release);
-                return runnable;
-            };
-        }
-    }
-
-    fn schedule(self: *Thread, batch: Runnable.Batch) void {
-        var runnable = batch.head orelse return;
-        const scheduler = self.scheduler;
-
-        if (runnable != batch.tail)
-            return scheduler.schedule(batch);
-
-        var next = @atomicLoad(?*Runnable, &self.runq_next, .Monotonic);
-        while (true) {
-            next = @cmpxchgWeak(
-                ?*Runnable,
-                &self.runq_next,
-                next,
-                runnable,
-                .Release,
-                .Monotonic,
-            ) orelse {
-                runnable = next orelse {
-                    if (@atomicLoad(usize, &scheduler.searching_workers, .Monotonic) == 0)
-                        scheduler.resumeThread(null);
-                    return;
-                };
-                break;
-            };
-        }
-        
-        const tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
-        while (true) {
-
-            if (tail -% head < self.runq_buffer.len) {
-                self.runq_buffer[tail % self.runq_buffer.len] = runnable;
-                @atomicStore(usize, &self.runq_tail, tail +% 1, .Release);
-                if (@atomicLoad(usize, &scheduler.searching_workers, .Monotonic) == 0)
-                    scheduler.resumeThread(null);
-                return;
-            }
-            
-            const new_head = head +% (self.runq_buffer.len / 2);
-            if (@cmpxchgWeak(
-                usize,
-                &self.runq_head,
-                head,
-                new_head,
-                .Release,
-                .Monotonic,
-            )) |updated_head| {
-                head = updated_head;
-                continue;
-            }
-
-            var overflow = Runnable.Batch{};
-            while (head != new_head) {
-                overflow.push(self.runq_buffer[head % self.runq_buffer.len]);
-                head +%= 1;
-            }
-            overflow.push(runnable);
-            return scheduler.schedule(overflow);
-        }
     }
 };
 

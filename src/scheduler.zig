@@ -1,7 +1,21 @@
 const std = @import("std");
 
+const HalfWord = @Type(std.builtin.TypeInfo{
+    .Int = std.builtin.TypeInfo.Int{
+        .is_signed = false,
+        .bits = @typeInfo(usize).Int.bits / 2,
+    },
+});
+
+const DoubleWord = @Type(std.builtin.TypeInfo{
+    .Int = std.builtin.TypeInfo.Int{
+        .is_signed = false,
+        .bits = @typeInfo(usize).Int.bits * 2,
+    },
+});
+
 pub const Config = struct {
-    runnable_buffer: usize = 256,
+    worker_buffer: HalfWord = 256,
     cache_line: usize = switch (std.builtin.arch) {
         .x86_64 => 64 * 2,
         else => 64,
@@ -11,7 +25,7 @@ pub const Config = struct {
 pub fn Executor(comptime config: Config) type {
     const cache_line = std.math.max(@alignOf(usize), config.cache_line);
     const CACHE_LINE = std.mem.alignForward(cache_line, @alignOf(usize));
-    const BUFFER_SIZE = std.math.max(CACHE_LINE / @sizeOf(usize), config.runnable_buffer);
+    const BUFFER_SIZE = std.math.max(CACHE_LINE / @sizeOf(usize), config.worker_buffer);
 
     return struct {
         pub const Node = extern struct {
@@ -96,13 +110,6 @@ pub fn Executor(comptime config: Config) type {
                 .i386, .x86_64 => extern struct {
                     value: usize align(@alignOf(DoubleWord)),
                     aba_tag: usize = 0,
-
-                    const DoubleWord = @Type(std.builtin.TypeInfo{
-                        .Int = std.builtin.TypeInfo.Int{
-                            .is_signed = false,
-                            .bits = @typeInfo(usize).Int.bits * 2,
-                        },
-                    });
 
                     fn load(
                         self: *const AtomicUsize,
@@ -201,7 +208,7 @@ pub fn Executor(comptime config: Config) type {
 
             active_workers: usize align(Worker.Slot.alignment),
             idle_workers: AtomicUsize align(CACHE_LINE),
-            runq_head: usize align(CACHE_LINE),
+            runq_head: *Runnable align(CACHE_LINE),
             runq_tail: usize align(CACHE_LINE),
             runq_stub: ?*Runnable,
             next: *Node align(CACHE_LINE),
@@ -233,17 +240,50 @@ pub fn Executor(comptime config: Config) type {
             }
 
             pub fn tryResumeWorker(self: *Node) ResumeHandle {
+                return self.tryResumeWorkerWhen(false);
+            }
+
+            fn tryResumeWorkerAfterWaking(self: *Node) ResumeHandle {
+                return self.tryResumeWorkerWhen(true);
+            }
+
+            fn tryResumeWorkerWhen(self: *Node, is_waking: bool) ResumeHandle {
                 var idle_workers = self.idle_workers.load(.SeqCst);
                 while (true) {
                     const ptr = idle_workers.value & ~@as(usize, ~@as(@TagType(IdleState), 0));
                     const state = @intToEnum(IdleState, @truncate(@TagType(IdleState), idle_workers.value));
+                    std.debug.assert(state != .shutdown);
 
                     var next_ptr = ptr;
                     var next_state = state;
-                    var resume_handle: ResumeHandle = undefined;
-                    
-                    switch (state) {
-                        .ready => {
+                    var resume_handle = ResumeHandle{ .empty = {} };
+
+                    if (is_waking) {
+                        if (state == .ready)
+                            return resume_handle;
+                        if (@intToPtr(?*Worker.Slot, ptr)) |slot| {
+                            next_state = .waking;
+                            switch (slot.decode()) {
+                                .slot => |next_slot| {
+                                    next_ptr = @ptrToInt(next_slot);
+                                    resume_handle = ResumeHandle{ .spawn = slot };
+                                },
+                                .worker => |worker| {
+                                    next_ptr = worker.next;
+                                    resume_handle = ResumeHandle{ .notify = worker };
+                                },
+                                .node => unreachable,
+                                .thread => unreachable,
+                            }
+                        } else if (state == .waking) {
+                            next_state = .ready;
+                        }
+                    } else {
+                        if (state == .notified)
+                            return resume_handle;
+                        next_state = .notified;
+                        resume_handle = ResumeHandle{ .notified = {} };
+                        if (state == .ready) {
                             if (@intToPtr(?*Worker.Slot, ptr)) |slot| {
                                 next_state = .waking;
                                 switch (slot.decode()) {
@@ -258,28 +298,96 @@ pub fn Executor(comptime config: Config) type {
                                     .node => unreachable,
                                     .thread => unreachable,
                                 }
-                            } else {
-                                next_state = .notified;
-                                resume_handle = ResumeHandle{ .notified = {} };
                             }
-                        },
-                        .waking => {
-                            next_state = .notified;
-                            resume_handle = ResumeHandle{ .notified = {} };
-                        },
-                        .notified => {
-                            return ResumeHandle{ .empty = {} };
-                        },
-                        .shutdown => unreachable},
+                        }
                     }
 
-                    idle_workers = self.idle_workers.compareExchangeWeak(
+                    if (self.idle_workers.compareExchangeWeak(
                         idle_workers,
                         next_ptr | @enumToInt(next_state),
                         .SeqCst,
                         .SeqCst,
-                    ) orelse return resume_handle;
+                    )) |new_idle_workers| {
+                        idle_workers = new_idle_workers;
+                        continue;
+                    }
+
+                    if (@atomicRmw(usize, &self.active_workers, .Add, 1, .SeqCst) == 0)
+                        _ = @atomicRmw(usize, self.active_nodes_ptr, .Add, 1, .SeqCst);
+                    
+                    switch (resume_handle.decode()) {
+                        .notify => |worker| {
+                            var new_state = worker.state.decode();
+                            std.debug.assert(new_state.status == .suspended);
+                            new_state.status = .waking;
+                            worker.state = Worker.State.encode(new_state);
+                        },
+                        .spawn => |slot| {
+                            const new_slot_ptr = Slot.encode(@ptrToInt(self), .node).ptr;
+                            @atomicStore(usize, &slot.ptr, new_slot_ptr, .Release);
+                        },
+                        else => {},
+                    }
+
+                    return resume_handle;
                 }
+            }
+
+            fn trySuspendWorker(noalias self: *Node, noalias worker: *Worker, is_waking: bool) void {
+                const slot = worker.slot;
+                std.debug.assert(worker.state.decode().status == .suspended);
+
+                var idle_workers = self.idle_workers.load(.SeqCst);
+                while (true) {
+                    const ptr = idle_workers.value & ~@as(usize, ~@as(@TagType(IdleState), 0));
+                    const state = @intToEnum(IdleState, @truncate(@TagType(IdleState), idle_workers.value));
+                    std.debug.assert(state != .shutdown);
+
+                    var next_ptr = ptr;
+                    var next_state = state;
+                    
+                    if (ptr == 0 and state == .notified) {
+                        next_state = .ready;
+                    } else {
+                        worker.next = next_ptr;
+                        next_ptr = @ptrToInt(worker);
+                    }
+
+                    if (self.idle_workers.compareExchangeWeak(
+                        idle_workers,
+                        next_ptr | @enumToInt(next_state),
+                        .SeqCst,
+                        .SeqCst,
+                    )) |new_idle_workers| {
+                        idle_workers = new_idle_workers;
+                        continue;
+                    }
+
+                    if (state == .notified and next_state == .ready) {
+                        var new_state = worker.state.decode()
+                        new_state.status = if (is_waking) .waking else .running;
+                        worker.state = Worker.State.encode(new_state);
+
+                    } else if (@atomicRmw(usize, &self.active_workers, .Sub, 1, .SeqCst) == 1) {
+                        if (@atomicRmw(usize, self.active_nodes_ptr, .Sub, 1, .SeqCst) == 1) {
+                            self.shutdown(worker);
+                        }
+                    }
+
+                    return;
+                }
+            }
+
+            fn shutdown(noalias self: *Node, noalias initiator: *Worker) void {
+                var idle_workers = @atomicRmw(
+                    usize,
+                    &self.idle_workers.value,
+                    .Xchg,
+                    @enumToInt(IdleState.shutdown),
+                    .AcqRel,
+                );
+
+                var 
             }
 
             fn push(self: *Node, batch: Runnable.Batch) void {
@@ -367,36 +475,54 @@ pub fn Executor(comptime config: Config) type {
                 }
             };
 
-            const State = enum(u8) {
-                stopped,
-                waking,
-                suspended,
-                running,
+            const State = extern struct {
+                value: u32,
+
+                const Status = enum(u8) {
+                    stopped,
+                    waking,
+                    suspended,
+                    running,
+                };
+
+                const Value = extern struct {
+                    status: Status,
+                    tick: u8,
+                    rng: u16,
+                };
+
+                fn encode(value: Value) State {
+                    return State{
+                        .value = 
+                            (@as(u32, @enumToInt(value.status)) << 24) |
+                            (@as(u32, value.tick) << 16) |
+                            @as(u32, value.rng)
+                    );
+                }
+
+                fn decode(state: State) Value {
+                    return Value{
+                        .status = @intToEnum(Status, @truncate(u8, self.value >> 24)),
+                        .tick = @truncate(u8, self.value >> 16),
+                        .rng = @truncate(u16, self.value),
+                    };
+                }
             };
 
-            const Action = union(enum) {
+            const Syscall = union(enum) {
                 @"suspend": void,
                 @"resume": *Worker,
                 @"async": *Worker.Slot,
-                @"await": void,
+                @"await": usize,
             };
 
-            runq_head: usize align(Slot.alignment),
-            runq_tail: usize align(CACHE_LINE),
+            runq_pos: usize align(Slot.alignment),
             runq_buffer: [BUFFER_SIZE]*Runnable align(CACHE_LINE),
             node: *Node,
             slot: *Slot,
             thread: usize,
             next: usize,
             state: u32,
-
-            fn encodeState(state: State, tick: u8, rng: u16) u32 {
-                return (
-                    (@as(u32, @enumToInt(state)) << 24) |
-                    (@as(u32, tick) << 16) |
-                    @as(u32, rng)
-                );
-            }
 
             pub fn init(
                 noalias self: *Worker,
@@ -407,129 +533,271 @@ pub fn Executor(comptime config: Config) type {
                 const node = slot_value.decode().node;
 
                 self.* = Worker{
-                    .runq_head = 0,
-                    .runq_tail = 0,
+                    .runq_pos = 0,
                     .runq_buffer = undefined,
                     .node = node,
                     .slot = slot,
                     .thread = thread,
                     .next = undefined,
-                    .state = encodeState(.waking, 0, @truncate(u16, @ptrToInt(slot) ^ @ptrToInt(self))),
+                    .state = State.encode(.{
+                        .status = .waking,
+                        .tick = 0,
+                        .rng = @truncate(u16, @ptrToInt(slot) ^ @ptrToInt(self)),
+                    }),
                 };
 
                 const new_value = Slot.encode(@ptrToInt(self), .worker).ptr;
                 @atomicStore(usize, &slot.ptr, new_value, .Release);
             }
 
-            pub fn run(self: *Worker) Action {
-                const raw_state = self.state;
-                var state = @intToEnum(State, @truncate(u8, raw_state >> 24));
-                var tick = @truncate(u8, raw_state >> 16);
-                var rng = @truncate(u16, raw_state);
-
-                if (state == .stopped)
-                    return Action{ .@"await" = {} };
-                if (state == .suspended)
-                    return Action{ .@"suspend" = {} };
-
-                const node = self.node;
+            pub fn run(self: *Worker) Syscall {
                 while (true) {
-                    var should_wake = false;
-                    const polled_runnable = @intToPtr(?*Runnable, self.next) orelse blk: {
-                        if (state != .waking) {
-                            if (tick % 61 == 0) {
-                                if (self.pollNode(node)) |runnable| {
-                                    should_wake = true;
-                                    break :blk runnable;
-                                }
-                            }
+                    var state = self.state.decode();
+                    if (state.status == .stopped)
+                        return Syscall{ .@"await" = self.thread };
+                    if (state.status == .suspended)
+                        return Syscall{ .@"suspend" = {} };
 
-                            if (self.pollLocal()) |runnable| {
-                                break :blk runnable;
-                            }
-                        }
-
-                        var steal_attempts: u3 = 4;
-                        while (steal_attempts != 0) : (steal_attempts -= 1) {
-                            var nodes = node.iter();
-                            while (nodes.next()) |target_node| {
-
-                                if (self.pollNode(target_node)) |runnable| {
-                                    should_wake = true;
-                                    break :blk runnable;
-                                }
-
-                                const slots = target_node.slots_ptr;
-                                const num_slots = target_node.slots_len;
-                                var index = rng_index: {
-                                    rng ^= rng << 7;
-                                    rng ^= rng >> 9;
-                                    rng ^= rng << 8;
-                                    break :rng_index (rng % num_slots);
-                                };
-
-                                var i = num_slots;
-                                while (i != 0) : (i -= 1) {
-                                    defer {
-                                        index += 1;
-                                        if (index == num_slots)
-                                            index = 0;
-                                    }
-
-                                    const slot_value = @atomicLoad(usize, &slots[index].ptr, .Acquire);
-                                    switch ((Slot{ .ptr = slot_value }).decode()) {
-                                        .worker => |worker| {
-                                            if (worker == self)
-                                                continue;
-                                            if (self.pollWorker(worker)) |runnable| {
-                                                break :blk runnable;
-                                            }
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            }
-                        }
-
-                        break :blk null;
-                    };
-
-                    if (polled_runnable) |runnable| {
-                        
-                        const resume_ptr = switch (
-                            if (state == .waking)
-                                node.tryResumeWorkerAfterWaking()
-                            else if (should_wake)
-                                node.tryResumeSomeWorker()
-                            else
-                                ResumeHandle{ .empty = {} }
-                        ) {
-                            .empty, .notified => 0,
-                            .notify => |worker| @ptrToInt(worker) | 1,
-                            .spawn => |slot| @ptrToInt(slot),
+                    const node = self.node;
+                    poll: while (true) {
+                        var wake_worker = false;
+                        const polled_runnable = @intToPtr(?*Runnable, self.next) orelse blk: {
+                            break :blk self.poll(node, &state, &wake_worker);
                         };
                         
-                        self.next = @ptrToInt(runnable);
-                        self.state = encodeState(.running, tick, rng);
-                        if (resume_ptr & 1 != 0)
-                            return Action{ .@"resume" = @intToPtr(*Worker, resume_ptr & ~@as(usize, 1)) };
-                        if (resume_ptr != 0)
-                            return Action{ .@"async" = @intToEnum(*Worker.Slot, resume_ptr) };
-
-                        var batch = (runnable.callback)(self, runnable);
-                        self.next = @intToPtr(batch.pop());
-                        if (self.next == 0 or batch.len == 0)
-                            continue;
+                        self.next = @ptrToInt(polled_runnable);
+                        var runnable = polled_runnable orelse break :poll;
                         
-                        node.push(batch);
+                        state.status = .running;
+                        self.state = State.encode(state);
+                        const resume_handle = 
+                            if (state.status == .waking)
+                                node.tryResumeWorkerAfterWaking()
+                            else if (wake_worker)
+                                node.tryResumeSomeWorker()
+                            else
+                                ResumeHandle{ .empty = {} };
+
+                        switch (resume_handle.decode()) {
+                            .empty, .notified => {},
+                            .notify => |worker| return Syscall{ .@"resume" = worker },
+                            .spawn => |slot| return Syscall{ .@"async" = slot },
+                        }
+
+                        state.tick +%= 1;
+                        self.state = State.encode(state);
+                        var batch = (runnable.callback)(self, runnable);
+
+                        self.next = @ptrToInt(batch.pop());
+                        runnable = batch.head orelse continue :poll;
+
+                        if (batch.len == 1)
+                            const pos = @atomicLoad(usize, &self.runq_pos, .Monotonic);
+                            const head = @bitCast([2]HalfWord, pos)[0];
+                            const tail = @bitCast([2]HalfWord, pos)[1];
+                            if (tail -% head < self.runq_buffer.len) {
+                                const tail_ptr = &@ptrCast(*[2]HalfWord, &self.runq_pos)[1];
+                                self.runq_buffer[tail % self.runq_buffer.len] = runnable;
+                                @atomicStore(HalfWord, tail_ptr, tail +% 1, .Release);
+                                _ = batch.pop();
+                            }
+                        }
+
+                        if (batch.len != 0)
+                            node.push(batch);
+
                         switch (node.tryResumeSomeWorker()) {
-                            .empty, .notified => continue,
-                            .notify => |worker| return Action{ .@"resume" = worker },
-                            .spawn => |slot| return Action{ .@"async" = slot },
+                            .empty, .notified => {},
+                            .notify => |worker| return Syscall{ .@"resume" = worker },
+                            .spawn => |slot| return Syscall{ .@"async" = slot },
                         }
                     }
 
-                    // TODO: suspend
+                    state.status = .suspended;
+                    self.state = State.encode(state);
+                    node.trySuspendWorker(self);
+                }
+            }
+
+            inline fn poll(
+                self: *Worker,
+                node: *Node,
+                state: *State.Value,
+                wake_worker: *bool,
+            ) ?*Runnable {
+                if (state.tick % 61 == 0) {
+                    if (self.pollNode(node)) |runnable| {
+                        wake_worker.* = true;
+                        return runnable;
+                    }
+                }
+
+                if (self.pollLocal()) |runnable| {
+                    return runnable;
+                }
+
+                var steal_attempts: u3 = 4;
+                while (steal_attempts != 0) : (steal_attempts -= 1) {
+                    var nodes = node.iter();
+                    while (nodes.next()) |target_node| {
+                        
+                        if (self.pollNode(target_node)) |runnable| {
+                            wake_worker.* = true;
+                            return runnable;
+                        }
+
+                        const num_slots = target_node.slots_len;
+                        var index = blk: {
+                            var rng = state.rng;
+                            rng ^= rng << 7;
+                            rng ^= rng >> 9;
+                            rng ^= rng << 8;
+                            break :blk (rng % num_slots);
+                        };
+
+                        const slots = target_node.slots_ptr;
+                        var i = num_slots;
+                        while (i != 0) : ({
+                            i -= 1;
+                            index += 1;
+                            if (index == num_slots)
+                                index = 0;
+                        }) {
+                            const target_slot_ptr = @atomicLoad(usize, &slots[index].ptr, .Acquire);
+                            switch ((Slot{ .ptr = target_slot_ptr }).decode()) {
+                                .slot, .node => {},
+                                .thread => unreachable,
+                                .worker => |target_worker| {
+                                    if (target_worker != self) {
+                                        if (self.pollWorker(target_worker)) |runnable| {
+                                            return runnable;
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            fn pollLocal(self: *Worker) ?*Runnable {
+                const pos = @atomicLoad(usize, &self.runq_pos, .Monotonic);
+                const tail = @bitCast([2]HalfWord, pos)[1];
+                var head = @bitCast([2]HalfWord, pos)[0];
+
+                while (true) {
+                    if (tail == head)
+                        return null;
+
+                    head = @cmpxchgWeak(
+                        HalfWord,
+                        &@ptrCast(*[2]HalfWord, &self.runq_pos)[0],
+                        head,
+                        head +%= 1,
+                        .Monotonic,
+                        .Monotonic,
+                    ) orelse return self.runq_buffer[head % self.runq_buffer.len];
+                }
+            }
+
+            fn pollNode(noalias self: *Worker, noalias node: *Node) ?*Runnable {
+                var runq_tail = @atomicLoad(usize, &node.runq_tail, .Monotonic);
+                while (true) {
+                    if (runq_tail & 1 != 0)
+                        return null;
+                    runq_tail = @cmpxchgWeak(
+                        usize,
+                        &node.runq_tail,
+                        runq_tail,
+                        runq_tail | 1,
+                        .Acquire,
+                        .Monotonic,
+                    ) orelse break;
+                }
+
+                const runq_stub = @fieldParentPtr(Runnable, "next", &node.runq_stub);
+                var pop_result: Node.PopResult = undefined;
+                pop_result.runq_tail = @intToPtr(*Runnable, runq_tail & ~@as(usize, 1));
+
+                pop_result = node.pop(pop_result.runq_tail, runq_stub);
+                const first_runnable = pop_result.runnable;
+
+                const pos = @atomicLoad(usize, &self.runq_pos, .Monotonic);
+                const head = @bitCast([2]HalfWord, pos)[0];
+                const tail = @bitCast([2]HalfWord, pos)[1];
+
+                var new_tail = tail;
+                var steal = self.runq_buffer.len - (tail -% head);
+                while (steal != 0) : ({
+                    steal -= 1;
+                    new_tail +%= 1;
+                }) {
+                    pop_result = node.pop(pop_result.runq_tail, runq_stub);
+                    const runnable = pop_result.runnable orelse break;
+                    self.runq_buffer[new_tail % self.runq_buffer.len] = runnable;
+                }
+
+                @atomicStore(usize, &node.runq_tail, @ptrToInt(pop_result.runq_tail), .Release);
+
+                if (new_tail != tail) {
+                    const tail_ptr = &@ptrCast(*[2]HalfWord, &self.runq_pos)[1];
+                    @atomicStore(HalfWord, tail_ptr, new_tail, .Release);
+                }
+                return first_runnable;
+            }
+
+            fn pollWorker(noalias self: *Worker, noalias target: *Worker) ?*Runnable {
+                const pos = @atomicLoad(usize, &self.runq_pos, .Monotonic);
+                const head = @bitCast([2]HalfWord, pos)[0];
+                const tail = @bitCast([2]HalfWord, pos)[1];
+                std.debug.assert(tail == head);
+
+                var spin: u5 = 1;
+                while (true) {
+                    const target_pos = @atomicLoad(usize, &target.runq_pos, .Acquire);
+                    const target_head = @bitCast([2]HalfWord, target_pos)[0];
+                    const target_tail = @bitCast([2]HalfWord, target_pos)[1];
+
+                    var steal = target_tail -% target_head;
+                    steal = steal - (steal / 2);
+                    if (steal == 0)
+                        return null;
+                    
+                    var new_target_head = target_head;
+                    const first_runnable = target.runq_buffer[new_target_head % target.runq_buffer.len];
+                    new_target_head +%= 1;
+                    steal -= 1;
+
+                    var new_tail = tail;
+                    while (steal != 0) : ({
+                        steal -= 1;
+                        new_tail +%= 1;
+                        new_target_head +%= 1;
+                    }) {
+                        const runnable = target.runq_buffer[new_target_head % target.runq_buffer.len];
+                        self.runq_buffer[new_tail % self.runq_buffer.len] = runnable;
+                    }
+
+                    if (@cmpxchgWeak(
+                        HalfWord,
+                        &@ptrCast(*[2]HalfWord, &target.runq_pos)[0],
+                        target_head,
+                        new_target_head,
+                        .AcqRel,
+                        .Release,
+                    )) |_| {
+                        std.SpinLock.loopHint(@as(usize, spin));
+                        spin +%= 1;
+                        continue;
+                    }
+
+                    if (new_tail != tail) {
+                        const tail_ptr = &@ptrCast(*[2]HalfWord, &self.runq_pos)[1];
+                        @atomicStore(HalfWord, tail_ptr, new_tail, .Release);
+                    }
+                    return first_runnable;
                 }
             }
         };

@@ -48,9 +48,14 @@ pub const Scheduler = struct {
         }
 
         defer {
-            std.debug.assert(@atomicLoad(usize, &self.active_threads, .Monotonic) == 0);
-            std.debug.assert(self.idle_queue.load(.Monotonic).value == IDLE_SHUTDOWN);
             self.run_queue.deinit();
+            if (std.debug.runtime_safety) {
+                const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
+                if (active_threads != 0)
+                    std.debug.panic("Scheduler exiting with {} active_threads", .{active_threads});
+                if (self.idle_queue.load(.Monotonic).value != IDLE_SHUTDOWN)
+                    std.debug.panic("Scheduler exiting when idle_queue is not shutdown", .{});
+            }
             for (workers) |*worker| {
                 const handle_ptr = @atomicLoad(?*std.Thread, &worker.handle, .Acquire);
                 const thread_handle = handle_ptr orelse continue;
@@ -84,7 +89,9 @@ pub const Scheduler = struct {
     fn resumeThread(self: *Scheduler) void {
         var idle_queue = self.idle_queue.load(.Acquire);
         while (true) {
-            std.debug.assert(idle_queue.value != IDLE_SHUTDOWN);
+            if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
+                std.debug.panic("Scheduler.resumeThread() when shutdown", .{});
+
             if (idle_queue.value == IDLE_NOTIFIED)
                 return;
             
@@ -148,7 +155,8 @@ pub const Scheduler = struct {
     ) void {
         var idle_queue = self.idle_queue.load(.Monotonic);
         while (true) {
-            std.debug.assert(idle_queue.value != IDLE_SHUTDOWN);
+            if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
+                std.debug.panic("Scheduler.suspendThread() when shutdown", .{});
 
             var next_value: usize = undefined;
             if (idle_queue.value == IDLE_NOTIFIED) {
@@ -201,7 +209,8 @@ pub const Scheduler = struct {
             thread.event.set();
         }
         
-        std.debug.assert(num_workers == self.workers.len);
+        if (std.debug.runtime_safety and num_workers != self.workers.len)
+            std.debug.panic("Scheduler.shutdown() only shutdown {}/{} workers", .{num_workers, self.workers.len});
     }
 };
 
@@ -288,6 +297,8 @@ const Thread = struct {
                 return task;
             }
 
+            const steal_next = steal_attempts < 2;
+
             var worker_index = blk: {
                 var rng = rng_ptr.*;
                 rng ^= rng << 13;
@@ -308,7 +319,7 @@ const Thread = struct {
                 const thread = thread_ptr orelse continue;
                 if (thread == self)
                     continue;
-                if (self.run_queue.tryStealFromLocal(&thread.run_queue)) |task| {
+                if (self.run_queue.tryStealFromLocal(&thread.run_queue, steal_next)) |task| {
                     return task;
                 }
             }
@@ -383,32 +394,53 @@ pub const Task = struct {
 const LocalQueue = struct {
     head: usize,
     tail: usize,
+    next: ?*Task,
     buffer: [256]*Task,
 
     fn init() LocalQueue {
         return LocalQueue{
             .head = 0,
             .tail = 0,
+            .next = null,
             .buffer = undefined,
         };
     }
 
     fn deinit(self: *LocalQueue) void {
         defer self.* = undefined;
-        std.debug.assert(self.isEmpty());
+        if (std.debug.runtime_safety and !self.isEmpty())
+            std.debug.panic("LocalQueue.deinit() when not-empty", .{});
     }
 
     fn isEmpty(self: *const LocalQueue) bool {
-        const head = @atomicLoad(usize, &self.head, .Monotonic);
-        const tail = @atomicLoad(usize, &self.tail, .Monotonic);
-        return tail == head;
+        while (true) {
+            const head = @atomicLoad(usize, &self.head, .Acquire);
+            const tail = @atomicLoad(usize, &self.tail, .Acquire);
+            const next = @atomicLoad(?*Task, &self.next, .Acquire);
+            if (tail == @atomicLoad(usize, &self.tail, .Monotonic))
+                return (tail == head) and (next == null);
+        }
     }
 
     fn pushWithOverflow(
         noalias self: *LocalQueue,
         noalias global_queue: *GlobalQueue,
-        noalias task: *Task,
+        noalias task_ptr: *Task,
     ) void {
+        const task = blk: {
+            var next = @atomicLoad(?*Task, &self.next, .Acquire);
+            while (true) {
+                next = @cmpxchgWeak(
+                    ?*Task,
+                    &self.next,
+                    next,
+                    task_ptr,
+                    .Acquire,
+                    .Acquire,
+                ) orelse break :blk next orelse return;
+            }
+        };
+
         const tail = self.tail;
         var head = @atomicLoad(usize, &self.head, .Acquire);
         
@@ -419,7 +451,9 @@ const LocalQueue = struct {
                 return;
             }
 
-            std.debug.assert(tail -% head == self.buffer.len);
+            if (std.debug.runtime_safety and tail -% head != self.buffer.len)
+                std.debug.panic("LocalQueue.push() with inconsisitent size {}", .{tail -% head});
+
             var steal = self.buffer.len / 2;
             if (@cmpxchgWeak(
                 usize,
@@ -466,10 +500,14 @@ const LocalQueue = struct {
     fn tryStealFromLocal(
         noalias self: *LocalQueue,
         noalias target: *LocalQueue,
+        steal_next: bool,
     ) ?*Task {
-        const head = @atomicLoad(usize, &self.head, .Monotonic);
         const tail = self.tail;
-        std.debug.assert(tail == head);
+        if (std.debug.runtime_safety) {
+            const head = @atomicLoad(usize, &self.head, .Monotonic);
+            if (tail != head)
+                std.debug.panic("LocalQueue.steal() when not-empty (size = {})", .{tail -% head});
+        }
 
         var target_head = @atomicLoad(usize, &target.head, .Acquire);
         while (true) {
@@ -478,7 +516,7 @@ const LocalQueue = struct {
             var steal = target_tail -% target_head;
             steal = steal - (steal / 2);
             if (steal == 0)
-                return null;
+                break;
 
             const first_task = target.buffer[target_head % target.buffer.len];
             var new_target_head = target_head +% 1;
@@ -503,6 +541,22 @@ const LocalQueue = struct {
                 @atomicStore(usize, &self.tail, new_tail, .Release);
                 return first_task;
             };
+        }
+
+        if (!steal_next)
+            return null;
+
+        var next = @atomicLoad(?*Task, &target.next, .Acquire);
+        while (true) {
+            const first_task = next orelse return null;
+            next = @cmpxchgWeak(
+                ?*Task,
+                &target.next,
+                next,
+                null,
+                .AcqRel,
+                .Acquire,
+            ) orelse return first_task;
         }
     }
 
@@ -549,8 +603,12 @@ const GlobalQueue = struct {
 
     fn deinit(self: *GlobalQueue) void {
         defer self.* = undefined;
-        std.debug.assert(self.isEmpty());
-        std.debug.assert(@atomicLoad(bool, &self.is_polling, .Monotonic) == false);
+        if (std.debug.runtime_safety) {
+            if (!self.isEmpty())
+                std.debug.panic("GlobalQueue.deinit() when not empty", .{});
+            if (@atomicLoad(bool, &self.is_polling, .Monotonic))
+                std.debug.panic("GlobalQueue.deinit() while is_polling", .{});
+        }
     }
 
     fn isEmpty(self: *const GlobalQueue) bool {
@@ -569,7 +627,9 @@ const GlobalQueue = struct {
     }
 
     fn pop(self: *GlobalQueue) ?*Task {
-        std.debug.assert(self.is_polling);
+        if (std.debug.runtime_safety and !self.is_polling)
+            std.debug.panic("GlobalQueue.pop() when not is_polling", .{});
+
         var tail = self.tail;
         var next = @atomicLoad(?*Task, &tail.next, .Acquire);
 

@@ -5,7 +5,7 @@ const num_tasks = 100 * 1000;
 const num_yields = 200;
 
 pub fn main() !void {
-    try (try zap.Scheduler.run(.{}, asyncMain, .{}));
+    try (try zap.Scheduler.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {

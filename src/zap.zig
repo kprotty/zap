@@ -6,7 +6,7 @@ const CACHE_LINE = switch (std.builtin.arch) {
 };
 
 pub const Scheduler = extern struct {
-    pub const Config = struct {
+    pub const Config = extern struct {
         max_workers: usize = std.math.maxInt(usize),
     };
 
@@ -20,22 +20,43 @@ pub const Scheduler = extern struct {
     workers_ptr: [*]Worker align(CACHE_LINE),
     workers_len: usize,
 
-    pub fn run(config: Config, comptime func: var, args: var) !@TypeOf(func).ReturnType {
+    pub fn runAsync(config: Config, comptime func: var, args: var) !@TypeOf(func).ReturnType {
+        const ReturnType = @TypeOf(func).ReturnType;
+        const Wrapper = struct {
+            fn call(func_args: var, task: *Task, result: *?ReturnType) void {
+                suspend {
+                    task.* = Task.init(@frame());
+                }
+                const value = @call(.{}, func, func_args);
+                result.* = value;
+            }
+        };
+
+        var task: Task = undefined;
+        var result: ?ReturnType = null;
+        var frame = async Wrapper.call(args, &task, &result);
+
+        try run(config, &task.runnable);
+
+        return result orelse error.DeadLocked;
+    }
+
+    pub fn run(config: Config, runnable: *Runnable) !void {
         var num_workers = if (std.builtin.single_threaded) 1 else (std.Thread.cpuCount() catch 1);
         num_workers = std.math.max(1, std.math.min(config.max_workers, num_workers));
 
         if (num_workers <= 8) {
             var workers: [8]Worker = undefined;
-            return runUsing(workers[0..num_workers], func, args);
+            return runUsing(workers[0..num_workers], runnable);
         }
 
         const allocator = if (std.builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator;
         const workers = try allocator.alloc(Worker, num_workers);
         defer allocator.free(workers);
-        return runUsing(workers, func, args);
+        return runUsing(workers, runnable);
     }
 
-    fn runUsing(workers: []Worker, comptime func: var, args: var) !@TypeOf(func).ReturnType {
+    fn runUsing(workers: []Worker, runnable: *Runnable) !void {
         var self = Scheduler{
             .active_threads = 0,
             .idle_queue = AtomicUsize{ .value = IDLE_EMPTY },
@@ -70,29 +91,8 @@ pub const Scheduler = extern struct {
             }
         }
 
-        const ReturnType = @TypeOf(func).ReturnType;
-        const Wrapper = struct {
-            fn call(func_args: var, task: *Task, result: *?ReturnType) void {
-                suspend {
-                    task.* = Task.init(@frame());
-                }
-                const value = @call(.{}, func, func_args);
-                result.* = value;
-            }
-        };
-
-        var task: Task = undefined;
-        var result: ?ReturnType = null;
-        var frame = async Wrapper.call(args, &task, &result);
-    
-        self.run_queue.push(blk: {
-            var batch = Task.Batch.init();
-            batch.push(&task);
-            break :blk batch;
-        });
-        self.resumeThread();
-
-        return result orelse error.DeadLocked;
+        self.run_queue.push(Runnable.Batch.from(runnable));
+        self.resumeThread();        
     }
 
     fn resumeThread(self: *Scheduler) void {
@@ -256,9 +256,9 @@ const Thread = struct {
         var rng = @truncate(u32, @ptrToInt(&self));
         while (self.scheduler != null) {
 
-            if (self.poll(scheduler, &rng, tick)) |task| {
+            if (self.poll(scheduler, &rng, tick)) |runnable| {
                 tick +%= 1;
-                resume task.frame;
+                (runnable.callback)(runnable);
                 continue;
             }
 
@@ -268,7 +268,7 @@ const Thread = struct {
         }
     }
 
-    fn schedule(self: *Thread, batch: Task.Batch, store_next: bool) void {
+    fn schedule(self: *Thread, batch: Runnable.Batch, store_next: bool) void {
         const scheduler = self.scheduler orelse unreachable;
 
         switch (batch.len) {
@@ -289,25 +289,25 @@ const Thread = struct {
         noalias scheduler: *Scheduler,
         noalias rng_ptr: *u32,
         tick: u8, 
-    ) ?*Task {
+    ) ?*Runnable {
         if (tick % 61 == 0) {
-            if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |task| {
+            if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
                 scheduler.resumeThread();
-                return task;
+                return runnable;
             }
         }
 
-        if (self.run_queue.tryPop()) |task| {
-            return task;
+        if (self.run_queue.tryPop()) |runnable| {
+            return runnable;
         }
 
         const workers = scheduler.workers_ptr[0..scheduler.workers_len];
         var steal_attempts: u3 = 4;
         while (steal_attempts != 0) : (steal_attempts -= 1) {
 
-            if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |task| {
+            if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
                 scheduler.resumeThread();
-                return task;
+                return runnable;
             }
 
             const steal_next = steal_attempts < 2;
@@ -332,8 +332,8 @@ const Thread = struct {
                 const thread = thread_ptr orelse continue;
                 if (thread == self)
                     continue;
-                if (self.run_queue.tryStealFromLocal(&thread.run_queue, steal_next)) |task| {
-                    return task;
+                if (self.run_queue.tryStealFromLocal(&thread.run_queue, steal_next)) |runnable| {
+                    return runnable;
                 }
             }
         }
@@ -342,46 +342,22 @@ const Thread = struct {
     }
 };
 
-pub const Task = struct {
-    next: ?*Task,
-    frame: anyframe,
+pub const Runnable = struct {
+    next: ?*Runnable,
+    callback: Callback,
 
-    pub fn init(frame: anyframe) Task {
-        return Task{
+    pub const Callback = fn(*Runnable) callconv(.C) void;
+
+    pub fn init(callback: Callback) Runnable {
+        return Runnable{
             .next = undefined,
-            .frame = frame,
+            .callback = callback,
         };
     }
 
-    pub fn schedule(self: *Task) void {
-        var batch = Task.Batch.init();
-        batch.push(self);
-        batch.schedule();
-    }
-
-    pub fn scheduleNext(self: *Task) void {
-        var batch = Task.Batch.init();
-        batch.push(self);
-        batch.scheduleNext();
-    }
-
-    pub fn yield() void {
-        var task = Task.init(@frame());
-        suspend {
-            task.schedule();
-        }
-    }
-
-    pub fn yieldNext() void {
-        var task = Task.init(@frame());
-        suspend {
-            task.scheduleNext();
-        }
-    }
-
     pub const Batch = struct {
-        head: ?*Task,
-        tail: ?*Task,
+        head: ?*Runnable,
+        tail: ?*Runnable,
         len: usize,
 
         pub fn init() Batch {
@@ -392,22 +368,28 @@ pub const Task = struct {
             };
         }
 
-        pub fn push(noalias self: *Batch, noalias task: *Task) void {
+        pub fn from(runnable: *Runnable) Batch {
+            var self = Batch.init();
+            self.push(runnable);
+            return self;
+        }
+
+        pub fn push(noalias self: *Batch, noalias runnable: *Runnable) void {
             if (self.head == null)
-                self.head = task;
+                self.head = runnable;
             if (self.tail) |tail|
-                tail.next = task;
-            self.tail = task;
-            task.next = null;
+                tail.next = runnable;
+            self.tail = runnable;
+            runnable.next = null;
             self.len += 1;
         }
 
-        pub fn pop(self: *Batch) ?*Task {
-            const task = self.head orelse return null;
-            self.head = task.next;
+        pub fn pop(self: *Batch) ?*Runnable {
+            const runnable = self.head orelse return null;
+            self.head = runnable.next;
             if (self.head == null)
                 self.tail = null;
-            return task;
+            return runnable;
         }
 
         pub fn schedule(self: Batch) void {
@@ -425,11 +407,50 @@ pub const Task = struct {
     };
 };
 
+pub const Task = struct {
+    runnable: Runnable,
+    frame: anyframe,
+
+    pub fn init(frame: anyframe) Task {
+        return Task{
+            .runnable = Runnable.init(Task.@"resume"),
+            .frame = frame,
+        };
+    }
+
+    fn @"resume"(runnable: *Runnable) callconv(.C) void {
+        const task = @fieldParentPtr(Task, "runnable", runnable);
+        resume task.frame;
+    }
+
+    pub fn schedule(self: *Task) void {
+        return Runnable.Batch.from(&self.runnable).schedule();
+    }
+
+    pub fn scheduleNext(self: *Task) void {
+        return Runnable.Batch.from(&self.runnable).scheduleNext();
+    }
+
+    pub fn yield() void {
+        var task = Task.init(@frame());
+        suspend {
+            task.schedule();
+        }
+    }
+
+    pub fn yieldNext() void {
+        var task = Task.init(@frame());
+        suspend {
+            task.scheduleNext();
+        }
+    }
+};
+
 const LocalQueue = extern struct {
     head: usize,
     tail: usize align(CACHE_LINE),
-    next: ?*Task,
-    buffer: [256]*Task align(CACHE_LINE),
+    next: ?*Runnable,
+    buffer: [256]*Runnable align(CACHE_LINE),
 
     fn init() LocalQueue {
         return LocalQueue{
@@ -450,7 +471,7 @@ const LocalQueue = extern struct {
         while (true) {
             const head = @atomicLoad(usize, &self.head, .Acquire);
             const tail = @atomicLoad(usize, &self.tail, .Acquire);
-            const next = @atomicLoad(?*Task, &self.next, .Acquire);
+            const next = @atomicLoad(?*Runnable, &self.next, .Acquire);
             if (tail == @atomicLoad(usize, &self.tail, .Monotonic))
                 return (tail == head) and (next == null);
         }
@@ -459,19 +480,19 @@ const LocalQueue = extern struct {
     fn pushWithOverflow(
         noalias self: *LocalQueue,
         noalias global_queue: *GlobalQueue,
-        noalias task_ptr: *Task,
+        noalias runnable_ptr: *Runnable,
         store_next: bool,
     ) void {
-        const task = blk: {
+        const runnable = blk: {
             if (!store_next)
-                break :blk task_ptr;
-            var next = @atomicLoad(?*Task, &self.next, .Acquire);
+                break :blk runnable_ptr;
+            var next = @atomicLoad(?*Runnable, &self.next, .Acquire);
             while (true) {
                 next = @cmpxchgWeak(
-                    ?*Task,
+                    ?*Runnable,
                     &self.next,
                     next,
-                    task_ptr,
+                    runnable_ptr,
                     .Acquire,
                     .Acquire,
                 ) orelse break :blk next orelse return;
@@ -483,7 +504,7 @@ const LocalQueue = extern struct {
         
         while (true) {
             if (tail -% head < self.buffer.len) {
-                self.buffer[tail % self.buffer.len] = task;
+                self.buffer[tail % self.buffer.len] = runnable;
                 @atomicStore(usize, &self.tail, tail +% 1, .Release);
                 return;
             }
@@ -504,30 +525,30 @@ const LocalQueue = extern struct {
                 continue;
             }
 
-            var batch = Task.Batch.init();
+            var batch = Runnable.Batch.init();
             while (steal != 0) : (steal -= 1) {
                 batch.push(self.buffer[head % self.buffer.len]);
                 head +%= 1;
             }
 
-            batch.push(task);
+            batch.push(runnable);
             global_queue.push(batch);
             return;
         }
     }
 
-    fn tryPop(self: *LocalQueue) ?*Task {
-        var next = @atomicLoad(?*Task, &self.next, .Acquire);
+    fn tryPop(self: *LocalQueue) ?*Runnable {
+        var next = @atomicLoad(?*Runnable, &self.next, .Acquire);
         while (true) {
-            const task = next orelse break;
+            const runnable = next orelse break;
             next = @cmpxchgWeak(
-                ?*Task,
+                ?*Runnable,
                 &self.next,
                 next,
                 null,
                 .AcqRel,
                 .Acquire,
-            ) orelse return task;
+            ) orelse return runnable;
         }
 
         var head = @atomicLoad(usize, &self.head, .Acquire);
@@ -551,7 +572,7 @@ const LocalQueue = extern struct {
         noalias self: *LocalQueue,
         noalias target: *LocalQueue,
         steal_next: bool,
-    ) ?*Task {
+    ) ?*Runnable {
         const head = @atomicLoad(usize, &self.head, .Acquire);
         const tail = self.tail;
         if (tail != head) {
@@ -569,9 +590,9 @@ const LocalQueue = extern struct {
 
             if (steal == 0) {
                 if (steal_next) {
-                    if (@atomicLoad(?*Task, &target.next, .Acquire)) |next| {
+                    if (@atomicLoad(?*Runnable, &target.next, .Acquire)) |next| {
                         _ = @cmpxchgWeak(
-                            ?*Task,
+                            ?*Runnable,
                             &target.next,
                             next,
                             null,
@@ -585,14 +606,14 @@ const LocalQueue = extern struct {
                 return null;
             }
 
-            const first_task = target.buffer[target_head % target.buffer.len];
+            const first_runnable = target.buffer[target_head % target.buffer.len];
             var new_target_head = target_head +% 1;
             var new_tail = tail;
             steal -= 1;
 
             while (steal != 0) : (steal -= 1) {
-                const task = target.buffer[new_target_head % target.buffer.len];
-                self.buffer[new_tail % self.buffer.len] = task;
+                const runnable = target.buffer[new_target_head % target.buffer.len];
+                self.buffer[new_tail % self.buffer.len] = runnable;
                 new_target_head +%= 1;
                 new_tail +%= 1;
             }
@@ -606,7 +627,7 @@ const LocalQueue = extern struct {
                 .Acquire,
             ) orelse {
                 @atomicStore(usize, &self.tail, new_tail, .Release);
-                return first_task;
+                return first_runnable;
             };
         }
     }
@@ -614,14 +635,14 @@ const LocalQueue = extern struct {
     fn tryStealFromGlobal(
         noalias self: *LocalQueue,
         noalias target: *GlobalQueue,
-    ) ?*Task {
+    ) ?*Runnable {
         if (@atomicLoad(bool, &target.is_polling, .Monotonic))
             return null;
         if (@atomicRmw(bool, &target.is_polling, .Xchg, true, .Acquire))
             return null;
         defer @atomicStore(bool, &target.is_polling, false, .Release);
 
-        const first_task = target.pop();
+        const first_runnable = target.pop();
 
         const head = @atomicLoad(usize, &self.head, .Acquire);
         const tail = self.tail;
@@ -629,24 +650,24 @@ const LocalQueue = extern struct {
 
         var steal = self.buffer.len - (tail -% head);
         while (steal != 0) : (steal -= 1) {
-            const task = target.pop() orelse break;
-            self.buffer[new_tail % self.buffer.len] = task;
+            const runnable = target.pop() orelse break;
+            self.buffer[new_tail % self.buffer.len] = runnable;
             new_tail +%= 1;
         }
 
         @atomicStore(usize, &self.tail, new_tail, .Release);
-        return first_task;
+        return first_runnable;
     }
 };
 
 const GlobalQueue = extern struct {
     is_polling: bool,
-    head: *Task align(CACHE_LINE),
-    tail: *Task align(CACHE_LINE),
-    stub_next: ?*Task,
+    head: *Runnable align(CACHE_LINE),
+    tail: *Runnable align(CACHE_LINE),
+    stub_next: ?*Runnable,
 
     fn init(self: *GlobalQueue) void {
-        const stub = @fieldParentPtr(Task, "next", &self.stub_next);
+        const stub = @fieldParentPtr(Runnable, "next", &self.stub_next);
         self.stub_next = null;
         self.head = stub;
         self.tail = stub;
@@ -663,32 +684,32 @@ const GlobalQueue = extern struct {
     }
 
     fn isEmpty(self: *const GlobalQueue) bool {
-        const stub = @fieldParentPtr(Task, "next", &self.stub_next);
-        const head = @atomicLoad(*Task, &self.head, .Monotonic);
+        const stub = @fieldParentPtr(Runnable, "next", &self.stub_next);
+        const head = @atomicLoad(*Runnable, &self.head, .Monotonic);
         return head == stub;
     }
 
-    fn push(self: *GlobalQueue, batch: Task.Batch) void {
+    fn push(self: *GlobalQueue, batch: Runnable.Batch) void {
         const head = batch.head orelse return;
         const tail = batch.tail orelse unreachable;
 
         tail.next = null;
-        const prev = @atomicRmw(*Task, &self.head, .Xchg, tail, .AcqRel);
-        @atomicStore(?*Task, &prev.next, head, .Release);
+        const prev = @atomicRmw(*Runnable, &self.head, .Xchg, tail, .AcqRel);
+        @atomicStore(?*Runnable, &prev.next, head, .Release);
     }
 
-    fn pop(self: *GlobalQueue) ?*Task {
+    fn pop(self: *GlobalQueue) ?*Runnable {
         if (std.debug.runtime_safety and !self.is_polling)
             std.debug.panic("GlobalQueue.pop() when not is_polling", .{});
 
         var tail = self.tail;
-        var next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        var next = @atomicLoad(?*Runnable, &tail.next, .Acquire);
 
-        const stub = @fieldParentPtr(Task, "next", &self.stub_next);
+        const stub = @fieldParentPtr(Runnable, "next", &self.stub_next);
         if (tail == stub) {
             tail = next orelse return null;
             self.tail = tail;
-            next = @atomicLoad(?*Task, &tail.next, .Acquire); 
+            next = @atomicLoad(?*Runnable, &tail.next, .Acquire); 
         }
 
         if (next) |next_tail| {
@@ -696,17 +717,12 @@ const GlobalQueue = extern struct {
             return tail;
         }
 
-        const head = @atomicLoad(*Task, &self.head, .Monotonic);
+        const head = @atomicLoad(*Runnable, &self.head, .Monotonic);
         if (head != tail)
             return null;
 
-        self.push(blk: {
-            var batch = Task.Batch.init();
-            batch.push(stub);
-            break :blk batch;
-        });
-
-        next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        self.push(Runnable.Batch.from(stub));
+        next = @atomicLoad(?*Runnable, &tail.next, .Acquire);
         self.tail = next orelse return null;
         return tail;
     }

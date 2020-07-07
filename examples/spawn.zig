@@ -6,7 +6,7 @@ const num_tasks_per_spawner = 500 * 1000;
 const num_tasks = num_tasks_per_spawner * num_spawners;
 
 pub fn main() !void {
-    try (try zap.Scheduler.run(.{}, asyncMain, .{}));
+    try (try zap.Scheduler.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -36,7 +36,7 @@ fn asyncMain() !void {
 fn spawner(spawned: *usize, task: *zap.Task, frames: []@Frame(inc)) void {
     zap.Task.yieldNext();
 
-    var batch = zap.Task.Batch.init();
+    var batch = zap.Runnable.Batch.init();
     for (frames) |*frame| {
         frame.* = async inc(spawned, task, &batch);
     }
@@ -44,10 +44,10 @@ fn spawner(spawned: *usize, task: *zap.Task, frames: []@Frame(inc)) void {
     batch.scheduleNext();
 }
 
-fn inc(spawned: *usize, task: *zap.Task, batch: *zap.Task.Batch) void {
+fn inc(spawned: *usize, task: *zap.Task, batch: *zap.Runnable.Batch) void {
     var self = zap.Task.init(@frame());
     suspend {
-        batch.push(&self);
+        batch.push(&self.runnable);
     }
 
     const spawned_count = @atomicRmw(usize, spawned, .Add, 1, .SeqCst);

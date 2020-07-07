@@ -7,6 +7,7 @@ pub fn build(b: *std.build.Builder) void {
     const run = b.option(bool, "run", "Run the target example") orelse false;
 
     const libzap = b.addStaticLibrary("libzap", "../src/c/zap.zig");
+    libzap.linkLibC();
     libzap.setBuildMode(mode);
     libzap.setTarget(target);
     libzap.addPackagePath("zap", "../src/zap.zig");

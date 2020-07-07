@@ -1,6 +1,11 @@
 const std = @import("std");
 
-pub const Scheduler = struct {
+const CACHE_LINE = switch (std.builtin.arch) {
+    .x86_64 => 64 * 2,
+    else => 64,
+};
+
+pub const Scheduler = extern struct {
     pub const Config = struct {
         max_workers: usize = std.math.maxInt(usize),
     };
@@ -10,9 +15,10 @@ pub const Scheduler = struct {
     const IDLE_SHUTDOWN = 2;
 
     active_threads: usize,
-    idle_queue: AtomicUsize,
+    idle_queue: AtomicUsize align(CACHE_LINE),
     run_queue: GlobalQueue,
-    workers: []Worker,
+    workers_ptr: [*]Worker align(CACHE_LINE),
+    workers_len: usize,
 
     pub fn run(config: Config, comptime func: var, args: var) !@TypeOf(func).ReturnType {
         var num_workers = if (std.builtin.single_threaded) 1 else (std.Thread.cpuCount() catch 1);
@@ -34,7 +40,8 @@ pub const Scheduler = struct {
             .active_threads = 0,
             .idle_queue = AtomicUsize{ .value = IDLE_EMPTY },
             .run_queue = undefined,
-            .workers = workers,
+            .workers_ptr = workers.ptr,
+            .workers_len = workers.len,
         };
 
         self.run_queue.init();
@@ -211,8 +218,8 @@ pub const Scheduler = struct {
             thread.event.set();
         }
         
-        if (std.debug.runtime_safety and num_workers != self.workers.len)
-            std.debug.panic("Scheduler.shutdown() only shutdown {}/{} workers", .{num_workers, self.workers.len});
+        if (std.debug.runtime_safety and num_workers != self.workers_len)
+            std.debug.panic("Scheduler.shutdown() only shutdown {}/{} workers", .{num_workers, self.workers_len});
     }
 };
 
@@ -294,7 +301,7 @@ const Thread = struct {
             return task;
         }
 
-        const workers = scheduler.workers;
+        const workers = scheduler.workers_ptr[0..scheduler.workers_len];
         var steal_attempts: u3 = 4;
         while (steal_attempts != 0) : (steal_attempts -= 1) {
 
@@ -411,11 +418,11 @@ pub const Task = struct {
     };
 };
 
-const LocalQueue = struct {
+const LocalQueue = extern struct {
     head: usize,
-    tail: usize,
+    tail: usize align(CACHE_LINE),
     next: ?*Task,
-    buffer: [256]*Task,
+    buffer: [256]*Task align(CACHE_LINE),
 
     fn init() LocalQueue {
         return LocalQueue{
@@ -625,10 +632,10 @@ const LocalQueue = struct {
     }
 };
 
-const GlobalQueue = struct {
+const GlobalQueue = extern struct {
     is_polling: bool,
-    head: *Task,
-    tail: *Task,
+    head: *Task align(CACHE_LINE),
+    tail: *Task align(CACHE_LINE),
     stub_next: ?*Task,
 
     fn init(self: *GlobalQueue) void {

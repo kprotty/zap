@@ -8,12 +8,13 @@ pub fn build(b: *std.build.Builder) void {
 
     inline for ([_][]const u8 {
         "yield",
+        "spawn",
     }) |example| {
         const exe = b.addExecutable(example, example ++ ".zig");
         if (libc) exe.linkLibC();
         exe.setBuildMode(mode);
         exe.setTarget(target);
-        exe.addPackagePath("zap", "../src/basic.zig");
+        exe.addPackagePath("zap", "../src/zap.zig");
         exe.setOutputDir("zig-cache");
         exe.install();
 

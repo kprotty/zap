@@ -26,10 +26,7 @@ fn asyncMain() !void {
 }
 
 fn yielder(counter: *usize, task: *zap.Task) void {
-    var self = zap.Task.init(@frame());
-    suspend {
-        self.scheduleNext();
-    }
+    zap.Task.yieldNext();
 
     var i: usize = num_yields;
     while (i != 0) : (i -= 1) {

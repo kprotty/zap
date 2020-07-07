@@ -13,7 +13,7 @@ pub fn build(b: *std.build.Builder) void {
         if (libc) exe.linkLibC();
         exe.setBuildMode(mode);
         exe.setTarget(target);
-        exe.addPackagePath("zap", "../src/zap.zig");
+        exe.addPackagePath("zap", "../src/basic.zig");
         exe.setOutputDir("zig-cache");
         exe.install();
 

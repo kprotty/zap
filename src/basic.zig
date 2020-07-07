@@ -66,7 +66,9 @@ pub const Scheduler = struct {
         const ReturnType = @TypeOf(func).ReturnType;
         const Wrapper = struct {
             fn call(func_args: var, task: *Task, result: *?ReturnType) void {
-                suspend task.* = Task.init(@frame());
+                suspend {
+                    task.* = Task.init(@frame());
+                }
                 const value = @call(.{}, func, func_args);
                 result.* = value;
             }
@@ -259,12 +261,16 @@ const Thread = struct {
         }
     }
 
-    fn schedule(self: *Thread, batch: Task.Batch) void {
+    fn schedule(self: *Thread, batch: Task.Batch, store_next: bool) void {
         const scheduler = self.scheduler orelse unreachable;
 
         switch (batch.len) {
             0 => return,
-            1 => self.run_queue.pushWithOverflow(&scheduler.run_queue, batch.head.?),
+            1 => self.run_queue.pushWithOverflow(
+                &scheduler.run_queue,
+                batch.head.?,
+                store_next,
+            ),
             else => scheduler.run_queue.push(batch),
         }
         
@@ -346,6 +352,12 @@ pub const Task = struct {
         batch.schedule();
     }
 
+    pub fn scheduleNext(self: *Task) void {
+        var batch = Task.Batch.init();
+        batch.push(self);
+        batch.scheduleNext();
+    }
+
     pub fn yield() void {
         var task = Task.init(@frame());
         suspend {
@@ -385,8 +397,16 @@ pub const Task = struct {
         }
 
         pub fn schedule(self: Batch) void {
+            return self._schedule(false);
+        }
+
+        pub fn scheduleNext(self: Batch) void {
+            return self._schedule(true);
+        }
+
+        fn _schedule(self: Batch, store_next: bool) void {
             const thread = Thread.current orelse unreachable;
-            return thread.schedule(self);
+            return thread.schedule(self, store_next);
         }
     };
 };
@@ -426,8 +446,11 @@ const LocalQueue = struct {
         noalias self: *LocalQueue,
         noalias global_queue: *GlobalQueue,
         noalias task_ptr: *Task,
+        store_next: bool,
     ) void {
         const task = blk: {
+            if (!store_next)
+                break :blk task_ptr;
             var next = @atomicLoad(?*Task, &self.next, .Acquire);
             while (true) {
                 next = @cmpxchgWeak(
@@ -480,19 +503,32 @@ const LocalQueue = struct {
     }
 
     fn tryPop(self: *LocalQueue) ?*Task {
-        var head = @atomicLoad(usize, &self.head, .Monotonic);
-        const tail = self.tail;
+        var next = @atomicLoad(?*Task, &self.next, .Acquire);
+        while (true) {
+            const task = next orelse break;
+            next = @cmpxchgWeak(
+                ?*Task,
+                &self.next,
+                next,
+                null,
+                .AcqRel,
+                .Acquire,
+            ) orelse return task;
+        }
 
+        var head = @atomicLoad(usize, &self.head, .Acquire);
+        const tail = self.tail;
         while (true) {
             if (tail == head)
                 return null;
+
             head = @cmpxchgWeak(
                 usize,
                 &self.head,
                 head,
                 head +% 1,
-                .Monotonic,
-                .Monotonic,
+                .AcqRel,
+                .Acquire,
             ) orelse return self.buffer[head % self.buffer.len];
         }
     }
@@ -502,11 +538,12 @@ const LocalQueue = struct {
         noalias target: *LocalQueue,
         steal_next: bool,
     ) ?*Task {
+        const head = @atomicLoad(usize, &self.head, .Acquire);
         const tail = self.tail;
-        if (std.debug.runtime_safety) {
-            const head = @atomicLoad(usize, &self.head, .Monotonic);
-            if (tail != head)
-                std.debug.panic("LocalQueue.steal() when not-empty (size = {})", .{tail -% head});
+        if (tail != head) {
+            if (std.debug.runtime_safety and tail -% head > self.buffer.len)
+                std.debug.panic("LocalQueue.steal() with inconsistent buffer size = {} (head = {}, tail = {})", .{tail -% head, head, tail});
+            return self.tryPop();
         }
 
         var target_head = @atomicLoad(usize, &target.head, .Acquire);
@@ -515,8 +552,24 @@ const LocalQueue = struct {
 
             var steal = target_tail -% target_head;
             steal = steal - (steal / 2);
-            if (steal == 0)
-                break;
+
+            if (steal == 0) {
+                if (steal_next) {
+                    if (@atomicLoad(?*Task, &target.next, .Acquire)) |next| {
+                        _ = @cmpxchgWeak(
+                            ?*Task,
+                            &target.next,
+                            next,
+                            null,
+                            .AcqRel,
+                            .Acquire,
+                        ) orelse return next;
+                        std.SpinLock.loopHint(1);
+                        continue;
+                    }
+                }
+                return null;
+            }
 
             const first_task = target.buffer[target_head % target.buffer.len];
             var new_target_head = target_head +% 1;
@@ -542,22 +595,6 @@ const LocalQueue = struct {
                 return first_task;
             };
         }
-
-        if (!steal_next)
-            return null;
-
-        var next = @atomicLoad(?*Task, &target.next, .Acquire);
-        while (true) {
-            const first_task = next orelse return null;
-            next = @cmpxchgWeak(
-                ?*Task,
-                &target.next,
-                next,
-                null,
-                .AcqRel,
-                .Acquire,
-            ) orelse return first_task;
-        }
     }
 
     fn tryStealFromGlobal(
@@ -572,7 +609,7 @@ const LocalQueue = struct {
 
         const first_task = target.pop();
 
-        const head = @atomicLoad(usize, &self.head, .Monotonic);
+        const head = @atomicLoad(usize, &self.head, .Acquire);
         const tail = self.tail;
         var new_tail = tail;
 

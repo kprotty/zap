@@ -26,7 +26,10 @@ fn asyncMain() !void {
 }
 
 fn yielder(counter: *usize, task: *zap.Task) void {
-    zap.Task.yield();
+    var self = zap.Task.init(@frame());
+    suspend {
+        self.scheduleNext();
+    }
 
     var i: usize = num_yields;
     while (i != 0) : (i -= 1) {
@@ -35,5 +38,5 @@ fn yielder(counter: *usize, task: *zap.Task) void {
 
     const count = @atomicRmw(usize, counter, .Add, 1, .SeqCst);
     if (count + 1 == num_tasks)
-        task.schedule();
+        task.scheduleNext();
 }

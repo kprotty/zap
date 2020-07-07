@@ -36,13 +36,19 @@ fn asyncMain() !void {
 fn spawner(spawned: *usize, task: *zap.Task, frames: []@Frame(inc)) void {
     zap.Task.yieldNext();
 
+    var batch = zap.Task.Batch.init();
     for (frames) |*frame| {
-        frame.* = async inc(spawned, task);
+        frame.* = async inc(spawned, task, &batch);
     }
+
+    batch.scheduleNext();
 }
 
-fn inc(spawned: *usize, task: *zap.Task) void {
-    zap.Task.yieldNext();
+fn inc(spawned: *usize, task: *zap.Task, batch: *zap.Task.Batch) void {
+    var self = zap.Task.init(@frame());
+    suspend {
+        batch.push(&self);
+    }
 
     const spawned_count = @atomicRmw(usize, spawned, .Add, 1, .SeqCst);
     if (spawned_count == num_tasks - 1) {

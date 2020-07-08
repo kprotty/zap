@@ -13,6 +13,7 @@ pub const Scheduler = extern struct {
     const IDLE_EMPTY = 0;
     const IDLE_NOTIFIED = 1;
     const IDLE_SHUTDOWN = 2;
+    const IDLE_WAKING = 4;
 
     active_threads: usize,
     idle_queue: AtomicUsize align(CACHE_LINE),
@@ -96,18 +97,28 @@ pub const Scheduler = extern struct {
     }
 
     fn resumeThread(self: *Scheduler) void {
+        self.resumeThreadWhen(false);
+    }
+
+    fn stopWaking(self: *Scheduler) void {
+        self.resumeThreadWhen(true);
+    }
+
+    fn resumeThreadWhen(self: *Scheduler, was_waking: bool) void {
         var idle_queue = self.idle_queue.load(.Acquire);
         while (true) {
             if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
                 std.debug.panic("Scheduler.resumeThread() when shutdown", .{});
 
-            if (idle_queue.value == IDLE_NOTIFIED)
-                return;
+            if (!was_waking) {
+                if (idle_queue.value == IDLE_NOTIFIED or idle_queue.value & IDLE_WAKING != 0)
+                    return;
+            }
             
-            const worker_ptr = @intToPtr(?*Worker, idle_queue.value);
+            const worker_ptr = @intToPtr(?*Worker, idle_queue.value & ~@as(usize, IDLE_WAKING | IDLE_NOTIFIED));
             var next_value: usize = undefined;
             if (worker_ptr) |worker| {
-                next_value = @atomicLoad(usize, &worker.next, .Unordered);
+                next_value = @atomicLoad(usize, &worker.next, .Unordered) | IDLE_WAKING;
             } else {
                 next_value = IDLE_NOTIFIED;
             }
@@ -132,6 +143,7 @@ pub const Scheduler = extern struct {
             }
 
             if (worker.thread) |thread| {
+                thread.state = .waking;
                 thread.event.set();
                 return;
             }
@@ -145,12 +157,12 @@ pub const Scheduler = extern struct {
 
             idle_queue = self.idle_queue.load(.Monotonic);
             while (true) {
-                worker.next = idle_queue.value;
+                worker.next = idle_queue.value & ~@as(usize, IDLE_WAKING);
                 if (worker.next == IDLE_NOTIFIED)
                     worker.next = IDLE_EMPTY;
                 idle_queue = self.idle_queue.compareExchangeWeak(
                     idle_queue,
-                    @ptrToInt(worker),
+                    @ptrToInt(worker) & ~@as(usize, IDLE_WAKING),
                     .Release,
                     .Monotonic,
                 ) orelse return;
@@ -161,7 +173,23 @@ pub const Scheduler = extern struct {
     fn suspendThread(
         noalias self: *Scheduler,
         noalias worker: *Worker,
+        noalias thread: *Thread,
     ) void {
+        const was_waking = switch (thread.state) {
+            .running => false,
+            .waking => true,
+            .suspended => {
+                if (std.debug.runtime_safety)
+                    std.debug.panic("suspendThread() when thread already suspended", .{});
+                unreachable;
+            },
+            .shutdown => {
+                if (std.debug.runtime_safety)
+                    std.debug.panic("suspendThread() when thread is shutdown", .{});
+                unreachable;
+            },
+        };
+
         var idle_queue = self.idle_queue.load(.Monotonic);
         while (true) {
             if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
@@ -171,8 +199,12 @@ pub const Scheduler = extern struct {
             if (idle_queue.value == IDLE_NOTIFIED) {
                 next_value = IDLE_EMPTY;
             } else {
-                next_value = @ptrToInt(worker);
-                @atomicStore(usize, &worker.next, idle_queue.value, .Unordered);
+                next_value = @ptrToInt(worker) | (idle_queue.value & IDLE_WAKING);
+                if (was_waking)
+                    next_value &= ~@as(usize, IDLE_WAKING);
+                thread.state = .suspended;
+                const next_worker = idle_queue.value & ~@as(usize, IDLE_WAKING);
+                @atomicStore(usize, &worker.next, next_worker, .Unordered);
             }
 
             if (self.idle_queue.compareExchangeWeak(
@@ -186,7 +218,7 @@ pub const Scheduler = extern struct {
             }
 
             if (idle_queue.value == IDLE_NOTIFIED) {
-                const thread = worker.thread orelse unreachable;
+                thread.state = if (was_waking) .waking else .running;
                 thread.event.set();
                 return;
             }
@@ -214,7 +246,7 @@ pub const Scheduler = extern struct {
             num_workers += 1;
             
             const thread = worker.thread orelse continue;
-            thread.scheduler = null;
+            thread.state = .shutdown;
             thread.event.set();
         }
         
@@ -223,8 +255,8 @@ pub const Scheduler = extern struct {
     }
 };
 
-const Worker = struct {
-    next: usize,
+const Worker = extern struct {
+    next: usize align(8),
     thread: ?*Thread,
     handle: ?*std.Thread,
 };
@@ -232,13 +264,22 @@ const Worker = struct {
 const Thread = struct {
     threadlocal var current: ?*Thread = null;
 
+    const State = enum {
+        running,
+        waking,
+        suspended,
+        shutdown,
+    };
+
+    state: State,
     event: std.ResetEvent,
     run_queue: LocalQueue,
-    scheduler: ?*Scheduler,
+    scheduler: *Scheduler,
 
     fn run(worker: *Worker) void {
         const scheduler = @intToPtr(*Scheduler, worker.next);
         var self = Thread{
+            .state = .waking,
             .event = std.ResetEvent.init(),
             .run_queue = LocalQueue.init(),
             .scheduler = scheduler,
@@ -247,6 +288,8 @@ const Thread = struct {
         defer {
             self.event.deinit();
             self.run_queue.deinit();
+            if (std.debug.runtime_safety and self.state != .shutdown)
+                std.debug.panic("Thread.exit() while state = {}", .{self.state});
         }
 
         Thread.current = &self;
@@ -254,22 +297,35 @@ const Thread = struct {
 
         var tick: u8 = 0;
         var rng = @truncate(u32, @ptrToInt(&self));
-        while (self.scheduler != null) {
+        while (true) {
 
             if (self.poll(scheduler, &rng, tick)) |runnable| {
+                if (self.state == .waking)
+                    scheduler.stopWaking();
                 tick +%= 1;
+                self.state = .running;
                 (runnable.callback)(runnable);
                 continue;
             }
 
-            scheduler.suspendThread(worker);
+            scheduler.suspendThread(worker, &self);
             self.event.wait();
             self.event.reset();
+
+            switch (self.state) {
+                .shutdown => break,
+                .waking, .running => {},
+                .suspended => {
+                    if (std.debug.runtime_safety)
+                        std.debug.panic("Thread.afterSuspend() still suspended", .{});
+                    unreachable;
+                },
+            }
         }
     }
 
     fn schedule(self: *Thread, batch: Runnable.Batch, store_next: bool) void {
-        const scheduler = self.scheduler orelse unreachable;
+        const scheduler = self.scheduler;
 
         switch (batch.len) {
             0 => return,
@@ -292,7 +348,8 @@ const Thread = struct {
     ) ?*Runnable {
         if (tick % 61 == 0) {
             if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
-                scheduler.resumeThread();
+                if (self.state != .waking)
+                    scheduler.resumeThread();
                 return runnable;
             }
         }
@@ -306,7 +363,8 @@ const Thread = struct {
         while (steal_attempts != 0) : (steal_attempts -= 1) {
 
             if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
-                scheduler.resumeThread();
+                if (self.state != .waking)
+                    scheduler.resumeThread();
                 return runnable;
             }
 

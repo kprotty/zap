@@ -77,37 +77,50 @@ pub const Scheduler = extern struct {
         }
 
         defer {
-            self.run_queue.deinit();
-            if (std.debug.runtime_safety) {
-                const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
-                if (active_threads != 0)
-                    std.debug.panic("Scheduler exiting with {} active_threads", .{active_threads});
-                if (self.idle_queue.load(.Monotonic).value != IDLE_SHUTDOWN)
-                    std.debug.panic("Scheduler exiting when idle_queue is not shutdown", .{});
-            }
             for (workers) |*worker| {
                 const handle_ptr = @atomicLoad(?*std.Thread, &worker.handle, .Acquire);
                 const thread_handle = handle_ptr orelse continue;
                 thread_handle.wait();
             }
+
+            const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
+            if (active_threads != 0) {
+                std.debug.panic("Scheduler exiting with {} active_threads", .{active_threads});
+            }
+
+            const idle_queue = self.idle_queue.load(.Monotonic).value;
+            if (idle_queue != IDLE_SHUTDOWN) {
+                std.debug.panic("Scheduler exiting when idle_queue is not shutdown", .{});
+            }
+
+            self.run_queue.deinit();
         }
 
         self.run_queue.push(Runnable.Batch.from(runnable));
-        self.resumeThread();        
+        self.resumeThreadWhen(.{ .is_main_thread = true });        
     }
 
     fn resumeThread(self: *Scheduler) void {
-        self.resumeThreadWhen(false);
+        self.resumeThreadWhen(.{});
     }
 
     fn stopWaking(self: *Scheduler) void {
-        self.resumeThreadWhen(true);
+        self.resumeThreadWhen(.{ .was_waking = true });
     }
 
-    fn resumeThreadWhen(self: *Scheduler, was_waking: bool) void {
+    const ResumeOptions = struct {
+        was_waking: bool = false,
+        is_main_thread: bool = false,
+    };
+
+    fn resumeThreadWhen(
+        self: *Scheduler,
+        resume_options: ResumeOptions,
+    ) void {
+        const was_waking = resume_options.was_waking;
         var idle_queue = self.idle_queue.load(.Acquire);
         while (true) {
-            if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
+            if (idle_queue.value == IDLE_SHUTDOWN)
                 std.debug.panic("Scheduler.resumeThread() when shutdown", .{});
 
             if (!was_waking) {
@@ -134,15 +147,17 @@ pub const Scheduler = extern struct {
             }
 
             const worker = worker_ptr orelse return;
-            const is_main_thread = @atomicRmw(usize, &self.active_threads, .Add, 1, .SeqCst) == 0;
+            _ = @atomicRmw(usize, &self.active_threads, .Add, 1, .SeqCst);
 
             worker.next = @ptrToInt(self);
-            if (is_main_thread) {
+            if (resume_options.is_main_thread) {
                 Thread.run(worker);
                 return;
             }
 
             if (worker.thread) |thread| {
+                if (thread.state != .suspended)
+                    std.debug.panic("resumeThread() with thread state {}", .{thread.state});
                 thread.state = .waking;
                 thread.event.set();
                 return;
@@ -155,7 +170,7 @@ pub const Scheduler = extern struct {
                 _ = @atomicRmw(usize, &self.active_threads, .Sub, 1, .SeqCst);
             }
 
-            idle_queue = self.idle_queue.load(.Monotonic);
+            idle_queue = self.idle_queue.load(.SeqCst);
             while (true) {
                 worker.next = idle_queue.value & ~@as(usize, IDLE_WAKING);
                 if (worker.next == IDLE_NOTIFIED)
@@ -163,8 +178,8 @@ pub const Scheduler = extern struct {
                 idle_queue = self.idle_queue.compareExchangeWeak(
                     idle_queue,
                     @ptrToInt(worker) & ~@as(usize, IDLE_WAKING),
-                    .Release,
-                    .Monotonic,
+                    .SeqCst,
+                    .SeqCst,
                 ) orelse return;
             }
         }
@@ -179,20 +194,16 @@ pub const Scheduler = extern struct {
             .running => false,
             .waking => true,
             .suspended => {
-                if (std.debug.runtime_safety)
-                    std.debug.panic("suspendThread() when thread already suspended", .{});
-                unreachable;
+                std.debug.panic("suspendThread() when thread already suspended", .{});
             },
             .shutdown => {
-                if (std.debug.runtime_safety)
-                    std.debug.panic("suspendThread() when thread is shutdown", .{});
-                unreachable;
+                std.debug.panic("suspendThread() when thread is shutdown", .{});
             },
         };
 
         var idle_queue = self.idle_queue.load(.Monotonic);
         while (true) {
-            if (std.debug.runtime_safety and idle_queue.value == IDLE_SHUTDOWN)
+            if (idle_queue.value == IDLE_SHUTDOWN)
                 std.debug.panic("Scheduler.suspendThread() when shutdown", .{});
 
             var next_value: usize = undefined;
@@ -224,8 +235,18 @@ pub const Scheduler = extern struct {
             }
 
             const active_threads = @atomicRmw(usize, &self.active_threads, .Sub, 1, .SeqCst);
-            if (active_threads == 1)
-                self.shutdown();
+            if (active_threads == 1) {
+                
+                // Bug on ReleaseFast where it somehow leaves is_polling set ??
+                // See: LocalQueue.tryStealFromGlobal() to see how is_polling is used.
+                if (!std.debug.runtime_safety and @atomicLoad(bool, &self.run_queue.is_polling, .SeqCst)) {
+                    @atomicStore(bool, &self.run_queue.is_polling, false, .SeqCst);
+                    self.resumeThread();
+                } else {
+                    self.shutdown();
+                }
+            }
+
             return;
         }
     }
@@ -250,7 +271,7 @@ pub const Scheduler = extern struct {
             thread.event.set();
         }
         
-        if (std.debug.runtime_safety and num_workers != self.workers_len)
+        if (num_workers != self.workers_len)
             std.debug.panic("Scheduler.shutdown() only shutdown {}/{} workers", .{num_workers, self.workers_len});
     }
 };
@@ -288,7 +309,7 @@ const Thread = struct {
         defer {
             self.event.deinit();
             self.run_queue.deinit();
-            if (std.debug.runtime_safety and self.state != .shutdown)
+            if (self.state != .shutdown)
                 std.debug.panic("Thread.exit() while state = {}", .{self.state});
         }
 
@@ -316,9 +337,7 @@ const Thread = struct {
                 .shutdown => break,
                 .waking, .running => {},
                 .suspended => {
-                    if (std.debug.runtime_safety)
-                        std.debug.panic("Thread.afterSuspend() still suspended", .{});
-                    unreachable;
+                    std.debug.panic("Thread.afterSuspend() still suspended", .{});
                 },
             }
         }
@@ -521,7 +540,7 @@ const LocalQueue = extern struct {
 
     fn deinit(self: *LocalQueue) void {
         defer self.* = undefined;
-        if (std.debug.runtime_safety and !self.isEmpty())
+        if (!self.isEmpty())
             std.debug.panic("LocalQueue.deinit() when not-empty", .{});
     }
 
@@ -567,7 +586,7 @@ const LocalQueue = extern struct {
                 return;
             }
 
-            if (std.debug.runtime_safety and tail -% head != self.buffer.len)
+            if (tail -% head != self.buffer.len)
                 std.debug.panic("LocalQueue.push() with inconsisitent size {}", .{tail -% head});
 
             var steal = self.buffer.len / 2;
@@ -633,8 +652,11 @@ const LocalQueue = extern struct {
     ) ?*Runnable {
         const head = @atomicLoad(usize, &self.head, .Acquire);
         const tail = self.tail;
+
+        // Occasionally, the local queue may not be empty for some reason ??
+        // This doesn't seem to happen in exact SPMC implementations of other langs.
         if (tail != head) {
-            if (std.debug.runtime_safety and tail -% head > self.buffer.len)
+            if (tail -% head > self.buffer.len)
                 std.debug.panic("LocalQueue.steal() with inconsistent buffer size = {} (head = {}, tail = {})", .{tail -% head, head, tail});
             return self.tryPop();
         }
@@ -733,12 +755,10 @@ const GlobalQueue = extern struct {
 
     fn deinit(self: *GlobalQueue) void {
         defer self.* = undefined;
-        if (std.debug.runtime_safety) {
-            if (!self.isEmpty())
-                std.debug.panic("GlobalQueue.deinit() when not empty", .{});
-            if (@atomicLoad(bool, &self.is_polling, .Monotonic))
-                std.debug.panic("GlobalQueue.deinit() while is_polling", .{});
-        }
+        if (@atomicLoad(bool, &self.is_polling, .Monotonic))
+            std.debug.panic("GlobalQueue.deinit() while is_polling", .{});
+        if (!self.isEmpty())
+            std.debug.panic("GlobalQueue.deinit() when not empty", .{});
     }
 
     fn isEmpty(self: *const GlobalQueue) bool {
@@ -757,7 +777,7 @@ const GlobalQueue = extern struct {
     }
 
     fn pop(self: *GlobalQueue) ?*Runnable {
-        if (std.debug.runtime_safety and !self.is_polling)
+        if (!self.is_polling)
             std.debug.panic("GlobalQueue.pop() when not is_polling", .{});
 
         var tail = self.tail;
@@ -775,7 +795,7 @@ const GlobalQueue = extern struct {
             return tail;
         }
 
-        const head = @atomicLoad(*Runnable, &self.head, .Monotonic);
+        const head = @atomicLoad(*Runnable, &self.head, .Acquire);
         if (head != tail)
             return null;
 

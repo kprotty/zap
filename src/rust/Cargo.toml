@@ -1,0 +1,14 @@
+[package]
+name = "zap-rs"
+version = "0.1.0"
+edition = "2018"
+authors = ["kprotty"]
+
+[features]
+default = []
+nightly = []
+all = ["os", "core", "rt"]
+
+os = []
+core = []
+rt = ["core", "os"]

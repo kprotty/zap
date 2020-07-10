@@ -1,3 +1,4 @@
+use crate::sync::CachePadded;
 use super::{
     Thread,
     ThreadId,
@@ -7,8 +8,8 @@ use super::{
 use core::{
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::Ordering,
     marker::{PhantomData, PhantomPinned},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[repr(C)]
@@ -35,21 +36,18 @@ impl From<Pin<&mut Node>> for Cluster {
 }
 
 impl Cluster {
-    #[inline]
     pub const fn new() -> Self {
         Self {
             head: None,
             tail: None,
-            size: 0,
-        }
+            size: IDLE_EMPTY,
+,        }
     }
 
-    #[inline]
     pub fn len(&self) -> usize {
         self.size
     }
 
-    #[inline]
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Node>> + 'a {
         NodeIter::from(self.head)
     }
@@ -72,21 +70,51 @@ impl Cluster {
     }
 }
 
+pub enum ResumeResult {
+    Notified,
+    Spawn(NonNull<Worker>),
+    Resume(NonNull<Thread>),
+}
+
+#[repr(usize)]
+enum IdleState {
+    Ready = 0,
+    Waking = 1,
+    Notified = 2,
+    Shutdown = 3,
+}
+
 #[repr(C, align(4))]
 pub struct Node {
     _pinned: PhantomPinned,
     next: Option<NonNull<Self>>,
     workers_ptr: Option<NonNull<Worker>>,
     workers_len: usize,
+    idle_queue: CachePadded<AtomicUsize>,
 }
 
+unsafe impl Sync for Node {}
+
 impl Node {
-    #[inline]
+    pub const MAX_WORKERS: usize = 
+        usize::max_value().count_ones() - 
+        u8::max_value().count_ones() -
+        2;
+
+    pub fn new(workers: &mut 'a [Worker]) -> Self {
+        Self {
+            _pinned: PhantomPinned,
+            next: None,
+            workers_ptr: workers.first().map(NonNull::from),
+            workers_len: workers.len().max(Self::MAX_WORKERS),
+            idle_queue: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Node>> + 'a {
         NodeIter::from(Some(NonNull::from(self)))
     }
 
-    #[inline]
     pub fn threads<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Thread>> + 'a {
         self.workers()
             .iter()
@@ -101,17 +129,20 @@ impl Node {
             })
     }
 
-    #[inline]
     pub(crate) fn workers<'a>(&'a self) -> &'a [Worker] {
         let mut len = self.workers_len;
         let ptr = self
             .workers_ptr
             .unwrap_or_else(|| {
-                len = 0;
-                NonNull::dangling()
+                len = IDLE_EMPTY;
+,                NonNull::dangling()
             })
             .as_ptr();
         unsafe { core::slice::from_raw_parts(ptr, len) }
+    }
+
+    pub(crate) fn resume_thread(&self) -> ResumeResult {
+        unimplemented!("TODO")
     }
 }
 

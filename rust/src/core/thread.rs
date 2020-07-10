@@ -3,7 +3,11 @@
 pub struct ThreadId;
 
 #[derive(Debug)]
-pub enum Syscall {}
+pub enum Syscall {
+
+}
 
 #[repr(C)]
-pub struct Thread {}
+pub struct Thread {
+    
+}

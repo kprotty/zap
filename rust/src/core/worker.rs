@@ -1,8 +1,5 @@
-use super::{Node, ThreadId, Thread};
-use core::{
-    ptr::NonNull,
-    sync::atomic::AtomicUsize,
-};
+use super::{Node, Thread, ThreadId};
+use core::{ptr::NonNull, sync::atomic::AtomicUsize};
 
 #[repr(C, align(4))]
 pub struct Worker {
@@ -10,7 +7,7 @@ pub struct Worker {
 }
 
 #[derive(Debug)]
-pub enum WorkerRef {
+pub(crate) enum WorkerRef {
     Worker(Option<NonNull<Worker>>),
     Node(NonNull<Node>),
     Thread(NonNull<Thread>),
@@ -34,7 +31,9 @@ impl From<usize> for WorkerRef {
         match tagged_ptr & 0b11 {
             0 => Self::Worker(NonNull::new(ptr as *mut _)),
             1 => Self::Node(NonNull::new(ptr as *mut _).expect("null Node pointer in WorkerRef")),
-            2 => Self::Thread(NonNull::new(ptr as *mut _).expect("null Thread pointer in WorkerRef")),
+            2 => {
+                Self::Thread(NonNull::new(ptr as *mut _).expect("null Thread pointer in WorkerRef"))
+            }
             3 => Self::ThreadId(NonNull::new(ptr as *mut _)),
             _ => unreachable!(),
         }

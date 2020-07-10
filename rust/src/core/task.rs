@@ -1,9 +1,6 @@
 use super::Thread;
 use core::{
-    fmt,
-    pin::Pin,
-    ptr::NonNull,
-    marker::PhantomPinned,
+    fmt, marker::PhantomPinned, mem::transmute, pin::Pin, ptr::NonNull, sync::atomic::AtomicUsize,
 };
 
 pub type RunFn = extern "C" fn(&mut Task, &Thread) -> Batch;
@@ -11,8 +8,8 @@ pub type RunFn = extern "C" fn(&mut Task, &Thread) -> Batch;
 #[repr(C)]
 pub struct Task {
     _pinned: PhantomPinned,
-    next: Option<NonNull<Self>>,
-    run_fn: RunFn,
+    pub(crate) next: AtomicUsize,
+    data: usize,
 }
 
 impl From<RunFn> for Task {
@@ -25,29 +22,28 @@ impl Task {
     pub fn new(run_fn: RunFn) -> Self {
         Self {
             _pinned: PhantomPinned,
-            next: None,
-            run_fn,
+            next: AtomicUsize::default(),
+            data: run_fn as usize,
         }
     }
-    
+
     pub fn run(&mut self, thread: &Thread) -> Batch {
-        (self.run_fn)(self, thread)
+        let run_fn: RunFn = unsafe { transmute(self.data) };
+        (run_fn)(self, thread)
     }
 }
 
 #[repr(C)]
 #[derive(Default)]
 pub struct Batch {
-    head: Option<NonNull<Task>>,
-    tail: Option<NonNull<Task>>,
+    pub(crate) head: Option<NonNull<Task>>,
+    pub(crate) tail: Option<NonNull<Task>>,
     size: usize,
 }
 
 impl fmt::Debug for Batch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Batch")
-            .field("size", &self.size)
-            .finish()
+        f.debug_struct("Batch").field("size", &self.size).finish()
     }
 }
 
@@ -55,7 +51,7 @@ impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
         let task = Some(NonNull::from(unsafe {
             let task = Pin::into_inner_unchecked(task);
-            task.next = None;
+            *task.next.get_mut() = 0;
             task
         }));
 
@@ -87,7 +83,10 @@ impl Batch {
     pub fn push_many(&mut self, batch: Self) {
         if let Some(batch_head) = batch.head {
             if let Some(mut tail) = self.tail {
-                unsafe { tail.as_mut().next = Some(batch_head); }
+                unsafe {
+                    let head_ptr = batch_head.as_ptr() as usize;
+                    *tail.as_mut().next.get_mut() = head_ptr;
+                }
                 self.tail = Some(tail);
                 self.size += batch.size;
             } else {
@@ -97,8 +96,11 @@ impl Batch {
     }
 
     pub fn pop(&mut self) -> Option<NonNull<Task>> {
-        let task = self.head?;
-        self.head = unsafe { task.as_ref().next };
+        let mut task = self.head?;
+        self.head = unsafe {
+            let head_ptr = *task.as_mut().next.get_mut();
+            NonNull::new(head_ptr as *mut _)
+        };
         if self.head.is_none() {
             self.tail = None;
         }

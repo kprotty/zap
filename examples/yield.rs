@@ -17,12 +17,12 @@ async fn main() {
                 tokio::task::yield_now().await;
             }
             
-            if counter.fetch_add(1, Ordering::Relaxed) + 1 == NUM_TASKS {
+            if counter.fetch_add(1, Ordering::SeqCst) + 1 == NUM_TASKS {
                 tx.send(()).await.unwrap();
             }
         });
     }
 
     rx.recv().await.unwrap();
-    assert_eq!(counter.load(Ordering::Relaxed), NUM_TASKS);
+    assert_eq!(counter.load(Ordering::SeqCst), NUM_TASKS);
 }

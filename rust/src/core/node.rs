@@ -159,25 +159,25 @@ impl Node {
     }
 
     pub(crate) fn init(&self) {
-        assert_eq!(self.runq_polling.load(Ordering::Relaxed), 0);
+        assert_eq!(self.runq_polling.load(Ordering::SeqCst), 0);
         let runq_stub_ptr = self.runq_stub_ptr();
         self.runq_stub_next.set(None);
         self.runq_head
-            .store(runq_stub_ptr as usize, Ordering::Relaxed);
+            .store(runq_stub_ptr as usize, Ordering::SeqCst);
         self.runq_tail.set(NonNull::new(runq_stub_ptr).unwrap());
     }
 
     pub(crate) fn deinit(&self) {
-        assert_eq!(self.workers_active.load(Ordering::Relaxed), 0);
+        assert_eq!(self.workers_active.load(Ordering::SeqCst), 0);
         assert_eq!(
             IdleState::Shutdown,
-            IdleState::decode(self.idle_queue.load(Ordering::Relaxed)).0,
+            IdleState::decode(self.idle_queue.load(Ordering::SeqCst)).0,
         );
 
         let runq_stub_ptr = self.runq_stub_ptr();
-        assert_eq!(self.runq_polling.load(Ordering::Relaxed), 0);
+        assert_eq!(self.runq_polling.load(Ordering::SeqCst), 0);
         assert_eq!(
-            self.runq_head.load(Ordering::Relaxed),
+            self.runq_head.load(Ordering::SeqCst),
             runq_stub_ptr as usize
         );
     }
@@ -195,7 +195,7 @@ impl Node {
             .workers()
             .iter()
             .filter_map(|worker| {
-                let ptr = worker.ptr.load(Ordering::Acquire);
+                let ptr = worker.ptr.load(Ordering::SeqCst);
                 match WorkerRef::from(ptr) {
                     WorkerRef::Thread(thread) => {
                         Some(unsafe { Pin::new_unchecked(&*thread.as_ptr()) })
@@ -244,7 +244,7 @@ impl Node {
     }
 
     unsafe fn resume_worker(&self, was_waking: bool) -> Option<ResumeResult> {
-        let mut idle_queue = self.idle_queue.load(Ordering::Relaxed);
+        let mut idle_queue = self.idle_queue.load(Ordering::SeqCst);
         loop {
             let (mut idle_state, mut worker_index, aba_tag) = IdleState::decode(idle_queue);
 
@@ -264,7 +264,7 @@ impl Node {
             let resume_item = if let Some(index) = worker_index {
                 let (worker, worker_ref) = {
                     let worker = &self.workers()[index.get() - 1];
-                    let worker_ref = WorkerRef::from(worker.ptr.load(Ordering::Acquire));
+                    let worker_ref = WorkerRef::from(worker.ptr.load(Ordering::SeqCst));
                     (NonNull::from(worker), worker_ref)
                 };
 
@@ -292,8 +292,8 @@ impl Node {
             if let Err(e) = self.idle_queue.compare_exchange_weak(
                 idle_queue,
                 idle_state.encode(worker_index, aba_tag),
-                Ordering::Acquire,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 idle_queue = e;
                 spin_loop_hint();
@@ -306,7 +306,7 @@ impl Node {
             };
 
             let mut first_in_cluster = false;
-            let first_in_node = self.workers_active.fetch_add(1, Ordering::AcqRel) == 0;
+            let first_in_node = self.workers_active.fetch_add(1, Ordering::SeqCst) == 0;
             if first_in_node {
                 let scheduler = self
                     .scheduler
@@ -314,7 +314,7 @@ impl Node {
                 first_in_cluster = scheduler
                     .as_ref()
                     .nodes_active
-                    .fetch_add(1, Ordering::Acquire)
+                    .fetch_add(1, Ordering::SeqCst)
                     == 0;
             }
 
@@ -356,9 +356,9 @@ impl Node {
 
         let worker = thread.worker.as_ref();
         let worker_ref = WorkerRef::Thread(NonNull::from(thread));
-        worker.ptr.store(worker_ref.into(), Ordering::Release);
+        worker.ptr.store(worker_ref.into(), Ordering::SeqCst);
 
-        let mut idle_queue = self.idle_queue.load(Ordering::Relaxed);
+        let mut idle_queue = self.idle_queue.load(Ordering::SeqCst);
         loop {
             let (mut idle_state, mut worker_index, aba_tag) = IdleState::decode(idle_queue);
 
@@ -377,8 +377,8 @@ impl Node {
             if let Err(e) = self.idle_queue.compare_exchange_weak(
                 idle_queue,
                 idle_state.encode(worker_index, aba_tag.wrapping_add(1)),
-                Ordering::Release,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 idle_queue = e;
                 spin_loop_hint();
@@ -390,7 +390,7 @@ impl Node {
                 return SuspendResult::Notified;
             }
 
-            let last_in_node = self.workers_active.fetch_sub(1, Ordering::Release) == 1;
+            let last_in_node = self.workers_active.fetch_sub(1, Ordering::SeqCst) == 1;
             let last_in_cluster = last_in_node && {
                 let scheduler = self
                     .scheduler
@@ -399,7 +399,7 @@ impl Node {
                 scheduler
                     .as_ref()
                     .nodes_active
-                    .fetch_sub(1, Ordering::Relaxed)
+                    .fetch_sub(1, Ordering::SeqCst)
                     == 1
             };
 
@@ -412,7 +412,7 @@ impl Node {
 
     pub(crate) unsafe fn shutdown(&self) -> Option<NonZeroUsize> {
         let idle_queue = IdleState::Shutdown.encode(None, 0);
-        let idle_queue = self.idle_queue.swap(idle_queue, Ordering::AcqRel);
+        let idle_queue = self.idle_queue.swap(idle_queue, Ordering::SeqCst);
         let (idle_state, mut worker_index, _aba_tag) = IdleState::decode(idle_queue);
 
         assert_eq!(idle_state, IdleState::Waking);
@@ -422,7 +422,7 @@ impl Node {
 
         while let Some(index) = worker_index {
             let worker = &workers[index.get() - 1];
-            match WorkerRef::from(worker.ptr.load(Ordering::Acquire)) {
+            match WorkerRef::from(worker.ptr.load(Ordering::SeqCst)) {
                 WorkerRef::Node(_) => {
                     unreachable!(
                         "Node::shutdown() when worker {} is spawning",
@@ -446,7 +446,7 @@ impl Node {
 
                     thread.state.set(ThreadState::Shutdown.encode(0, 0));
                     let worker_ref = WorkerRef::ThreadId(thread.id.get());
-                    worker.ptr.store(worker_ref.into(), Ordering::Release);
+                    worker.ptr.store(worker_ref.into(), Ordering::SeqCst);
 
                     thread.next_index.set(idle_threads);
                     idle_threads = NonZeroUsize::new(thread as *const _ as usize);
@@ -459,10 +459,10 @@ impl Node {
     }
 
     pub(crate) fn try_acquire_polling(&self) -> Option<NodePoller<'_>> {
-        match self.runq_polling.load(Ordering::Relaxed) {
+        match self.runq_polling.load(Ordering::SeqCst) {
             0 => self
                 .runq_polling
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                 .ok()
                 .map(|_| NodePoller { node: self }),
             1 => None,
@@ -485,13 +485,13 @@ impl Node {
 
             let prev_ptr = self
                 .runq_head
-                .swap(tail.as_ptr() as usize, Ordering::AcqRel);
+                .swap(tail.as_ptr() as usize, Ordering::SeqCst);
 
             (prev_ptr as *const Task)
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("Node::push() with null runq_head"))
                 .next
-                .store(head.as_ptr() as usize, Ordering::Release);
+                .store(head.as_ptr() as usize, Ordering::SeqCst);
         }
     }
 }
@@ -502,7 +502,7 @@ pub(crate) struct NodePoller<'a> {
 
 impl<'a> Drop for NodePoller<'a> {
     fn drop(&mut self) {
-        self.node.runq_polling.store(0, Ordering::Release);
+        self.node.runq_polling.store(0, Ordering::SeqCst);
     }
 }
 
@@ -512,13 +512,13 @@ impl<'a> Iterator for NodePoller<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
             let mut tail = self.node.runq_tail.get();
-            let mut next = NonNull::new(tail.as_ref().next.load(Ordering::Acquire) as *mut Task);
+            let mut next = NonNull::new(tail.as_ref().next.load(Ordering::SeqCst) as *mut Task);
 
             let runq_stub_ptr = self.node.runq_stub_ptr() as *mut Task;
             if tail.as_ptr().eq(&runq_stub_ptr) {
                 tail = next?;
                 self.node.runq_tail.set(tail);
-                next = NonNull::new(tail.as_ref().next.load(Ordering::Acquire) as *mut Task);
+                next = NonNull::new(tail.as_ref().next.load(Ordering::SeqCst) as *mut Task);
             }
 
             if let Some(next) = next {
@@ -526,7 +526,7 @@ impl<'a> Iterator for NodePoller<'a> {
                 return Some(tail);
             }
 
-            let head = self.node.runq_head.load(Ordering::Acquire) as *mut Task;
+            let head = self.node.runq_head.load(Ordering::SeqCst) as *mut Task;
             if !tail.as_ptr().eq(&head) {
                 return None;
             }
@@ -535,7 +535,7 @@ impl<'a> Iterator for NodePoller<'a> {
                 .push(Batch::from(Pin::new_unchecked(&mut *runq_stub_ptr)));
 
             let task = tail;
-            tail = NonNull::new(tail.as_ref().next.load(Ordering::Acquire) as *mut Task)?;
+            tail = NonNull::new(tail.as_ref().next.load(Ordering::SeqCst) as *mut Task)?;
             self.node.runq_tail.set(tail);
             Some(task)
         }

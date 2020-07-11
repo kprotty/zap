@@ -20,7 +20,7 @@ async fn main() {
                 let spawned = spawned.clone();
 
                 tokio::spawn(async move {
-                    if spawned.fetch_add(1, Ordering::Relaxed) == NUM_TASKS - 1 {
+                    if spawned.fetch_add(1, Ordering::SeqCst) == NUM_TASKS - 1 {
                         tx.send(()).await.unwrap();
                     }
                 });
@@ -30,7 +30,7 @@ async fn main() {
 
     let _ = rx.recv().await.unwrap();
     assert_eq!(
-        spawned.load(Ordering::Relaxed),
+        spawned.load(Ordering::SeqCst),
         NUM_TASKS,
     );
 }

@@ -81,7 +81,7 @@ unsafe impl Sync for Thread {}
 impl Thread {
     pub fn new(id: Option<NonNull<ThreadId>>, worker: NonNull<Worker>) -> Self {
         let node = unsafe {
-            let ptr = worker.as_ref().ptr.load(Ordering::Acquire);
+            let ptr = worker.as_ref().ptr.load(Ordering::SeqCst);
             match WorkerRef::from(ptr) {
                 WorkerRef::Node(node) => node,
                 worker_ref => unreachable!("Invalid worker ptr on thread spawn {:?}", worker_ref),
@@ -118,9 +118,9 @@ impl Thread {
             );
 
             if state == ThreadState::Shutdown {
-                let tail = self.runq_tail.load(Ordering::Relaxed);
-                let head = self.runq_head.load(Ordering::Relaxed);
-                let next = self.runq_next.load(Ordering::Relaxed);
+                let tail = self.runq_tail.load(Ordering::SeqCst);
+                let head = self.runq_head.load(Ordering::SeqCst);
+                let next = self.runq_next.load(Ordering::SeqCst);
                 assert_eq!(next, 0, "Thread runq_next not empty on shutdown");
                 assert_eq!(tail, head, "Thread runq not empty {} on shutdown", tail.wrapping_sub(head));
                 return Syscall::Shutdown { id: self.id.get() };
@@ -229,7 +229,7 @@ impl Thread {
                 };
 
                 for _ in 0..workers.len() {
-                    let ptr = workers[index].ptr.load(Ordering::Acquire);
+                    let ptr = workers[index].ptr.load(Ordering::SeqCst);
                     index += 1;
                     if index == workers.len() {
                         index = 0;
@@ -263,8 +263,8 @@ impl Thread {
 
         let next_task = node_poller.next()?;
 
-        let tail = self.runq_tail.load(Ordering::Relaxed);
-        let head = self.runq_head.load(Ordering::Relaxed);
+        let tail = self.runq_tail.load(Ordering::SeqCst);
+        let head = self.runq_head.load(Ordering::SeqCst);
         let runq_size = tail.wrapping_sub(head);
         assert!(runq_size <= self.runq_buffer.len());
 
@@ -276,32 +276,32 @@ impl Thread {
                 tail.wrapping_add(1)
             });
 
-        self.runq_tail.store(new_tail, Ordering::Release);
+        self.runq_tail.store(new_tail, Ordering::SeqCst);
         Some(next_task)
     }
 
     fn poll_local(&self) -> Option<NonNull<Task>> {
-        let mut next = self.runq_next.load(Ordering::Relaxed);
+        let mut next = self.runq_next.load(Ordering::SeqCst);
         while let Some(next_task) = NonNull::new(next as *mut Task) {
             match self.runq_next.compare_exchange_weak(
                 next,
                 0,
-                Ordering::Acquire,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => return Some(next_task),
                 Err(e) => next = e,
             }
         }
 
-        let mut head = self.runq_head.load(Ordering::Acquire);
-        let tail = self.runq_tail.load(Ordering::Relaxed);
+        let mut head = self.runq_head.load(Ordering::SeqCst);
+        let tail = self.runq_tail.load(Ordering::SeqCst);
         while tail != head {
             match self.runq_head.compare_exchange_weak(
                 head,
                 head.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => return Some(unsafe { self.read_buffer(head) }),
                 Err(e) => {
@@ -315,8 +315,8 @@ impl Thread {
     }
 
     fn poll_steal(&self, target: &Thread, steal_next: bool) -> Option<NonNull<Task>> {
-        let head = self.runq_head.load(Ordering::Relaxed);
-        let tail = self.runq_tail.load(Ordering::Relaxed);
+        let head = self.runq_head.load(Ordering::SeqCst);
+        let tail = self.runq_tail.load(Ordering::SeqCst);
         assert_eq!(
             tail,
             head,
@@ -324,21 +324,21 @@ impl Thread {
             tail.wrapping_sub(head)
         );
 
-        let mut target_head = target.runq_head.load(Ordering::Acquire);
+        let mut target_head = target.runq_head.load(Ordering::SeqCst);
         loop {
-            let target_tail = target.runq_tail.load(Ordering::Acquire);
+            let target_tail = target.runq_tail.load(Ordering::SeqCst);
 
             let steal = target_tail.wrapping_sub(target_tail);
             let steal = steal - (steal / 2);
             if steal == 0 {
                 if steal_next {
-                    let target_next = target.runq_next.load(Ordering::Relaxed);
+                    let target_next = target.runq_next.load(Ordering::SeqCst);
                     if let Some(next_task) = NonNull::new(target_next as *mut Task) {
                         match target.runq_next.compare_exchange_weak(
                             target_next,
                             0,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
                         ) {
                             Ok(_) => return Some(next_task),
                             Err(_) => continue,
@@ -361,12 +361,12 @@ impl Thread {
             match target.runq_head.compare_exchange_weak(
                 target_head,
                 target_head.wrapping_add(steal),
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => {
                     self.runq_tail
-                        .store(tail.wrapping_add(steal), Ordering::Release);
+                        .store(tail.wrapping_add(steal), Ordering::SeqCst);
                     return Some(next_task);
                 }
                 Err(e) => {
@@ -390,20 +390,20 @@ impl Thread {
             if task.as_ref().priority() == Priority::Lifo {
                 match self
                     .runq_next
-                    .swap(task.as_ptr() as usize, Ordering::AcqRel)
+                    .swap(task.as_ptr() as usize, Ordering::SeqCst)
                 {
                     0 => return,
                     ptr => task = NonNull::from(&*(ptr as *mut Task)),
                 }
             }
 
-            let mut head = self.runq_head.load(Ordering::Acquire);
-            let tail = self.runq_tail.load(Ordering::Relaxed);
+            let mut head = self.runq_head.load(Ordering::SeqCst);
+            let tail = self.runq_tail.load(Ordering::SeqCst);
             loop {
                 if tail.wrapping_sub(head) < self.runq_buffer.len() {
                     self.write_buffer(tail, task);
                     self.runq_tail
-                        .store(tail.wrapping_add(1), Ordering::Release);
+                        .store(tail.wrapping_add(1), Ordering::SeqCst);
                     return;
                 }
 
@@ -411,8 +411,8 @@ impl Thread {
                 if let Err(e) = self.runq_head.compare_exchange_weak(
                     head,
                     head.wrapping_add(steal),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
                 ) {
                     spin_loop_hint();
                     head = e;

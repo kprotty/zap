@@ -93,7 +93,7 @@ impl Scheduler {
     pub unsafe fn finish<'a>(
         self: Pin<&'a mut Self>,
     ) -> impl Iterator<Item = NonNull<ThreadId>> + 'a {
-        assert_eq!(self.nodes_active.load(Ordering::Relaxed), 0);
+        assert_eq!(self.nodes_active.load(Ordering::SeqCst), 0);
 
         Pin::into_inner_unchecked(self)
             .node_cluster
@@ -102,7 +102,7 @@ impl Scheduler {
                 let node = Pin::into_inner_unchecked(node);
                 node.deinit();
                 node.workers().iter().filter_map(|worker| {
-                    let ptr = worker.ptr.load(Ordering::Acquire);
+                    let ptr = worker.ptr.load(Ordering::SeqCst);
                     match WorkerRef::from(ptr) {
                         WorkerRef::Worker(_) => None,
                         WorkerRef::ThreadId(tid) => tid,

@@ -84,14 +84,31 @@ impl IdleState {
 #[derive(Debug)]
 pub(crate) enum ResumeResult {
     Notified,
-    Spawn(NonNull<Worker>),
-    Resume(NonNull<Thread>),
+    Spawn {
+        worker: NonNull<Worker>,
+        first_in_node: bool,
+        first_in_cluster: bool,
+    },
+    Resume {
+        thread: NonNull<Thread>,
+        first_in_node: bool,
+        first_in_cluster: bool,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum SuspendResult {
+    Notified,
+    Suspended {
+        last_in_node: bool,
+        last_in_cluster: bool,
+    },
 }
 
 #[repr(align(4))]
 pub struct Node {
     _pinned: PhantomPinned,
-    next: Option<NonNull<Self>>,
+    pub(crate) next: Option<NonNull<Self>>,
     scheduler: Option<NonNull<Scheduler>>,
     workers_ptr: Option<NonNull<Worker>>,
     workers_len: usize,
@@ -244,7 +261,7 @@ impl Node {
                 }
             }
 
-            let resume_result = if let Some(index) = worker_index {
+            let resume_item = if let Some(index) = worker_index {
                 let (worker, worker_ref) = {
                     let worker = &self.workers()[index.get() - 1];
                     let worker_ref = WorkerRef::from(worker.ptr.load(Ordering::Acquire));
@@ -260,16 +277,16 @@ impl Node {
                     }
                     WorkerRef::Thread(thread) => {
                         worker_index = thread.as_ref().next_index.get();
-                        ResumeResult::Resume(thread)
+                        Some(Ok(thread))
                     }
                     WorkerRef::Worker(next_worker) => {
                         worker_index = next_worker.map(|w| self.worker_index_of(w));
-                        ResumeResult::Spawn(worker)
+                        Some(Err(worker))
                     }
                 }
             } else {
                 idle_state = IdleState::Notified;
-                ResumeResult::Notified
+                None
             };
 
             if let Err(e) = self.idle_queue.compare_exchange_weak(
@@ -283,34 +300,52 @@ impl Node {
                 continue;
             }
 
-            let new_active_worker = match resume_result {
-                ResumeResult::Notified => false,
-                ResumeResult::Resume(thread) => {
-                    let thread = thread.as_ref();
-                    let (_, tick, rng) = ThreadState::decode(thread.state.get());
-                    thread.state.set(ThreadState::Waking.encode(tick, rng));
-                    true
-                }
-                ResumeResult::Spawn(mut worker) => {
-                    let new_worker_ref = WorkerRef::Node(NonNull::from(self));
-                    *worker.as_mut().ptr.get_mut() = new_worker_ref.into();
-                    true
-                }
+            let resume_item = match resume_item {
+                None => return Some(ResumeResult::Notified),
+                Some(resume_item) => resume_item,
             };
 
-            if new_active_worker && self.workers_active.fetch_add(1, Ordering::AcqRel) == 0 {
-                self.scheduler
-                    .expect("Node::resume_worker() without a scheduler")
+            let mut first_in_cluster = false;
+            let first_in_node = self.workers_active.fetch_add(1, Ordering::AcqRel) == 0;
+            if first_in_node {
+                let scheduler = self
+                    .scheduler
+                    .expect("Node::resume_worker() without a scheduler");
+                first_in_cluster = scheduler
                     .as_ref()
                     .nodes_active
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Acquire)
+                    == 0;
             }
 
-            return Some(resume_result);
+            return Some(match resume_item {
+                Ok(thread) => {
+                    let thread_ref = thread.as_ref();
+                    let (state, tick, rng) = ThreadState::decode(thread_ref.state.get());
+                    assert_eq!(state, ThreadState::Suspended);
+
+                    thread_ref.next_index.set(None);
+                    thread_ref.state.set(ThreadState::Waking.encode(tick, rng));
+                    ResumeResult::Resume {
+                        thread,
+                        first_in_node,
+                        first_in_cluster,
+                    }
+                }
+                Err(mut worker) => {
+                    let worker_ref = WorkerRef::Node(NonNull::from(self));
+                    *worker.as_mut().ptr.get_mut() = worker_ref.into();
+                    ResumeResult::Spawn {
+                        worker,
+                        first_in_node,
+                        first_in_cluster,
+                    }
+                }
+            });
         }
     }
 
-    pub(crate) unsafe fn suspend_worker(&self, thread: &Thread) -> Option<ShutdownThreadIter> {
+    pub(crate) unsafe fn suspend_worker(&self, thread: &Thread) -> SuspendResult {
         let (old_thread_state, tick, rng) = ThreadState::decode(thread.state.get());
         thread.state.set(ThreadState::Suspended.encode(tick, rng));
         assert_ne!(
@@ -338,7 +373,7 @@ impl Node {
             if old_thread_state == ThreadState::Waking {
                 idle_state = IdleState::Ready;
             }
-            
+
             if let Err(e) = self.idle_queue.compare_exchange_weak(
                 idle_queue,
                 idle_state.encode(worker_index, aba_tag.wrapping_add(1)),
@@ -352,28 +387,30 @@ impl Node {
 
             if old_idle_state == IdleState::Notified {
                 thread.state.set(old_thread_state.encode(tick, rng));
+                return SuspendResult::Notified;
             }
 
-            if self.workers_active.fetch_sub(1, Ordering::Release) == 1 {
+            let last_in_node = self.workers_active.fetch_sub(1, Ordering::Release) == 1;
+            let last_in_cluster = last_in_node && {
                 let scheduler = self
                     .scheduler
                     .expect("Node::suspend_worker() without a scheduler");
 
-                let scheduler = scheduler.as_ref();
-                if scheduler.nodes_active.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    return Some(ShutdownThreadIter {
-                        idle_threads: None,
-                        node: NonNull::from(self),
-                        count: scheduler.node_cluster.len(),
-                    });
-                }
-            }
+                scheduler
+                    .as_ref()
+                    .nodes_active
+                    .fetch_sub(1, Ordering::Relaxed)
+                    == 1
+            };
 
-            return None;
+            return SuspendResult::Suspended {
+                last_in_node,
+                last_in_cluster,
+            };
         }
     }
 
-    unsafe fn shutdown(&self) -> Option<NonZeroUsize> {
+    pub(crate) unsafe fn shutdown(&self) -> Option<NonZeroUsize> {
         let idle_queue = IdleState::Shutdown.encode(None, 0);
         let idle_queue = self.idle_queue.swap(idle_queue, Ordering::AcqRel);
         let (idle_state, mut worker_index, _aba_tag) = IdleState::decode(idle_queue);
@@ -501,41 +538,6 @@ impl<'a> Iterator for NodePoller<'a> {
             tail = NonNull::new(tail.as_ref().next.load(Ordering::Acquire) as *mut Task)?;
             self.node.runq_tail.set(tail);
             Some(task)
-        }
-    }
-}
-
-pub(crate) struct ShutdownThreadIter {
-    idle_threads: Option<NonZeroUsize>,
-    node: NonNull<Node>,
-    count: usize,
-}
-
-impl Iterator for ShutdownThreadIter {
-    type Item = NonNull<Thread>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.count == 0 {
-                return None;
-            }
-
-            if let Some(thread_ptr) = self.idle_threads {
-                let thread = unsafe { &*(thread_ptr.get() as *const Thread) };
-                self.idle_threads = thread.next_index.get();
-                return Some(NonNull::from(thread));
-            }
-
-            let this_node = self.node;
-            unsafe {
-                let new_node = this_node
-                    .as_ref()
-                    .next
-                    .expect("encountered Node with null link");
-                self.idle_threads = new_node.as_ref().shutdown();
-                self.node = new_node;
-                self.count -= 1;
-            };
         }
     }
 }

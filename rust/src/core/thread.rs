@@ -1,19 +1,38 @@
-use super::{Worker, WorkerRef, Node, Task};
+use super::{Batch, Node, Priority, Task, Worker, WorkerRef, SuspendResult, ResumeResult};
 use crate::sync::CachePadded;
 use core::{
-    pin::Pin,
     cell::Cell,
-    num::NonZeroUsize,
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
     mem::MaybeUninit,
+    num::NonZeroUsize,
+    pin::Pin,
+    ptr::{self, NonNull},
+    marker::PhantomPinned,
+    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
 };
 
 #[repr(C, align(4))]
 pub struct ThreadId;
 
 #[derive(Debug)]
-pub enum Syscall {}
+pub enum Syscall {
+    Shutdown {
+        id: Option<NonNull<ThreadId>>,
+    },
+    Spawn {
+        worker: NonNull<Worker>,
+        first_in_node: bool,
+        first_in_cluster: bool,
+    },
+    Resume {
+        thread: NonNull<Thread>,
+        first_in_node: bool,
+        first_in_cluster: bool,
+    },
+    Suspend {
+        last_in_node: bool,
+        last_in_cluster: bool,
+    },
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ThreadState {
@@ -25,9 +44,7 @@ pub(crate) enum ThreadState {
 
 impl ThreadState {
     pub fn encode(self, tick: u8, rng: u16) -> u32 {
-        ((self as u32) << 24)
-            | ((tick as u32) << 16)
-            | (rng as u32)
+        ((self as u32) << 24) | ((tick as u32) << 16) | (rng as u32)
     }
 
     pub fn decode(state: u32) -> (Self, u8, u16) {
@@ -47,6 +64,7 @@ impl ThreadState {
 
 #[repr(C)]
 pub struct Thread {
+    _pinned: PhantomPinned,
     pub(crate) state: Cell<u32>,
     pub(crate) worker: NonNull<Worker>,
     pub(crate) id: Cell<Option<NonNull<ThreadId>>>,
@@ -61,10 +79,7 @@ pub struct Thread {
 unsafe impl Sync for Thread {}
 
 impl Thread {
-    pub fn new(
-        id: Option<NonNull<ThreadId>>,
-        worker: NonNull<Worker>,
-    ) -> Self {
+    pub fn new(id: Option<NonNull<ThreadId>>, worker: NonNull<Worker>) -> Self {
         let node = unsafe {
             let ptr = worker.as_ref().ptr.load(Ordering::Acquire);
             match WorkerRef::from(ptr) {
@@ -78,6 +93,7 @@ impl Thread {
         let rng = ((rng * 31) >> 17) as u16;
 
         Self {
+            _pinned: PhantomPinned,
             state: Cell::new(ThreadState::Waking.encode(0, rng)),
             worker,
             id: Cell::new(id),
@@ -90,19 +106,102 @@ impl Thread {
         }
     }
 
-    pub fn run(
-        self: Pin<&Self>,
-        failed_syscall: Option<Syscall>,
-    ) -> Syscall {
-        unimplemented!("TODO")
+    pub unsafe fn run(self: Pin<&Self>) -> Syscall {
+        loop {
+            let (state, mut tick, mut rng) = ThreadState::decode(self.state.get());
+            let node = self.node.as_ref();
+
+            assert_ne!(
+                state,
+                ThreadState::Suspended,
+                "Thread::run() when suspended",
+            );
+
+            if state == ThreadState::Shutdown {
+                let tail = self.runq_tail.load(Ordering::Relaxed);
+                let head = self.runq_head.load(Ordering::Relaxed);
+                let next = self.runq_next.load(Ordering::Relaxed);
+                assert_eq!(next, 0, "Thread runq_next not empty on shutdown");
+                assert_eq!(tail, head, "Thread runq not empty {} on shutdown", tail.wrapping_sub(head));
+                return Syscall::Shutdown { id: self.id.get() };
+            }
+
+            if let Some(mut task) = self
+                .next_index
+                .get()
+                .and_then(|index| NonNull::<Task>::new(index.get() as *mut Task))
+                .or_else(|| {
+                    let (next_task, new_rng) = self.poll(tick, rng, node);
+                    self.state.set(state.encode(tick, new_rng));
+                    rng = new_rng;
+                    next_task
+                })
+            {
+                if state == ThreadState::Running {
+                    tick = tick.wrapping_add(1);
+                }
+                self.state.set(ThreadState::Running.encode(tick, rng));
+
+                if state == ThreadState::Waking {
+                    match node.stop_waking() {
+                        Some(ResumeResult::Resume {
+                            thread,
+                            first_in_node,
+                            first_in_cluster,
+                        }) => {
+                            self.next_index.set(NonZeroUsize::new(task.as_ptr() as usize));
+                            return Syscall::Resume { thread, first_in_node, first_in_cluster };
+                        }
+                        Some(ResumeResult::Spawn {
+                            worker,
+                            first_in_node,
+                            first_in_cluster,
+                        }) => {
+                            self.next_index.set(NonZeroUsize::new(task.as_ptr() as usize));
+                            return Syscall::Spawn { worker, first_in_node, first_in_cluster };
+                        }
+                        _ => {},
+                    }
+                }
+                
+                let batch = task.as_mut().run(&*self);
+                
+                self.next_index.set(None);
+                if batch.len() == 0 {
+                    continue;
+                }
+
+                self.push(node, batch);
+                match node.try_resume_some_worker() {
+                    Some(ResumeResult::Resume {
+                        thread,
+                        first_in_node,
+                        first_in_cluster,
+                    }) => {
+                        return Syscall::Resume { thread, first_in_node, first_in_cluster };
+                    }
+                    Some(ResumeResult::Spawn {
+                        worker,
+                        first_in_node,
+                        first_in_cluster,
+                    }) => {
+                        return Syscall::Spawn { worker, first_in_node, first_in_cluster };
+                    }
+                    _ => continue
+                }
+            }
+
+            match node.suspend_worker(&*self) {
+                SuspendResult::Notified => {},
+                SuspendResult::Suspended {
+                    last_in_node,
+                    last_in_cluster,
+                } => return Syscall::Suspend { last_in_node, last_in_cluster },
+            }
+        }
     }
 
-    fn poll(
-        &self,
-        tick: u8,
-        mut rng: u16,
-        node: &Node,
-    ) -> (Option<NonNull<Task>>, u16) {
+    fn poll(&self, tick: u8, mut rng: u16, node: &Node) -> (Option<NonNull<Task>>, u16) {
         if tick % 61 == 0 {
             if let Some(task) = self.poll_global(node) {
                 return (Some(task), rng);
@@ -120,7 +219,7 @@ impl Thread {
                 if let Some(task) = self.poll_global(&*target_node) {
                     return (Some(task), rng);
                 }
-                
+
                 let workers = target_node.workers();
                 let mut index = {
                     rng ^= rng << 7;
@@ -137,11 +236,10 @@ impl Thread {
                     }
 
                     match WorkerRef::from(ptr) {
-                        WorkerRef::Node(_) |
-                        WorkerRef::Worker(_) => {},
+                        WorkerRef::Node(_) | WorkerRef::Worker(_) => {}
                         WorkerRef::ThreadId(_) => {
                             unreachable!("Thread::poll() when other worker is shutting down");
-                        },
+                        }
                         WorkerRef::Thread(thread) => {
                             if (thread.as_ptr() as usize) == (self as *const _ as usize) {
                                 continue;
@@ -150,8 +248,8 @@ impl Thread {
                             let target_thread = unsafe { thread.as_ref() };
                             if let Some(task) = self.poll_steal(target_thread, steal_next) {
                                 return (Some(task), rng);
-                            } 
-                        },
+                            }
+                        }
                     }
                 }
             }
@@ -162,16 +260,183 @@ impl Thread {
 
     fn poll_global(&self, target: &Node) -> Option<NonNull<Task>> {
         let mut node_poller = target.try_acquire_polling()?;
-        unimplemented!("TODO")
+
+        let next_task = node_poller.next()?;
+
+        let tail = self.runq_tail.load(Ordering::Relaxed);
+        let head = self.runq_head.load(Ordering::Relaxed);
+        let runq_size = tail.wrapping_sub(head);
+        assert!(runq_size <= self.runq_buffer.len());
+
+        let new_tail = core::iter::repeat_with(|| node_poller.next())
+            .filter_map(|task| task)
+            .take(self.runq_buffer.len() - runq_size)
+            .fold(tail, |tail, task| unsafe {
+                self.write_buffer(tail, task);
+                tail.wrapping_add(1)
+            });
+
+        self.runq_tail.store(new_tail, Ordering::Release);
+        Some(next_task)
     }
 
     fn poll_local(&self) -> Option<NonNull<Task>> {
-        unimplemented!("TODO")
+        let mut next = self.runq_next.load(Ordering::Relaxed);
+        while let Some(next_task) = NonNull::new(next as *mut Task) {
+            match self.runq_next.compare_exchange_weak(
+                next,
+                0,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(next_task),
+                Err(e) => next = e,
+            }
+        }
+
+        let mut head = self.runq_head.load(Ordering::Acquire);
+        let tail = self.runq_tail.load(Ordering::Relaxed);
+        while tail != head {
+            match self.runq_head.compare_exchange_weak(
+                head,
+                head.wrapping_add(1),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(unsafe { self.read_buffer(head) }),
+                Err(e) => {
+                    spin_loop_hint();
+                    head = e
+                }
+            }
+        }
+
+        None
     }
 
     fn poll_steal(&self, target: &Thread, steal_next: bool) -> Option<NonNull<Task>> {
-        unimplemented!("TODO")
+        let head = self.runq_head.load(Ordering::Relaxed);
+        let tail = self.runq_tail.load(Ordering::Relaxed);
+        assert_eq!(
+            tail,
+            head,
+            "Invalid runq size on steal {}",
+            tail.wrapping_sub(head)
+        );
+
+        let mut target_head = target.runq_head.load(Ordering::Acquire);
+        loop {
+            let target_tail = target.runq_tail.load(Ordering::Acquire);
+
+            let steal = target_tail.wrapping_sub(target_tail);
+            let steal = steal - (steal / 2);
+            if steal == 0 {
+                if steal_next {
+                    let target_next = target.runq_next.load(Ordering::Relaxed);
+                    if let Some(next_task) = NonNull::new(target_next as *mut Task) {
+                        match target.runq_next.compare_exchange_weak(
+                            target_next,
+                            0,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => return Some(next_task),
+                            Err(_) => continue,
+                        }
+                    }
+                }
+                return None;
+            }
+
+            let steal = steal - 1;
+            let next_task = unsafe {
+                let first_task = target.read_buffer(target_head);
+                for offset in 0..steal {
+                    let task = target.read_buffer(target_head.wrapping_add(offset + 1));
+                    self.write_buffer(tail.wrapping_add(offset), task);
+                }
+                first_task
+            };
+
+            match target.runq_head.compare_exchange_weak(
+                target_head,
+                target_head.wrapping_add(steal),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.runq_tail
+                        .store(tail.wrapping_add(steal), Ordering::Release);
+                    return Some(next_task);
+                }
+                Err(e) => {
+                    spin_loop_hint();
+                    target_head = e;
+                }
+            }
+        }
+    }
+
+    fn push(&self, node: &Node, mut batch: Batch) {
+        if batch.len() > 1 {
+            return node.push(batch);
+        }
+
+        let mut task = batch
+            .head
+            .unwrap_or_else(|| unreachable!("Thread::push() with null empty batch"));
+
+        unsafe {
+            if task.as_ref().priority() == Priority::Lifo {
+                match self
+                    .runq_next
+                    .swap(task.as_ptr() as usize, Ordering::AcqRel)
+                {
+                    0 => return,
+                    ptr => task = NonNull::from(&*(ptr as *mut Task)),
+                }
+            }
+
+            let mut head = self.runq_head.load(Ordering::Acquire);
+            let tail = self.runq_tail.load(Ordering::Relaxed);
+            loop {
+                if tail.wrapping_sub(head) < self.runq_buffer.len() {
+                    self.write_buffer(tail, task);
+                    self.runq_tail
+                        .store(tail.wrapping_add(1), Ordering::Release);
+                    return;
+                }
+
+                let steal = self.runq_buffer.len() / 2;
+                if let Err(e) = self.runq_head.compare_exchange_weak(
+                    head,
+                    head.wrapping_add(steal),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    spin_loop_hint();
+                    head = e;
+                    continue;
+                }
+
+                for offset in 0..steal {
+                    let mut task = self.read_buffer(head.wrapping_add(offset));
+                    batch.push(Pin::new_unchecked(task.as_mut()));
+                }
+
+                node.push(batch);
+                return;
+            }
+        }
+    }
+
+    unsafe fn read_buffer(&self, index: usize) -> NonNull<Task> {
+        let buffer_slot = &self.runq_buffer[index % self.runq_buffer.len()];
+        ptr::read(buffer_slot.as_ptr())
+    }
+
+    unsafe fn write_buffer(&self, index: usize, task: NonNull<Task>) {
+        let buffer_slot = &self.runq_buffer[index % self.runq_buffer.len()];
+        ptr::write(buffer_slot.as_ptr() as *mut NonNull<Task>, task);
     }
 }
-
-

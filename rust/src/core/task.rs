@@ -1,9 +1,26 @@
 use super::Thread;
 use core::{
-    fmt, marker::PhantomPinned, mem::transmute, pin::Pin, ptr::NonNull, sync::atomic::AtomicUsize,
+    fmt,
+    marker::PhantomPinned,
+    mem::{align_of, transmute},
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::AtomicUsize,
 };
 
 pub type RunFn = extern "C" fn(&mut Task, &Thread) -> Batch;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Priority {
+    Fifo = 0,
+    Lifo = 1,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Self::Fifo
+    }
+}
 
 #[repr(C)]
 pub struct Task {
@@ -14,21 +31,30 @@ pub struct Task {
 
 impl From<RunFn> for Task {
     fn from(run_fn: RunFn) -> Self {
-        Self::new(run_fn)
+        Self::new(Priority::default(), run_fn)
     }
 }
 
 impl Task {
-    pub fn new(run_fn: RunFn) -> Self {
+    pub fn new(priority: Priority, run_fn: RunFn) -> Self {
+        assert!(align_of::<RunFn>() > 1);
         Self {
             _pinned: PhantomPinned,
             next: AtomicUsize::default(),
-            data: run_fn as usize,
+            data: (run_fn as usize) | (priority as usize),
+        }
+    }
+
+    pub fn priority(&self) -> Priority {
+        match self.data & 1 {
+            0 => Priority::Fifo,
+            1 => Priority::Lifo,
+            _ => unreachable!(),
         }
     }
 
     pub fn run(&mut self, thread: &Thread) -> Batch {
-        let run_fn: RunFn = unsafe { transmute(self.data) };
+        let run_fn: RunFn = unsafe { transmute(self.data & !1usize) };
         (run_fn)(self, thread)
     }
 }

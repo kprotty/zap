@@ -137,17 +137,17 @@ impl Node {
         }
     }
 
-    fn runq_stub_ptr(&self) -> *const Task {
-        &self.runq_stub_next as *const _ as *const Task
+    fn runq_stub_ptr(&self) -> *mut Task {
+        &self.runq_stub_next as *const _ as *mut Task
     }
 
     pub(crate) fn init(&self) {
         assert_eq!(self.runq_polling.load(Ordering::Relaxed), 0);
-        let runq_stub_ptr = self.runq_stub_ptr() as usize;
+        let runq_stub_ptr = self.runq_stub_ptr();
         self.runq_stub_next.set(None);
-        self.runq_head.store(runq_stub_ptr, Ordering::Relaxed);
-        self.runq_tail
-            .set(NonNull::from(unsafe { &*(runq_stub_ptr as *const _) }));
+        self.runq_head
+            .store(runq_stub_ptr as usize, Ordering::Relaxed);
+        self.runq_tail.set(NonNull::new(runq_stub_ptr).unwrap());
     }
 
     pub(crate) fn deinit(&self) {
@@ -169,7 +169,7 @@ impl Node {
         (unsafe { Pin::into_inner_unchecked(self) }).iter_nodes()
     }
 
-    fn iter_nodes<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Node>> + 'a {
+    pub(crate) fn iter_nodes<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Node>> + 'a {
         NodeIter::from(Some(NonNull::from(self)))
     }
 
@@ -286,7 +286,9 @@ impl Node {
             let new_active_worker = match resume_result {
                 ResumeResult::Notified => false,
                 ResumeResult::Resume(thread) => {
-                    thread.as_ref().state.set(ThreadState::Waking);
+                    let thread = thread.as_ref();
+                    let (_, tick, rng) = ThreadState::decode(thread.state.get());
+                    thread.state.set(ThreadState::Waking.encode(tick, rng));
                     true
                 }
                 ResumeResult::Spawn(mut worker) => {
@@ -308,14 +310,14 @@ impl Node {
         }
     }
 
-    pub(crate) unsafe fn suspend_worker(
-        &self,
-        thread: &Thread,
-    ) -> Option<impl Iterator<Item = NonNull<Thread>>> {
-        let old_thread_state = match thread.state.replace(ThreadState::Suspended) {
-            ThreadState::Shutdown => unreachable!("Node::suspend_worker() when thread is shutdown"),
-            thread_state => thread_state,
-        };
+    pub(crate) unsafe fn suspend_worker(&self, thread: &Thread) -> Option<ShutdownThreadIter> {
+        let (old_thread_state, tick, rng) = ThreadState::decode(thread.state.get());
+        thread.state.set(ThreadState::Suspended.encode(tick, rng));
+        assert_ne!(
+            old_thread_state,
+            ThreadState::Shutdown,
+            "Node::suspend_worker() when thread is shutdown",
+        );
 
         let worker = thread.worker.as_ref();
         let worker_ref = WorkerRef::Thread(NonNull::from(thread));
@@ -336,7 +338,7 @@ impl Node {
             if old_thread_state == ThreadState::Waking {
                 idle_state = IdleState::Ready;
             }
-
+            
             if let Err(e) = self.idle_queue.compare_exchange_weak(
                 idle_queue,
                 idle_state.encode(worker_index, aba_tag.wrapping_add(1)),
@@ -349,56 +351,20 @@ impl Node {
             }
 
             if old_idle_state == IdleState::Notified {
-                thread.state.set(old_thread_state);
+                thread.state.set(old_thread_state.encode(tick, rng));
             }
 
             if self.workers_active.fetch_sub(1, Ordering::Release) == 1 {
-                if self
+                let scheduler = self
                     .scheduler
-                    .expect("Node::suspend_worker() without a scheduler")
-                    .as_ref()
-                    .nodes_active
-                    .fetch_sub(1, Ordering::Relaxed)
-                    == 1
-                {
-                    struct ShutdownIter {
-                        thread_iter: ThreadIter,
-                        node: NonNull<Node>,
-                        count: usize,
-                    }
+                    .expect("Node::suspend_worker() without a scheduler");
 
-                    impl Iterator for ShutdownIter {
-                        type Item = NonNull<Thread>;
-
-                        fn next(&mut self) -> Option<Self::Item> {
-                            loop {
-                                if self.count == 0 {
-                                    return None;
-                                }
-
-                                if let Some(thread) = self.thread_iter.next() {
-                                    return Some(thread);
-                                }
-
-                                unsafe {
-                                    let this_node = self.node;
-                                    let new_node = this_node
-                                        .as_ref()
-                                        .iter_nodes()
-                                        .next()
-                                        .expect("Invalid node link inside ShutdownIter");
-                                    self.node = NonNull::from(&*new_node);
-                                    self.thread_iter = new_node.shutdown();
-                                    self.count -= 1;
-                                }
-                            }
-                        }
-                    }
-
-                    return Some(ShutdownIter {
-                        thread_iter: self.shutdown(),
+                let scheduler = scheduler.as_ref();
+                if scheduler.nodes_active.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    return Some(ShutdownThreadIter {
+                        idle_threads: None,
                         node: NonNull::from(self),
-                        count: self.iter_nodes().count(),
+                        count: scheduler.node_cluster.len(),
                     });
                 }
             }
@@ -407,7 +373,7 @@ impl Node {
         }
     }
 
-    unsafe fn shutdown(&self) -> ThreadIter {
+    unsafe fn shutdown(&self) -> Option<NonZeroUsize> {
         let idle_queue = IdleState::Shutdown.encode(None, 0);
         let idle_queue = self.idle_queue.swap(idle_queue, Ordering::AcqRel);
         let (idle_state, mut worker_index, _aba_tag) = IdleState::decode(idle_queue);
@@ -441,7 +407,7 @@ impl Node {
                     let thread = thread.as_ref();
                     worker_index = thread.next_index.get();
 
-                    thread.state.set(ThreadState::Shutdown);
+                    thread.state.set(ThreadState::Shutdown.encode(0, 0));
                     let worker_ref = WorkerRef::ThreadId(thread.id.get());
                     worker.ptr.store(worker_ref.into(), Ordering::Release);
 
@@ -452,7 +418,7 @@ impl Node {
         }
 
         assert_eq!(found_workers, workers.len());
-        ThreadIter(idle_threads)
+        idle_threads
     }
 
     pub(crate) fn try_acquire_polling(&self) -> Option<NodePoller<'_>> {
@@ -490,21 +456,6 @@ impl Node {
                 .next
                 .store(head.as_ptr() as usize, Ordering::Release);
         }
-    }
-}
-
-struct ThreadIter(Option<NonZeroUsize>);
-
-impl Iterator for ThreadIter {
-    type Item = NonNull<Thread>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0
-            .and_then(|index| unsafe { (index.get() as *const Thread).as_ref() })
-            .map(|thread| {
-                self.0 = thread.next_index.get();
-                NonNull::from(thread)
-            })
     }
 }
 
@@ -550,6 +501,41 @@ impl<'a> Iterator for NodePoller<'a> {
             tail = NonNull::new(tail.as_ref().next.load(Ordering::Acquire) as *mut Task)?;
             self.node.runq_tail.set(tail);
             Some(task)
+        }
+    }
+}
+
+pub(crate) struct ShutdownThreadIter {
+    idle_threads: Option<NonZeroUsize>,
+    node: NonNull<Node>,
+    count: usize,
+}
+
+impl Iterator for ShutdownThreadIter {
+    type Item = NonNull<Thread>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.count == 0 {
+                return None;
+            }
+
+            if let Some(thread_ptr) = self.idle_threads {
+                let thread = unsafe { &*(thread_ptr.get() as *const Thread) };
+                self.idle_threads = thread.next_index.get();
+                return Some(NonNull::from(thread));
+            }
+
+            let this_node = self.node;
+            unsafe {
+                let new_node = this_node
+                    .as_ref()
+                    .next
+                    .expect("encountered Node with null link");
+                self.idle_threads = new_node.as_ref().shutdown();
+                self.node = new_node;
+                self.count -= 1;
+            };
         }
     }
 }

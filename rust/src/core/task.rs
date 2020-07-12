@@ -2,9 +2,9 @@ use super::Thread;
 use core::{
     fmt,
     marker::PhantomPinned,
-    mem::{align_of, transmute},
+    mem,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::atomic::AtomicUsize,
 };
 
@@ -37,7 +37,7 @@ impl From<RunFn> for Task {
 
 impl Task {
     pub fn new(priority: Priority, run_fn: RunFn) -> Self {
-        assert!(align_of::<RunFn>() > 1);
+        assert!(mem::align_of::<RunFn>() > 1);
         Self {
             _pinned: PhantomPinned,
             next: AtomicUsize::default(),
@@ -54,7 +54,7 @@ impl Task {
     }
 
     pub fn run(&mut self, thread: &Thread) -> Batch {
-        let run_fn: RunFn = unsafe { transmute(self.data & !1usize) };
+        let run_fn: RunFn = unsafe { mem::transmute(self.data & !1usize) };
         (run_fn)(self, thread)
     }
 }
@@ -62,8 +62,7 @@ impl Task {
 #[repr(C)]
 #[derive(Default)]
 pub struct Batch {
-    pub(crate) head: Option<NonNull<Task>>,
-    pub(crate) tail: Option<NonNull<Task>>,
+    pub(crate) head_tail: Option<(NonNull<Task>, NonNull<Task>)>,
     size: usize,
 }
 
@@ -75,15 +74,14 @@ impl fmt::Debug for Batch {
 
 impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
-        let task = Some(NonNull::from(unsafe {
+        let task = NonNull::from(unsafe {
             let task = Pin::into_inner_unchecked(task);
             *task.next.get_mut() = 0;
             task
-        }));
+        });
 
         Self {
-            head: task,
-            tail: task,
+            head_tail: Some((task, task)),
             size: 1,
         }
     }
@@ -92,8 +90,7 @@ impl From<Pin<&mut Task>> for Batch {
 impl Batch {
     pub const fn new() -> Self {
         Self {
-            head: None,
-            tail: None,
+            head_tail: None,
             size: 0,
         }
     }
@@ -106,30 +103,28 @@ impl Batch {
         self.push_many(Self::from(task))
     }
 
-    pub fn push_many(&mut self, batch: Self) {
-        if let Some(batch_head) = batch.head {
-            if let Some(mut tail) = self.tail {
-                unsafe {
-                    let head_ptr = batch_head.as_ptr() as usize;
-                    *tail.as_mut().next.get_mut() = head_ptr;
+    pub fn push_many(&mut self, other: Self) {
+        if let Some((other_head, other_tail)) = other.head_tail {
+            unsafe {
+                if let Some((head, mut tail)) = self.head_tail {
+                    *tail.as_mut().next.get_mut() = other_head.as_ptr() as usize;
+                    self.head_tail = Some((head, other_tail));
+                    self.size += other.size;
+                } else {
+                    ptr::write(self, other);
                 }
-                self.tail = Some(tail);
-                self.size += batch.size;
-            } else {
-                *self = batch;
             }
         }
     }
 
     pub fn pop(&mut self) -> Option<NonNull<Task>> {
-        let mut task = self.head?;
-        self.head = unsafe {
-            let head_ptr = *task.as_mut().next.get_mut();
-            NonNull::new(head_ptr as *mut _)
-        };
-        if self.head.is_none() {
-            self.tail = None;
+        unsafe {
+            let (mut head, tail) = self.head_tail?;
+            let new_head = mem::replace(head.as_mut().next.get_mut(), 0);
+            self.head_tail = NonNull::new(new_head as *mut Task)
+                .map(|new_head| (new_head, tail));
+            self.size -= 1;
+            Some(head)
         }
-        Some(task)
     }
 }

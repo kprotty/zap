@@ -5,28 +5,27 @@ use core::{
     marker::{PhantomData, PhantomPinned},
     num::NonZeroUsize,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
 };
 
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct Cluster {
-    head: Option<NonNull<Node>>,
-    tail: Option<NonNull<Node>>,
+    head_tail: Option<(NonNull<Node>, NonNull<Node>)>,
     size: usize,
 }
 
 impl From<Pin<&mut Node>> for Cluster {
     fn from(node: Pin<&mut Node>) -> Self {
-        let node = Some(NonNull::from(unsafe {
+        let node = NonNull::from(unsafe {
             let node = Pin::into_inner_unchecked(node);
             node.next = NonNull::new(node);
             node
-        }));
+        });
+
         Self {
-            head: node,
-            tail: node,
+            head_tail: Some((node, node)),
             size: 1,
         }
     }
@@ -35,8 +34,7 @@ impl From<Pin<&mut Node>> for Cluster {
 impl Cluster {
     pub const fn new() -> Self {
         Self {
-            head: None,
-            tail: None,
+            head_tail: None,
             size: 0,
         }
     }
@@ -46,7 +44,40 @@ impl Cluster {
     }
 
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Pin<&'a Node>> + 'a {
-        NodeIter::from(self.head)
+        let head = self.head_tail.map(|(head, _)| head);
+        NodeIter::from(head)
+    }
+
+    pub fn push(&mut self, node: Pin<&mut Node>) {
+        self.push_many(Self::from(node))
+    }
+
+    pub fn push_many(&mut self, other: Self) {
+        if let Some((other_head, mut other_tail)) = other.head_tail {
+            unsafe {
+                if let Some((head, mut tail)) = self.head_tail {
+                    tail.as_mut().next = Some(other_head);
+                    other_tail.as_mut().next = Some(head);
+                    self.head_tail = Some((head, other_tail));
+                    self.size += other.size;
+                } else {
+                    ptr::write(self, other);
+                }
+            }
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<NonNull<Node>> {
+        unsafe {
+            let (mut head, tail) = self.head_tail?;
+            self.head_tail = match head.as_ref().next? {
+                new_head if new_head == tail => None,
+                new_head => Some((new_head, tail)),
+            };
+            head.as_mut().next = Some(head);
+            self.size -= 1;
+            Some(head)
+        }
     }
 }
 
@@ -471,17 +502,11 @@ impl Node {
     }
 
     pub(crate) fn push(&self, batch: Batch) {
-        if batch.len() == 0 {
-            return;
-        }
-
         unsafe {
-            let head = batch
-                .head
-                .unwrap_or_else(|| unreachable!("Node::push() with null batch head"));
-            let tail = batch
-                .tail
-                .unwrap_or_else(|| unreachable!("Node::push() with null batch tail"));
+            let (head, tail) = match batch.head_tail {
+                Some(head_tail) => head_tail,
+                None => return,
+            };
 
             let prev_ptr = self
                 .runq_head

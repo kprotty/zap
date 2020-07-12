@@ -382,9 +382,9 @@ impl Thread {
             return node.push(batch);
         }
 
-        let mut task = batch
-            .head
-            .unwrap_or_else(|| unreachable!("Thread::push() with null empty batch"));
+        let (mut task, _) = batch
+            .head_tail
+            .expect("Thread::push() with empty batch");
 
         unsafe {
             if task.as_ref().priority() == Priority::Lifo {

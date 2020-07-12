@@ -9,6 +9,6 @@ pub mod core;
 #[cfg_attr(feature = "nightly", doc(cfg(feature = "sync")))]
 pub mod sync;
 
-#[cfg(feature = "rt")]
+#[cfg(feature = "runtime")]
 #[cfg_attr(feature = "nightly", doc(cfg(feature = "rt")))]
 pub mod runtime;

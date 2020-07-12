@@ -59,8 +59,7 @@ impl Cluster {
 #[repr(C)]
 pub struct Node {
     inner: CoreNode,
-    numa_node: Option<u32>,
-    cpu_affinity: Option<(u16, u16)>,
+    numa_node: NonNull<NumaNode>,
 }
 
 impl Node {

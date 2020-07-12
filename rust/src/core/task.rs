@@ -8,7 +8,7 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 
-pub type RunFn = extern "C" fn(&mut Task, &Thread) -> Batch;
+pub type RunFn = extern "C" fn(*mut Task, *const Thread) -> Batch;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Priority {
@@ -53,9 +53,9 @@ impl Task {
         }
     }
 
-    pub fn run(&mut self, thread: &Thread) -> Batch {
-        let run_fn: RunFn = unsafe { mem::transmute(self.data & !1usize) };
-        (run_fn)(self, thread)
+    pub unsafe fn run(task: NonNull<Task>, thread: &Thread) -> Batch {
+        let run_fn: RunFn = mem::transmute(self.as_ref().data & !1usize);
+        (run_fn)(self.as_ptr(), thread)
     }
 }
 

@@ -164,31 +164,35 @@ impl Thread {
                     }
                 }
                 
-                let batch = task.as_mut().run(&*self);
+                let batch = Task::run(task, &*self);
                 
-                self.next_index.set(None);
-                if batch.len() == 0 {
-                    continue;
+                self.next_index.set(batch
+                    .pop()
+                    .and_then(|task| NonZeroUsize::new(task.as_ptr() as usize))
+                );
+
+                if batch.len() != 0 {
+                    self.push(node, batch);
+                    match node.try_resume_some_worker() {
+                        Some(ResumeResult::Resume {
+                            thread,
+                            first_in_node,
+                            first_in_cluster,
+                        }) => {
+                            return Syscall::Resume { thread, first_in_node, first_in_cluster };
+                        }
+                        Some(ResumeResult::Spawn {
+                            worker,
+                            first_in_node,
+                            first_in_cluster,
+                        }) => {
+                            return Syscall::Spawn { worker, first_in_node, first_in_cluster };
+                        }
+                        _ => {}
+                    }
                 }
 
-                self.push(node, batch);
-                match node.try_resume_some_worker() {
-                    Some(ResumeResult::Resume {
-                        thread,
-                        first_in_node,
-                        first_in_cluster,
-                    }) => {
-                        return Syscall::Resume { thread, first_in_node, first_in_cluster };
-                    }
-                    Some(ResumeResult::Spawn {
-                        worker,
-                        first_in_node,
-                        first_in_cluster,
-                    }) => {
-                        return Syscall::Spawn { worker, first_in_node, first_in_cluster };
-                    }
-                    _ => continue
-                }
+                continue;
             }
 
             match node.suspend_worker(&*self) {

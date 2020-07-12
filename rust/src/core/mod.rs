@@ -13,6 +13,8 @@ pub use thread::{Syscall, Thread, ThreadId};
 mod task;
 pub use task::{Batch, Priority, RunFn, Task};
 
+pub mod future;
+
 use core::{
     marker::PhantomPinned,
     num::NonZeroUsize,

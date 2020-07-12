@@ -7,6 +7,7 @@ authors = ["kprotty"]
 [features]
 default = []
 nightly = []
+std = []
 all = ["runtime", "sync"]
 
 os = []

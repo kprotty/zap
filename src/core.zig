@@ -18,6 +18,10 @@ pub const Platform = struct {
             return self.value;
         }
 
+        pub fn set(self: *AtomicUsize, value: usize) void {
+            self.value = value;
+        }
+
         pub fn load(
             self: *const AtomicUsize,
             comptime ordering: std.builtin.AtomicOrder,
@@ -147,7 +151,100 @@ pub fn Executor(comptime platform: Platform) type {
 
         pub const Node = extern struct {
             pub const Cluster = extern struct {
+                head: ?*Node,
+                tail: *Node,
+                size: usize,
 
+                pub fn init() Cluster {
+                    return initFrom(null);
+                }
+
+                pub fn from(node: *Node) Cluster {
+                    return initFrom(node);
+                }
+
+                fn initFrom(node: ?*Node) Cluster {
+                    return Cluster{
+                        .head = node,
+                        .tail = node orelse undefined,
+                        .size = if (node == null) 0 else 1,
+                    };
+                }
+
+                pub fn len(self: Cluster) usize {
+                    return self.size;
+                }
+
+                pub fn pushFront(noalias self: *Cluster, noalias node: *Node) void {
+                    return self.pushFrontMany(Cluster.from(node));
+                }
+
+                pub fn pushBack(noalias self: *Cluster, noalias node: *Node) void {
+                    return self.pushBackMany(Cluster.from(node));
+                }
+
+                pub fn pushFrontMany(noalias self: *Cluster, cluster: Cluster) void {
+                    return self.pushCluster(.front, cluster);
+                }
+
+                pub fn pushBackMany(noalias self: *Cluster, cluster: Cluster) void {
+                    return self.pushCluster(.back, cluster);
+                }
+                
+                const Side = enum {
+                    front,
+                    back,
+                };
+
+                fn pushCluster(self: *Cluster, side: Side, cluster: Cluster) void {
+                    const cluster_head = cluster.head orelse return;
+                    if (self.head) |head| {
+                        self.size += cluster.size;
+                        const cluster_tail = cluster.tail;
+                        cluster_tail.next = head;
+                        self.tail.next = cluster_head;
+                        switch (side) {
+                            .front => self.head = cluster_head,
+                            .back => self.tail = cluster_tail,
+                        }
+                    } else {
+                        self.* = cluster;
+                    }
+                }
+
+                pub fn popFront(noalias self: *Cluster) ?*Node {
+                    const node = self.head orelse return null;
+                    self.size -= 1;
+                    self.head = node.next;
+                    if (self.head == self.tail)
+                        self.head = null;
+                    node.next = node;
+                    return node;
+                }
+
+                pub fn iter(self: Cluster) Iter {
+                    Iter.from(self.head);
+                }
+            };
+
+            pub const Iter = extern struct {
+                start: ?*Node,
+                node: ?*Node,
+
+                fn from(node: ?*Node) Iter {
+                    return Iter{
+                        .start = node,
+                        .node = node,
+                    };
+                }
+
+                pub fn next(noalias self: *Iter) ?*Node {
+                    const node = self.node orelse return null;
+                    self.node = node.next;
+                    if (self.node == self.start)
+                        self.node = null;
+                    return node;
+                }
             };
 
             const IdleState = enum(u2) {
@@ -157,7 +254,7 @@ pub fn Executor(comptime platform: Platform) type {
                 shutdown = 0,
             };
 
-            const MAX_WORKERS = (@as(usize, 1) << (@typeInfo(usize).Int.bits - 10)) - 1;
+            const MAX_SLOTS = (@as(usize, 1) << (@typeInfo(usize).Int.bits - 10)) - 1;
 
             workers_active: AtomicUsize,
             idle_queue: AtomicUsize align(CACHE_LINE),
@@ -167,13 +264,13 @@ pub fn Executor(comptime platform: Platform) type {
             runq_next: ?*Runnable,
             next: *Node align (CACHE_LINE),
             scheduler: *Scheduler,
-            ref_ptr: [*]Worker,
-            ref_len: usize,
+            slots_ptr: [*]Thread.Slot,
+            slots_len: usize,
 
-            pub fn init(thread_refs: []Thread.Ref) Node {
+            pub fn init(slots: []Thread.Slot) Node {
                 var self: Node = undefined;
-                self.ref_ptr = thread_refs.ptr;
-                self.ref_len = std.math.min(MAX_WORKERS, thread_refs.len);
+                self.slots_ptr = slots.ptr;
+                self.slots_len = std.math.min(MAX_SLOTS, slots.len);
                 return self;
             }
 
@@ -182,7 +279,9 @@ pub fn Executor(comptime platform: Platform) type {
                 noalias scheduler: *Scheduler,
             ) void {
                 var idle_queue: usize = 0;
+                for (self.slots_ptr[0..self.slots_len]) |*slot| {
 
+                }
 
                 self.workers_active = AtomicUsize.init(0);
                 self.idle_queue = AtomicUsize.init(idle_queue);
@@ -220,8 +319,8 @@ pub fn Executor(comptime platform: Platform) type {
         };
 
         pub const Thread = extern struct {
-            pub const Ref = extern struct {
-                ptr: usize align(4),
+            pub const Slot = extern struct {
+                ptr: AtomicUsize align(4),
             };
 
             runq_head: AtomicUsize,
@@ -231,6 +330,140 @@ pub fn Executor(comptime platform: Platform) type {
             next: usize,
             node: *Node,
 
+        };
+
+        pub const Runnable = extern struct {
+            pub const Batch = extern struct {
+                head: ?*Runnable,
+                tail: *Runnable,
+                size: usize,
+
+                pub fn init() Batch {
+                    return initFrom(null);
+                }
+
+                pub fn from(runnable: *Runnable) Batch {
+                    return initFrom(runnable);
+                }
+
+                fn initFrom(runnable: ?*Runnable) Batch {
+                    if (runnable) |runnable_ref|
+                        runnable_ref.next.set(0);
+                    return Batch{
+                        .head = runnable,
+                        .tail = runnable orelse undefined,
+                        .size = if (runnable == null) 0 else 1,
+                    };
+                }
+
+                pub fn len(self: Batch) usize {
+                    return self.size;
+                }
+
+                pub fn pushFront(noalias self: *Batch, noalias runnable: *Runnable) void {
+                    return self.pushFrontMany(Batch.from(runnable));
+                }
+
+                pub fn pushBack(noalias self: *Batch, noalias runnable: *Runnable) void {
+                    return self.pushBackMany(Batch.from(runnable));
+                }
+
+                pub fn pushFrontMany(noalias self: *Batch, batch: Batch) void {
+                    return self.pushBatch(.front, batch);
+                }
+
+                pub fn pushBackMany(noalias self: *Batch, batch: Batch) void {
+                    return self.pushBatch(.back, batch);
+                }
+                
+                const Side = enum {
+                    front,
+                    back,
+                };
+
+                fn pushBatch(self: *Batch, side: Side, batch: Batch) void {
+                    const batch_head = batch.head orelse return;
+                    if (self.head) |head| {
+                        self.size += batch.size;
+                        const batch_tail = batch.tail;
+                        switch (side) {
+                            .front => {
+                                batch_tail.next.set(@ptrToInt(head));
+                                self.head = batch_head;
+                            },
+                            .back => {
+                                self.tail.next.set(@ptrToInt(batch_head));
+                                self.tail = batch_tail;
+                            },
+                        }
+                    } else {
+                        self.* = batch;
+                    }
+                }
+
+                pub fn popFront(noalias self: *Batch) ?*Runnable {
+                    const runnable = self.head orelse return null;
+                    self.size -= 1;
+                    self.head = @intToPtr(?*Runnable, runnable.next.get());
+                    return runnable;
+                }
+
+                pub fn iter(self: Batch) Iter {
+                    Iter.from(self.head);
+                }
+            };
+
+            pub const Iter = extern struct {
+                runnable: ?*Runnable,
+
+                fn from(runnable: ?*Runnable) Iter {
+                    return Iter{ .runnable = runnable };
+                }
+
+                pub fn next(noalias self: *Iter) ?*Runnable {
+                    const runnable = self.runnable orelse return null;
+                    self.runnable = @intToPtr(?*Runnable, runnable.next.get());
+                    return runnable;
+                }
+            };
+
+            pub const Context = extern struct {
+                thread: *Thread,
+
+            };
+
+            pub const Callback = fn(
+                noalias *Runnable,
+                noalias *Context,
+            ) callconv(.C) void;
+
+            pub const Hint = enum(u1) {
+                Fifo = 0,
+                Lifo = 1,
+            };
+
+            next: AtomicUsize,
+            data: usize,
+
+            pub fn init(hint: Hint, callback: Callback) Runnable {
+                return Runnable{
+                    .next = AtomicUsize.init(undefined),
+                    .data = @ptrToInt(callback) | @enumToInt(hint),
+                };
+            }
+
+            fn getHint(self: Runnable) Hint {
+                return @intToEnum(Hint, @truncate(@TagType(Hint), self.data));
+            }
+
+            pub fn run(
+                noalias self: *Runnable,
+                noalias context: *Context,
+            ) void {
+                const ptr_mask = ~@as(usize, ~@as(@TagType(Hint), 0));
+                const callback = @intToPtr(Callback, self.data & ptr_mask);
+                return (callback)(self, context);
+            }
         };
     };
 }

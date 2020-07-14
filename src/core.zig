@@ -1,120 +1,143 @@
 const std = @import("std");
 
-pub const Platform = struct {
-    thread_buffer: usize = 256,
-    cache_line: u29 = switch (std.builtin.arch) {
-        .x86_64 => 64 * 2,
-        else => 64,
-    },
-
-    pub const AtomicUsize = struct {
-        value: usize,
-
-        pub fn init(value: usize) AtomicUsize {
-            return AtomicUsize{ .value = value };
-        }
-
-        pub fn get(self: AtomicUsize) usize {
-            return self.value;
-        }
-
-        pub fn set(self: *AtomicUsize, value: usize) void {
-            self.value = value;
-        }
-
-        pub fn load(
-            self: *const AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) AtomicUsize {
-            const value = @atomicLoad(usize, &self.value, ordering);
-            return AtomicUsize{ .value = value };
-        }
-
-        pub fn store(
-            self: *AtomicUsize,
-            value: AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) void {
-            @atomicStore(usize, &self.value, value, ordering);
-        }
-
-        pub fn swap(
-            self: *AtomicUsize,
-            value: AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) AtomicUsize {
-            const new_value = @atomicRmw(usize, &self.value, .Xchg, value.get(), ordering);
-            return AtomicUsize{ .value = new_value };
-        }
-
-        pub fn fetchAdd(
-            self: *AtomicUsize,
-            value: AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) AtomicUsize {
-            const new_value = @atomicRmw(usize, &self.value, .Add, value.get(), ordering);
-            return AtomicUsize{ .value = new_value };
-        }
-
-        pub fn compareExchange(
-            self: *AtomicUsize,
-            compare: AtomicUsize,
-            exchange: AtomicUsize,
-            comptime success: std.builtin.AtomicOrder,
-            comptime failure: std.builtin.AtomicOrder,
-        ) ?AtomicUsize {
-            const new_value = @cmpxchgWeak(
-                usize,
-                &self.value,
-                compare.get(),
-                exchange.get(),
-                success,
-                failure,
-            ) orelse return null;
-            return AtomicUsize{ .value = new_value };
-        }
-
-        pub fn testAndSet(
-            self: *AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) bool {
-            return switch (std.builtin.arch) {
-                .i386 => asm volatile(
-                    \\ lock btsl $0, %[ptr]
-                    \\ setnc %[was_set]
-                    : [was_set] "=r" (-> bool),
-                    : [ptr] "*m" (ptr),
-                    : "cc", "memory"
-                ),
-                .x86_64 => asm volatile(
-                    \\ lock btsq $0, %[ptr]
-                    \\ setnc %[was_set]
-                    : [was_set] "=r" (-> bool),
-                    : [ptr] "*m" (ptr),
-                    : "cc", "memory"
-                ),
-                else => self.swap(1, ordering).get() == 0,
-            };
-        }
-
-        pub fn clear(
-            self: *AtomicUsize,
-            comptime ordering: std.builtin.AtomicOrder,
-        ) void {
-            return self.store(0, ordering);
-        }
-    };
-};
-
-pub fn Executor(comptime platform: Platform) type {
-    const AtomicUsize = platform.AtomicUsize;
-    const BUFFER_SIZE = std.math.max(1, platform.thread_buffer);
-    const CACHE_LINE = std.mem.alignForward(platform.cache_line, @alignOf(usize));
-
+pub fn Executor(comptime Platform: type) type {
     return struct {
+        const opt_cache_line = "cache_line";
+        const CACHE_LINE = switch (@hasDecl(Platform, opt_cache_line)) {
+            true => std.mem.alignForward(@field(Platform, opt_cache_line), @alignOf(usize)),
+            else => switch (std.builtin.arch) {
+                .x86_64 => 64 * 2,
+                else => 64,      
+            },
+        };
+
+        const opt_buffer_size = "thread_buffer";
+        const BUFFER_SIZE = switch (@hasDecl(Platform, opt_buffer_size)) {
+            true => std.math.max(1, @field(Platform, opt_buffer_size)),
+            else => 256,
+        };
+
+        const opt_atomic_usize = "AtomicUsize";
+        const AtomicUsize = switch (@hasDecl(Platform, opt_atomic_usize)) {
+            true => @field(Platform, opt_atomic_usize),
+            else => AtomicUsize = struct {
+                value: usize,
+
+                pub fn init(value: usize) AtomicUsize {
+                    return AtomicUsize{ .value = value };
+                }
+
+                pub fn get(self: AtomicUsize) usize {
+                    return self.value;
+                }
+
+                pub fn set(self: *AtomicUsize, value: usize) void {
+                    self.value = value;
+                }
+
+                pub fn load(
+                    self: *const AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) AtomicUsize {
+                    const value = @atomicLoad(usize, &self.value, ordering);
+                    return AtomicUsize{ .value = value };
+                }
+
+                pub fn store(
+                    self: *AtomicUsize,
+                    value: AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) void {
+                    @atomicStore(usize, &self.value, value, ordering);
+                }
+
+                pub fn swap(
+                    self: *AtomicUsize,
+                    value: AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) AtomicUsize {
+                    const new_value = @atomicRmw(usize, &self.value, .Xchg, value.get(), ordering);
+                    return AtomicUsize{ .value = new_value };
+                }
+
+                pub fn fetchAdd(
+                    self: *AtomicUsize,
+                    value: AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) AtomicUsize {
+                    const new_value = @atomicRmw(usize, &self.value, .Add, value.get(), ordering);
+                    return AtomicUsize{ .value = new_value };
+                }
+
+                pub fn fetchSub(
+                    self: *AtomicUsize,
+                    value: AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) AtomicUsize {
+                    const new_value = @atomicRmw(usize, &self.value, .Add, value.get(), ordering);
+                    return AtomicUsize{ .value = new_value };
+                }
+
+                pub fn compareExchange(
+                    self: *AtomicUsize,
+                    compare: AtomicUsize,
+                    exchange: AtomicUsize,
+                    comptime success: std.builtin.AtomicOrder,
+                    comptime failure: std.builtin.AtomicOrder,
+                ) ?AtomicUsize {
+                    const new_value = @cmpxchgWeak(
+                        usize,
+                        &self.value,
+                        compare.get(),
+                        exchange.get(),
+                        success,
+                        failure,
+                    ) orelse return null;
+                    return AtomicUsize{ .value = new_value };
+                }
+
+                pub fn testAndSet(
+                    self: *AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) bool {
+                    return switch (std.builtin.arch) {
+                        .i386 => asm volatile(
+                            \\ lock btsl $0, %[ptr]
+                            \\ setnc %[was_set]
+                            : [was_set] "=r" (-> bool),
+                            : [ptr] "*m" (ptr),
+                            : "cc", "memory"
+                        ),
+                        .x86_64 => asm volatile(
+                            \\ lock btsq $0, %[ptr]
+                            \\ setnc %[was_set]
+                            : [was_set] "=r" (-> bool),
+                            : [ptr] "*m" (ptr),
+                            : "cc", "memory"
+                        ),
+                        else => self.swap(1, ordering).get() == 0,
+                    };
+                }
+
+                pub fn clear(
+                    self: *AtomicUsize,
+                    comptime ordering: std.builtin.AtomicOrder,
+                ) void {
+                    return self.store(0, ordering);
+                }
+            },
+        };
+
+        const opt_ref = "Ref";
+        const PlatformRef = switch (@hasDecl(Platform, opt_ref)) {
+            true => @field(Platform, opt_ref),
+            else => @compileError("Platform type requires reference type in decl " ++ opt_ref),
+        };
+
         pub const Scheduler = extern struct {
             nodes_active: usize,
             node_cluster: Node.Cluster,
+            platform: PlatformRef,
 
             pub const Error = error {
                 EmptyCluster,
@@ -122,31 +145,37 @@ pub fn Executor(comptime platform: Platform) type {
                 InvalidStartingNode,
             };
 
-            pub fn init(
-                noalias self: *Scheduler,
+            pub fn run(
+                platform: PlatformRef,
                 cluster: Node.Cluster,
                 starting_node_index: usize,
                 noalias starting_runnable: *Runnable,
-            ) !*Worker {
-                if (cluster.len() == 0)
+            ) Error!void {
+                var nodes = cluster.iter();
+                if (cluster.size() == 0)
                     return error.EmptyCluster;
 
-                var start_node: ?*Node = null;
+                var self = Scheduler{
+                    .nodes_active = 0,
+                    .node_cluster = cluster,
+                    .platform = platform,
+                };
+
                 var node_index: usize = 0;
-                var node_iter = cluster.iter();
-                while (node_iter.next()) |node| {
+                var start_node: ?*Node = null;
+                while (nodes.iter()) |node| {
+                    defer node_index += 1;
+                    node.initFrom(&self);
                     if (node_index == starting_node_index)
                         start_node = node;
-                    node.initUsing(self);
-                    node_index += 1;
                 }
 
                 const starting_node = start_node orelse return error.InvalidStartingNode;
-            }
+                if (!starting_node.tryResumeSomeWorker({ .is_main_thread = true }))
+                    return error.EmptyWorkers;
 
-            pub fn deinit(
-                self: *Scheduler,
-            )
+                
+            }
         };
 
         pub const Node = extern struct {
@@ -247,14 +276,12 @@ pub fn Executor(comptime platform: Platform) type {
                 }
             };
 
-            const IdleState = enum(u2) {
-                ready = 3,
-                waking = 2,
-                notified = 1,
-                shutdown = 0,
-            };
+            const IDLE_EMPTY: usize = 0;
+            const IDLE_NOTIFIED: usize = 1;
+            const IDLE_SHUTDOWN: usize = 2;
+            const IDLE_WAKING: usize = 4;
 
-            const MAX_SLOTS = (@as(usize, 1) << (@typeInfo(usize).Int.bits - 10)) - 1;
+            const MAX_SLOTS = (@as(usize, 1) << (@typeInfo(usize).Int.bits - 11)) - 1;
 
             workers_active: AtomicUsize,
             idle_queue: AtomicUsize align(CACHE_LINE),
@@ -316,14 +343,64 @@ pub fn Executor(comptime platform: Platform) type {
                 if (runq_head != runq_stub)
                     std.debug.panic("Node.deinit() when run queue not empty", .{});
             }
+
+            fn iter(self: *Node) Iter {
+                return Iter.from(self);
+            }
+
+            const ResumeContext = struct {
+                was_waking: bool = false,
+                is_main_thread: bool = false,
+            };
+
+            fn tryResumeSomeWorker(resume_context: ResumeContext) bool {
+                var nodes = self.iter();
+                while (nodes.next()) |node| {
+                    if (node.tryResumeWorker(resume_context))
+                        return true;
+                }
+                return false;
+            }
+
+            fn tryResumeWorker(noalias self: *Node, resume_context: ResumeContext) bool {
+                
+                const was_waking = resume_context.was_waking;
+                var idle_queue = self.idle_queue.load(.Acquire);
+
+                while (true) {
+                    var aba_tag = @truncate(u8, idle_queue.get());
+                    var slot_index = idle_queue.get() >> 11;
+                    var idle_tag = idle_queue.get() >> 8;
+
+                    if (idle_tag & IDLE_SHUTDOWN != 0)
+                        std.debug.panic("Node resuming worker when shutdown", .{});
+
+                    if (!was_waking && (
+                        (idle_tag == IDLE_NOTIFIED) or
+                        (idle_tag & IDLE_WAKING != 0)
+                    )) {
+                        return;
+                    }
+
+                    var slot: ?*Thread.Slot = null;
+                    if (slot_index != 0) {
+                        slot = &self.slots_ptr[0..self.slots_len][slot_index - 1];
+                        idle_tag = 
+                    } else {
+                        idle_tag = IDLE_NOTIFIED;
+                    }
+                }
+            }
         };
 
+        
+
         pub const Thread = extern struct {
-            pub const Slot = extern struct {
+            const Slot = extern struct {
                 ptr: AtomicUsize align(4),
             };
 
-            runq_head: AtomicUsize,
+            runq_head: AtomicUsize align(4),
             runq_tail: AtomicUsize align(CACHE_LINE),
             runq_next: ?*Runnable,
             runq_buffer: [THREAD_BUFFER]*Runnable align(CACHE_LINE),

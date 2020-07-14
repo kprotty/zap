@@ -259,6 +259,8 @@ pub const Scheduler = extern struct {
             IDLE_SHUTDOWN,
             .SeqCst,
         );
+
+        var s :
         
         var num_workers: usize = 0;
         while (true) {

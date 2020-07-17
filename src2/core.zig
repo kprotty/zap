@@ -84,7 +84,7 @@ pub const Node = extern struct {
                 const scheduler = self.scheduler;
                 const nodes_active = @atomicRmw(usize, &scheduler.nodes_active, .Sub, 1, .AcqRel);
                 if (nodes_active == 1) {
-                    self.shutdown(scheduler, thread);
+                    self.shutdownAllNodes();
                     return .Shutdown;
                 }
             }
@@ -93,12 +93,43 @@ pub const Node = extern struct {
         }
     }
 
-    fn shutdown(
+    fn shutdownAllNodes(
         noalias self: *Node,
         noalias scheduler: *Scheduler,
-        noalias initiator: *Thread,
     ) void {
+        var idle_threads: ?*Thread = null;
 
+        var nodes = self.iter();
+        idle_threads = nodes.next().?.shutdown(idle_threads, true);
+        while (nodes.next()) |target_node|
+            idle_threads = remote_node.shutdown(idle_threads, false);
+
+        const schedule_fn = scheduler.schedule_fn;
+        while (idle_threads) |idle_thread| {
+            const thread = idle_thread;
+            idle_threads = @intToPtr(?*Thread, thread.next);
+            (schedule_fn)(Scheduler.ScheduleType.thread, thread);
+        }
+    }
+
+    fn shutdown(noalias self: *Node, skip_first: bool) void {
+        var found_slots: u16 = 0;
+        var idle_queue = self.idle_queue;
+        const slots = self.slots_ptr;
+
+        while (true) {
+            const slot_index = idle_queue >> 16;
+            if (slot_index == 0)
+                break;
+
+            const ptr = @atomicLoad(usize, &slots[slot_index - 1].ptr, .Acquire);
+            found_slots += 1;
+            if (ptr & 1 == 0)
+                continue;
+        }
+
+        if (found_slots != self.slots_len)
+            std.debug.panic("{}/{} idle slots on shutdown", .{found_slots, self.slots_len});
     }
 };
 

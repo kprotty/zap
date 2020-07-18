@@ -43,7 +43,7 @@ pub const Scheduler = extern struct {
     }
 
     pub fn run(config: Config, runnable: *Runnable) !void {
-        var num_workers = if (std.builtin.single_threaded) 1 else (std.Thread.cpuCount() catch 1);
+        var num_workers: usize = if (std.builtin.single_threaded) 1 else (std.Thread.cpuCount() catch 1);
         num_workers = std.math.max(1, std.math.min(config.max_workers, num_workers));
 
         if (num_workers <= 8) {
@@ -155,6 +155,9 @@ pub const Scheduler = extern struct {
                 return;
             }
 
+            if (std.builtin.single_threaded)
+                std.debug.panic("resumeThread() spawning/resume another thread besides main", .{});
+
             if (worker.thread) |thread| {
                 if (thread.state != .suspended)
                     std.debug.panic("resumeThread() with thread state {}", .{thread.state});
@@ -259,8 +262,6 @@ pub const Scheduler = extern struct {
             IDLE_SHUTDOWN,
             .SeqCst,
         );
-
-        var s :
         
         var num_workers: usize = 0;
         while (true) {
@@ -367,20 +368,12 @@ const Thread = struct {
         noalias rng_ptr: *u32,
         tick: u8, 
     ) ?*Runnable {
-        if (tick % 61 == 0) {
-            if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
-                if (self.state != .waking)
-                    scheduler.resumeThread();
-                return runnable;
-            }
-        }
-
         if (self.run_queue.tryPop()) |runnable| {
             return runnable;
         }
 
         const workers = scheduler.workers_ptr[0..scheduler.workers_len];
-        var steal_attempts: u3 = 4;
+        var steal_attempts: u3 = 2;
         while (steal_attempts != 0) : (steal_attempts -= 1) {
 
             if (self.run_queue.tryStealFromGlobal(&scheduler.run_queue)) |runnable| {
@@ -567,6 +560,10 @@ const LocalQueue = extern struct {
                 break :blk runnable_ptr;
             var next = @atomicLoad(?*Runnable, &self.next, .Acquire);
             while (true) {
+                const next_runnable = next orelse {
+                    @atomicStore(?*Runnable, &self.next, runnable_ptr, .Release);
+                    return;
+                };
                 next = @cmpxchgWeak(
                     ?*Runnable,
                     &self.next,
@@ -574,7 +571,7 @@ const LocalQueue = extern struct {
                     runnable_ptr,
                     .Acquire,
                     .Acquire,
-                ) orelse break :blk next orelse return;
+                ) orelse break :blk next_runnable;
             }
         };
 
@@ -601,6 +598,7 @@ const LocalQueue = extern struct {
                 .Acquire,
             )) |new_head| {
                 head = new_head;
+                std.SpinLock.loopHint(1);
                 continue;
             }
 
@@ -644,6 +642,7 @@ const LocalQueue = extern struct {
                 .AcqRel,
                 .Acquire,
             ) orelse return self.buffer[head % self.buffer.len];
+            std.SpinLock.loopHint(1);
         }
     }
 
@@ -711,6 +710,7 @@ const LocalQueue = extern struct {
                 @atomicStore(usize, &self.tail, new_tail, .Release);
                 return first_runnable;
             };
+            std.SpinLock.loopHint(1);
         }
     }
 
@@ -718,6 +718,8 @@ const LocalQueue = extern struct {
         noalias self: *LocalQueue,
         noalias target: *GlobalQueue,
     ) ?*Runnable {
+        if (@atomicLoad(*Runnable, &target.head, .Monotonic) == @fieldParentPtr(Runnable, "next", &target.stub_next))
+            return null;
         if (@atomicLoad(bool, &target.is_polling, .Monotonic))
             return null;
         if (@atomicRmw(bool, &target.is_polling, .Xchg, true, .Acquire))
@@ -737,7 +739,8 @@ const LocalQueue = extern struct {
             new_tail +%= 1;
         }
 
-        @atomicStore(usize, &self.tail, new_tail, .Release);
+        if (new_tail != tail)
+            @atomicStore(usize, &self.tail, new_tail, .Release);
         return first_runnable;
     }
 };

@@ -1,0 +1,5 @@
+[package]
+name = "zur"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"

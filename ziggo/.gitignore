@@ -1,0 +1,4 @@
+.vscode/
+.history/
+zig-cache/
+main.*

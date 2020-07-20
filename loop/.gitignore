@@ -1,0 +1,16 @@
+*
+!*.*
+!*/
+
+*.o
+*.obj
+*.exe
+*.pdb
+*.old
+*.data
+*.out.*
+vgcore.*
+
+.vscode/
+.history/
+zig-cache/

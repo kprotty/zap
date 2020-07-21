@@ -21,10 +21,10 @@ pub const Scheduler = extern struct {
     workers_ptr: [*]Worker align(CACHE_LINE),
     workers_len: usize,
 
-    pub fn runAsync(config: Config, comptime func: var, args: var) !@TypeOf(func).ReturnType {
+    pub fn runAsync(config: Config, comptime func: anytype, args: anytype) !@TypeOf(func).ReturnType {
         const ReturnType = @TypeOf(func).ReturnType;
         const Wrapper = struct {
-            fn call(func_args: var, task: *Task, result: *?ReturnType) void {
+            fn call(func_args: anytype, task: *Task, result: *?ReturnType) void {
                 suspend {
                     task.* = Task.init(@frame());
                 }

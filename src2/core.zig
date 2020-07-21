@@ -269,8 +269,21 @@ pub const Node = extern struct {
         return tail;
     }
 
+    fn fromWorkerIndex(noalias self: *Node, worker_index: usize) ?*Worker {
+        if (worker_index == 0)  
+            return null;
+        return &self.workers_ptr[worker_index - 1];
+    }
+
+    fn toWorkerIndex(noalias self: *Node, noalias worker: ?*Worker) usize {
+        const worker_ptr = worker orelse return 0;
+        const offset = @ptrToInt(worker_ptr) - @ptrToInt(self.workers_ptr);
+        const index = offset / @sizeOf(Worker);
+        return index - 1;
+    }
+
     const ResumeResult = union(enum) {
-        notified: void,
+        notified: bool,
         resumed: *Thread,
         spawned: *Worker,
     };
@@ -285,47 +298,233 @@ pub const Node = extern struct {
         context: ResumeContext,
     ) ?ResumeResult {
         const is_waking = context.is_waking;
+        var resume_result: ?ResumeResult = undefined;
         var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
 
         while (true) {
+            var flags = @truncate(u8, idle_queue);
+            var aba_tag = @truncate(u8, idle_queue >> 8);
+            var worker_index = @truncate(u16, idle_queue >> 16);
+
+            resume_result = null;
             if (idle_queue == IDLE_SHUTDOWN)
                 std.debug.panic("Node.tryResumeThread() when shutdown", .{});
+            
+            if (!is_waking and (flags & IDLE_WAKING != 0)) {
+                if (flags & IDLE_WAKING_NOTIFIED != 0)
+                    break;
+                flags |= IDLE_WAKING_NOTIFIED;
+                resume_result = ResumeContext{ .notified = true };
+
+            } else if (self.fromWorkerIndex(worker_index)) |worker| {
+                flags |= IDLE_WAKING;
+                const worker_ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
+                switch (Worker.Ref.decode(worker_ptr)) {
+                    .handle => std.debug.panic("Node.tryResumeThread() found shutdown worker", .{}),
+                    .node => std.debug.panic("Node.tryResumeThread() found spawning worker", .{}),
+                    .thread => |thread| {
+                        resume_result = ResumeResult{ .resumed = thread };
+                        worker_index = thread.ptr;
+                    };
+                    .worker => |next_worker| {
+                        resume_result = ResumeResult{ .spawned = worker };
+                        worker_index = self.toWorkerIndex(next_worker);
+                    },
+                };   
+            } else if (flags & IDLE_NOTIFIED == 0) {
+                flags |= IDLE_NOTIFIED;
+                resume_result = ResumeContext{ .notified = false };
+            } else {
+                break;
+            }
+
+            if (is_waking) {
+                flags &= ~@as(u8, IDLE_WAKING_NOTIFIED);
+                if (flags & IDLE_WAKING == 0)
+                    std.debug.panic("Node.tryResumeThread(is_waking) when not waking", .{});
+                if (worker_ref == null)
+                    flags &= ~@as(u8, IDLE_WAKING);
+            }
+
+            const new_idle_queue =
+                @as(usize, flags) |
+                (@as(usize, aba_tag) << 8) |
+                (@as(usize, worker_index) << 16);
+
+            if (@cmpxchgWeak(
+                usize,
+                &self.idle_queue,
+                idle_queue,
+                new_idle_queue,
+                .Acquire,
+                .Acquire,
+            )) |updated_idle_queue| {
+                idle_queue = updated_idle_queue;
+                continue;
+            }
+
+            var new_worker = true;
+            if (resume_result) |result| {
+                switch (result) {
+                    .notified => new_worker = false,
+                    .resumed => |thread| {},
+                    .spawned => |worker| {
+                        const worker_ref = Worker.Ref{ .node = self };
+                        @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
+                    },
+                }
+            }
+
+            if (new_worker) {
+                const threads_active = @atomicRmw(usize, &self.threads_active, .Add, 1, .Monotonic);
+                if (threads_active == 0) {
+                    _ = @atomicRmw(usize, &self.scheduler.nodes_active, .Add, 1, .Monotonic);
+                }
+            }
+
+            break;
         }
 
-        if (!context.is_remote) {
+        if (resume_result == null and !context.is_remote) {
             var nodes = self.iter();
             _ = nodes.next();
             while (nodes.next()) |remote_node| {
-                if (remote_node.tryResumeThread(.{
+                resume_result = remote_node.tryResumeThread(.{
                     .is_waking = is_waking,
                     .is_remote = true,
-                })) |resume_result| {
-                    return resume_result;
-                }
+                }) orelse continue;
+                break;
             }
         }
 
-        return null;
+        return resume_result;
     }
 
     fn undoResumeThread(
         noalias self: *Node,
-        ptr_type: Thread.SchedulePtr,
-        ptr: usize,
+        event_type: Thread.EventType,
+        event_ptr: usize,
     ) void {
         var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
-    }
+        while (true) {
+            var flags = @truncate(u8, idle_queue);
+            var aba_tag = @truncate(u8, idle_queue >> 8);
+            var worker_index = @truncate(u16, idle_queue >> 16);
 
-    const SuspendResult = enum {
-        suspended,
-        shutdown,
-    };
+            if (idle_queue == IDLE_SHUTDOWN)
+                std.debug.panic("Node.undoResumeThread() when shutdown", .{});
+            if (flags & IDLE_WAKING == 0)
+                std.debug.panic("Node.undoResumeThread() when not waking", .{});
+
+            switch (event_type) {
+                .@"run" => unreachable,
+                .@"spawn" => {
+                    const worker = @intToPtr(*Worker, event_ptr);
+                    const next_worker = self.fromWorkerIndex(worker_index);
+                    const worker_ref = Worker.Ref{ .worker = next_worker };
+                    @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
+                    worker_index = self.toWorkerIndex(worker);
+                },
+                .@"resume" => {
+                    const thread = @intToPtr(*Thread, event_ptr);
+                    thread.next = worker_index;
+                    worker_index = self.toWorkerIndex(thread.worker);
+                },
+            }
+
+            const new_idle_queue =
+                @as(usize, flags) |
+                (@as(usize, aba_tag +% 1) << 8) |
+                (@as(usize, worker_index) << 16);
+
+            idle_queue = @cmpxchgWeak(
+                usize,
+                &self.idle_queue,
+                idle_queue,
+                new_idle_queue,
+                .AcqRel,
+                .Monotonic,
+            ) orelse break;
+        }
+
+        const threads_active = @atomicRmw(usize, &self.threads_active, .Sub, 1, .Monotonic);
+        if (threads_active == 1) {
+            _ = @atomicRmw(usize, &self.scheduler.nodes_active, .Sub, 1, .Monotonic);
+        }
+    }
 
     fn trySuspendThread(
         noalias self: *Node,
         noalias thread: *Thread,
+        noalias worker: *Worker,
         is_waking: bool,
-    ) ?SuspendResult {
+    ) bool {
+        const old_ptr = thread.ptr;
+        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+
+        while (true) {
+            var flags = @truncate(u8, idle_queue);
+            var aba_tag = @truncate(u8, idle_queue >> 8);
+            var worker_index = @truncate(u16, idle_queue >> 16);
+
+            if (idle_queue == IDLE_SHUTDOWN)
+                std.debug.panic("Node.trySuspendThread() when shutdown", .{});
+            if (is_waking and (flags & IDLE_WAKING == 0))
+                std.debug.panic("Node.trySuspendThread(is_waking) when not waking", .{});
+
+            var is_notified = false;
+            if (is_waking and (flags & IDLE_WAKING_NOTIFIED != 0)) {
+                flags &= ~@as(u8, IDLE_WAKING_NOTIFIED);
+                is_notified = true;
+            } else if (flags & IDLE_NOTIFIED != 0) {
+                flags &= ~@as(u8, IDLE_NOTIFIED);
+                is_notified = true;
+            } else {
+                if (is_waking)
+                    flags &= ~@as(u8, IDLE_WAKING);
+                thread.ptr = worker_index;
+                worker_index = self.toWorkerIndex(worker);
+            }
+
+            const new_idle_queue =
+                @as(usize, flags) |
+                (@as(usize, aba_tag +% 1) << 8) |
+                (@as(usize, worker_index) << 16);
+
+            if (@cmpxchgWeak(
+                usize,
+                &self.idle_queue,
+                idle_queue,
+                new_idle_queue,
+                .AcqRel,
+                .Monotonic,
+            )) |updated_idle_queue| {
+                idle_queue = updated_idle_queue;
+                continue;
+            }
+
+            if (is_notified) {
+                thread.ptr = old_ptr;
+                return null;
+            }
+
+            const threads_active = @atomicRmw(usize, &self.threads_active, .Sub, 1, .Monotonic);
+            if (threads_active == 1) {
+                const nodes_active = @atomicRmw(usize, &self.scheduler.nodes_active, .Sub, 1, .Monotonic);
+                if (nodes_active == 1) {
+                    self.shutdown(@intToPtr(*Thread.EventFn, old_ptr));
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    fn shutdown(
+        noalias self: *Node,
+        noalias event_fn_ptr: *Thread.EventFn,
+    ) void {
         
     }
 };
@@ -363,12 +562,6 @@ pub const Worker = extern struct {
 
 pub const Thread = extern struct {
     pub const Handle = ?*const u32;
-
-    pub const ScheduleFn = fn(SchedulePtr, usize) callconv(.C) bool;
-    pub const SchedulePtr = extern enum {
-        worker,
-        thread,
-    };
 
     prng: u16,
     ptr: usize,
@@ -420,38 +613,29 @@ pub const Thread = extern struct {
             std.debug.panic("Thread.deinit() with {} pending runq tasks", .{tail -% head });
     }
 
-    fn resumeThread(
-        noalias self: *Thread,
-        noalias node: *Node,
-        is_waking: bool,
-    ) void {
-        if (node.tryResumeThread(.{ .is_waking = is_waking })) |resume_result| {
-            var schedule_ptr: SchedulePtr = undefined;
-            const ptr = switch (resume_result) {
-                .notified => return,
-                .spawn => |worker| blk: {
-                    schedule_ptr = .worker;
-                    break :blk @ptrToInt(worker);
-                },
-                .resume => |thread| blk: {
-                    schedule_ptr = .thread;
-                    break :blk @ptrToInt(thread);
-                },
-            };
+    pub const EventFn = fn(
+        noalias *EventFn,
+        EventType,
+        noalias *c_void,
+    ) callconv(.C) bool;
 
-            const schedule_fn = @intToPtr(ScheduleFn, self.ptr);
-            const scheduled = (schedule_fn)(schedule_ptr, ptr);
-            if (!scheduled)
-                node.undoResumeThread(schedule_ptr, ptr);
-        }
-    }
+    pub const EventType = extern enum {
+        @"run" = 0,
+        @"spawn" = 1,
+        @"resume" = 2,
+    };
+
+    pub const Poll = extern enum {
+        @"shutdown" = 0,
+        @"suspend" = 1,
+    };
 
     pub fn poll(
         noalias self: *Thread,
-        schedule_fn: ScheduleFn,
-    ) bool {
-        const worker = self.worker orelse return false;
-        self.ptr = @ptrToInt(schedule_fn);
+        noalias event_fn_ptr: *EventFn,
+    ) Poll {
+        var worker = self.worker orelse return Poll.@"shutdown";
+        self.ptr = @ptrToInt(event_fn_ptr);
         const node = self.node;
         var is_waking = true;
 
@@ -505,18 +689,22 @@ pub const Thread = extern struct {
             if (next_task) |task| {
                 if (is_waking or polled_node)
                     self.resumeThread(node, is_waking);
-                
                 is_waking = false;
-                task.run(self);
+
+                const executed = (event_fn_ptr.*)(event_fn_ptr, .@"run", @ptrToInt(task));
+                if (!executed)
+                    self.schedule(Task.Batch.from(task));
+
                 continue;
             }
 
-            if (node.trySuspendThread(self, is_waking)) |suspend_result| {
-                return switch (suspend_result) {
-                    .suspended => true,
-                    .shutdown => false,
-                };
+            if (node.trySuspendThread(self, worker, is_waking)) |last_in_scheduler| {
+                if (last_in_scheduler)
+                    return Poll.@"shutdown";
+                return Poll.@"suspend";
             }
+
+            worker = self.worker orelse return Poll.@"shutdown";
         }
     }
 
@@ -670,7 +858,7 @@ pub const Thread = extern struct {
         return first_task;
     }
 
-    pub fn schedule(noalias self: *Thread, batch: Batch) void {
+    pub fn schedule(noalias self: *Thread, batch: Task.Batch) void {
         var tasks = batch;
         const node = self.node;
         const tail = self.runq_tail;
@@ -753,6 +941,45 @@ pub const Thread = extern struct {
             node.pushBack(tasks);
 
         self.resumeThread(node, false);
+    }
+
+    fn resumeThread(
+        noalias self: *Thread,
+        noalias node: *Node,
+        is_waking: bool,
+    ) void {
+        if (node.tryResumeThread(.{ .is_waking = is_waking })) |resume_result| {
+            var event_type: EventType = undefined;
+            const event_ptr = switch (resume_result) {
+                .notified => return,
+                .spawn => |worker| blk: {
+                    event_type = .@"spawn";
+                    break :blk @ptrToInt(worker);
+                },
+                .resume => |thread| blk: {
+                    event_type = .@"resume";
+                    break :blk @ptrToInt(thread);
+                },
+            };
+
+            const event_fn_ptr = @intToPtr(*EventFn, self.ptr);
+            const success = (event_fn_ptr.*)(event_fn_ptr, event_type, event_ptr);
+            if (success)
+                return;
+
+            const resume_node = switch (event_type) {
+                .thread => @intToPtr(*Thread, ptr).node,
+                .worker => blk: {
+                    const worker_ptr = @atomicLoad(usize, &worker.ptr, .Monotonic);
+                    break :blk switch (Worker.Ref.decode(worker_ptr)) {
+                        .node => |worker_node| worker_node,
+                        .thread, .worker, .handle => std.debug.panic("Thread.resumeThread() with invalid worker", .{}),
+                    };
+                },
+            };
+
+            resume_node.undoResumeThread(event_type, event_ptr);
+        }
     }
 };
 

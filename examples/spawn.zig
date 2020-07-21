@@ -46,12 +46,12 @@ fn spawner(spawned: *usize, task: *zap.Task, frames: []@Frame(inc)) void {
 
 fn inc(spawned: *usize, task: *zap.Task, batch: *zap.Runnable.Batch) void {
     var self = zap.Task.init(@frame());
-    suspend {
-        batch.push(&self.runnable);
-    }
+    suspend batch.push(&self.runnable);
 
-    const spawned_count = @atomicRmw(usize, spawned, .Add, 1, .SeqCst);
-    if (spawned_count == num_tasks - 1) {
-        task.scheduleNext();
+    suspend {
+        const spawned_count = @atomicRmw(usize, spawned, .Add, 1, .SeqCst);
+        if (spawned_count == num_tasks - 1) {
+            task.scheduleNext();
+        }
     }
 }

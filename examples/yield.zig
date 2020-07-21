@@ -5,7 +5,7 @@ const num_tasks = 100 * 1000;
 const num_yields = 200;
 
 pub fn main() !void {
-    try (try zap.Scheduler.runAsync(.{}, asyncMain, .{}));
+    try (try zap.Scheduler.runAsync(.{.max_workers = 3}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -33,7 +33,9 @@ fn yielder(counter: *usize, task: *zap.Task) void {
         zap.Task.yield();
     }
 
-    const count = @atomicRmw(usize, counter, .Add, 1, .SeqCst);
-    if (count + 1 == num_tasks)
-        task.scheduleNext();
+    suspend {
+        const count = @atomicRmw(usize, counter, .Add, 1, .SeqCst);
+        if (count + 1 == num_tasks)
+            task.scheduleNext();
+    }
 }

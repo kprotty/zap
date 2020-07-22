@@ -1,2 +1,0 @@
-[alias]
-c = ["check", "--features=all"]

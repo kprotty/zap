@@ -32,32 +32,41 @@ pub const Scheduler = extern struct {
         self.* = undefined;
     }
 
+    pub const StartError = error {
+        EmptyNodes,
+        EmptyWorkers,
+        InvalidStartingNode,
+    };
+
     pub fn start(
         noalias self: *Scheduler,
-        noalias starting_node: *Node,
+        starting_node_index: usize,
         noalias starting_task: *Task,
-    ) !*Worker {
+    ) StartError!*Worker {
         if (self.nodes.isEmpty()) {
-            return error.EmptyNodes;
+            return StartError.EmptyNodes;
         }
 
-        var has_starting_node = false;
+        var starting_node_ptr: ?*Node = null;
+        var node_index: usize = 0;
         var nodes = self.nodes.iter();
         while (nodes.next()) |node| {
-            has_starting_node = has_starting_node || (node == starting_node);
-            node.start(self);
+            if (node_index == starting_node_index)
+                starting_node_ptr = node;
+            node.start(self); 
+            nodex_index += 1;
         }
 
-        if (!has_starting_node) {
-            return error.InvalidStartingNode;
-        }
+        const starting_node = starting_node_ptr orelse {
+            return StartError.InvalidStartingNode;
+        };
 
-        const resumt_result = starting_node.tryResumeThread(.{}) orelse {
-            return error.EmptyWorkers;
+        const resume_result = starting_node.tryResumeThread(.{}) orelse {
+            return StartError.EmptyWorkers;
         };
 
         switch (resume_result) {
-            .notified => std.debug.panic("Scheduler.start() with waking thread", .{}),
+            .notified => StartError.EmptyWorkers,
             .resume => std.debug.panic("Scheduler.start() with already spawned thread", .{}),
             .spawn => |worker| {
                 starting_node.pushBack(Task.Batch.from(starting_task));
@@ -237,14 +246,21 @@ pub const Node = extern struct {
         return Iter.from(self);
     }
 
-    fn pushBack(noalias self: *Node, batch: Task.Batch) {
+    fn pushBack(
+        noalias self: *Node,
+        batch: Task.Batch,
+    ) {
         const head = batch.head orelse return;
         const tail = batch.tail;
         const prev = @atomicRmw(*Task, &self.runq_head, .Xchg, tail, .AcqRel);
         @atomicStore(?*Task, &prev.next, head, .Release);
     }
 
-    fn popFront(noalias self: *Node, noalias runq_tail: **Task) ?*Task {
+    fn popFront(
+        noalias self: *Node,
+        noalias runq_tail: **Task,
+        noalias event_fn_ptr: *Thread.EventFn,
+    ) ?*Task {
         var tail = runq_tail.*;
         var next = @atomicLoad(?*Task, &tail.next, .Acquire);
 
@@ -260,9 +276,13 @@ pub const Node = extern struct {
             return tail;
         }
 
-        const head = @atomicLoad(*Task, &self.head, .Monotonic);
-        if (head != tail)
-            return null;
+        var head = @atomicLoad(*Task, &self.head, .Monotonic);
+        if (head != tail) {
+            _ = (event_fn_ptr.*)(event_fn_ptr, .@"yield", @enumToInt(Thread.EventYield.@"node_fifo"));
+            head = @atomicLoad(*Task, &self.head, .Monotonic);
+            if (head != tail)
+                return null;
+        }
 
         self.pushBack(Batch.from(stub));
         runq_tail.* = @atomicLoad(?*Task, &tail.next, .Acquire) orelse return null;
@@ -281,6 +301,11 @@ pub const Node = extern struct {
         const index = offset / @sizeOf(Worker);
         return index - 1;
     }
+
+    const IDLE_SHUTDOWN = ~@as(usize, 0);
+    const IDLE_WAKING = 1 << 0;
+    const IDLE_NOTIFIED = 1 << 1;
+    const IDLE_WAKING_NOTIFIED = 1 << 2;
 
     const ResumeResult = union(enum) {
         notified: bool,
@@ -512,7 +537,7 @@ pub const Node = extern struct {
             if (threads_active == 1) {
                 const nodes_active = @atomicRmw(usize, &self.scheduler.nodes_active, .Sub, 1, .Monotonic);
                 if (nodes_active == 1) {
-                    self.shutdown(@intToPtr(*Thread.EventFn, old_ptr));
+                    self.shutdown(thread, @intToPtr(*Thread.EventFn, old_ptr));
                     return true;
                 }
             }
@@ -523,9 +548,54 @@ pub const Node = extern struct {
 
     fn shutdown(
         noalias self: *Node,
+        noalias initiator: *Thread,
         noalias event_fn_ptr: *Thread.EventFn,
     ) void {
-        
+        var idle_threads: ?*Thread = null;
+        var nodes = self.iter();
+        while (nodes.next()) |node| {
+            var idle_workers: u16 = 0;
+            var idle_queue = @atomicRmw(usize, &node.idle_queue, .Xchg, IDLE_SHUTDOWN, .Acquire);
+
+            if (idle_queue == IDLE_SHUTDOWN)
+                std.debug.panic("Node.shutdown() when already shutdown", .{});
+            if (idle_queue & IDLE_WAKING != 0)
+                std.debug.panic("Node.shutdown() when a thread is waking", .{});
+            if (idle_queue & (IDLE_NOTIFIED | IDLE_WAKING_NOTIFIED) != 0)
+                std.debug.panic("Node.shutdown() when idle queue notified", .{});
+
+            const workers = node.workers_ptr;
+            var worker_index = @truncate(u16, idle_queue >> 16);
+            while (worker_index != 0) {
+                const worker = &workers_ptr[worker_index - 1];
+                switch (Worker.Ref.decode(@atomicLoad(usize, &worker.ptr, .Acquire))) {
+                    .node => std.debug.panic("Node.shutdown() when worker is spawning", .{}),
+                    .handle => std.debug.panic("Node.shutdown() when worker is already shutdown", .{}),
+                    .worker => |next_worker| {
+                        worker_index = node.toWorkerIndex(next_worker);
+                        const worker_ref = Worker.Ref{ .handle = null };
+                        @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
+                    },
+                    .thread => |thread| {
+                        thread.ptr = @ptrToInt(idle_threads);
+                        idle_threads = thread;
+                        const worker_ref = Worker.Ref{ .handle = thread.handle };
+                        @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
+                    },
+                }
+            }
+
+            if (idle_workers != node.workers_len)
+                std.debug.panic("Node.shutdown() when all workers weren't idle", .{});
+        }
+
+        const event_fn = event_fn_ptr.*;
+        while (idle_threads) |idle_thread| {
+            const thread = idle_thread;
+            thread.worker = null;
+            idle_threads = @intToPtr(?*Thread, thread.ptr);
+            (event_fn)(event_fn_ptr, initiator, .@"resume", thread);
+        }
     }
 };
 
@@ -610,19 +680,29 @@ pub const Thread = extern struct {
         if (next != null)
             std.debug.panic("Thread.deinit() with pending runq next {*}", .{next});
         if (tail != head)
-            std.debug.panic("Thread.deinit() with {} pending runq tasks", .{tail -% head });
+            std.debug.panic("Thread.deinit() with {} pending runq tasks", .{tail -% head});
     }
 
     pub const EventFn = fn(
         noalias *EventFn,
+        noalias *Thread,
         EventType,
-        noalias *c_void,
+        usize,
     ) callconv(.C) bool;
 
     pub const EventType = extern enum {
         @"run" = 0,
         @"spawn" = 1,
         @"resume" = 2,
+        @"yield" = 3,
+    };
+
+    pub const EventYield = extern enum {
+        @"poll_fifo" = 0,
+        @"poll_lifo" = 1,
+        @"node_fifo" = 2,
+        @"steal_fifo" = 3,
+        @"steal_lifo" = 4,
     };
 
     pub const Poll = extern enum {
@@ -635,10 +715,10 @@ pub const Thread = extern struct {
         noalias event_fn_ptr: *EventFn,
     ) Poll {
         var worker = self.worker orelse return Poll.@"shutdown";
-        self.ptr = @ptrToInt(event_fn_ptr);
         const node = self.node;
         var is_waking = true;
 
+        self.ptr = @ptrToInt(event_fn_ptr);
         while (true) {
             var polled_node = false;
             const next_task = blk: {
@@ -648,7 +728,7 @@ pub const Thread = extern struct {
 
                 var nodes = node.iter();
                 while (nodes.next()) |target_node| {
-                    if (self.pollNode(target_node)) |task| {
+                    if (self.pollNode(target_node, event_fn_ptr)) |task| {
                         polled_node = true;
                         break :blk task;
                     }
@@ -676,7 +756,7 @@ pub const Thread = extern struct {
                             .thread => |target_thread| {
                                 if (target_thread == self)
                                     continue;
-                                if (self.pollThread(target_thread)) |task|
+                                if (self.pollThread(target_thread, event_fn_ptr)) |task|
                                     break :blk task;
                             }
                         }
@@ -691,7 +771,7 @@ pub const Thread = extern struct {
                     self.resumeThread(node, is_waking);
                 is_waking = false;
 
-                const executed = (event_fn_ptr.*)(event_fn_ptr, .@"run", @ptrToInt(task));
+                const executed = (event_fn_ptr.*)(event_fn_ptr, self, .@"run", @ptrToInt(task));
                 if (!executed)
                     self.schedule(Task.Batch.from(task));
 
@@ -710,6 +790,7 @@ pub const Thread = extern struct {
 
     fn pollSelf(
         noalias self: *Thread,
+        noalias event_fn_ptr: *EventFn,
     ) ?*Task {
         var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
         while (runq_next) |next| {
@@ -721,6 +802,7 @@ pub const Thread = extern struct {
                 .Monotonic,
                 .Monotonic,
             ) orelse return next;
+            _ = (event_fn_ptr.*)(event_fn_ptr, .@"yield", @enumToInt(EventYield.@"poll_lifo"));
         }
 
         const tail = self.runq_tail;
@@ -740,6 +822,7 @@ pub const Thread = extern struct {
                 .Monotonic,
                 .Monotonic,
             ) orelse return self.runq_buffer[head % self.runq_buffer.len];
+            _ = (event_fn_ptr.*)(event_fn_ptr, .@"yield", @enumToInt(EventYield.@"poll_fifo"));
         }
 
         return null;
@@ -748,6 +831,7 @@ pub const Thread = extern struct {
     fn pollThread(
         noalias self: *Thread,
         noalias target: *Thread,
+        noalias event_fn_ptr: *EventFn,
     ) ?*Task {
         const tail = self.runq_tail;
         const head = @atomicLoad(usize, &self.runq_head, .Monotonic);
@@ -764,6 +848,7 @@ pub const Thread = extern struct {
             var steal = target_size - (target_size / 2);
             if (steal == 0) {
                 const target_next = @atomicLoad(?*Task, &target.runq_next, .Monotonic) orelse return null;
+                _ = (event_fn_ptr.*)(event_fn_ptr, .@"yield", @enumToInt(EventYield.@"steal_lifo"));
                 _ = @cmpxchgWeak(
                     ?*Task,
                     &target.runq_next,
@@ -795,6 +880,7 @@ pub const Thread = extern struct {
                 .Release,
                 .Acquire,
             )) |updated_target_head| {
+                _ = (event_fn_ptr.*)(event_fn_ptr, .@"yield", @enumToInt(EventYield.@"steal_fifo"));
                 target_head = updated_target_head;
                 continue;
             }
@@ -808,6 +894,7 @@ pub const Thread = extern struct {
     fn pollNode(
         noalias self: *Thread,
         noalias node: *Node,
+        noalias event_fn_ptr: *EventFn,
     ) ?*Task {
         var runq_tail = @atomicLoad(usize, &node.runq_tail, .Monotonic);
         while (true) {
@@ -824,8 +911,8 @@ pub const Thread = extern struct {
         }
 
         var node_tail = @intToPtr(*Task, runq_tail);
-        var first_task = node.popFront(&node_tail);
-        var next_task = node.popFront(&node_tail);
+        var first_task = node.popFront(&node_tail, event_fn_ptr);
+        var next_task = node.popFront(&node_tail, event_fn_ptr);
 
         const head = @atomicLoad(usize, &self.runq_head, .Monotonic);
         const tail = self.runq_tail;
@@ -835,7 +922,7 @@ pub const Thread = extern struct {
 
         var new_tail = tail;
         while (new_tail -% head < self.runq_buffer.len) {
-            const task = node.popFront(&node_tail) orelse break;
+            const task = node.popFront(&node_tail, event_fn_ptr) orelse break;
             if (first_task == null) {
                 first_task = task;
             } else {
@@ -963,7 +1050,7 @@ pub const Thread = extern struct {
             };
 
             const event_fn_ptr = @intToPtr(*EventFn, self.ptr);
-            const success = (event_fn_ptr.*)(event_fn_ptr, event_type, event_ptr);
+            const success = (event_fn_ptr.*)(event_fn_ptr, self, event_type, event_ptr);
             if (success)
                 return;
 

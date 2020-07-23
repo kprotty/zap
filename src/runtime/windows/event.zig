@@ -2,7 +2,62 @@ const std = @import("std");
 const windows = std.os.windows;
 
 pub const Event = struct {
+    state: State,
 
+    const State = enum(u32) {
+        empty,
+        waiting,
+        notified,
+    };
+
+    pub fn init(noalias self: *Event) void {
+        self.state = .empty;
+    }
+
+    pub fn deinit(noalias self: *Event) void {
+        switch (@atomicLoad(State, &self.state, .Monotonic)) {
+            .empty => self.* = undefined,
+            .waiting => std.debug.panic("Event.deinit() with pending waiter", .{}),
+            .notified => std.debug.panic("Event.deinit() with missing notification", .{}),
+        }
+    }
+
+    pub fn notify(noalias self: *Event) void {
+        if (@cmpxchgStrong(
+            State,
+            &self.state,
+            .empty,
+            .notified,
+            .Release,
+            .Monotonic,
+        )) |state| {
+            switch (state) {
+                .empty => unreachable,
+                .waiting => KeyedEvent.notify(@ptrCast(KeyedEvent.Key, &self.state)),
+                .notified => std.debug.panic("Event.notify() when already notified", .{}),
+            }
+        }
+    }
+
+    pub fn wait(noalias self: *Event) void {
+        if (@cmpxchgStrong(
+            State,
+            &self.state,
+            .empty,
+            .waiting,
+            .Acquire,
+            .Acquire,
+        )) |state| {
+            switch (state) {
+                .empty => unreachable,
+                .waiting => std.debug.panic("Event.wait() when already waiting", .{}),
+                .notified => @atomicStore(State, &self.state, .empty, .Monotonic),
+            }
+        } else {
+            KeyedEvent.wait(@ptrCast(KeyedEvent.Key, &self.state), null) catch unreachable;
+            @atomicStore(State, &self.state, .empty, .Monotonic);
+        }
+    }
 };
 
 pub const KeyedEvent = struct {

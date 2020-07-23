@@ -13,6 +13,7 @@ const system =
         struct {
             pub usingnamespace @import("./windows/time.zig");
             pub usingnamespace @import("./windows/event.zig");
+            pub usingnamespace @import("./windows/thread.zig");
         }
     else if (is_posix)
         struct {

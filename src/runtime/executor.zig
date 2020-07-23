@@ -146,9 +146,10 @@ pub const Scheduler = struct {
 
         Thread.run(null, starting_worker);
 
-        var platform_threads = scheduler.finish();
-        while (platform_threads.next()) |platform_thread| {
-            platform_thread.join();
+        var thread_handles = scheduler.finish();
+        while (thread_handles.next()) |thread_handle| {
+            const thread = @ptrCast(*platform.Thread, @alignCast(@alignOf(platform.Thread), thread_handle));
+            thread.join();
         }
     }
 };
@@ -166,7 +167,7 @@ pub const Node = struct {
     ) void {
         self.inner.init(workers);
         self.numa_node = numa_node;
-        self.stack_size = stack_size;
+        self.stack_size = platform.Thread.getStackSize(stack_size);
     }
 
     pub const Cluster = struct {
@@ -240,9 +241,13 @@ pub const Thread = struct {
             .@"spawn" => {
                 const node = @fieldParentPtr(Node, "inner", inner_thread.node);
                 const worker = @intToPtr(*Worker, event_ptr);
+                const worker_index = blk: {
+                    const offset = @ptrToInt(worker) - @ptrToInt(node.workers().ptr);
+                    break :blk (offset / @sizeOf(Worker));
+                };
                 const thread_handle = platform.Thread.spawn(
-                    node.numa_node,
-                    node.stack_size,
+                    node,
+                    worker_index,
                     Thread.run,
                     worker,
                 ) catch return false;
@@ -251,9 +256,8 @@ pub const Thread = struct {
                 const event_yield = @truncate(@TagType(core.Thread.EventYield), event_ptr);
                 switch (@intToEnum(core.Thread.EventYield, event_yield)) {
                     .@"poll_lifo" => {},
-                    .@"poll_fifo" => platform.yield(.cpu),
-                    .@"steal_lifo" => platform.sleep(3 * std.time.ns_per_us),
-                    .@"steal_fifo" => platform.yield(.cpu),
+                    .@"poll_fifo", .@"steal_fifo" => platform.yield(.cpu),
+                    .@"steal_lifo" => platform.sleep(1 * std.time.ns_per_us),
                     .@"node_fifo" => platform.yield(.os),
                 }
             }

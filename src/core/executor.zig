@@ -289,6 +289,10 @@ pub const Node = extern struct {
         return tail;
     }
 
+    pub fn workers(noalias self: *Node) []Worker {
+        return self.workers_ptr[0..self.workers_len];
+    }
+
     fn fromWorkerIndex(noalias self: *Node, worker_index: usize) ?*Worker {
         if (worker_index == 0)  
             return null;

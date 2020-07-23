@@ -155,6 +155,19 @@ pub const Scheduler = struct {
 };
 
 pub const Node = struct {
+    pub const Cluster = struct {
+        inner: core.Node.Cluster = core.Node.Cluster.init(),
+        len: usize = 0,
+
+        pub fn push(
+            noalias self: *Cluster,
+            noalias node: *Node,
+        ) void {
+            self.inner.push(&node.inner);
+            self.len += 1;
+        }
+    };
+
     inner: core.Node,
     numa_node: *platform.NumaNode,
     stack_size: usize,
@@ -170,21 +183,12 @@ pub const Node = struct {
         self.stack_size = platform.Thread.getStackSize(stack_size);
     }
 
-    pub const Cluster = struct {
-        inner: core.Node.Cluster = core.Node.Cluster.init(),
-        len: usize = 0,
-
-        pub fn push(
-            noalias self: *Cluster,
-            noalias node: *Node,
-        ) void {
-            self.inner.push(&node.inner);
-            self.len += 1;
-        }
-    };
+    pub fn workers(self: Node) []Worker {
+        return self.inner.workers();
+    }
 };
 
-pub const Worker = core.Worker'
+pub const Worker = core.Worker;
 
 pub const Thread = struct {
     threadlocal var current: ?*Thread = null;
@@ -212,6 +216,13 @@ pub const Thread = struct {
 
         self.event.init();
         defer self.event.deinit();
+
+        const node = @fieldParentPtr(Node, "inner", self.inner.node);
+        platform.Thread.bindCurrentToNodeAffinity(node, blk: {
+            const offset = @ptrToInt(worker) - @ptrToInt(node.workers().ptr);
+            const worker_index = @divFloor(offset, @sizeOf(Worker));
+            break :blk worker_index;
+        });
 
         var event_fn = on_event;
         while (true) {

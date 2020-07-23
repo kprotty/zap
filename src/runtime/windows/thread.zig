@@ -1,6 +1,7 @@
 const std = @import("std");
 const windows = std.os.windows;
 const Node = @import("./executor.zig").Node;
+const isWindowsVersionOrHigher = @import("./version.zig").isWindowsVersionOrHigher;
 
 pub const Thread = struct {
     var alloc_granularity: usize = 0;
@@ -29,28 +30,12 @@ pub const Thread = struct {
         return @intToPtr([*]align(std.mem.page_size) u8, stack_ptr)[0..stack_size]; 
     }
 
-    var _is_win_7: usize = 0;
-
-    fn isWindows7OrHigher() bool {
-        var is_win7 = @atomicLoad(usize, &_is_win_7, .Monotonic);
-        if (is_win7 != 0)
-            return is_win7 == 1;
-
-        is_win7 = 2;
-        if (IsWindows7OrGreater() != windows.FALSE)
-            is_win7 = 1;
-        
-        @atomicStore(usize, &_is_win_7, is_win7, .Monotonic);
-        return is_win7;
-    }
-    
     handle: windows.HANDLE,
     parameter: usize,
     node: *Node,
 
     pub fn spawn(
         noalias node: *Node,
-        ideal_cpu: ?usize,
         comptime func: anytype,
         parameter: anytype,
     ) !*Thread {
@@ -58,7 +43,7 @@ pub const Thread = struct {
         const Wrapper = struct {
             fn entry(raw_arg: windows.LPVOID) callconv(.C) windows.DWORD {
                 const thread = @ptrCast(*Thread, @alignCast(@alignOf(Thread), raw_arg));
-                const stack = self.getBackingMemory();
+                const stack = thread.getBackingMemory();
 
                 const param = @intToPtr(ParameterPtr, thread.parameter);
                 const handle = @ptrCast(*core.Thread.Handle, thread);
@@ -86,38 +71,6 @@ pub const Thread = struct {
             null,
         ) orelse return error.SpawnError;
 
-        const cpu_begin = node.numa_node.affinity.cpu_begin;
-        const cpu_end = node.numa_node.affinity.cpu_end;
-        const mask = blk: {
-            var mask: KAFFINITY = 0;
-            var cpu = cpu_begin;
-            while (cpu <= cpu_end and cpu < usize.bits) : (cpu += 1)
-                mask |= @as(usize, 1) << @intCast(std.math.Log2Int(usize), cpu - cpu_begin);
-            break :blk mask;
-        };
-
-        if (isWindows7OrHigher()) {
-            var group_affinity: GROUP_AFFINITY = undefined;
-            group_affinity.Group = @intCast(windows.WORD, cpu_begin / 64);
-            group_affinity.Mask = mask;
-            _ = SetThreadGroupAffinity(thread.handle, &group_affinity, null);
-
-            if (ideal_cpu) |ideal| {
-                var proc_num: PROCESSOR_NUMBER = undefined;
-                proc_num.Group = @intCast(windows.WORD, ideal / 64);
-                proc_num.Number = @intCast(windows.BYTE, ideal % 64);
-                _ = SetThreadIdealProcessorEx(thread.handle, &proc_num, null);
-            }
-
-        } else {
-            _ = SetThreadAffinityMask(thread.handle, mask);
-            if (ideal_cpu) |ideal| {
-                if (ideal < 64) {
-                    _ = SetThreadIdealProcessor(thread.handle, @intCast(windows.DWORD, ideal));
-                }
-            }
-        }
-
         return thread;
     }
 
@@ -127,6 +80,47 @@ pub const Thread = struct {
         windows.WaitForSingleObjectEx(self.handle, windows.INFINITE, false) catch unreachable;
         windows.CloseHandle(self.handle);
         self.node.numa_node.free(self.getBackingMemory());
+    }
+
+    pub fn bindCurrentToNodeAffinity(
+        noalias node: *Node,
+        ideal_cpu: ?usize,
+    ) void {
+        const thread_handle = windows.kernel32.GetCurrentThread();
+
+        const numa_node = node.numa_node;
+        const cpu_begin = numa_node.cpu_begin;
+        const cpu_end = numa_node.cpu_end;
+
+        const mask = blk: {
+            var mask: KAFFINITY = 0;
+            var cpu = cpu_begin;
+            while (cpu <= cpu_end and cpu < usize.bits) : (cpu += 1)
+                mask |= @as(usize, 1) << @intCast(std.math.Log2Int(usize), cpu - cpu_begin);
+            break :blk mask;
+        };
+
+        if (isWindowsVersionOrHigher(.win7)) {
+            var group_affinity: GROUP_AFFINITY = undefined;
+            group_affinity.Group = @intCast(windows.WORD, cpu_begin / 64);
+            group_affinity.Mask = mask;
+            _ = SetThreadGroupAffinity(thread_handle, &group_affinity, null);
+
+            if (ideal_cpu) |ideal| {
+                var proc_num: PROCESSOR_NUMBER = undefined;
+                proc_num.Group = @intCast(windows.WORD, ideal / 64);
+                proc_num.Number = @intCast(windows.BYTE, ideal % 64);
+                _ = SetThreadIdealProcessorEx(thread_handle, &proc_num, null);
+            }
+
+        } else {
+            _ = SetThreadAffinityMask(thread_handle, mask);
+            if (ideal_cpu) |ideal| {
+                if (ideal < 64) {
+                    _ = SetThreadIdealProcessor(thread_handle, @intCast(windows.DWORD, ideal));
+                }
+            }
+        }
     }
 
     const KAFFINITY = usize;
@@ -141,8 +135,6 @@ pub const Thread = struct {
         Number: windows.BYTE,
         Reserved: windows.BYTE,
     };
-
-    extern "kernel32" fn IsWindows7OrGreater() callconv(.Stdcall) windows.BOOLEAN;
 
     extern "kernel32" fn SetThreadAffinityMask(
         hThread: windows.HANDLE,

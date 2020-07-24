@@ -49,7 +49,7 @@ pub const Scheduler = struct {
         
         const Wrapper = struct {
             fn call(args: ArgsType, task: *Task, result: *?ReturnType) void {
-                suspend task.* = Task.init(.lifo, @frame());
+                suspend task.* = Task.init(@frame());
                 const ret_value = @call(.{}, func, args);
                 suspend result.* = ret_value;
             }
@@ -90,36 +90,52 @@ pub const Scheduler = struct {
             .numa => |numa_config| {
                 return runWithNuma(numa_config, runnable);
             },
+            .uma => {
+                var node: Node = undefined;
+                var workers = [_]Worker{undefined};
+                node.init(&platform.NumaNode.getTopology()[0], &workers, 0);
+
+                var cluster = Node.Cluster{};
+                cluster.push(&node);
+                const numa_config = Config.Numa{
+                    .cluster = cluster,
+                    .start_index = 0,
+                };
+
+                return runWithNuma(numa_config, runnable);
+            },
             .smp => |smp_config| {
+                const worker_offset = std.mem.alignForward(@sizeOf(Node), @alignOf(Worker));
+
                 var cluster = Node.Cluster{};
                 defer {
                     var nodes = cluster.iter();
                     while (nodes.next()) |node| {
-                        const num_workers = node.workers().len;
-                        const memory_ptr = @ptrCast([*]align(std.mem.page_size) u8, node);
+                        const num_workers = node.getWorkers().len;
+                        const memory_ptr = @ptrCast([*]align(std.mem.page_size) u8, @alignCast(std.mem.page_size, node));
                         const memory_len = worker_offset + (@sizeOf(Worker) * num_workers);
                         node.numa_node.free(memory_ptr[0..memory_len]);
                     }
                 }
 
-                const worker_offset = std.mem.alignForward(@sizeOf(Node), @alignOf(Worker));
                 var remaining_workers = std.math.max(1, smp_config.max_threads);
                 if (std.builtin.single_threaded)
                     remaining_workers = 1;
 
-                const topology = platform.NuamNode.getTopology();
+                const topology = platform.NumaNode.getTopology();
                 for (topology) |*numa_node| {
-                    const num_workers = std.math.min(numa_node.affinity.getCount(), remaining_workers);
+                    var num_workers = (numa_node.cpu_end + 1) - (numa_node.cpu_begin);
+                    num_workers = std.math.min(num_workers, remaining_workers);
                     remaining_workers -= num_workers;
-                    const bytes = worker_offset + (@sizeOf(Worker) * num_workers);
 
+                    const bytes = worker_offset + (@sizeOf(Worker) * num_workers);
                     const memory = numa_node.alloc(bytes) catch return RunError.OutOfNodeMemory;
                     const node = @ptrCast(*Node, @alignCast(@alignOf(Node), &memory[0]));
                     const workers_ptr = @ptrCast([*]Worker, @alignCast(@alignOf(Worker), &memory[worker_offset]));
 
                     const workers = workers_ptr[0..num_workers];
                     node.init(numa_node, workers, smp_config.stack_size);
-                    cluster.add(node);
+                    cluster.push(node);
                 }
 
                 const numa_config = Config.Numa{
@@ -128,7 +144,7 @@ pub const Scheduler = struct {
                 };
                 return runWithNuma(numa_config, runnable);
             },
-        };
+        }
     }
 
     fn runWithNuma(
@@ -163,8 +179,25 @@ pub const Node = struct {
             noalias self: *Cluster,
             noalias node: *Node,
         ) void {
-            self.inner.push(&node.inner);
+            self.inner.pushBack(&node.inner);
             self.len += 1;
+        }
+
+        pub fn iter(self: Cluster) Iter {
+            return Iter.from(self.inner.iter());
+        }
+    };
+
+    pub const Iter = struct {
+        inner: core.Node.Iter,
+
+        fn from(inner: core.Node.Iter) Iter {
+            return Iter{ .inner = inner };
+        }
+
+        pub fn next(noalias self: *Iter) ?*Node {
+            const inner_node = self.inner.next() orelse return null;
+            return @fieldParentPtr(Node, "inner", inner_node);
         }
     };
 
@@ -183,8 +216,12 @@ pub const Node = struct {
         self.stack_size = platform.Thread.getStackSize(stack_size);
     }
 
-    pub fn workers(self: Node) []Worker {
-        return self.inner.workers();
+    pub fn getWorkers(noalias self: *Node) []Worker {
+        return self.inner.getWorkers();
+    }
+
+    pub fn iter(noalias self: *Node) Iter {
+        return Iter.from(self.inner.iter());
     }
 };
 
@@ -211,7 +248,7 @@ pub const Thread = struct {
             .event = undefined,
         };
 
-        self.inner.init(worker, @ptrCast(?*core.Thread.Handle, handle));
+        self.inner.init(worker, @ptrCast(core.Thread.Handle, handle));
         defer self.inner.deinit();
 
         self.event.init();
@@ -219,14 +256,14 @@ pub const Thread = struct {
 
         const node = @fieldParentPtr(Node, "inner", self.inner.node);
         platform.Thread.bindCurrentToNodeAffinity(node, blk: {
-            const offset = @ptrToInt(worker) - @ptrToInt(node.workers().ptr);
+            const offset = @ptrToInt(worker) - @ptrToInt(node.getWorkers().ptr);
             const worker_index = @divFloor(offset, @sizeOf(Worker));
             break :blk worker_index;
         });
 
-        var event_fn = on_event;
+        var event_handler = core.Thread.EventHandler.init(on_event);
         while (true) {
-            switch (self.inner.poll(&event_fn)) {
+            switch (self.inner.poll(&event_handler)) {
                 .@"suspend" => self.event.wait(),
                 .@"shutdown" => break,
             }
@@ -234,7 +271,7 @@ pub const Thread = struct {
     }
 
     fn on_event(
-        noalias self: *core.Thread.EventFn,
+        noalias self: *core.Thread.EventHandler,
         noalias inner_thread: *core.Thread,
         event_type: core.Thread.EventType,
         event_ptr: usize, 
@@ -242,7 +279,7 @@ pub const Thread = struct {
         switch (event_type) {
             .@"run" => {
                 const runnable = @intToPtr(*Task.Runnable, event_ptr);
-                runnable.run();
+                runnable.run(inner_thread);
             },
             .@"resume" => {
                 const target_inner_thread = @intToPtr(*core.Thread, event_ptr);
@@ -253,18 +290,17 @@ pub const Thread = struct {
                 const node = @fieldParentPtr(Node, "inner", inner_thread.node);
                 const worker = @intToPtr(*Worker, event_ptr);
                 const worker_index = blk: {
-                    const offset = @ptrToInt(worker) - @ptrToInt(node.workers().ptr);
+                    const offset = @ptrToInt(worker) - @ptrToInt(node.getWorkers().ptr);
                     break :blk (offset / @sizeOf(Worker));
                 };
                 const thread_handle = platform.Thread.spawn(
                     node,
-                    worker_index,
                     Thread.run,
                     worker,
                 ) catch return false;
             },
             .@"yield" => {
-                const event_yield = @truncate(@TagType(core.Thread.EventYield), event_ptr);
+                const event_yield = @intCast(@TagType(core.Thread.EventYield), event_ptr);
                 switch (@intToEnum(core.Thread.EventYield, event_yield)) {
                     .@"poll_lifo" => {},
                     .@"poll_fifo", .@"steal_fifo" => platform.yield(.cpu),
@@ -285,9 +321,9 @@ pub const Task = struct {
 
     pub const Priority = Runnable.Priority;
 
-    pub fn init(priority: Priority, frame: anyframe) Task {
+    pub fn init(frame: anyframe) Task {
         return Task{
-            .runnable = Runnable.init(priority, @"resume"),
+            .runnable = Runnable.init(@"resume"),
             .frame = frame,
         };
     }
@@ -301,37 +337,52 @@ pub const Task = struct {
     }
 
     pub const Batch = extern struct {
-        inner: Runnable.Batch = Runnable.Batch.init(),
+        inner: Runnable.Batch = Runnable.Batch{},
 
-        pub fn from(noalias runnable: *Runnable) Batch {
+        pub fn from(priority: Priority, noalias task: *Task) Batch {
+            return fromRunnable(priority, &task.runnable);
+        }
+
+        pub fn fromRunnable(priority: Priority, noalias runnable: *Runnable) Batch {
+            runnable.setPriority(priority);
             return Batch{
                 .inner = Runnable.Batch.from(runnable),
             };
         }
 
-        pub fn push(noalias self: *Batch, noalias task: *Task) void {
-            return self.pushRunnable(&task.runnable);
+        pub fn push(noalias self: *Batch, priority: Priority, noalias task: *Task) void {
+            return self.pushRunnable(priority, &task.runnable);
         }
 
-        pub fn pushRunnable(noalias self: *Batch, noalias runnable: *Runnable) void {
-            return self.pushMany(Batch.from(runnable));
+        pub fn pushRunnable(noalias self: *Batch, priority: Priority, noalias runnable: *Runnable) void {
+            return self.pushMany(Batch.fromRunnable(priority, runnable));
         }
 
         pub fn pushMany(noalias self: *Batch, batch: Batch) void {
-            return self.inner.pushManyBack(batch.inner);
+            return self.inner.pushBackMany(batch.inner);
         }
 
         pub fn schedule(self: Batch) void {
-            return Thread.getCurrent().schedule(self);
+            return Thread.getCurrent().inner.schedule(self.inner);
         }
     };
 
-    pub fn schedule(noalias self: *Task) void {
-        Batch.from(&self.runnable).schedule();
+    pub fn schedule(noalias self: *Task, priority: Priority) void {
+        Batch.from(priority, self).schedule();
     }
 
     pub fn yield(priority: Priority) void {
-        var task = Task.init(priority, @frame());
-        suspend task.schedule();
+        var task = Task.init(@frame());
+        suspend {
+            task.schedule(priority);
+        }
+    }
+
+    pub fn run(
+        comptime async_func: anytype,
+        func_args: anytype,
+    ) Scheduler.RunAsyncError!@TypeOf(async_func).ReturnType {
+        const config = Scheduler.Config{ .smp = Scheduler.Config.Smp{} };
+        return Scheduler.runAsync(config, async_func, func_args);
     }
 };

@@ -70,7 +70,7 @@ pub const KeyedEvent = struct {
             .SUCCESS => {},
             else => {
                 @setEvalBranchQuota(4000);
-                std.debug.panic("KeyedEvent.notify() with unknown status {}", status);
+                std.debug.panic("KeyedEvent.notify() with unknown status {}", .{status});
             },
         };
     }
@@ -81,7 +81,7 @@ pub const KeyedEvent = struct {
         if (timeout_ns) |timeout| {
             timeout_ptr = &timeout_value;
             timeout_value = @intCast(windows.LARGE_INTEGER, timeout);
-            timeout_value /= 100;
+            timeout_value = @divFloor(timeout_value, 100);
             timeout_value = -timeout_value;
         }
 
@@ -91,7 +91,7 @@ pub const KeyedEvent = struct {
             .TIMEOUT => error.TimedOut,
             else => {
                 @setEvalBranchQuota(4000);
-                std.debug.panic("KeyedEvent.wait() with unknown status {}", status);
+                std.debug.panic("KeyedEvent.wait() with unknown status {}", .{status});
             },
         };
     }

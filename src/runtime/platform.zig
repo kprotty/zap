@@ -12,6 +12,7 @@ const system =
     if (is_windows)
         struct {
             pub usingnamespace @import("./windows/time.zig");
+            pub usingnamespace @import("./windows/numa.zig");
             pub usingnamespace @import("./windows/event.zig");
             pub usingnamespace @import("./windows/thread.zig");
         }

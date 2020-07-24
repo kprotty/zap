@@ -39,7 +39,7 @@ pub const NumaNode = struct {
                 return windows.unexpectedError(windows.kernel32.GetLastError());
         }
 
-        if (@intToPtr([*]align(std.mem.page_size) u8, addr)) |memory_ptr|
+        if (@intToPtr(?[*]align(std.mem.page_size) u8, addr)) |memory_ptr|
             return memory_ptr[0..bytes];
         return std.mem.Allocator.Error.OutOfMemory;
     }
@@ -101,7 +101,7 @@ pub const NumaNode = struct {
 
     fn getSystemTopology() ![]NumaNode {
         if (
-            usize.bits < 64 or
+            @typeInfo(usize).Int.bits < 64 or
             std.builtin.single_threaded or
             !isWindowsVersionOrHigher(.win7)
         ) {
@@ -120,11 +120,9 @@ pub const NumaNode = struct {
         }
 
         const heap = windows.kernel32.GetProcessHeap() orelse return error.NoProcessHeap;
-        const alignment = std.math.max(@alignOf(NUMA_INFO_EX), @alignOf(Node));
+        const alignment = std.math.max(@alignOf(NUMA_INFO_EX), @alignOf(NumaNode));
         const buf_ptr = windows.kernel32.HeapAlloc(heap, 0, length + alignment) orelse return error.OutOfHeapMemory;
-        errdefer if (windows.kernel32.HeapFree(heap, 0, buf_ptr) == windows.FALSE) {
-            _ = windows.unexpectedError(windows.kernel32.GetLastError()); 
-        };
+        errdefer std.debug.assert(windows.kernel32.HeapFree(heap, 0, buf_ptr) == windows.FALSE);
 
         const numa_info_ptr = @ptrCast([*]NUMA_INFO_EX, @alignCast(@alignOf(NUMA_INFO_EX), buf_ptr));
         if (GetLogicalProcessorInformationEx(relationship, numa_info_ptr, &length) == windows.FALSE)
@@ -157,24 +155,4 @@ pub const NumaNode = struct {
 
         return nodes[0..num_nodes];
     }
-
-    const PROCESSOR_RELATIONSHIP = extern enum(windows.WORD) {
-        NumaNode = 1,
-    };
-
-    const NUMA_INFO_EX = extern struct {
-        Relationship: PROCESSOR_RELATIONSHIP,
-        Size: windows.DWORD,
-        NodeNumer: windows.DWORD,
-        Reserved1: [20]windows.BYTE,
-        Mask: usize,
-        Group: windows.WORD,
-        Reserved2: [3]windows.DWORD,
-    };
-
-    extern "kernel32" fn GetLogicalProcessorInformationEx(
-        RelationshipType: PROCESSOR_RELATIONSHIP,
-        Buffer: ?[*]NUMA_INFO_EX,
-        ReturnLength: *windows.DWORD,
-    ) callconv(.Stdcall) windows.BOOL;
 };

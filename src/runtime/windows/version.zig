@@ -1,5 +1,5 @@
 const std = @import("std");
-const windows = std.os.windows;
+const windows = @import("./windows.zig");
 
 const VersionState = enum(usize) {
     uninit,
@@ -24,8 +24,8 @@ pub fn isWindowsVersionOrHigher(
             @setCold(true);
 
             const is_version_or_higher = switch (version) {
-                .win7 => IsWindows7OrGreater() != windows.FALSE,
-                .vista => IsWindowsVistaOrGreater() != windows.FALSE,
+                .win7 => IsWindowsVersionOrGreater(.WIN7, 0),
+                .vista => IsWindowsVersionOrGreater(.VISTA, 0),
                 else => @compileError("TODO: add more windows version checks"),
             };
 
@@ -33,12 +33,37 @@ pub fn isWindowsVersionOrHigher(
             @atomicStore(VersionState, &version_state, state, .Monotonic);
             return is_version_or_higher;
         }
+
+        fn IsWindowsVersionOrGreater(
+            nt_version: windows._WIN32_WINNT,
+            service_pack: windows.WORD,
+        ) windows.VERSIONHELPERAPI {
+            var vi = std.mem.zeroes(windows.OSVERSIONINFOEXW);
+            vi.dwOSVersionInfoSize = @sizeOf(@TypeOf(vi));
+            vi.dwMajorVersion = @enumToInt(nt_version) >> 16;
+            vi.dwMinorVersion = @enumToInt(nt_version) & 0xffff;
+            vi.wServicePackMajor = service_pack;
+            
+            return windows.VerifyVersionInfoW(
+                &vi,
+                windows.VER_MAJORVERSION | windows.VER_MINORVERSION | windows.VER_SERVICEPACKMAJOR,
+                windows.VerSetConditionMask(
+                    windows.VerSetConditionMask(
+                        windows.VerSetConditionMask(
+                            @as(windows.ULONGLONG, 0),
+                            windows.VER_MAJORVERSION,
+                            windows.VER_GREATER_EQUAL,
+                        ),
+                        windows.VER_MINORVERSION,
+                        windows.VER_GREATER_EQUAL,
+                    ),
+                    windows.VER_SERVICEPACKMAJOR,
+                    windows.VER_GREATER_EQUAL,
+                ),
+            );
+        }
     };
 
     return Cached.get();
 }
 
-const VERSIONHELPERAPI = windows.BOOL;
-
-extern "kernel32" fn IsWindows7OrGreater() callconv(.C) VERSIONHELPERAPI;
-extern "kernel32" fn IsWindowsVistaOrGreater() callconv(.C) VERSIONHELPERAPI;

@@ -1,6 +1,7 @@
 const std = @import("std");
-const windows = std.os.windows;
-const Node = @import("./executor.zig").Node;
+const windows = @import("./windows.zig");
+const Node = @import("../executor.zig").Node;
+const core = @import("../../zap.zig").core.executor;
 const isWindowsVersionOrHigher = @import("./version.zig").isWindowsVersionOrHigher;
 
 pub const Thread = struct {
@@ -43,13 +44,20 @@ pub const Thread = struct {
         const Wrapper = struct {
             fn entry(raw_arg: windows.LPVOID) callconv(.C) windows.DWORD {
                 const thread = @ptrCast(*Thread, @alignCast(@alignOf(Thread), raw_arg));
-                const stack = thread.getBackingMemory();
-
                 const param = @intToPtr(ParameterPtr, thread.parameter);
-                const handle = @ptrCast(*core.Thread.Handle, thread);
-                _ = @asyncCall(stack, {}, func, .{handle, param});
+                const stack = thread.getBackingMemory();
+                
+                // TODO: https://github.com/ziglang/zig/issues/4699
+                _ = @asyncCall(stack, {}, asyncEntry, .{thread, param});
                 
                 return 0; 
+            }
+
+            fn asyncEntry(
+                noalias thread: *Thread,
+                noalias param: ParameterPtr,
+            ) callconv(.Async) void {
+                return func(thread, param);
             }
         };
 
@@ -58,7 +66,7 @@ pub const Thread = struct {
         errdefer node.numa_node.free(memory);
 
         const thread = @ptrCast(*Thread, @alignCast(@alignOf(Thread), &memory[stack_size - @sizeOf(Thread)]));
-        thread.parameter = @intToPtr(parameter);
+        thread.parameter = @ptrToInt(parameter);
         thread.node = node;
 
         const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000;
@@ -95,7 +103,7 @@ pub const Thread = struct {
         const mask = blk: {
             var mask: KAFFINITY = 0;
             var cpu = cpu_begin;
-            while (cpu <= cpu_end and cpu < usize.bits) : (cpu += 1)
+            while (cpu <= cpu_end and cpu < @typeInfo(usize).Int.bits) : (cpu += 1)
                 mask |= @as(usize, 1) << @intCast(std.math.Log2Int(usize), cpu - cpu_begin);
             break :blk mask;
         };
@@ -104,57 +112,33 @@ pub const Thread = struct {
             var group_affinity: GROUP_AFFINITY = undefined;
             group_affinity.Group = @intCast(windows.WORD, cpu_begin / 64);
             group_affinity.Mask = mask;
-            _ = SetThreadGroupAffinity(thread_handle, &group_affinity, null);
+            _ = windows.SetThreadGroupAffinity(
+                thread_handle,
+                &group_affinity,
+                null,
+            );
 
             if (ideal_cpu) |ideal| {
                 var proc_num: PROCESSOR_NUMBER = undefined;
                 proc_num.Group = @intCast(windows.WORD, ideal / 64);
                 proc_num.Number = @intCast(windows.BYTE, ideal % 64);
-                _ = SetThreadIdealProcessorEx(thread_handle, &proc_num, null);
+                _ = windows.SetThreadIdealProcessorEx(
+                    thread_handle,
+                    &proc_num,
+                    null,
+                );
             }
 
         } else {
-            _ = SetThreadAffinityMask(thread_handle, mask);
+            _ = windows.SetThreadAffinityMask(thread_handle, mask);
             if (ideal_cpu) |ideal| {
                 if (ideal < 64) {
-                    _ = SetThreadIdealProcessor(thread_handle, @intCast(windows.DWORD, ideal));
+                    _ = windows.SetThreadIdealProcessor(
+                        thread_handle,
+                        @intCast(windows.DWORD, ideal),
+                    );
                 }
             }
         }
     }
-
-    const KAFFINITY = usize;
-    const GROUP_AFFINITY = extern struct {
-        Mask: KAFFINITY,
-        Group: windows.WORD,
-        Reserved: [3]windows.WORD,
-    };
-
-    const PROCESSOR_NUMBER = extern struct {
-        Group: windows.WORD,
-        Number: windows.BYTE,
-        Reserved: windows.BYTE,
-    };
-
-    extern "kernel32" fn SetThreadAffinityMask(
-        hThread: windows.HANDLE,
-        affintyMask: KAFFINITY,
-    ) callconv(.Stdcall) KAFFINITY;
-
-    extern "kernel32" fn SetThreadGroupAffinity(
-        hThread: windows.HANDLE,
-        group_affinity: *const GROUP_AFFINITY,
-        prev_affinity: ?*GROUP_AFFINITY,
-    ) callconv(.Stdcall) windows.BOOL;
-
-    extern "kernel32" fn SetThreadIdealProcessor(
-        hThread: windows.HANDLE,
-        dwIdealProcessor: windows.DWORD;
-    ) callconv(.Stdcall) windows.DWORD;
-
-    extern "kernel32" fn SetThreadIdealProcessorEx(
-        hThread: windows.HANDLE,
-        lpIdealProcessor: *const PROCESSOR_NUMBER,
-        lpPrevIdealProcessor: ?*PROCESSOR_NUMBER,
-    ) callconv(.Stdcall) windows.BOOL;
 };

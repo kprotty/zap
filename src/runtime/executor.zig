@@ -172,7 +172,7 @@ pub const Scheduler = struct {
 
 pub const Node = struct {
     pub const Cluster = struct {
-        inner: core.Node.Cluster = core.Node.Cluster.init(),
+        inner: core.Node.Cluster = core.Node.Cluster{},
         len: usize = 0,
 
         pub fn push(
@@ -254,7 +254,7 @@ pub const Thread = struct {
         self.event.init();
         defer self.event.deinit();
 
-        const node = @fieldParentPtr(Node, "inner", self.inner.node);
+        const node = @fieldParentPtr(Node, "inner", self.inner.getNode());
         platform.Thread.bindCurrentToNodeAffinity(node, blk: {
             const offset = @ptrToInt(worker) - @ptrToInt(node.getWorkers().ptr);
             const worker_index = @divFloor(offset, @sizeOf(Worker));
@@ -262,63 +262,51 @@ pub const Thread = struct {
         });
 
         Thread.current = &self;
-        var event_handler = core.Thread.EventHandler.init(on_event);
         while (true) {
-            switch (self.inner.poll(&event_handler)) {
-                .@"suspend" => self.event.wait(),
-                .@"shutdown" => break,
+            switch (self.inner.poll()) {
+                .run => |runnable| {
+                    runnable.run(&self.inner);
+                },
+                .scheduled => |schedule| {
+                    self.scheduleThreadAction(schedule);
+                },
+                .shutdown => {
+                    break;
+                },
+                .suspended => |last_thread| {
+                    if (last_thread) {
+                        var inner_threads = node.inner.getScheduler().shutdown();
+                        while (inner_threads.next()) |inner_thread| {
+                            const thread = @fieldParentPtr(Thread, "inner", inner_thread);
+                            if (thread != &self)
+                                thread.event.notify();
+                        }
+                        break;
+                    } else {
+                        self.event.wait();
+                    }
+                },
             }
         }
     }
 
-    fn on_event(
-        noalias self: *core.Thread.EventHandler,
-        noalias inner_thread: *core.Thread,
-        event_type: core.Thread.EventType,
-        event_ptr: usize, 
-    ) callconv(.C) bool {
-        switch (event_type) {
-            .@"run" => {
-                const runnable = @intToPtr(*Task.Runnable, event_ptr);
-                runnable.run(inner_thread);
+    fn scheduleThreadAction(
+        noalias self: *Thread,
+        schedule: core.Thread.Schedule,
+    ) void {
+        switch (schedule.action) {
+            .resumed => |inner_thread| {
+                const thread = @fieldParentPtr(Thread, "inner", inner_thread);
+                thread.event.notify();
             },
-            .@"resume" => {
-                const target_inner_thread = @intToPtr(*core.Thread, event_ptr);
-                const target_thread = @fieldParentPtr(Thread, "inner", target_inner_thread);
-                target_thread.event.notify();
-            },
-            .@"spawn" => {
-                const node = @fieldParentPtr(Node, "inner", inner_thread.node);
-                const worker = @intToPtr(*Worker, event_ptr);
-                const worker_index = blk: {
-                    const offset = @ptrToInt(worker) - @ptrToInt(node.getWorkers().ptr);
-                    break :blk (offset / @sizeOf(Worker));
+            .spawned => |worker| {
+                const node = @fieldParentPtr(Node, "inner", self.inner.getNode());
+                const handle = platform.Thread.spawn(node, Thread.run, worker) catch |err| {
+                    self.inner.undoSchedule(schedule);
+                    return;
                 };
-                const thread_handle = platform.Thread.spawn(
-                    node,
-                    Thread.run,
-                    worker,
-                ) catch return false;
             },
-            .@"yield" => {
-                const event_yield = @intCast(@TagType(core.Thread.EventYield), event_ptr);
-                switch (@intToEnum(core.Thread.EventYield, event_yield)) {
-                    .@"node_fifo" => platform.yield(.os),
-                    .@"poll_fifo" => platform.yield(.cpu),
-                    .@"poll_lifo" => {},
-                    .@"steal_fifo" => platform.yield(.cpu),
-                    .@"steal_lifo" => {
-                        if (std.builtin.os.tag == .windows) {
-                            platform.yield(.os);
-                        } else {
-                            platform.sleep(1 * std.time.ns_per_us);
-                        }
-                    },
-                    
-                }
-            }
         }
-        return true;
     }
 };
 
@@ -372,7 +360,10 @@ pub const Task = struct {
         }
 
         pub fn schedule(self: Batch) void {
-            return Thread.getCurrent().inner.schedule(self.inner);
+            const thread = Thread.getCurrent();
+            if (thread.inner.schedule(self.inner)) |schedule_action| {
+                thread.scheduleThreadAction(schedule_action);
+            }
         }
     };
 

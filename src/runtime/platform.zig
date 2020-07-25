@@ -1,12 +1,12 @@
 const std = @import("std");
 
-pub const is_posix = std.builtin.link_libc and (is_linux or is_bsd);
 pub const is_windows = std.builtin.os.tag == .windows;
 pub const is_linux = std.builtin.os.tag == .linux;
 pub const is_bsd = switch (std.builtin.os.tag) {
     .macosx, .freebsd, .netbsd, .openbsd, .dragonfly => true,
     else => false,
 };
+pub const is_posix = std.builtin.link_libc and (is_linux or is_bsd);
 
 const system =  
     if (is_windows)
@@ -18,7 +18,10 @@ const system =
         }
     else if (is_posix)
         struct {
-
+            pub usingnamespace @import("./posix/time.zig");
+            pub usingnamespace @import("./posix/numa.zig");
+            pub usingnamespace @import("./posix/event.zig");
+            pub usingnamespace @import("./posix/thread.zig");
         }
     else if (is_linux)
         struct {

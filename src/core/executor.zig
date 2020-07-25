@@ -87,17 +87,24 @@ pub const Scheduler = extern struct {
 
         return ThreadHandleIter{
             .node_iter = self.nodes.iter(),
-            .worker_index = 0,
+            .worker_index = undefined,
+            .node = null,
         };
     }
 
     pub const ThreadHandleIter = extern struct {
         node_iter: Node.Iter,
         worker_index: usize,
+        node: ?*Node,
 
         pub fn next(noalias self: *ThreadHandleIter) Thread.Handle {
-            var node = self.node_iter.current orelse return null;
             while (true) {
+                const node = self.node orelse blk: {
+                    const new_node = self.node_iter.next() orelse return null;
+                    self.worker_index = 0;
+                    self.node = new_node;
+                    break :blk new_node;
+                };
 
                 while (self.worker_index < node.workers_len) {
                     const ptr = @atomicLoad(usize, &node.workers_ptr[self.worker_index].ptr, .Acquire);
@@ -112,8 +119,7 @@ pub const Scheduler = extern struct {
                     }
                 }
 
-                node = self.node_iter.next() orelse return null;
-                self.worker_index = 0;
+                self.node = null;
             }
         }
     };
@@ -208,9 +214,11 @@ pub const Node = extern struct {
     idle_queue: usize,
     threads_active: usize,
 
+    pub const MAX_WORKERS = std.math.maxInt(u16) - 1;
+
     pub fn init(noalias self: *Node, workers: []Worker) void {
         self.workers_ptr = workers.ptr;
-        self.workers_len = @truncate(u16, std.math.min(std.math.maxInt(u16), workers.len));
+        self.workers_len = @truncate(u16, std.math.min(MAX_WORKERS, workers.len));
     }
 
     pub fn deinit(noalias self: *Node) void {
@@ -223,6 +231,14 @@ pub const Node = extern struct {
         self.runq_head = @fieldParentPtr(Task, "next", &self.runq_stub);
         self.runq_tail = @ptrToInt(self.runq_head);
         self.threads_active = 0;
+
+        self.idle_queue = 0;
+        for (self.getWorkers()) |*worker, index| {
+            const next_index = @intCast(u16, self.idle_queue >> 16);
+            const next_worker = self.fromWorkerIndex(next_index);
+            worker.ptr = (Worker.Ref{ .worker = next_worker }).encode();
+            self.idle_queue = @as(usize, self.toWorkerIndex(worker)) << 16;
+        }
     }
 
     fn finish(noalias self: *Node) void {
@@ -304,7 +320,7 @@ pub const Node = extern struct {
         const worker_ptr = worker orelse return 0;
         const offset = @ptrToInt(worker_ptr) - @ptrToInt(self.workers_ptr);
         const index = offset / @sizeOf(Worker);
-        return @intCast(u16, index - 1);
+        return @intCast(u16, index + 1);
     }
 
     const IDLE_SHUTDOWN = ~@as(usize, 0);
@@ -328,58 +344,65 @@ pub const Node = extern struct {
         context: ResumeContext,
     ) ?ResumeResult {
         const is_waking = context.is_waking;
-        var resume_result: ?ResumeResult = undefined;
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
 
         while (true) {
             var flags = @truncate(u8, idle_queue);
             var aba_tag = @truncate(u8, idle_queue >> 8);
             var worker_index = @truncate(u16, idle_queue >> 16);
 
-            resume_result = null;
             if (idle_queue == IDLE_SHUTDOWN)
                 std.debug.panic("Node.tryResumeThread() when shutdown", .{});
-            
-            if (!is_waking and (flags & IDLE_WAKING != 0)) {
-                if (flags & IDLE_WAKING_NOTIFIED != 0)
-                    break;
+
+            var resume_result: ResumeResult = undefined;
+            if (is_waking or (flags & (IDLE_NOTIFIED | IDLE_WAKING_NOTIFIED) == 0)) {
+                if (is_waking)
+                    flags &= ~@as(u8, IDLE_WAKING_NOTIFIED);
+
+                var found_worker = false;
+                if (self.fromWorkerIndex(worker_index)) |worker| {
+                    if (is_waking or (flags & IDLE_WAKING == 0)) {
+                        found_worker = true;
+                        flags |= IDLE_WAKING;
+                        switch (Worker.Ref.decode(@atomicLoad(usize, &worker.ptr, .Acquire))) {
+                            .handle => {
+                                std.debug.panic("Node.tryResumeThread() when thread shutting down", .{});
+                            },
+                            .node => {
+                                idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+                                continue;
+                            },
+                            .worker => |next_worker| {
+                                worker_index = self.toWorkerIndex(next_worker);
+                                resume_result = ResumeResult{ .spawned = worker };
+                            },
+                            .thread => |thread| {
+                                const thread_ptr = @atomicLoad(usize, &thread.ptr, .Unordered);
+                                if (thread_ptr < (MAX_WORKERS + 1)) {
+                                    worker_index = @intCast(u16, thread_ptr);
+                                    resume_result = ResumeResult{ .resumed = thread };
+                                } else {
+                                    idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+                                    continue;
+                                }
+                            },
+                        }
+                    }
+                }
+
+                if (!found_worker) {
+                    if (is_waking)
+                        flags &= ~@as(u8, IDLE_WAKING);
+                    flags |= IDLE_NOTIFIED;
+                    resume_result = ResumeResult{ .notified = false };
+                }
+            } else if (flags & (IDLE_WAKING | IDLE_WAKING_NOTIFIED) == IDLE_WAKING) {
                 flags |= IDLE_WAKING_NOTIFIED;
                 resume_result = ResumeResult{ .notified = true };
-
-            } else if (self.fromWorkerIndex(worker_index)) |worker| {
-                flags |= IDLE_WAKING;
-                const worker_ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
-                switch (Worker.Ref.decode(worker_ptr)) {
-                    .handle => std.debug.panic("Node.tryResumeThread() found shutdown worker", .{}),
-                    .node => std.debug.panic("Node.tryResumeThread() found spawning worker", .{}),
-                    .thread => |thread| {
-                        resume_result = ResumeResult{ .resumed = thread };
-                        worker_index = @truncate(u16, thread.ptr);
-                    },
-                    .worker => |next_worker| {
-                        resume_result = ResumeResult{ .spawned = worker };
-                        worker_index = self.toWorkerIndex(next_worker);
-                    },
-                }
-            } else if (flags & IDLE_NOTIFIED == 0) {
-                flags |= IDLE_NOTIFIED;
-                resume_result = ResumeResult{ .notified = false };
             } else {
                 break;
             }
-
-            if (is_waking) {
-                flags &= ~@as(u8, IDLE_WAKING_NOTIFIED);
-                if (flags & IDLE_WAKING == 0)
-                    std.debug.panic("Node.tryResumeThread(is_waking) when not waking", .{});
-                if (resume_result) |result| {
-                    switch (result) {
-                        .resumed, .spawned => flags &= ~@as(u8, IDLE_WAKING),
-                        else => {},
-                    }   
-                }
-            }
-
+            
             const new_idle_queue =
                 @as(usize, flags) |
                 (@as(usize, aba_tag) << 8) |
@@ -390,48 +413,47 @@ pub const Node = extern struct {
                 &self.idle_queue,
                 idle_queue,
                 new_idle_queue,
-                .Acquire,
-                .Acquire,
+                .AcqRel,
+                .Monotonic,
             )) |updated_idle_queue| {
                 idle_queue = updated_idle_queue;
                 continue;
             }
 
-            var new_worker = true;
-            if (resume_result) |result| {
-                switch (result) {
-                    .notified => new_worker = false,
-                    .resumed => |thread| {},
-                    .spawned => |worker| {
-                        const worker_ref = Worker.Ref{ .node = self };
-                        @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
-                    },
-                }
-            }
+            const is_new_worker = switch (resume_result) {
+                .notified => false,
+                .resumed => true,
+                .spawned => |worker| blk: {
+                    const worker_ref = Worker.Ref{ .node = self };
+                    @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Release);
+                    break :blk true;
+                },
+            };
 
-            if (new_worker) {
+            if (is_new_worker) {
                 const threads_active = @atomicRmw(usize, &self.threads_active, .Add, 1, .Monotonic);
                 if (threads_active == 0) {
                     _ = @atomicRmw(usize, &self.scheduler.nodes_active, .Add, 1, .Monotonic);
                 }
             }
 
-            break;
+            return resume_result;
         }
 
-        if (resume_result == null and !context.is_remote) {
+        if (!context.is_remote) {
             var nodes = self.iter();
             _ = nodes.next();
             while (nodes.next()) |remote_node| {
-                resume_result = remote_node.tryResumeThread(.{
+                if (remote_node.tryResumeThread(.{
                     .is_waking = is_waking,
                     .is_remote = true,
-                }) orelse continue;
-                break;
+                })) |resume_result| {
+                    return resume_result;
+                }
             }
         }
 
-        return resume_result;
+        return null;
     }
 
     fn undoResumeThread(
@@ -504,7 +526,7 @@ pub const Node = extern struct {
             if (idle_queue == IDLE_SHUTDOWN)
                 std.debug.panic("Node.trySuspendThread() when shutdown", .{});
             if (is_waking and (flags & IDLE_WAKING == 0))
-                std.debug.panic("Node.trySuspendThread(is_waking) when not waking", .{});
+                std.debug.panic("Node.trySuspendThread(is_waking) when not waking 0b{b}", .{flags});
 
             var is_notified = false;
             if (is_waking and (flags & IDLE_WAKING_NOTIFIED != 0)) {
@@ -516,7 +538,7 @@ pub const Node = extern struct {
             } else {
                 if (is_waking)
                     flags &= ~@as(u8, IDLE_WAKING);
-                thread.ptr = worker_index;
+                @atomicStore(usize, &thread.ptr, worker_index, .Unordered);
                 worker_index = self.toWorkerIndex(worker);
             }
 
@@ -538,7 +560,7 @@ pub const Node = extern struct {
             }
 
             if (is_notified) {
-                thread.ptr = old_ptr;
+                @atomicStore(usize, &thread.ptr, old_ptr, .Unordered);
                 return null;
             }
 
@@ -576,20 +598,30 @@ pub const Node = extern struct {
             const workers = node.workers_ptr;
             var worker_index = @truncate(u16, idle_queue >> 16);
             while (worker_index != 0) {
+                idle_workers += 1;
                 const worker = &workers[worker_index - 1];
                 switch (Worker.Ref.decode(@atomicLoad(usize, &worker.ptr, .Acquire))) {
-                    .node => std.debug.panic("Node.shutdown() when worker is spawning", .{}),
-                    .handle => std.debug.panic("Node.shutdown() when worker is already shutdown", .{}),
+                    .node => {
+                        std.debug.panic("Node.shutdown() when worker is spawning", .{});
+                    },
+                    .handle => {
+                        std.debug.panic("Node.shutdown() when worker is already shutdown", .{});
+                    },
                     .worker => |next_worker| {
                         worker_index = node.toWorkerIndex(next_worker);
                         const worker_ref = Worker.Ref{ .handle = null };
                         @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
                     },
                     .thread => |thread| {
-                        thread.ptr = @ptrToInt(idle_threads);
-                        idle_threads = thread;
+                        thread.worker = null;
+                        worker_index = @intCast(u16, thread.ptr);
                         const worker_ref = Worker.Ref{ .handle = thread.handle };
                         @atomicStore(usize, &worker.ptr, worker_ref.encode(), .Monotonic);
+
+                        if (thread != initiator) {
+                            thread.ptr = @ptrToInt(idle_threads);
+                            idle_threads = thread;
+                        }
                     },
                 }
             }
@@ -600,9 +632,7 @@ pub const Node = extern struct {
 
         while (idle_threads) |idle_thread| {
             const thread = idle_thread;
-            thread.worker = null;
             idle_threads = @intToPtr(?*Thread, thread.ptr);
-
             const notified = event_handler.emit(initiator, .@"resume", @ptrToInt(thread));
             std.debug.assert(notified);
         }
@@ -745,7 +775,7 @@ pub const Thread = extern struct {
         const node = self.node;
         var is_waking = true;
 
-        self.ptr = @ptrToInt(event_handler);
+        @atomicStore(usize, &self.ptr, @ptrToInt(event_handler), .Unordered);
         while (true) {
             var polled_node = false;
             const next_task = blk: {
@@ -869,8 +899,11 @@ pub const Thread = extern struct {
         while (true) {
             const target_tail = @atomicLoad(usize, &target.runq_tail, .Acquire);
             const target_size = target_tail -% target_head;
-            if (target_size > target.runq_buffer.len)
-                std.debug.panic("Thread.pollThread() with invalid target runq size {}", .{target_size});
+            if (target_size > target.runq_buffer.len) {
+                _ = event_handler.emit(self, .@"yield", @enumToInt(EventYield.@"steal_fifo"));
+                target_head = @atomicLoad(usize, &target.runq_head, .Acquire);
+                continue;
+            }
 
             var steal = target_size - (target_size / 2);
             if (steal == 0) {
@@ -884,6 +917,7 @@ pub const Thread = extern struct {
                     .Acquire,
                     .Monotonic,
                 ) orelse return target_next;
+                target_head = @atomicLoad(usize, &target.runq_head, .Acquire);
                 continue;
             }
 

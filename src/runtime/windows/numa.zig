@@ -145,7 +145,7 @@ pub const NumaNode = struct {
             const numa_node = NumaNode{
                 .node_id = @intCast(windows.WORD, numa_info.NodeNumber),
                 .cpu_begin = group_affinity.Group * 64,
-                .cpu_end = (group_affinity.Group * 64) + @popCount(usize, group_affinity.Mask),
+                .cpu_end = (group_affinity.Group * 64) + (@popCount(usize, group_affinity.Mask) - 1),
             };
 
             // memory barrier to ensure that the nodes[] write below

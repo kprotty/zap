@@ -3,7 +3,9 @@ const windows = @import("./windows.zig");
 const KeyedEvent = @import("./event.zig").KeyedEvent;
 
 pub fn yield() void {
-    _ = windows.kernel32.SwitchToThread();
+    if (windows.kernel32.SwitchToThread() != windows.TRUE) {
+        windows.kernel32.Sleep(1);
+    }
 }
 
 pub fn sleep(nanoseconds: u64) void {

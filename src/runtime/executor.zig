@@ -261,6 +261,7 @@ pub const Thread = struct {
             break :blk worker_index;
         });
 
+        Thread.current = &self;
         var event_handler = core.Thread.EventHandler.init(on_event);
         while (true) {
             switch (self.inner.poll(&event_handler)) {
@@ -302,10 +303,18 @@ pub const Thread = struct {
             .@"yield" => {
                 const event_yield = @intCast(@TagType(core.Thread.EventYield), event_ptr);
                 switch (@intToEnum(core.Thread.EventYield, event_yield)) {
-                    .@"poll_lifo" => {},
-                    .@"poll_fifo", .@"steal_fifo" => platform.yield(.cpu),
-                    .@"steal_lifo" => platform.sleep(1 * std.time.ns_per_us),
                     .@"node_fifo" => platform.yield(.os),
+                    .@"poll_fifo" => platform.yield(.cpu),
+                    .@"poll_lifo" => {},
+                    .@"steal_fifo" => platform.yield(.cpu),
+                    .@"steal_lifo" => {
+                        if (std.builtin.os.tag == .windows) {
+                            platform.yield(.os);
+                        } else {
+                            platform.sleep(1 * std.time.ns_per_us);
+                        }
+                    },
+                    
                 }
             }
         }

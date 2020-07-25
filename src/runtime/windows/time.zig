@@ -1,5 +1,5 @@
 const std = @import("std");
-const windows = std.os.windows;
+const windows = @import("./windows.zig");
 const KeyedEvent = @import("./event.zig").KeyedEvent;
 
 pub fn yield() void {

@@ -37,11 +37,11 @@ pub fn isWindowsVersionOrHigher(
         fn IsWindowsVersionOrGreater(
             nt_version: windows._WIN32_WINNT,
             service_pack: windows.WORD,
-        ) windows.VERSIONHELPERAPI {
+        ) bool {
             var vi = std.mem.zeroes(windows.OSVERSIONINFOEXW);
             vi.dwOSVersionInfoSize = @sizeOf(@TypeOf(vi));
-            vi.dwMajorVersion = @enumToInt(nt_version) >> 16;
-            vi.dwMinorVersion = @enumToInt(nt_version) & 0xffff;
+            vi.dwMajorVersion = @enumToInt(nt_version) >> 8;
+            vi.dwMinorVersion = @enumToInt(nt_version) & 0xff;
             vi.wServicePackMajor = service_pack;
             
             return windows.VerifyVersionInfoW(
@@ -60,7 +60,7 @@ pub fn isWindowsVersionOrHigher(
                     windows.VER_SERVICEPACKMAJOR,
                     windows.VER_GREATER_EQUAL,
                 ),
-            );
+            ) == windows.TRUE;
         }
     };
 

@@ -101,7 +101,7 @@ pub const Thread = struct {
         const cpu_end = numa_node.cpu_end;
 
         const mask = blk: {
-            var mask: KAFFINITY = 0;
+            var mask: windows.KAFFINITY = 0;
             var cpu = cpu_begin;
             while (cpu <= cpu_end and cpu < @typeInfo(usize).Int.bits) : (cpu += 1)
                 mask |= @as(usize, 1) << @intCast(std.math.Log2Int(usize), cpu - cpu_begin);
@@ -109,7 +109,7 @@ pub const Thread = struct {
         };
 
         if (isWindowsVersionOrHigher(.win7)) {
-            var group_affinity: GROUP_AFFINITY = undefined;
+            var group_affinity: windows.GROUP_AFFINITY = undefined;
             group_affinity.Group = @intCast(windows.WORD, cpu_begin / 64);
             group_affinity.Mask = mask;
             _ = windows.SetThreadGroupAffinity(
@@ -119,7 +119,7 @@ pub const Thread = struct {
             );
 
             if (ideal_cpu) |ideal| {
-                var proc_num: PROCESSOR_NUMBER = undefined;
+                var proc_num: windows.PROCESSOR_NUMBER = undefined;
                 proc_num.Group = @intCast(windows.WORD, ideal / 64);
                 proc_num.Number = @intCast(windows.BYTE, ideal % 64);
                 _ = windows.SetThreadIdealProcessorEx(

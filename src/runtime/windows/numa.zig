@@ -1,5 +1,5 @@
 const std = @import("std");
-const windows = std.os.windows;
+const windows = @import("./windows.zig");
 const isWindowsVersionOrHigher = @import("./version.zig").isWindowsVersionOrHigher;
 
 pub const NumaNode = struct {
@@ -27,7 +27,7 @@ pub const NumaNode = struct {
         if (self.node_id) |numa_node| {
             if (isWindowsVersionOrHigher(.vista)) {
                 const proc = windows.kernel32.GetCurrentProcess();
-                addr = @ptrToInt(VirtualAllocExNuma(proc, null, bytes, alloc_type, protect, numa_node));
+                addr = @ptrToInt(windows.VirtualAllocExNuma(proc, null, bytes, alloc_type, protect, numa_node));
                 if (addr == 0)
                     return windows.unexpectedError(windows.kernel32.GetLastError());
             }
@@ -111,38 +111,41 @@ pub const NumaNode = struct {
         }
 
         var length: windows.DWORD = 0;
-        const relationship = PROCESSOR_RELATIONSHIP.NumaNode;
+        const PROC_INFO = windows.SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+        const relationship = windows.LOGICAL_PROCESSOR_RELATIONSHIP.RelationNumaNode;
         if (
-            (GetLogicalProcessorInformationEx(relationship, null, &length) != windows.FALSE) or
+            (windows.GetLogicalProcessorInformationEx(relationship, null, &length) != windows.FALSE) or
             (windows.kernel32.GetLastError() != .INSUFFICIENT_BUFFER)
         ) {
             return error.InvalidGetProcInfo;
         }
 
         const heap = windows.kernel32.GetProcessHeap() orelse return error.NoProcessHeap;
-        const alignment = std.math.max(@alignOf(NUMA_INFO_EX), @alignOf(NumaNode));
+        const alignment = std.math.max(@alignOf(PROC_INFO), @alignOf(NumaNode));
         const buf_ptr = windows.kernel32.HeapAlloc(heap, 0, length + alignment) orelse return error.OutOfHeapMemory;
         errdefer std.debug.assert(windows.kernel32.HeapFree(heap, 0, buf_ptr) == windows.FALSE);
 
-        const numa_info_ptr = @ptrCast([*]NUMA_INFO_EX, @alignCast(@alignOf(NUMA_INFO_EX), buf_ptr));
-        if (GetLogicalProcessorInformationEx(relationship, numa_info_ptr, &length) == windows.FALSE)
+        const proc_info_ptr = @ptrCast([*]PROC_INFO, @alignCast(@alignOf(PROC_INFO), buf_ptr));
+        if (windows.GetLogicalProcessorInformationEx(relationship, proc_info_ptr, &length) == windows.FALSE)
             return error.InvalidGetProcInfo;
         
         var num_nodes: usize = 0;
-        const nodes = @ptrCast([*]NumaNode, @alignCast(@alignOf(NumaNode), numa_info_ptr));
+        const nodes = @ptrCast([*]NumaNode, @alignCast(@alignOf(NumaNode), proc_info_ptr));
 
-        var info_ptr = @ptrToInt(numa_info_ptr);
+        var info_ptr = @ptrToInt(proc_info_ptr);
         while (length != 0) {
-            const numa_info = @intToPtr(*NUMA_INFO_EX, info_ptr);
-            info_ptr += numa_info.Size;
-            length -= numa_info.Size;
-            if (numa_info.Relationship != relationship)
+            const proc_info = @intToPtr(*PROC_INFO, info_ptr);
+            info_ptr += proc_info.Size;
+            length -= proc_info.Size;
+            if (proc_info.Relationship != relationship)
                 continue;
 
+            const numa_info = proc_info.u.NumaNode;
+            const group_affinity = numa_info.GroupMask;
             const numa_node = NumaNode{
                 .node_id = @intCast(windows.WORD, numa_info.NodeNumber),
-                .cpu_begin = numa_info.Group * 64,
-                .cpu_end = (numa_info.Group * 64) + @popCount(usize, numa_info.Mask),
+                .cpu_begin = group_affinity.Group * 64,
+                .cpu_end = (group_affinity.Group * 64) + @popCount(usize, group_affinity.Mask),
             };
 
             // memory barrier to ensure that the nodes[] write below

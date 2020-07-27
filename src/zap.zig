@@ -200,7 +200,7 @@ const Thread = struct {
                 slot: ?*Slot,
                 thread: *Thread,
                 handle: ?*std.Thread,
-                spawning: void,
+                spawning: ?*align(4) const c_void,
 
                 /// Convert a Slot.Ptr into a tagged opaque pointer
                 fn encode(self: Ptr) usize {
@@ -219,7 +219,7 @@ const Thread = struct {
                         0 => Ptr{ .slot = @intToPtr(?*Slot, ptr) },
                         1 => Ptr{ .thread = @intToPtr(*Thread, ptr) },
                         2 => Ptr{ .handle = @intToPtr(?*std.Thread, ptr) },
-                        3 => Ptr{ .spawning = {} },
+                        3 => Ptr{ .spawning = @intToPtr(?*align(4) const c_void, ptr) },
                     };
                 }
             };
@@ -301,6 +301,8 @@ const Thread = struct {
                 std.debug.panic("Pool.deinit() when runq is not empty", .{});
         }
 
+        fn resumeThread()
+
         /// Push a batch of tasks to the pool's run queue in a *wait-free manner.
         /// 
         /// * The algorithm isnt technically wait-free 
@@ -365,6 +367,113 @@ const Thread = struct {
     runq_head: usize,
     runq_tail: usize,
     runq_buffer: [256]*Task,
+
+    fn run(run_info: RunInfo) void {
+
+        var self = Thread{
+            .ptr = @ptrToInt(run_info.pool),
+            .handle = null,
+            .event = std.ResetEvent.init(),
+            .runq_next = null,
+            .runq_head = 0,
+            .runq_tail = 0,
+            .runq_buffer = undefined,
+        };
+
+        var is_waking = true;
+        var prng = @truncate(Index, self.ptr ^ @ptrToInt(self));
+        
+        // continuously poll for tasks until the thread is shutdown
+        while (self.ptr != 0) {
+            var polled_global = false;
+            if (self.poll(pool, &prng, &polled_global)) |task| {
+                
+                // if a task was found and this thread was waking or found it in pool runq, wake another thread.
+                // - the last waking thread wakes another instead of thundering herd waking to avoid contention.
+                // - polling the pool runq acts as a lock so wake another thread that was waiting on said lock.
+                const was_waking = is_waking;
+                is_waking = false;
+                if (was_waking or polled_global)
+                    pool.resumeThread(.{ .was_waking = was_waking });
+
+                // execute the task itself
+                // TODO: support callbacks instead of restricting to zig async frames
+                resume task.frame;
+                continue;
+            }
+
+            if (pool.suspendThread(&self))
+        }
+    }
+
+    /// Check for a task that the current thread can execute.
+    fn poll(
+        self: *Thread,
+        pool: *Pool,
+        prng: *Index,
+        polled_global: *bool,
+    ) ?*Task {
+        // first check for tasks locally
+        if (self.pollLocal()) |task| {
+            return task;
+        }
+
+        // then check for tasks globally (which fills in local pools)
+        if (self.pollGlobal(pool)) |task| {
+            polled_global.* = true;
+            return task;
+        }
+        
+        // generate a random number (using xorshift)
+        var rng = prng.*;
+        switch (Index) {
+            u16 => {
+                rng ^= rng << 7;
+                rng ^= rng >> 9;
+                rng ^= rng << 8;
+            },
+            u32 => {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+            },
+            else => unreachable,
+        }
+        prng.* = rng;
+
+        // use the random number to iterate the pool's slots 
+        // starting at a random position in order to avoid steal contention.
+        const num_slots = pool.slots.len;
+        var slot_iter = num_slots;
+        var slot_index = rng % num_slots;
+
+        while (slot_iter != 0) : (slot_iter -= 1) {
+            const slot = &pool.slots[slot_index];
+            if (slot_index == num_slots - 1) {
+                slot_index = 0;
+            } else {
+                slot_index += 1;
+            }
+
+            const slot_ptr = @atomicLoad(usize, &slot.ptr, .Acquire);
+            switch (Slot.Ptr.decode(slot_ptr)) {
+                .slot => {},
+                .spawning => {},
+                .handle => {
+                    std.debug.panic("Thread.poll() found thread which was shutdown", .{});
+                },
+                .thread => |thread| {
+                    if (thread == self)
+                        continue;
+                    if (self.pollSteal(thread)) |task|
+                        return task;
+                },
+            }
+        }
+
+        // no tasks (that this thread could run) were found in the thread pool...
+        return null;
+    }
 
     /// Check for a task by polling the local run queue of this Thread
     fn pollLocal(self: *Thread) ?*Task {
@@ -587,6 +696,7 @@ const Thread = struct {
         return first_task;
     }
 
+    /// Mark a batch of tasks as runnable to the scheduler using the priorioty as a hint.
     fn schedule(
         self: *Thread,
         task_batch: Task.Batch,

@@ -11,7 +11,7 @@ This includes a few notable features:
 - [x] Multi-threaded, work-stealing scheduler
 - [x] Lock-free scheduler
 - [x] Intrusive memory model
-- [x] Usable as a C library
+- [ ] Usable as a C library
 - [x] Does not require libc on linux and windows
 - [x] Supports Zig `async/await`
 - [ ] Supports Rust `future::Future`

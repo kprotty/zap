@@ -30,6 +30,20 @@ pub const Task = struct {
         return Batch.from(self).schedule();
     }
 
+    /// Schedule the task to be executed once the current task yields.
+    /// Useful as a SwitchTo mechanism to ensure LIFO scheduling for cache-aware scheduling algorithms.
+    ///
+    /// Notes:
+    /// - The scheduled task may not begin execution until the current caller Task suspends.
+    /// - If there are two succeesive calls to scheduleNext() without suspended, 
+    //      the previously scheduled task will be scheduled to the end of the local run queue.
+    pub fn scheduleNext(self: *Task) void {
+        const thread = Thread.getCurrent();
+        if (thread.ptr != 1)
+            thread.schedule(Batch.from(@intToPtr(*Task, thread.ptr)));
+        thread.ptr = @ptrToInt(self);
+    }
+
     /// Yield execution of the current/callers Task to the thread pool, allowing another task to run.
     pub fn yield() void {
         var task = Task.init(@frame());
@@ -38,16 +52,6 @@ pub const Task = struct {
             const pool = @intToPtr(*Thread.Pool, thread.ptr);
             pool.schedule(Task.Batch.from(&task));
         }
-    }
-
-    /// Switch execution from the caller into the passed in Task object.
-    /// The task object that is scheduled into should normally have a way to reschedule the caller.
-    /// 
-    /// Similar to Google's SwitchTo FUTEX_SWAP API 
-    /// https://lwn.net/Articles/826860/
-    pub fn yieldInto(self: *Task) void {
-        const thread = Thread.getCurrent();
-        suspend thread.ptr = @ptrToInt(self);
     }
 
     /// An ordered set of Task's which can be scheduled together at once.
@@ -224,7 +228,7 @@ const Thread = struct {
                 slot: ?*Slot,
                 thread: *Thread,
                 handle: ?*std.Thread,
-                spawning: ?*align(4) const c_void,
+                spawning: ?*std.Thread,
 
                 /// Convert a Slot.Ptr into a tagged opaque pointer
                 fn encode(self: Ptr) usize {
@@ -243,7 +247,7 @@ const Thread = struct {
                         0 => Ptr{ .slot = @intToPtr(?*Slot, ptr) },
                         1 => Ptr{ .thread = @intToPtr(*Thread, ptr) },
                         2 => Ptr{ .handle = @intToPtr(?*std.Thread, ptr) },
-                        3 => Ptr{ .spawning = @intToPtr(?*align(4) const c_void, ptr) },
+                        3 => Ptr{ .spawning = @intToPtr(?*std.Thread, ptr) },
                     };
                 }
             };
@@ -324,23 +328,104 @@ const Thread = struct {
             if (runq_head != runq_stub)
                 std.debug.panic("Pool.deinit() when runq is not empty", .{});
         }
+        
+        // Convert a non-zero slot index to a Thread slot pointer on the current thread pool. 
+        fn indexToSlot(self: *Pool, index: Index) ?*Slot {
+            if (index == 0)
+                return null;
+            return &self.slots[index - 1];
+        }
 
+        // Convert a slot pointer from the current pool into a non-zero Thread slot index
+        fn slotToIndex(self: *Pool, slot: ?*Slot) Index {
+            const slot_ptr = @ptrToInt(slot orelse return 0);
+            const base_ptr = @ptrToInt(self.slots.ptr);
+            const base_end = base_ptr + (self.slots.len * @sizeOf(Slot));
+
+            if ((slot_ptr < base_ptr) or (slot_ptr >= base_end))
+                std.debug.panic("Pool.slotToIndex() given invalid slot pointer {*}", .{slot_ptr});
+
+            const index = (slot_ptr - base_ptr) / @sizeOf(Slot);
+            return @intCast(Index, index - 1);
+        }
+
+        /// Options used to control how a thread is woken up when using a *resumeThread() function
         const ResumeOptions = struct {
+            /// If true, don't spawn a new thread but instead reusing the caller thread
             no_spawn: bool = false,
+            /// If true, then the caller was a thread previously waken by resumeThread() and found work.
             was_waking: bool = false,
         };
 
+        /// Wake up a thread on the thread pool in order to run tasks using the provided options
         fn resumeThread(self: *Pool, options: ResumeOptions) void {
-            const can_spawn = !options.no_spawn;
-            const is_waking = options.was_waking;
-            var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+            _ = self.tryResumeThread(options);
+        }
 
+        /// The type of resume operation to perform and necessary pointer to do so.
+        const ResumePtr = union(enum) {
+            /// Spawn a Thread and associate it with the provided thread Slot.
+            spawned: *Slot,
+            /// Wake up the OS thread of an existing associated Thread.
+            resumed: *Thread,
+        };
+
+        /// Try to wake up a thread on the thread pool in order to run tasks.
+        /// Returns true if it was able to successfully do the equivalent of a thread spawn/resume.
+        fn tryResumeThread(self: *Pool, options: ResumeOptions) bool {
+            // Acquire ordering to ensure updated value to the slot from the index computed by the idle_queue
+            var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
             while (true) {
                 if (idle_queue & IS_SHUTDOWN != 0)
                     std.debug.panic("Pool.resumeThread() when shutdown", .{});
                 
-                var new_idle_queue = idle_queue;
+                // if the caller didnt set the IS_WAKING bit 
+                // and the queue is empty or theres already a thread being woken up,
+                //      then theres nothing really left to try.
+                if (!options.was_waking and (idle_queue & (IS_NOTIFIED | IS_WAKING) != 0))
+                    return false;
+                
+                // prepare a new idle queue value to update with.
+                // leave the aba counter unchanged as its only modified when pushing to the idle queue.
+                const aba_mask = @as(usize, ~@as(u8, 0)) << 8;
+                var new_idle_queue = idle_queue & aba_mask;
 
+                // check if theres a pending slot on the idle quuee
+                var new_resume_ptr: ?ResumePtr = null;
+                if (self.indexToSlot(@truncate(Index, idle_queue >> 16))) |slot| {
+                    var slot_index: Index = undefined;
+                    switch (Slot.Ptr.decode(@atomicLoad(usize, &slot.ptr, .Acquire))) {
+                        // theres a pending slot which isnt associated with a Thread yet, try to spawn it
+                        .slot => |next_slot| {
+                            slot_index = self.slotToIndex(next_slot);
+                            new_resume_ptr = ResumePtr{ .spawned = slot };
+                        },
+                        // there is a pending slot which has an associated Thread, try to resume the Thread.
+                        .thread => |thread| {
+                            slot_index = self.slotToIndex(@atomicLoad(usize, &thread.ptr, .Unordered));
+                            new_resume_ptr = ResumePtr{ .resumed = thread };
+                        },
+                        // some other thread is in the process of resuming this slot, so check back again
+                        .spawning => {
+                            idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+                            continue;
+                        },
+                        // this slot was marked as shutdown for some reason (should'nt happen).
+                        .handle => {
+                            std.debug.panic("Pool.resumeThread() found already shutdown thread", .{});
+                        },
+                    }
+                    new_idle_queue |= (@as(usize, slot_index) << 16) | IS_WAKING;
+                
+                // the idle queue is empty, but there was no notification.
+                // leave a notification that a resume() happened on the idle queue
+                // so that lock-free suspending threads dont miss a wake-up request.
+                } else {
+                    new_idle_queue |= IS_NOTIFIED;
+                }
+
+                // Try to either notify a resume happened, or dequeue a pending slot on the idle queue.
+                // Acquire barriers as read needs to be updated on slot computed by index in idle_queue.
                 if (@cmpxchgWeak(
                     usize,
                     &self.idle_queue,
@@ -351,6 +436,102 @@ const Thread = struct {
                 )) |updated_idle_queue| {
                     idle_queue = updated_idle_queue;
                     continue;
+                }
+
+                // return true without bumping the active thread count below if it was just a notification
+                const resume_ptr = new_resume_ptr orelse return true;
+                const is_single_threaded = std.builtin.single_threaded or self.slots.len == 1;
+
+                // increment the active_thread tracker as a new OS thread is about to be scheduled.
+                _ = @atomicRmw(usize, &self.active_threads, .Add, 1, .Monotonic) + 1;
+
+                switch (resume_ptr) {
+                    .resumed => |thread| {
+                        // single threaded pools shouldnt have any other threads to wake up
+                        if (is_single_threaded)
+                            std.debug.panic("Thread.resumeThread() waking a thread when single-threaded", .{});
+                        
+                        // wake up the thread & make sure its .ptr is the pool instead of null to avoid it shutting down
+                        @atomicStore(usize, &thread.ptr, @ptrToInt(self), .Unordered);
+                        thread.event.set();
+                        return true;
+                    },
+                    .spawned => |slot| {
+                        // prepare the slot ptr to be spawned.
+                        @atomicStore(usize, &slot.ptr, (Slot.Ptr{ .spawning = null }).encode(), .Monotonic);
+                        const run_info = RunInfo{
+                            .pool = self,
+                            .slot = slot,
+                        };
+                        
+                        // use the current thread instead of spawning a new one if requested
+                        if (options.no_spawn) {
+                            Thread.run(run_info);
+                            return true;
+                        }
+
+                        // single-threaded pools should never have to spawn a new thread, just use their own thread above.
+                        if (is_single_threaded)
+                            std.debug.panic("Thread.resumeThread() spawning a thread when single-threaded", .{});
+
+                        if (std.Thread.spawn(run_info, Thread.run)) |handle| {
+                            // spawned the thread and received a thread handle
+                            // try to store the thread handle for the thread to see and consume.
+                            const new_slot_ptr = @cmpxchgStrong(
+                                usize,
+                                &slot.ptr,
+                                (Slot.Ptr{ .spawning = null }).encode(),
+                                (Slot.Ptr{ .spawning = handle }).encode(),
+                                .Release,
+                                .Acquire,
+                            ) orelse return true;
+
+                            // If we lost the race to the thread, set its handle directly on the thread object instead.
+                            switch (Slot.Ptr.decode(new_slot_ptr)) {
+                                .thread => {
+                                    thread.handle = handle;
+                                    return true;
+                                },
+                                .slot => {
+                                    std.debug.panic("Thread.resumeThread() spawned a thread that never spawned?", .{});
+                                },
+                                .handle => {
+                                    std.debug.panic("Thread.resumeThread() spawned a thread that already shutdown?", .{});
+                                },
+                                .spawning => |handle| {
+                                    std.debug.panic("Thread.resumeThread() spawning saw unknown handle {*}", .{handle});
+                                },
+                            }
+                        } else |err| {}
+
+                        // Failed to spawn a thread using the given slot, untrack it.
+                        _ = @atomicRmw(usize, &self.active_threads, .Sub, 1, .Monotonic);
+
+                        // Then add the slot we dequeued back into the idle_queue without a thread association
+                        idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+                        while (true) {
+                            // set the slot's "next" link to form the LIFO idle_queue node
+                            const next_slot_index = @truncate(Index, idle_queue >> 16);
+                            const next_slot_ptr = Slot.Ptr{ .slot = self.indexToSlot(next_slot_index) };
+                            @atomicStore(usize, &slot.ptr, next_slot_ptr.encode(), .Unordered);
+
+                            // update the idle_queue slot index to our own, bump the ABA tag, and remove any waking or notification flags
+                            const slot_index = self.slotToIndex(slot);
+                            const aba_tag = @truncate(u8, idle_queue >> 8) +% 1;
+                            const new_idle_queue = (@as(usize, slot_index) << 16) | (@as(usize, aba_tag) << 8);
+
+                            // try to enqueue the slot back to effectively perform a rewind.
+                            // Release barrier to ensure that other resumeThread() see valid slot.ptr unordered write above.
+                            idle_queue = @cmpxchgWeak(
+                                usize,
+                                &self.idle_queue,
+                                idle_queue,
+                                new_idle_queue,
+                                .Release,
+                                .Monotonic,
+                            ) orelse return false;
+                        }
+                    }
                 }
             }
         }
@@ -422,12 +603,20 @@ const Thread = struct {
     }
 
     ptr: usize,
+    pool: *Pool,
     handle: ?*std.Thread,
     event: std.ResetEvent,
     runq_head: usize,
     runq_tail: usize,
     runq_buffer: [256]*Task,
 
+    /// Information needed for a Thread to start running
+    const RunInfo = struct {
+        pool: *Pool,
+        slot: *Slot,
+    };
+
+    /// Start running a Thread in the provided thread Pool using the caller's OS thread
     fn run(run_info: RunInfo) void {
         var is_waking = true;
         const pool = run_info.pool;
@@ -436,13 +625,31 @@ const Thread = struct {
 
         // allocate our Thread object on our OS thread's stack.
         var self = Thread{
-            .ptr = @ptrToInt(pool),
+            .ptr = undefined,
+            .pool = pool,
             .handle = null,
             .event = std.ResetEvent.init(),
             .runq_head = 0,
             .runq_tail = 0,
             .runq_buffer = undefined,
         };
+
+        // Associate the thread Slot with our Thread, saving the thread handle if provided.
+        // AcqRel barrier used to ensure two properties:
+        //  - Acquire barrier ensures up-to-date writes to the thread handle later on
+        //  - Release barrier ensures the self: Thread init writes above are visible to other threads. 
+        var slot_ptr = Slot.Ptr{ .thread = &self };
+        slot_ptr = Slot.Ptr.decode(@atomicRmw(usize, &slot.ptr, .Xchg, slot_ptr.encode(), .AcqRel));
+        switch (slot_ptr) {
+            .spawning => |handle_ptr| {
+                if (handle_ptr) |handle| {
+                    self.handle = handle;
+                }
+            },
+            else => {
+                std.debug.panic("Thread.init() found invalid slot_ptr of {*}", .{slot_ptr});
+            },
+        }
         
         // continuously poll for tasks until the thread is shutdown
         while (true) {
@@ -463,27 +670,29 @@ const Thread = struct {
                     
                     // run the next task by starting with self.ptr to be the thread's pool pointer.
                     const task = next_task orelse break;
-                    @atomicStore(usize, &self.ptr, @ptrToInt(pool), .Unordered);
+                    @atomicStore(usize, &self.ptr, 1, .Unordered);
                     task.run();
 
                     // if the task above yielded a new task, it would be inside self.ptr, replacing the pool above.
                     next_task = null;
-                    if (self.ptr != @ptrToInt(pool)) {
+                    if (self.ptr != 1) {
                         next_task = @intToPtr(*Task, self.ptr);
                     }
                 }
 
                 // re-poll for more tasks after executing the last.
                 // if a "yielded into" task was not processed, reschedule it to let other tasks run 
-                if (next_task) |task|
+                if (next_task) |task| {
                     self.schedule(Task.Batch.from(task));
+                }
                 continue;
             }
 
             // this thread found no work/tasks in the thread pool so it should sleep until woken up.
             const suspended = pool.suspendThread(&self);
-            if (suspended)
+            if (suspended) {
                 self.event.wait();
+            }
             
             // the thread was woken up after a suspend, check if it was shutdown or not
             if (self.ptr == 0) {
@@ -740,7 +949,7 @@ const Thread = struct {
     /// Mark a batch of tasks as runnable to the scheduler
     fn schedule(self: *Thread, tasks: Task.Batch) void {
         var batch = tasks;
-        const pool = @intToPtr(*Pool, self.ptr);
+        const pool = self.pool;
         
         var tail = self.runq_tail;
         var head = @atomicLoad(usize, &self.runq_head, .Monotonic);

@@ -424,7 +424,6 @@ const Thread = struct {
     ptr: usize,
     handle: ?*std.Thread,
     event: std.ResetEvent,
-    runq_next: ?*Task,
     runq_head: usize,
     runq_tail: usize,
     runq_buffer: [256]*Task,
@@ -573,20 +572,6 @@ const Thread = struct {
 
     /// Check for a task by polling the local run queue of this Thread
     fn pollLocal(self: *Thread) ?*Task {
-        // check the runq_next slot first as it's a 1-sized LIFO buffer
-        var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-        while (runq_next) |next| {
-            runq_next = @cmpxchgWeak(
-                ?*Task,
-                &self.runq_next,
-                runq_next,
-                null,
-                .Monotonic,
-                .Monotonic,
-            ) orelse return next;
-        }
-
-        // check the runq buffer in a FIFO fashion after
         const tail = self.runq_tail;
         var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
         while (head != tail) {
@@ -628,23 +613,9 @@ const Thread = struct {
             }
 
             // prepare to steal half of the target runq's tasks into our own local runq.
-            // if the target runq is empty, try to steal from its runq_next slot.
-            // if that is also empty, then bail on trying to steal at all.
-            //
-            // Acquire barrier on runq_next steal to ensure visibility of next's Task writes.
             var steal = target_size - (target_size / 2);
             if (steal == 0) {
-                const next = @atomicLoad(?*Task, &target.runq_next, .Monotonic) orelse return null;
-                _ = @cmpxchgWeak(
-                    ?*Task,
-                    &target.runq_next,
-                    next,
-                    null,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse return next;
-                target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
-                continue;
+                return null;
             }
             
             // Will be returning the first stolen task from the target runq.
@@ -713,19 +684,6 @@ const Thread = struct {
         
         // pop one task from the pool's run queue as the first task to return
         var first_task = pool.pop(&runq_tail);
-        
-        // try to pop a task from the pool runq and store it in our runq_next slot
-        // Release barrier to ensure that the task writes are visible to stealer Threads
-        if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
-            while (pool.pop(&runq_tail)) |task| {
-                if (first_task == null) {
-                    first_task = task;
-                } else {
-                    @atomicStore(?*Task, &self.runq_next, task, .Release);
-                    break;
-                }
-            }
-        }
 
         // try to pop many tasks from the pool runq and store it in out local runq
         var tail = self.runq_tail;
@@ -773,19 +731,6 @@ const Thread = struct {
             }
         }
 
-        // try to add a new runq_next if it was stolen during the local buffer adding.
-        // Release barrier to ensure that the task writes are visible to stealer Threads.
-        if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
-            while (pool.pop(&runq_tail)) |task| {
-                if (first_task == null) {
-                    first_task = task;
-                } else {
-                    @atomicStore(?*Task, &self.runq_next, task, .Release);
-                    break;
-                }
-            }
-        }
-
         // finished polling the thread pool's run queue.
         // release the IS_POLLING lock while at the same time updating the runq_tail.
         @atomicStore(usize, &pool.runq_tail, @ptrToInt(runq_tail), .Release);
@@ -795,32 +740,8 @@ const Thread = struct {
     /// Mark a batch of tasks as runnable to the scheduler
     fn schedule(self: *Thread, tasks: Task.Batch) void {
         var batch = tasks;
-        var task = batch.pop() orelse return;
         const pool = @intToPtr(*Pool, self.ptr);
-
-        // Try to replace the runq_next slot
-        // Release ordering on store to ensure stealer Threads read valid frame on runq_next Task.
-        var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-        while (true) {
-            const next = runq_next orelse {
-                @atomicStore(?*Task, &self.runq_next, task, .Release);
-                task = batch.pop() orelse return;
-                break;
-            };
-            runq_next = @cmpxchgWeak(
-                ?*Task,
-                &self.runq_next,
-                next,
-                task,
-                .Release,
-                .Monotonic,
-            ) orelse {
-                task = next;
-                break;
-            };
-        }
         
-        batch.pushFront(task);
         var tail = self.runq_tail;
         var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
         while (true) {
@@ -876,12 +797,6 @@ const Thread = struct {
                 head +%= 1;
             }
 
-            // Update the runq_next if it was stolen while we were creating the batch.
-            if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
-                const next = overflow_batch.pop();
-                @atomicStore(?*Task, &self.runq_next, next, .Release);
-            }
-            
             // Combine the local runq batch and the scheduled batch, then push them all to the pool.
             overflow_batch.pushBackMany(batch);
             pool.push(overflow_batch);

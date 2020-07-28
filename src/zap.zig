@@ -5,16 +5,12 @@ pub const Runtime = struct {
 
 };
 
+/// A Task represents an eventual continuation that can be freely scheduled on a thread pool.
 pub const Task = struct {
     next: ?*Task,
     frame: anyframe,
 
-    /// Hints to the scheduler about how to schedule a Batch of tasks.
-    pub const Priority = enum {
-        fifo,
-        lifo,
-    };
-
+    /// Initialize a continuation task using the given async frame.
     pub fn init(frame: anyframe) Task {
         return Task{
             .next = undefined,
@@ -22,8 +18,36 @@ pub const Task = struct {
         };
     }
 
-    pub fn schedule(self: *Task, priority: Priority) void {
-        return Batch.from(self).schedule(priority);
+    /// Execute the continuation represented by this Task
+    ///
+    /// TODO: support callbacks instead of being restricted to zig async frames
+    pub fn run(self: *Task) void {
+        resume self.frame;
+    }
+
+    /// Schedule the task for eventual execution via its run() function in the thread pool.
+    pub fn schedule(self: *Task) void {
+        return Batch.from(self).schedule();
+    }
+
+    /// Yield execution of the current/callers Task to the thread pool, allowing another task to run.
+    pub fn yield() void {
+        var task = Task.init(@frame());
+        suspend {
+            const thread = Thread.getCurrent();
+            const pool = @intToPtr(*Thread.Pool, thread.ptr);
+            pool.schedule(Task.Batch.from(&task));
+        }
+    }
+
+    /// Switch execution from the caller into the passed in Task object.
+    /// The task object that is scheduled into should normally have a way to reschedule the caller.
+    /// 
+    /// Similar to Google's SwitchTo FUTEX_SWAP API 
+    /// https://lwn.net/Articles/826860/
+    pub fn yieldInto(self: *Task) void {
+        const thread = Thread.getCurrent();
+        suspend thread.ptr = @ptrToInt(self);
     }
 
     /// An ordered set of Task's which can be scheduled together at once.
@@ -97,8 +121,8 @@ pub const Task = struct {
         /// Schedule the batch of tasks into the currently running thread pool.
         /// Panics if the caller is not running in a task thread pool.
         /// This operation takes ownership of the batch's tasks so it may not be used after.
-        pub fn schedule(self: Batch, priority: Priority) void {
-            return Thread.getCurrent().schedule(self, priority);
+        pub fn schedule(self: Batch) void {
+            return Thread.getCurrent().schedule(self);
         }
     };
 
@@ -301,7 +325,35 @@ const Thread = struct {
                 std.debug.panic("Pool.deinit() when runq is not empty", .{});
         }
 
-        fn resumeThread()
+        const ResumeOptions = struct {
+            no_spawn: bool = false,
+            was_waking: bool = false,
+        };
+
+        fn resumeThread(self: *Pool, options: ResumeOptions) void {
+            const can_spawn = !options.no_spawn;
+            const is_waking = options.was_waking;
+            var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+
+            while (true) {
+                if (idle_queue & IS_SHUTDOWN != 0)
+                    std.debug.panic("Pool.resumeThread() when shutdown", .{});
+                
+                var new_idle_queue = idle_queue;
+
+                if (@cmpxchgWeak(
+                    usize,
+                    &self.idle_queue,
+                    idle_queue,
+                    new_idle_queue,
+                    .Acquire,
+                    .Acquire,
+                )) |updated_idle_queue| {
+                    idle_queue = updated_idle_queue;
+                    continue;
+                }
+            }
+        }
 
         /// Push a batch of tasks to the pool's run queue in a *wait-free manner.
         /// 
@@ -348,6 +400,15 @@ const Thread = struct {
             runq_tail.* = next orelse return null;
             return tail;
         }
+
+        /// Schedule a batch of tasks onto the thread pool from a caller outside of the thread pool.
+        ///
+        /// This defaults to pushing the batch of tasks to the back of the global
+        /// run queue allowing previously scheduled tasks a turn on the Threads.
+        pub fn schedule(self: *Pool, tasks: Task.Batch) void {
+            self.push(tasks);
+            self.resumeThread(.{});
+        }
     };
 
     threadlocal var current: ?*Thread = null;
@@ -369,41 +430,76 @@ const Thread = struct {
     runq_buffer: [256]*Task,
 
     fn run(run_info: RunInfo) void {
+        var is_waking = true;
+        const pool = run_info.pool;
+        const slot = run_info.slot;
+        var prng = @truncate(Index, @ptrToInt(pool) ^ @ptrToInt(self));
 
+        // allocate our Thread object on our OS thread's stack.
         var self = Thread{
-            .ptr = @ptrToInt(run_info.pool),
+            .ptr = @ptrToInt(pool),
             .handle = null,
             .event = std.ResetEvent.init(),
-            .runq_next = null,
             .runq_head = 0,
             .runq_tail = 0,
             .runq_buffer = undefined,
         };
-
-        var is_waking = true;
-        var prng = @truncate(Index, self.ptr ^ @ptrToInt(self));
         
         // continuously poll for tasks until the thread is shutdown
-        while (self.ptr != 0) {
+        while (true) {
             var polled_global = false;
-            if (self.poll(pool, &prng, &polled_global)) |task| {
+            if (self.poll(pool, &prng, &polled_global)) |new_task| {
                 
                 // if a task was found and this thread was waking or found it in pool runq, wake another thread.
                 // - the last waking thread wakes another instead of thundering herd waking to avoid contention.
                 // - polling the pool runq acts as a lock so wake another thread that was waiting on said lock.
-                const was_waking = is_waking;
+                if (is_waking or polled_global)
+                    pool.resumeThread(.{ .was_waking = is_waking });
                 is_waking = false;
-                if (was_waking or polled_global)
-                    pool.resumeThread(.{ .was_waking = was_waking });
 
-                // execute the task itself
-                // TODO: support callbacks instead of restricting to zig async frames
-                resume task.frame;
+                // A task was found, keep executing tasks if they keep yielding more
+                var next_task: ?*Task = new_task;
+                var direct_yields = 7;
+                while (direct_yields) : (direct_yields -= 1) {
+                    
+                    // run the next task by starting with self.ptr to be the thread's pool pointer.
+                    const task = next_task orelse break;
+                    @atomicStore(usize, &self.ptr, @ptrToInt(pool), .Unordered);
+                    task.run();
+
+                    // if the task above yielded a new task, it would be inside self.ptr, replacing the pool above.
+                    next_task = null;
+                    if (self.ptr != @ptrToInt(pool)) {
+                        next_task = @intToPtr(*Task, self.ptr);
+                    }
+                }
+
+                // re-poll for more tasks after executing the last.
+                // if a "yielded into" task was not processed, reschedule it to let other tasks run 
+                if (next_task) |task|
+                    self.schedule(Task.Batch.from(task));
                 continue;
             }
 
-            if (pool.suspendThread(&self))
+            // this thread found no work/tasks in the thread pool so it should sleep until woken up.
+            const suspended = pool.suspendThread(&self);
+            if (suspended)
+                self.event.wait();
+            
+            // the thread was woken up after a suspend, check if it was shutdown or not
+            if (self.ptr == 0) {
+                break;
+            } else if (suspended) {
+                self.event.reset();
+            }
         }
+
+        // de-initialize the Thread with some safety checks
+        self.event.deinit();
+        const runq_tail = self.runq_tail;
+        const runq_head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        if (runq_tail != runq_head)
+            std.debug.panic("Thread.deinit() with invalid runq size of {}", .{runq_tail -% runq_head});
     }
 
     /// Check for a task that the current thread can execute.
@@ -696,109 +792,100 @@ const Thread = struct {
         return first_task;
     }
 
-    /// Mark a batch of tasks as runnable to the scheduler using the priorioty as a hint.
-    fn schedule(
-        self: *Thread,
-        task_batch: Task.Batch,
-        priority: Task.Priority,
-    ) void {
-        var batch = task_batch;
+    /// Mark a batch of tasks as runnable to the scheduler
+    fn schedule(self: *Thread, tasks: Task.Batch) void {
+        var batch = tasks;
         var task = batch.pop() orelse return;
         const pool = @intToPtr(*Pool, self.ptr);
+
+        // Try to replace the runq_next slot
+        // Release ordering on store to ensure stealer Threads read valid frame on runq_next Task.
+        var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
+        while (true) {
+            const next = runq_next orelse {
+                @atomicStore(?*Task, &self.runq_next, task, .Release);
+                task = batch.pop() orelse return;
+                break;
+            };
+            runq_next = @cmpxchgWeak(
+                ?*Task,
+                &self.runq_next,
+                next,
+                task,
+                .Release,
+                .Monotonic,
+            ) orelse {
+                task = next;
+                break;
+            };
+        }
         
-        enqueue: {
-            // Try to replace the runq_next slot if fifo scheduling
-            // Release ordering on store to ensure stealer Threads read valid frame on runq_next Task.
-            if (priority == .lifo) {
-                var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-                while (true) {
-                    const next = runq_next orelse {
-                        @atomicStore(?*Task, &self.runq_next, task, .Release);
-                        task = batch.pop() orelse break :enqueue;
-                        break;
-                    };
-                    runq_next = @cmpxchgWeak(
-                        ?*Task,
-                        &self.runq_next,
-                        next,
-                        task,
-                        .Release,
-                        .Monotonic,
-                    ) orelse {
-                        task = next;
-                        break;
-                    };
-                }
-            }
+        batch.pushFront(task);
+        var tail = self.runq_tail;
+        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        while (true) {
 
-            batch.pushFront(task);
-            var tail = self.runq_tail;
-            var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+            const size = tail -% head;
+            if (size > self.runq_buffer.len)
+                std.debug.panic("Thread.schedule() with invalid runq size of {}", .{size});
 
-            const BUFFER_SIZE = self.runq_buffer.len;
-            while (true) {
-                const size = tail -% head;
-                if (size > BUFFER_SIZE)
-                    std.debug.panic("Thread.schedule() with invalid runq size of {}", .{size});
-
-                // check if theres space in the local runq buffer to push the batch tasks to
-                if (batch.len <= (BUFFER_SIZE - size)) {
-                    var new_tail = tail;
-                    while (new_tail -% head < BUFFER_SIZE) {
-                        task = batch.pop() orelse break;
-                        @atomicStore(*Task, &self.runq_buffer[new_tail % BUFFER_SIZE], task, .Unordered);
-                        new_tail +%= 1;
-                    }
-
-                    // only do a store if tasks were pushed to the runq buffer.
-                    // Release barrier to ensure stealer Threads read value Tasks from our runq_buffer.
-                    if (new_tail != tail) {
-                        tail = new_tail;
-                        @atomicStore(usize, &self.runq_tail, new_tail, .Release);
-                    }
-
-                    // handle the remaining batch tasks if there are any.
-                    if (batch.len == 0) {
-                        break :enqueue;
-                    } else {
-                        head = @atomicLoad(usize, &self.runq_head, .Monotonic);
-                        continue;
-                    }
+            // check if theres space in the local runq buffer to push the batch tasks to
+            if (batch.len <= (self.runq_buffer.len - size)) {
+                var new_tail = tail;
+                while (new_tail -% head < self.runq_buffer.len) {
+                    task = batch.pop() orelse break;
+                    @atomicStore(*Task, &self.runq_buffer[new_tail % self.runq_buffer.len], task, .Unordered);
+                    new_tail +%= 1;
                 }
 
-                // The batch hash more tasks than the runq buffer could affort to take.
-                // try to steal half of the buffers tasks in order to overflow them into the pool runq.
-                var steal: usize = BUFFER_SIZE / 2;
-                if (@cmpxchgWeak(
-                    usize,
-                    &self.runq_head,
-                    head,
-                    head +% steal,
-                    .Monotonic,
-                    .Monotonic,
-                )) |new_head| {
-                    head = new_head;
+                // only do a store if tasks were pushed to the runq buffer.
+                // Release barrier to ensure stealer Threads read value Tasks from our runq_buffer.
+                if (new_tail != tail) {
+                    tail = new_tail;
+                    @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+                }
+
+                // handle the remaining batch tasks if there are any.
+                if (batch.len == 0) {
+                    break;
+                } else {
+                    head = @atomicLoad(usize, &self.runq_head, .Monotonic);
                     continue;
                 }
-
-                // Create a batch of tasks out of those stolen from the local runq buffer.
-                var overflow_batch = Task.Batch{};
-                while (steal != 0) : (steal -= 1) {
-                    overflow_batch.pushBack(self.runq_buffer[head % BUFFER_SIZE]);
-                    head +%= 1;
-                }
-
-                // Update the runq_next if it was stolen while we were creating the batch.
-                if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
-                    const next = overflow_batch.pop();
-                    @atomicStore(?*Task, &self.runq_next, next, .Release);
-                }
-                
-                // Combine the local runq batch and the scheduled batch, then push them all to the pool.
-                overflow_batch.pushBackMany(batch);
-                pool.push(overflow_batch);
-                break :enqueue;
             }
+
+            // The batch hash more tasks than the runq buffer could affort to take.
+            // try to steal half of the buffers tasks in order to overflow them into the pool runq.
+            var steal: usize = self.runq_buffer.len / 2;
+            if (@cmpxchgWeak(
+                usize,
+                &self.runq_head,
+                head,
+                head +% steal,
+                .Monotonic,
+                .Monotonic,
+            )) |new_head| {
+                head = new_head;
+                continue;
+            }
+
+            // Create a batch of tasks out of those stolen from the local runq buffer.
+            var overflow_batch = Task.Batch{};
+            while (steal != 0) : (steal -= 1) {
+                overflow_batch.pushBack(self.runq_buffer[head % self.runq_buffer.len]);
+                head +%= 1;
+            }
+
+            // Update the runq_next if it was stolen while we were creating the batch.
+            if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
+                const next = overflow_batch.pop();
+                @atomicStore(?*Task, &self.runq_next, next, .Release);
+            }
+            
+            // Combine the local runq batch and the scheduled batch, then push them all to the pool.
+            overflow_batch.pushBackMany(batch);
+            pool.push(overflow_batch);
+            break;
         }
 
         // Tasks were scheduled into either our Thread or our Pool.

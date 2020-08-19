@@ -155,6 +155,8 @@ pub const PROCESSOR_CACHE_TYPE = extern enum {
     CacheTrace,
 };
 
+pub const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000;
+
 pub extern "kernel32" fn GetLogicalProcessorInformationEx(
     RelationshipType: LOGICAL_PROCESSOR_RELATIONSHIP,
     Buffer: ?[*]SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
@@ -206,14 +208,14 @@ pub extern "kernel32" fn SetThreadIdealProcessorEx(
 
 pub extern "ntdll" fn NtWaitForKeyedEvent(
     handle: ?HANDLE,
-    key: ?*const c_void,
+    key: ?windows.PVOID,
     alertable: BOOLEAN,
     timeout: ?*const LARGE_INTEGER, 
 ) callconv(.Stdcall) NTSTATUS;
 
 pub extern "ntdll" fn NtReleaseKeyedEvent(
     handle: ?HANDLE,
-    key: ?*const c_void,
+    key: ?windows.PVOID,
     alertable: BOOLEAN,
     timeout: ?*const LARGE_INTEGER, 
 ) callconv(.Stdcall) NTSTATUS;

@@ -24,7 +24,7 @@ const is_bsd = switch (std.builtin.os.tag) {
     else => false,
 };
 
-pub const subspace = 
+pub const subsystem = 
     if (is_windows)
         "./windows"
     else if (is_posix)
@@ -34,6 +34,7 @@ pub const subspace =
     else
         @compileError("Operating System not supported yet");
 
-pub const Event = @import(subspace ++ "/event.zig").Event;
-pub const Thread = @import(subspace ++ "/thread.zig").Thread;
-pub const Memory = @import(subspace ++ "/memory.zig").Memory;
+
+pub const Event = @import(subsystem ++ "/event.zig").Event;
+pub const Thread = @import(subsystem ++ "/thread.zig").Thread;
+pub const NumaNode = @import(subsystem ++ "/numa.zig").NumaNode;

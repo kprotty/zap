@@ -15,7 +15,7 @@
 const std = @import("std");
 const windows = @import("./windows.zig");
 const NumaNode = @import("./numa.zig").NumaNode;
-const isWindowsVersionOrHigher = @import("./version.zig").isWindowsVersionOrHigher;
+const isWindowsVersionOrHigher = windows.isWindowsVersionOrHigher;
 
 pub const Thread = extern struct {
     ideal_cpu: u32,

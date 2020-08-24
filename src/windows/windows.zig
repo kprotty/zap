@@ -16,6 +16,10 @@ const std = @import("std");
 
 pub usingnamespace std.os.windows;
 
+pub fn isWindowsVersionOrHigher(comptime version: anytype) bool {
+    return std.Target.current.os.isAtLeast(.windows, .version);
+}
+
 pub const KAFFINITY = usize;
 pub const GROUP_AFFINITY = extern struct {
     Mask: KAFFINITY,

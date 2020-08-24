@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const windows = @import("./windows.zig");
-const isWindowsVersionOrHigher = @import("./version.zig").isWindowsVersionOrHigher;
+const isWindowsVersionOrHigher = windows.isWindowsVersionOrHigher;
 
 pub const NumaNode = extern struct {
     node_id: ?u32,

@@ -182,5 +182,10 @@ pub const Thread = extern struct {
             }
         }
     }
+
+    // yield the OS thread back to the scheduler if possible
+    pub fn yield() void {
+        windows.kernel32.Sleep(1);
+    }
 };
 

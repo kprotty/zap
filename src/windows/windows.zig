@@ -161,6 +161,19 @@ pub const PROCESSOR_CACHE_TYPE = extern enum {
 
 pub const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000;
 
+pub const SRWLOCK = usize;
+pub const PSRWLOCK = *SRWLOCK;
+
+pub const SRWLOCK_INIT: SRWLOCK = 0;
+
+pub extern "kernel32" fn AcquireSRWLockExclusive(
+    pSRWLock: PSRWLOCK,
+) callconv(.Stdcall) void;
+
+pub extern "kernel32" fn ReleaseSRWLockExclusive(
+    pSRWLock: PSRWLOCK,
+) callconv(.Stdcall) void;
+
 pub extern "kernel32" fn GetLogicalProcessorInformationEx(
     RelationshipType: LOGICAL_PROCESSOR_RELATIONSHIP,
     Buffer: ?[*]SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,

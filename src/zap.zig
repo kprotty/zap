@@ -26,6 +26,12 @@ pub const Task = struct {
         };
     }
 
+    pub fn getCurrentThread() *Thread {
+        return Thread.getCurrent() orelse {
+            std.debug.panic("Task.getCurrentThread() from outside the Thread", .{});
+        };
+    }
+
     pub fn spawn(allocator: *std.mem.Allocator, comptime func: anytype, args: anytype) !void {
         const Args = @typeOf(args);
         const Wrapper = struct {
@@ -48,15 +54,46 @@ pub const Task = struct {
     }
 
     pub fn scheduleNext(self: *Task) void {
-        @compileError("TODO");
+        const thread = getCurrentThread();
+
+        if (thread.runq_next) |old_task|
+            thread.schedule(Batch.from(old_task));
+
+        thread.runq_next = self;
     }
 
     pub fn yield() void {
-        @compileError("TODO");
+        const thread = getCurrentThread();
+
+        if (self.runq_next == null) {
+            const next_task = thread.poll() orelse return;
+            self.runq_next = next_task;
+        }
+
+        var task = Task.init(@frame());
+        suspend thread.schedule(Batch.from(&task));
     }
 
     pub fn callBlocking(comptime func: anytype, args: anytype) @TypeOf(func).ReturnType {
+        var task: Task = undefined;
 
+        const pool = getCurrentThread().getPool();
+        const blocking_pool = pool.getBlockingPool();
+        const was_blocking = pool == blocking_pool;
+
+        if (!was_blocking) {
+            task = Task.init(@frame());
+            suspend blocking_pool.schedule(Batch.from(&task));
+        }
+
+        const result = @call(.{}, func, args);
+
+        if (!was_blocking) {
+            task = Tatsk.init(@frame());
+            suspend pool.schedule(Batch.from(&task));
+        }
+
+        return result;
     }
 
     pub const Batch = struct {
@@ -120,7 +157,8 @@ pub const Task = struct {
         }
 
         pub fn schedule(self: Batch) void {
-            @compileError("TODO")
+            const thread = Task.getCurrentThread();
+            thread.schedule(self);
         }
     };
 
@@ -181,12 +219,17 @@ pub const Task = struct {
 
             self.core_pool.deinit();
             self.blocking_pool.deinit();
+
+            const active_pools = @atomicLoad(usize, &self.active_pools, .Monotonic);
+            if (active_pools != 0)
+                std.debug.panic("Scheduler.deinit() with {} active pools", .{active_pools});
         }
     };
 
-    const Pool = extern struct {
+    pub const Pool = extern struct {
         workers_ptr: [*]Worker,
         workers_len: usize,
+        run_queue: ?*Task,
         idle_queue: usize,
         active_threads: usize,
 
@@ -200,6 +243,7 @@ pub const Task = struct {
             self.* = Pool{
                 .workers_ptr = workers.ptr,
                 .workers_len = (workers.len << 1) | @boolToInt(is_blocking),
+                .run_queue = null,
                 .idle_queue = 0,
                 .active_threads = 0,
             };
@@ -223,6 +267,10 @@ pub const Task = struct {
             if (idle_queue != IDLE_SHUTDOWN)
                 std.debug.panic("Pool.deinit() when not shutdown", .{});
 
+            const run_queue = @atomicLoad(?*Task, &self.run_queue, .Monotonic);
+            if (run_queue != null)
+                std.debug.panic("Pool.deinit() when runq not empty", .{});
+
             for (workers) |*worker, index| {
                 const ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
                 switch (Worker.Ptr.fromUsize(ptr)) {
@@ -245,6 +293,14 @@ pub const Task = struct {
             if (self.isBlocking())
                 return @fieldParentPtr(Scheduler, "blocking_pool", self);
             return @fieldParentPtr(Scheduler, "core_pool", self);
+        }
+
+        pub fn getCorePool(self: *Pool) *Pool {
+            return &self.getScheduler().core_pool;
+        }
+
+        pub fn getBlockingPool(self: *Pool) *Pool {
+            return &self.getScheduler().blocking_pool;
         }
 
         fn getWorkers(self: Pool) []Worker {
@@ -404,6 +460,30 @@ pub const Task = struct {
         fn suspendThread(noalias self: *Pool, noalias thread: *Thread) void {
             @compileError("TODO");
         }
+
+        fn push(self: *Pool, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            var run_queue = @atomicLoad(?*Task, &self.run_queue, .Monotonic);
+            while (true) {
+                batch.tail.next = run_queue;
+
+                run_queue = @cmpxchgWeak(
+                    ?*Task,
+                    &self.run_queue,
+                    run_queue,
+                    batch.head,
+                    .Release,
+                    .Monotonic,
+                ) orelse break;
+            }
+        }
+
+        pub fn schedule(self: *Pool, batch: Batch) void {
+            self.push(batch);
+            self.resumeThread(.{});
+        }
     };
 
     const Worker = struct {
@@ -471,6 +551,7 @@ pub const Task = struct {
         handle: ?*std.Thread,
         ptr: usize,
         worker: usize,
+        prng: usize,
 
         threadlocal var current: ?*Thread = null;
 
@@ -496,6 +577,7 @@ pub const Task = struct {
                 .handle = null,
                 .ptr = @ptrToInt(pool),
                 .worker = worker,
+                .prng = (@ptrToInt(&self) ^ 13) ^ (@ptrToInt(pool) ^ 31),
             };
 
             const old_current = Thread.currnet;
@@ -522,32 +604,26 @@ pub const Task = struct {
                 },
             }
 
-            var is_waking = true;
-            var prng = (@ptrToInt(&self) ^ 13) ^ (@ptrToInt(pool) ^ 31);
-
             while (true) {
-                var pushed = false;
-                if (self.poll(pool, &prng, &pushed)) |new_task| {
+                if (self.poll()) |new_task| {
                     var task = new_task;
-
-                    if (is_waking or pushed) {
-                        pool.resumeThread({ .is_waking = is_waking });
-                        is_waking = false;
-                    }
 
                     var direct_yields: usize = 0;
                     while (direct_yields < 7) : (direct_yields += 1) {
+                        self.runq_next = null;
                         task.run();
                         task = self.runq_next orelse break;
+                    }
+
+                    if (self.runq_next != null) {
+                        self.runq_next = null;
+                        self.schedule(Batch.from(task));
                     }
 
                     continue;
                 }
 
                 pool.suspendThread(&self);
-                const ptr = @atomicLoad(usize, &self.ptr, .Unordered);
-
-                is_waking = (self.ptr & 1) ! = 0;
                 if ((self.ptr & ~@as(usize, 1)) != @ptrToInt(pool))
                     break;                
             }
@@ -568,13 +644,357 @@ pub const Task = struct {
             return;
         }
 
-        fn poll(
-            noalias self: *Thread,
+        pub fn getPool(self: *Thread) *Pool {
+            return @intToPtr(*Pool, self.ptr & ~@as(usize, 1));
+        }
+
+        pub fn schedule(self: *Thread, batch: Batch) void {
+            self.push(batch);
+            self.getPool().resumeThread(.{});
+        }
+
+        fn readBuffer(self: *const Thread, index: usize) *Task {
+            const ptr = &self.runq_buffer[index % self.runq_buffer.len];
+            return @atomicLoad(*Task, ptr, .Unordered);
+        }
+
+        fn writeBuffer(self: *Thread, index: usize, task: *Task) void {
+            const ptr = &self.runq_buffer[index % self.runq_buffer.len];
+            return @atomicStore(*Task, ptr, task, .Unordered);
+        }
+
+        fn isBufferEmpty(self: *const Thread) bool {
+            const tail = self.runq_tail;
+            const head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+            const overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+            
+            const size = tail -% head;
+            if (size > self.runq_buffer.len)
+                std.debug.panic("Thread.isBufferEmpty() on worker {} with invalid runq size of {}", .{self.worker, size});
+            
+            return (size == 0) and (overflow == null);
+        }
+
+        fn push(self: *Thread, batch: Batch) void {
+            var tasks = batch;
+            var tail = self.runq_tail;
+            var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+
+            while (!tasks.isEmpty()) {
+                const size = tail -% head;
+                if (size > self.runq_buffer.len)
+                    std.debug.panic("Thread.push() on worker {} with invalid runq size of {}", .{self.worker, size});
+
+                var remaining = self.runq_buffer.len - size;
+                if (remaining > 0) {
+                    while (remaining > 0) : (remaining -= 1) {
+                        const task = tasks.pop() orelse break;
+                        self.writeBuffer(tail, task);
+                        tail +%= 1;
+                    }
+
+                    @atomicStore(usize, &self.runq_tail, tail, .Release);
+                    head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+                    continue;
+                }
+
+                var migrate = size / 2;
+                if (@cmpxchgWeak(
+                    usize,
+                    &self.runq_head,
+                    head,
+                    head +% migrate,
+                    .Acquire,
+                    .Monotonic,
+                )) |updated_head| {
+                    head = updated_head;
+                    continue;
+                }
+
+                tasks.pushFrontMany(blk: {
+                    var migrated = Batch{};
+                    while (migrate > 0) : (migrate -= 1) {
+                        const task = self.readBuffer(head);
+                        migrated.push(task);
+                        head +%= 1;
+                    }
+                    break :blk migrated;
+                });
+
+                var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+                while (true) {
+                    tasks.tail.next = overflow;
+
+                    if (overflow == null) {
+                        @atomicStore(?*Task, &self.runq_overflow, tasks.head, .Release);
+                        break;
+                    }
+
+                    overflow = @cmpxchgWeak(
+                        ?*Task,
+                        &self.runq_overflow,
+                        overflow,
+                        tasks.head,
+                        .Release,
+                        .Monotonic,
+                    ) orelse break;
+                }
+
+                std.debug.assert(tasks.isEmpty());
+                return;
+            }
+        }
+
+        fn poll(self: *Thread) ?*Task {
+            var pushed = false;
+            const ptr = self.ptr;
+            const pool = @intToPtr(*Pool, ptr & ~@as(usize, 1));
+
+            const task = self.pollTask(pool, &pushed) orelse return null;
+
+            const is_waking = (ptr & 1) != 0;
+            if (is_waking or pushed) {
+                pool.resumeThread({ .is_waking = is_waking });
+                @atomicStore(usize, &self.ptr, @ptrToInt(pool), .Unordered);
+            }
+
+            return task;
+        }
+
+        fn pollTask(
+            self: *Thread,
             noalias pool *Pool,
-            noalias prng: *usize,
             noalias pushed: *usize,
         ) ?*Task {
-            @compileError("TODO");
+            if (self.pollLocal()) |task| {
+                return task;
+            }
+            
+            var index = blk: {
+                var x = self.prng;
+                switch (@typeInfo(usize).Int.bits) {
+                    16 => {
+                        xs ^= xs << 7;
+                        xs ^= xs >> 9;
+                        xs ^= xs << 8;
+                    },
+                    32 => {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                    },
+                    64 => {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                    },
+                    else => @compileError("Unsupported architecture"),
+                }
+                self.prng = x;
+                break :blk x;
+            };
+
+            var iter: usize = 0;
+            const workers = pool.getWorkers();
+            while (iter < workers.len) : (iter += 1) {
+                const worker_index = index;
+                const worker = &workers[worker_index];
+                index = if (index == workers.len - 1) 0 else (index +% 1);
+
+                const worker_ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
+                switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                    .idle, .spawning => {},
+                    .shutdown => {
+                        std.debug.panic("Thread.poll() on worker {} when worker {} is shutdown", .{self.worker, worker_index});
+                    },
+                    .running => |thread| {
+                        if (thread == self)
+                            continue;
+                        if (self.pollSteal(thread)) |task| {
+                            pushed.* = self.isBufferEmpty();
+                            return task;
+                        }
+                    },
+                }
+            }
+
+            if (self.pollGlobal(pool)) |task| {
+                pushed.* = self.isBufferEmpty();
+                return task;
+            }
+
+            return null;
+        }
+
+        fn pollLocal(self: *Thread) ?*Task {
+            var tail = self.runq_tail;
+            var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+            while (true) {
+
+                const size = tail -% head;
+                if (size > self.runq_buffer.len)
+                    std.debug.panic("Thread.pollLocal() on worker {} with invalid runq size of {}", .{self.worker, size});
+
+                if (size == 0)
+                    break;
+
+                head = @cmpxchgWeak(
+                    usize,
+                    &self.runq_head,
+                    head,
+                    head +% 1,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return self.readBuffer(head);
+            }
+
+            var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+            while (true) {
+                const task = overflow orelse break;
+
+                if (@cmpxchgWeak(
+                    ?*Task,
+                    &self.runq_overflow,
+                    overflow,
+                    null,
+                    .Acquire,
+                    .Monotonic,
+                )) |updated_overflow| {
+                    overflow = updated_overflow;
+                    continue;
+                }
+
+                self.inject(task.next);
+                return task;
+            }
+
+            return null;
+        }
+
+        fn pollGlobal(noalias self: *Thread, noalias target: *Pool) ?*Task {
+            var run_queue = @atomicLoad(?*Task, &target.run_queue, .Monotonic);
+            while (true) {
+                const task = run_queue orelse break;
+
+                if (@cmpxchgWeak(
+                    ?*Task,
+                    &target.run_queue,
+                    run_queue,
+                    null,
+                    .Acquire,
+                    .Monotonic,
+                )) |updated_run_queue| {
+                    run_queue = updated_run_queue;
+                    continue;
+                }
+
+                self.inject(task.next);
+                return task;
+            }
+
+            return null;
+        }
+
+        fn pollSteal(noalias self: *Thread, noalias target: *Thread) ?*Task {
+            var tail = self.runq_tail;
+            var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+            var size = tail -% head;
+            if (size > self.runq_buffer.len)
+                std.debug.panic("Thread.pollSteal() on worker {} with invalid runq size of {}", .{self.worker, size});
+            if (size != 0)
+                std.debug.panic("Thread.pollSteal() on worker {} with non-empty runq size of {}", .{self.worker, size});
+        
+            var target_head = @atomicLoad(usize, &target.runq_head, .Acquire);
+            while (true) {
+                const target_tail = @atomicLoad(usize, &target.runq_tail, .Acquire);
+
+                size = target_tail -% target_head;
+                if (size > self.runq_buffer.len) {
+                    std.SpinLock.loopHint(1);
+                    target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                    continue;
+                }
+
+                size = size - (size / 2);
+                if (size == 0) {
+                    const task = @atomicLoad(?*Task, &target.runq_overflow, .Monotonic) orelse break;
+
+                    if (@cmpxchgWeak(
+                        ?*Task,
+                        &target.runq_overflow,
+                        task,
+                        null,
+                        .Acquire,
+                        .Monotonic,
+                    )) |_| {
+                        std.SpinLock.loopHint(1);
+                        target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                        continue;
+                    }
+
+                    self.inject(task.next);
+                    return task;
+                }
+
+                const first_task = target.readBuffer(target_head); 
+                var new_target_head = target_head +% 1;
+                var new_tail = tail;
+                steal -= 1;
+
+                while (steal > 0) : (steal -= 1) {
+                    const task = target.readBuffer(new_target_head);
+                    new_target_head +%= 1;
+                    self.writeBuffer(new_tail, task);
+                    new_tail +%= 1;
+                }
+
+                if (@cmpxchgWeak(
+                    usize,
+                    &target.head,
+                    target_head,
+                    new_target_head,
+                    .AcqRel,
+                    .Monotonic,
+                )) |updated_target_head| {
+                    target_head = updated_target_head;
+                    continue;
+                }
+
+                if (new_tail != tail)
+                    @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+                return first_task;
+            }
+        }
+
+        fn inject(noalias self: *Task, noalias batch_head: ?*Task) void {
+            var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+            if (overflow != null)
+                std.debug.panic("Thread.inject() on worker {} with non-empty runq overflow", .{self.worker});
+
+            var tail = self.runq_tail;
+            var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+            var size = tail -% head;
+            if (size > self.runq_buffer.len)
+                std.debug.panic("Thread.inject() on worker {} with invalid runq size of {}", .{self.worker, size});
+            if (size != 0)
+                std.debug.panic("Thread.inject() on worker {} with non-empty runq size of {}", .{self.worker, size});
+
+            var runq = batch_head;
+            var new_tail = tail;
+            while (size < self.runq_buffer.len) : (size += 1) {
+                const task = runq orelse break;
+                runq = task.next;
+                self.writeBuffer(new_tail, task);
+                new_tail +%= 1;
+            }
+
+            if (new_tail != tail) {
+                @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+            }
+
+            if (runq != null) {
+                @atomicStore(?*Task, &self.runq_overflow, runq, .Release);    
+            }
         }
     };
 };

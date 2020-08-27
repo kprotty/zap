@@ -17,17 +17,18 @@ const std = @import("std");
 
 pub const Task = struct {
     next: ?*Task,
-    frame: anyframe,
+    frame: usize,
 
     pub fn init(frame: anyframe) Task {
         return Task{
             .next = undefined,
-            .frame = frame,
+            .frame = @ptrToInt(frame),
         };
     }
 
     pub fn execute(self: *Task, thread: *Thread) void {
-        resume self.frame;
+        const frame = @intToPtr(anyframe, self.frame);
+        resume frame;
     }
 
     pub fn getCurrentThread() *Thread {
@@ -69,9 +70,9 @@ pub const Task = struct {
     pub fn yield() void {
         const thread = getCurrentThread();
 
-        if (self.runq_next == null) {
+        if (thread.runq_next == null) {
             const next_task = thread.poll() orelse return;
-            self.runq_next = next_task;
+            thread.runq_next = next_task;
         }
 
         var task = Task.init(@frame());
@@ -176,11 +177,7 @@ pub const Task = struct {
         blocking_threads: usize = 0,
     };
 
-    pub fn runAsync(comptime func: anytype, args: anytype) !@TypeOf(func).ReturnType {
-        return runAsyncWithConfig(RunConfig{}, func, args);
-    }
-
-    pub fn runAsyncWithConfig(config: RunConfig, comptime func: anytype, args: anytype) !@TypeOf(func).ReturnType {
+    pub fn runAsync(config: RunConfig, comptime func: anytype, args: anytype) !@TypeOf(func).ReturnType {
         const Args = @TypeOf(args);
         const ReturnType = @TypeOf(func).ReturnType;
         const Wrapper = struct {
@@ -195,16 +192,12 @@ pub const Task = struct {
         var result: ?ReturnType = null;
         var frame = async Wrapper.entry(args, &task, &result);
 
-        try task.runWithConfig(config);
+        try task.run(config);
 
         return result orelse error.DeadLocked;
     }
 
-    pub fn run(self: *Task) !void {
-        return self.runWithConfig(RunConfig{});
-    }
-
-    pub fn runWithConfig(self: *Task, config: RunConfig) !void {
+    pub fn run(self: *Task, config: RunConfig) !void {
         const num_threads = switch (std.builtin.single_threaded) {
             true => 1,
             else => switch (config.threads) {
@@ -368,9 +361,12 @@ pub const Task = struct {
                 var new_resume_type: ?ResumeType = null;
                 var new_idle_queue: usize = (@as(usize, aba_tag) << 1) | IDLE_MARKED;
 
+                std.debug.warn("{} resuming: waking={} index={} mark={}\n", .{
+                    std.Thread.getCurrentId(), options.is_waking, worker_index, idle_queue & IDLE_MARKED});
+
                 if (worker_index != 0) {
                     if (!options.is_waking and (idle_queue & IDLE_MARKED != 0))
-                        return;
+                        break;
 
                     const worker = &workers[worker_index - 1];
                     const ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
@@ -396,7 +392,7 @@ pub const Task = struct {
                         },
                     }
                 } else if (idle_queue & IDLE_MARKED != 0) {
-                    return;
+                    break;
                 }
 
                 if (@cmpxchgWeak(
@@ -411,9 +407,11 @@ pub const Task = struct {
                     continue;
                 }
 
-                const resume_type = new_resume_type orelse return;
+                std.debug.warn("{} resumeType: {}\n", .{std.Thread.getCurrentId(), new_resume_type});
 
-                var active_threads = @atomicRmw(usize, &self.active_threads, .Add, 1, .Monotonic);
+                const resume_type = new_resume_type orelse break;
+
+                var active_threads = @atomicRmw(usize, &self.active_threads, .Add, 1, .Acquire);
                 if (active_threads == 0)
                     _ = @atomicRmw(usize, &self.getScheduler().active_pools, .Add, 1, .Monotonic);
 
@@ -465,9 +463,13 @@ pub const Task = struct {
                             if (options.is_main_thread)
                                 std.debug.panic("Pool.resumeThread() waking worker {} thread when is_main_thread", .{worker_index - 1});
 
-                            const thread_ptr = @ptrToInt(self) | @boolToInt(options.is_waking);
+                            const thread_ptr = @ptrToInt(self) | 1;
+                            const worker_ptr = Worker.Ptr{ .running = thread };
+                            
+                            const worker = &workers[worker_index - 1];
                             @atomicStore(usize, &thread.ptr, thread_ptr, .Unordered);
-
+                            @atomicStore(usize, &worker.ptr, worker_ptr.toUsize(), .Release);
+                        
                             return thread.event.set();
                         }
                     }
@@ -515,6 +517,9 @@ pub const Task = struct {
                 const idle_index = idle_queue >> 8;
                 const aba_tag = @truncate(u7, idle_queue >> 1);
                 var new_idle_queue = (worker_index << 8) | (idle_queue & IDLE_MARKED);
+
+                std.debug.warn("{} suspending: waking={} index={} next={} mark={}\n", .{
+                    std.Thread.getCurrentId(), is_waking, worker_index, idle_index, idle_queue & IDLE_MARKED});
 
                 const notified = (idle_index == 0) and (idle_queue & IDLE_MARKED != 0);
                 if (notified) {
@@ -740,7 +745,7 @@ pub const Task = struct {
                 .runq_next = null,
                 .event = std.ResetEvent.init(),
                 .handle = null,
-                .ptr = @ptrToInt(pool),
+                .ptr = @ptrToInt(pool) | 1,
                 .worker = worker,
                 .prng = (@ptrToInt(&pool.getWorkers()[worker]) ^ 13) ^ (@ptrToInt(pool) ^ 31),
             };
@@ -915,7 +920,6 @@ pub const Task = struct {
                     ) orelse break;
                 }
 
-                std.debug.assert(tasks.isEmpty());
                 return;
             }
         }
@@ -985,6 +989,9 @@ pub const Task = struct {
                     .running => |thread| {
                         if (thread == self)
                             continue;
+
+                        std.debug.warn("{} stealing from {}\n", .{self.worker, thread.worker});
+
                         if (self.pollSteal(thread)) |task| {
                             pushed.* = self.isBufferEmpty();
                             return task;

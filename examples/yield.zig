@@ -1,10 +1,11 @@
 const std = @import("std");
 const zap = @import("zap");
 
-const num_tasks = 100;
+const num_tasks = 5;
+const num_yields = 5;
 
 pub fn main() !void {
-    try (try (zap.Task.runAsync(asyncMain, .{})));
+    try (try (zap.Task.runAsync(.{ .threads = 0 }, asyncMain, .{})));
 }
 
 fn asyncMain() !void {
@@ -33,7 +34,10 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         batch.push(&task);
     }
 
-    std.debug.warn("Running on tid {}\n", .{std.Thread.getCurrentId()});
+    var i: usize = num_yields;
+    while (i != 0) : (i -= 1) {
+        zap.Task.yield();
+    }
 
     suspend {
         const completed = @atomicRmw(usize, counter, .Add, 1, .Monotonic);

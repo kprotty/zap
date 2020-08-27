@@ -94,7 +94,7 @@ pub const Task = struct {
         const result = @call(.{}, func, args);
 
         if (!was_blocking) {
-            task = Tatsk.init(@frame());
+            task = Task.init(@frame());
             suspend pool.schedule(Batch.from(&task));
         }
 

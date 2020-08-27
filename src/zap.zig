@@ -100,6 +100,11 @@ pub const Task = struct {
         return result;
     }
 
+    pub fn getAllocator() *std.mem.Allocator {
+        const thread = getCurrentThread();
+        return thread.getAllocator();
+    }
+
     pub const Batch = struct {
         head: ?*Task = null,
         tail: *Task = undefined,
@@ -218,7 +223,7 @@ pub const Task = struct {
         const stack_workers = ((std.mem.page_size / 2) / @sizeOf(Worker)) + 64;
         if (all_threads <= stack_workers)  {
             var workers: [stack_workers]Worker = undefined;
-            return Scheduler.runUsing(workers[0..], num_threads, self);
+            return Scheduler.runUsing(workers[0..all_threads], num_threads, self);
         }
 
         const allocator = std.heap.page_allocator;
@@ -498,8 +503,8 @@ pub const Task = struct {
 
         fn suspendThread(noalias self: *Pool, noalias thread: *Thread) void {
             const workers = self.getWorkers();
-            const worker_index = thread.worker;
-            const worker = &workers[worker_index];
+            const worker_index = thread.worker + 1;
+            const worker = &workers[worker_index - 1];
             const is_waking = (thread.ptr & 1) != 0;
             var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
 
@@ -940,6 +945,7 @@ pub const Task = struct {
                 return task;
             }
             
+            const workers = pool.getWorkers();
             var index = blk: {
                 var x = self.prng;
                 switch (@typeInfo(usize).Int.bits) {
@@ -961,11 +967,10 @@ pub const Task = struct {
                     else => @compileError("Unsupported architecture"),
                 }
                 self.prng = x;
-                break :blk x;
+                break :blk (x % workers.len);
             };
 
             var iter: usize = 0;
-            const workers = pool.getWorkers();
             while (iter < workers.len) : (iter += 1) {
                 const worker_index = index;
                 const worker = &workers[worker_index];
@@ -1167,6 +1172,22 @@ pub const Task = struct {
             if (runq != null) {
                 @atomicStore(?*Task, &self.runq_overflow, runq, .Release);    
             }
+        }
+
+        fn getAllocator(self: *Thread) *std.mem.Allocator {
+            if (std.builtin.link_libc) {
+                return std.heap.c_allocator;
+            }
+
+            if (std.builtin.os.tag == .windows) {
+                return &(struct {
+                    var heap = std.heap.HeapAllocator.init();
+                }.heap.allocator);
+            }
+
+            return &(struct {
+                var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            }.gpa.allocator);
         }
     };
 };

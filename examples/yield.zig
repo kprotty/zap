@@ -19,7 +19,7 @@ const num_tasks = 100 * 1000;
 const num_yields = 200;
 
 pub fn main() !void {
-    try (try (zap.Task.runAsync(.{ .threads = 0 }, asyncMain, .{})));
+    try (try (zap.Task.runAsync(.{}, asyncMain, .{})));
 }
 
 fn asyncMain() !void {

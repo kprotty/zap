@@ -1,0 +1,17 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2018"
+authors = ["kprotty"]
+
+[dependencies]
+tokio = { version = "0.2", features = ["rt-threaded", "sync", "macros"] }
+
+[[bin]]
+name = "yield"
+path = "./yield.rs"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1

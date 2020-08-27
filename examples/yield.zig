@@ -1,8 +1,8 @@
 const std = @import("std");
 const zap = @import("zap");
 
-const num_tasks = 5;
-const num_yields = 5;
+const num_tasks = 100 * 1000;
+const num_yields = 200;
 
 pub fn main() !void {
     try (try (zap.Task.runAsync(.{ .threads = 0 }, asyncMain, .{})));

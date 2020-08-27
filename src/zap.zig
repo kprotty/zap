@@ -359,10 +359,7 @@ pub const Task = struct {
                 var worker_index = idle_queue >> 8;
                 var aba_tag = @truncate(u7, idle_queue >> 1);
                 var new_resume_type: ?ResumeType = null;
-                var new_idle_queue: usize = (@as(usize, aba_tag) << 1) | IDLE_MARKED;
-
-                std.debug.warn("{} resuming: waking={} index={} mark={}\n", .{
-                    std.Thread.getCurrentId(), options.is_waking, worker_index, idle_queue & IDLE_MARKED});
+                var new_idle_queue: usize = @as(usize, aba_tag) << 1;
 
                 if (worker_index != 0) {
                     if (!options.is_waking and (idle_queue & IDLE_MARKED != 0))
@@ -373,12 +370,12 @@ pub const Task = struct {
                     switch (Worker.Ptr.fromUsize(ptr)) {
                         .idle => |idle_ptr| switch (idle_ptr) {
                             .worker => |next_index| {
-                                new_idle_queue |= next_index << 8;
+                                new_idle_queue |= (next_index << 8) | @boolToInt(next_index != 0);
                                 new_resume_type = ResumeType{ .spawn = worker };
                             },
                             .thread => |thread| {
                                 const next_index = @atomicLoad(usize, &thread.ptr, .Unordered);
-                                new_idle_queue |= next_index << 8;
+                                new_idle_queue |= (next_index << 8) | @boolToInt(next_index != 0);
                                 new_resume_type = ResumeType{ .notify = thread };
                             },
                         },
@@ -393,6 +390,8 @@ pub const Task = struct {
                     }
                 } else if (idle_queue & IDLE_MARKED != 0) {
                     break;
+                } else {
+                    new_idle_queue |= IDLE_MARKED;
                 }
 
                 if (@cmpxchgWeak(
@@ -406,8 +405,6 @@ pub const Task = struct {
                     idle_queue = updated_idle_queue;
                     continue;
                 }
-
-                std.debug.warn("{} resumeType: {}\n", .{std.Thread.getCurrentId(), new_resume_type});
 
                 const resume_type = new_resume_type orelse break;
 
@@ -465,7 +462,7 @@ pub const Task = struct {
 
                             const thread_ptr = @ptrToInt(self) | 1;
                             const worker_ptr = Worker.Ptr{ .running = thread };
-                            
+
                             const worker = &workers[worker_index - 1];
                             @atomicStore(usize, &thread.ptr, thread_ptr, .Unordered);
                             @atomicStore(usize, &worker.ptr, worker_ptr.toUsize(), .Release);
@@ -517,9 +514,6 @@ pub const Task = struct {
                 const idle_index = idle_queue >> 8;
                 const aba_tag = @truncate(u7, idle_queue >> 1);
                 var new_idle_queue = (worker_index << 8) | (idle_queue & IDLE_MARKED);
-
-                std.debug.warn("{} suspending: waking={} index={} next={} mark={}\n", .{
-                    std.Thread.getCurrentId(), is_waking, worker_index, idle_index, idle_queue & IDLE_MARKED});
 
                 const notified = (idle_index == 0) and (idle_queue & IDLE_MARKED != 0);
                 if (notified) {
@@ -796,6 +790,7 @@ pub const Task = struct {
                 }
 
                 pool.suspendThread(&self);
+
                 if (self.isShutdown())
                     break;                
             }
@@ -989,8 +984,6 @@ pub const Task = struct {
                     .running => |thread| {
                         if (thread == self)
                             continue;
-
-                        std.debug.warn("{} stealing from {}\n", .{self.worker, thread.worker});
 
                         if (self.pollSteal(thread)) |task| {
                             pushed.* = self.isBufferEmpty();

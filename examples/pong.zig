@@ -16,7 +16,6 @@ const std = @import("std");
 const zap = @import("zap");
 
 const num_tasks = 100 * 1000;
-const num_yields = 200;
 
 pub fn main() !void {
     try (try (zap.Task.runAsync(.{ .threads = 0 }, asyncMain, .{})));
@@ -27,7 +26,7 @@ fn asyncMain() !void {
     const frames = try allocator.alloc(@Frame(asyncWorker), num_tasks);
     defer allocator.free(frames);
 
-    var counter: usize = num_tasks;
+    var counter: usize = 0;
     var event = zap.Task.init(@frame());
     
     suspend {
@@ -37,7 +36,7 @@ fn asyncMain() !void {
         batch.schedule();
     }
 
-    const completed = num_tasks - @atomicLoad(usize, &counter, .Monotonic);
+    const completed = @atomicLoad(usize, &counter, .Monotonic);
     if (completed != num_tasks)
         std.debug.panic("Only {}/{} tasks completed\n", .{completed, num_tasks});
 }
@@ -48,14 +47,34 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         batch.push(&task);
     }
 
-    var i: usize = num_yields;
-    while (i != 0) : (i -= 1) {
-        zap.Task.yield();
-    }
+    const Channel = zap.sync.Channel;
+    const Pong = struct {
+        fn run(c1: *Channel(void), c2: *Channel(void)) void {
+            suspend {
+                var task = zap.Task.init(@frame());
+                task.schedule();
+            }
+
+            _ = c1.get() catch unreachable;
+            c2.put({}) catch unreachable;
+        }
+    };
+
+    var c1 = Channel(void).init(&[0]void{});
+    defer c1.deinit();
+
+    var c2 = Channel(void).init(&[0]void{});
+    defer c2.deinit();
+
+    var pong = async Pong.run(&c1, &c2);
+    c1.put({}) catch unreachable;
+    _ = c2.get() catch unreachable;
+    _ = await pong;
 
     suspend {
-        const completed = @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
-        if (completed - 1 == 0)
+        const completed = @atomicRmw(usize, counter, .Add, 1, .Monotonic);
+        if (completed + 1 == num_tasks)
             event.scheduleNext();
     }
 }
+

@@ -420,6 +420,9 @@ pub const Task = struct {
                             if (options.is_main_thread)
                                 return Thread.run(spawn_info);
 
+                            if (std.builtin.single_threaded)
+                                std.debug.panic("Tried to spawn more than one thread in single-threaded mode", .{});
+
                             const handle = std.Thread.spawn(spawn_info, Thread.run) catch break :blk worker;
                             const idle_ptr = Worker.IdlePtr{ .worker = new_idle_queue >> 8 };
                             const worker_ptr = @cmpxchgStrong(

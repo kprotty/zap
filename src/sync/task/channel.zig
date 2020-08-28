@@ -80,7 +80,7 @@ pub fn Channel(comptime T: type) type {
                         if (prev) |tail| {
                             tail.next = held;
                         } else {
-                            resume @frame();
+                            held.task.scheduleNext();
                         }
                     }
                 }

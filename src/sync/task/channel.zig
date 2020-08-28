@@ -231,14 +231,13 @@ pub fn Channel(comptime T: type) type {
                     batch.push(unlock_task);
 
                 suspend {
-                    var task = zap.Task.init(@frame());
-                    batch.push(&task);
-
                     const thread = zap.Task.getCurrentThread();
                     waiter.item = Waiter.Item{ .some = item };
                     if (thread.scheduleNext(&waiter.task)) |old_next|
                         batch.pushFront(old_next);
 
+                    var task = zap.Task.init(@frame());
+                    batch.push(&task);
                     thread.schedule(batch);
                 }
 

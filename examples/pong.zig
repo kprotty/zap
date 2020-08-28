@@ -47,7 +47,7 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         batch.push(&task);
     }
 
-    const Channel = zap.sync.Channel;
+    const Channel = zap.sync.task.Channel;
     const Pong = struct {
         fn run(c1: *Channel(void), c2: *Channel(void)) void {
             suspend {

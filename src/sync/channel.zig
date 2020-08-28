@@ -13,22 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
-const zap = @import("../zap.zig");
 
-pub fn Channel(comptime T: type) type {
-    const Lock = struct {
-        const Self = @This();
-
-        inner: std.Mutex = std.Mutex{},
-
-        fn acquire(self: *Self) void {
-            _ = self.inner.acquire();
-        }
-
-        fn release(self: *Self) void {
-            (std.Mutex.Held{ .mutex = &self.inner }).release();
-        }
-    };
+pub fn Channel(comptime config: anytype) type {
+    const T = config.Type;
+    const Lock = config.Lock;
+    const Signal = config.Signal;
     
     return struct {
         const Self = @This();
@@ -42,7 +31,7 @@ pub fn Channel(comptime T: type) type {
         buffer_len: usize,
 
         const Waiter = struct {
-            task: zap.Task,
+            signal: Signal,
             next: ?*Waiter,
             last: *Waiter,
             state: State,
@@ -70,7 +59,6 @@ pub fn Channel(comptime T: type) type {
             
             {
                 self.lock.acquire();
-                defer self.lock.release();
 
                 waiters = self.putters;
                 if (self.getters) |getter_head| {
@@ -88,17 +76,16 @@ pub fn Channel(comptime T: type) type {
 
                 self.putters = null;
                 self.getters = null;
+
+                self.lock.release();
             }
 
-            var batch = zap.Task.Batch{};
             while (waiters) |idle_waiter| {
                 const waiter = idle_waiter;
                 waiters = waiter.next;
                 waiter.state = Waiter.State{ .closed = {} };
-                batch.push(&waiter.task);
+                waiter.signal.notify();
             }
-
-            batch.schedule();
         }
 
         pub fn put(self: *Self, item: T) error{Closed}!void {
@@ -112,11 +99,7 @@ pub fn Channel(comptime T: type) type {
                 self.lock.release();
 
                 waiter.state = Waiter.State{ .item = item };
-                suspend {
-                    var task = zap.Task.init(@frame());
-                    waiter.task.scheduleNext();
-                    task.schedule();
-                }
+                waiter.signal.notifyHandoff();
                 return;
             }
 
@@ -128,7 +111,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             var waiter: Waiter = undefined;
-            waiter.task = zap.Task.init(@frame());
+            waiter.signal.init();
             waiter.next = null;
             waiter.last = &waiter;
             waiter.state = Waiter.State{ .item = item };
@@ -139,10 +122,10 @@ pub fn Channel(comptime T: type) type {
             } else {
                 self.putters = &waiter;
             }
+            self.lock.release();
 
-            suspend {
-                self.lock.release();
-            }
+            waiter.signal.wait();
+            waiter.signal.deinit();
 
             return switch (waiter.state) {
                 .item => unreachable,
@@ -167,7 +150,7 @@ pub fn Channel(comptime T: type) type {
                 };
 
                 waiter.state = Waiter.State{ .none = {} };
-                waiter.task.schedule();
+                waiter.signal.notify();
                 return item;
             }
 
@@ -179,7 +162,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             var waiter: Waiter = undefined;
-            waiter.task = zap.Task.init(@frame());
+            waiter.signal.init();
             waiter.next = null;
             waiter.last = &waiter;
             waiter.state = Waiter.State{ .none = {} };
@@ -190,10 +173,10 @@ pub fn Channel(comptime T: type) type {
             } else {
                 self.getters = &waiter;
             }
+            self.lock.release();
 
-            suspend {
-                self.lock.release();
-            }
+            waiter.signal.wait();
+            waiter.signal.deinit();
 
             return switch (waiter.state) {
                 .item => |item| item,

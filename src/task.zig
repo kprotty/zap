@@ -59,12 +59,9 @@ pub const Task = struct {
     }
 
     pub fn scheduleNext(self: *Task) void {
-        const thread = getCurrentThread();
-
-        if (thread.runq_next) |old_task|
-            thread.schedule(Batch.from(old_task));
-
-        thread.runq_next = self;
+        const thread = getCurrentThread();        
+        if (thread.scheduleNext(self)) |old_next|
+            thread.schedule(Batch.from(old_next));
     }
 
     pub fn yield() void {
@@ -826,6 +823,12 @@ pub const Task = struct {
         pub fn schedule(self: *Thread, batch: Batch) void {
             self.push(batch);
             self.getPool().resumeThread(.{});
+        }
+
+        pub fn scheduleNext(self: *Thread, task: *Task) ?*Task {
+            const old_next = self.runq_next;
+            self.runq_next = task;
+            return old_next;
         }
 
         fn readBuffer(self: *const Thread, index: usize) *Task {

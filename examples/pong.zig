@@ -47,9 +47,9 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         batch.push(&task);
     }
 
-    const Channel = zap.sync.task.Channel;
+    const OneShot = zap.sync.task.OneShot;
     const Pong = struct {
-        fn run(c1: *Channel(void), c2: *Channel(void)) void {
+        fn run(c1: *OneShot(void), c2: *OneShot(void)) void {
             suspend {
                 var task = zap.Task.init(@frame());
                 task.schedule();
@@ -60,11 +60,8 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         }
     };
 
-    var c1 = Channel(void).init(&[0]void{});
-    defer c1.deinit();
-
-    var c2 = Channel(void).init(&[0]void{});
-    defer c2.deinit();
+    var c1 = OneShot(void){};
+    var c2 = OneShot(void){};
 
     var pong = async Pong.run(&c1, &c2);
     c1.put({}) catch unreachable;
@@ -77,4 +74,3 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
             event.scheduleNext();
     }
 }
-

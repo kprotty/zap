@@ -41,8 +41,9 @@ pub const sync = struct {
 
     fn withNamespace(comptime namespace: []const u8) type {
         return struct {
+            pub const Lock = @import(namespace ++ "/lock.zig").Lock;
             pub const Signal = @import(namespace ++ "/signal.zig").Signal;
-            // pub const Lock = @import(namespace ++ "/lock.zig").Lock;
+            pub const OneShot = @import(namespace ++ "/oneshot.zig").OneShot;
             pub const Channel = @import(namespace ++ "/channel.zig").Channel;
         };
     }

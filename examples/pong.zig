@@ -49,23 +49,25 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
 
     const OneShot = zap.sync.task.OneShot;
     const Pong = struct {
-        fn run(c1: *OneShot(void), c2: *OneShot(void)) void {
+        fn run(c1: *OneShot(u8), c2: *OneShot(u8)) void {
             suspend {
                 var task = zap.Task.init(@frame());
                 task.schedule();
             }
 
-            _ = c1.get() catch unreachable;
-            c2.put({}) catch unreachable;
+            if ((c1.get() catch unreachable) != 0)
+                std.debug.panic("invalid receive from c1", .{});
+            c2.put(1) catch unreachable;
         }
     };
 
-    var c1 = OneShot(void){};
-    var c2 = OneShot(void){};
+    var c1 = OneShot(u8){};
+    var c2 = OneShot(u8){};
 
     var pong = async Pong.run(&c1, &c2);
-    c1.put({}) catch unreachable;
-    _ = c2.get() catch unreachable;
+    c1.put(0) catch unreachable;
+    if ((c2.get() catch unreachable) != 1)
+        std.debug.panic("invalid receive from c2", .{});
     _ = await pong;
 
     suspend {

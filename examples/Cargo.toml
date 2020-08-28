@@ -11,6 +11,10 @@ tokio = { version = "0.2", features = ["rt-threaded", "sync", "macros"] }
 name = "yield"
 path = "./yield.rs"
 
+[[bin]]
+name = "pong"
+path = "./pong.rs"
+
 [profile.release]
 lto = true
 opt-level = 3

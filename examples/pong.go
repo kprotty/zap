@@ -24,16 +24,22 @@ func main() {
 
 	for i := 0; i < num_tasks; i++ {
 		go func(){
-			c1 := make(chan struct{})
-			c2 := make(chan struct{})
+			c1 := make(chan byte, 1)
+			c2 := make(chan byte, 1)
 
 			go func(){
-				<- c1
-				c2 <- struct{}{}
+				x := <- c1
+				if x != 0 {
+					panic("invalid receive from c1")
+				}
+				c2 <- 1
 			}()
 
-			c1 <- struct{}{}
-			<- c2
+			c1 <- 0
+			x := <- c2
+			if x != 1 {
+				panic("invalid receive from c2")
+			}
 
 			if atomic.AddUintptr(&counter, ^uintptr(0)) == 0 {
 				event <- struct{}{}

@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 const std = @import("std");
+const sync = @import("./zap.zig").sync;
+
+fn spinLoopHint() void {
+    sync.spinLoopHint(@as(u1, 1));
+}
 
 pub const Task = struct {
     next: ?*Task,
@@ -164,6 +168,9 @@ pub const Task = struct {
         }
 
         pub fn schedule(self: Batch) void {
+            if (self.isEmpty())
+                return;
+
             const thread = Task.getCurrentThread();
             thread.schedule(self);
         }
@@ -225,7 +232,7 @@ pub const Task = struct {
     const Scheduler = struct {
         core_pool: Pool,
         blocking_pool: Pool,
-        active_pools: usize,
+        active_pools: usize align(sync.CACHE_ALIGN),
 
         fn runUsing(all_workers: []Worker, core_workers: usize, task: *Task) !void {
             const workers = all_workers[0..core_workers];
@@ -256,9 +263,9 @@ pub const Task = struct {
     pub const Pool = extern struct {
         workers_ptr: [*]Worker,
         workers_len: usize,
-        run_queue: ?*Task,
-        idle_queue: usize,
-        active_threads: usize,
+        run_queue: ?*Task align(sync.CACHE_ALIGN),
+        idle_queue: usize align(sync.CACHE_ALIGN),
+        active_threads: usize align(sync.CACHE_ALIGN),
 
         const IDLE_MARKED = 1;
         const IDLE_SHUTDOWN = ~@as(usize, 0);
@@ -377,7 +384,7 @@ pub const Task = struct {
                             },
                         },
                         .spawning, .running => {
-                            std.SpinLock.loopHint(1);
+                            spinLoopHint();
                             idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
                             continue;
                         },
@@ -467,7 +474,8 @@ pub const Task = struct {
                             @atomicStore(usize, &thread.ptr, thread_ptr, .Unordered);
                             @atomicStore(usize, &worker.ptr, worker_ptr.toUsize(), .Release);
                         
-                            return thread.event.set();
+                            thread.signal.notify();
+                            return;
                         }
                     }
                 };
@@ -558,8 +566,7 @@ pub const Task = struct {
                         scheduler.shutdown();
                 }
 
-                thread.event.wait();
-                thread.event.reset();
+                thread.signal.wait();
                 return;
             }
         }
@@ -612,7 +619,7 @@ pub const Task = struct {
                 const thread = idle_thread;
                 idle_threads = @intToPtr(?*Thread, thread.worker);
                 thread.shutdown();
-                thread.event.set();
+                thread.signal.notify();
             }
         }
 
@@ -704,13 +711,13 @@ pub const Task = struct {
         };
     };
 
-    const Thread = struct {
+    const Thread = extern struct {
         runq_head: usize,
-        runq_tail: usize,
-        runq_overflow: ?*Task,
-        runq_buffer: [256]*Task,
-        runq_next: ?*Task,
-        event: std.ResetEvent,
+        runq_tail: usize align(sync.CACHE_ALIGN),
+        runq_overflow: ?*Task align(sync.CACHE_ALIGN),
+        runq_buffer: [256]*Task align(sync.CACHE_ALIGN),
+        signal: sync.os.Signal,
+        runq_next: ?*Task align(sync.CACHE_ALIGN),
         handle: ?*std.Thread,
         ptr: usize,
         worker: usize,
@@ -737,12 +744,15 @@ pub const Task = struct {
                 .runq_overflow = null,
                 .runq_buffer = undefined,
                 .runq_next = null,
-                .event = std.ResetEvent.init(),
+                .signal = undefined,
                 .handle = null,
                 .ptr = @ptrToInt(pool) | 1,
                 .worker = worker,
                 .prng = (@ptrToInt(&pool.getWorkers()[worker]) ^ 13) ^ (@ptrToInt(pool) ^ 31),
             };
+
+            self.signal.init();
+            defer self.signal.deinit();
 
             const old_current = Thread.current;
             Thread.current = &self;
@@ -774,16 +784,10 @@ pub const Task = struct {
                 if (self.poll()) |new_task| {
                     var task = new_task;
 
-                    var direct_yields: usize = 0;
-                    while (direct_yields < 7) : (direct_yields += 1) {
+                    while (true) {
                         self.runq_next = null;
                         task.execute(&self);
                         task = self.runq_next orelse break;
-                    }
-
-                    if (self.runq_next != null) {
-                        self.runq_next = null;
-                        self.schedule(Batch.from(task));
                     }
 
                     continue;
@@ -806,9 +810,6 @@ pub const Task = struct {
             const runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
             if (runq_overflow != null)
                 std.debug.panic("Thread.deinit() on worker {} when runq overflow not empty", .{worker});
-
-            self.event.deinit();
-            return;
         }
 
         fn shutdown(self: *Thread) void {
@@ -1091,7 +1092,7 @@ pub const Task = struct {
 
                 size = target_tail -% target_head;
                 if (size > self.runq_buffer.len) {
-                    std.SpinLock.loopHint(1);
+                    spinLoopHint();
                     target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
                     continue;
                 }
@@ -1108,7 +1109,7 @@ pub const Task = struct {
                         .Acquire,
                         .Monotonic,
                     )) |_| {
-                        std.SpinLock.loopHint(1);
+                        spinLoopHint();
                         target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
                         continue;
                     }

@@ -12,40 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const std = @import("std");
+
 pub const Task = @import("./task.zig").Task;
 
 pub const sync = struct {
-    pub const core = struct {
-        pub const Lock = @import("./sync/lock.zig").Lock;
-
-        pub const Channel = @import("./sync/channel.zig").Channel;
+    pub const CACHE_ALIGN = switch (std.builtin.arch) {
+        .arm, .armeb, .mips, .mipsel, .mips64, .mips64el, .riscv64 => 32,
+        .aarch64, .wasm32, .wasm64, .i386, .x86_64 => 64,
+        .powerpc64 => 128,
+        .s390x => 256,
+        else => @alignOf(usize), 
     };
 
-    pub const os = struct {
-        pub const Signal = @import("./sync/signal/os.zig").Signal;
-
-        pub const Lock = core.Lock(Signal);
-
-        pub fn Channel(comptime T: type) type {
-            return core.Channel(.{
-                .Type = T,
-                .Lock = Lock,
-                .Signal = Signal,
-            });
+    pub fn spinLoopHint(iterations: anytype) void {
+        var i = iterations;
+        while (i > 0) : (i -= 1) {
+            switch (std.builtin.arch) {
+                .i386, .x86_64 => asm volatile("pause" ::: "memory"),
+                .arm, .aarch64 => asm volatile("yield" ::: "memory"),
+                else => {},
+            }
         }
-    };
+    }
 
-    pub const task = struct {
-        pub const Signal = @import("./sync/signal/task.zig").Signal;
+    pub const os = withNamespace("./sync/os");
+    pub const task = withNamespace("./sync/task");
 
-        pub const Lock = core.Lock(Signal);
-
-        pub fn Channel(comptime T: type) type {
-            return core.Channel(.{
-                .Type = T,
-                .Lock = os.Lock,
-                .Signal = Signal,
-            });
-        }
-    };
+    fn withNamespace(comptime namespace: []const u8) type {
+        return struct {
+            pub const Signal = @import(namespace ++ "/signal.zig").Signal;
+            // pub const Lock = @import(namespace ++ "/lock.zig").Lock;
+            pub const Channel = @import(namespace ++ "/channel.zig").Channel;
+        };
+    }
 };

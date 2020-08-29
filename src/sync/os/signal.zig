@@ -87,7 +87,7 @@ const LinuxSignal = extern struct {
 
     state: State,
 
-    const State = enum(i32) {
+    const State = extern enum(i32) {
         waiting = 0,
         notified = 1,
     };

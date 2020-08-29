@@ -13,7 +13,29 @@
 // limitations under the License.
 
 const std = @import("std");
+const io = @import("./io.zig");
 const sync = @import("./zap.zig").sync;
+
+const IoDriverState = enum(u2) {
+    uninit = 0,
+    creating = 1,
+    init = 2,
+    crashed = 3,
+
+    fn fromUsize(value: usize) IoDriverState {
+        const tag = @truncate(u2, value);
+        return @intToEnum(IoDriverState, tag);
+    }
+
+    fn toUsize(self: IoDriverState, payload: usize) usize {
+        std.debug.assert(payload & 0b11 == 0);
+        return @enumToInt(self) | payload;
+    }
+
+    fn getPayload(value: usize) usize {
+        return payload & ~@as(usize, 0b11);
+    }
+};
 
 fn spinLoopHint() void {
     sync.spinLoopHint(@as(u1, 1));
@@ -38,6 +60,91 @@ pub const Task = struct {
     pub fn getCurrentThread() *Thread {
         return Thread.getCurrent() orelse {
             std.debug.panic("Task.getCurrentThread() from outside the Thread", .{});
+        };
+    }
+
+    pub fn getIoDriver() ?*io.Driver {
+        const thread = getCurrentThread();
+        const io_driver_ptr = &thread.getPool().getScheduler().io_driver;
+        
+        var io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
+        if (IoDriverState.fromUsize(io_driver) == .init)
+            return @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver));
+
+        return getIoDriverSlow(thread);
+    }
+
+    fn getIoDriverSlow(thread: *Thread) ?*io.Driver {
+        @setCold(true);
+        const io_driver_ptr = &thread.getPool().getScheduler().io_driver;
+
+        suspend {
+            var task = zap.Task.init(@frame());
+            var io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
+
+            while (true) {
+                switch (IoDriverState.fromUsize(io_driver)) {
+                    .uninit => {
+                        if (@cmpxchgWeak(
+                            usize,
+                            io_driver_ptr,
+                            io_driver,
+                            IoDriverState.creating.toUsize(0),
+                            .Acquire,
+                            .Acquire,
+                        )) |updated_io_driver_ptr| {
+                            io_driver = updated_io_driver_ptr;
+                            continue;
+                        }
+
+                        var new_payload: usize = undefined;
+                        if (io.Driver.alloc()) |driver_ptr| {
+                            new_payload = IoDriverState.init.toUsize(@ptrToInt(driver_ptr));
+                        } else {
+                            new_payload = IoDriverState.crashed.toUsize(0);
+                        }
+                        io_driver = @atomicRmw(usize, io_driver_ptr, .Xchg, new_payload, .AcqRel);
+
+                        var batch = Batch{};
+                        var waiting_tasks = IoDriverState.getPayload(io_driver);
+                        while (waiting_tasks) |waiting_task| {
+                            const next = waiting_task.next;
+                            batch.pushFront(waiting_task);
+                            waiting_tasks = next;
+                        }
+
+                        if (thread.scheduleNext(&task)) |old_next|
+                            batch.pushFront(old_next);
+
+                        thread.schedule(batch);
+                        break;
+                    },
+                    .creating => {
+                        task.next = @intToPtr(?*zap.Task, IoDriverState.getPayload(io_driver));
+                        io_driver = @cmpxchgWeak(
+                            usize,
+                            io_driver_ptr,
+                            io_driver,
+                            IoDriverState.creating.toUsize(@ptrToInt(&task)),
+                            .Release,
+                            .Acquire,
+                        ) orelse break
+                    },
+                    .init, .crashed => {
+                        if (thread.scheduleNext(&task)) |old_next|
+                            thread.schedule(old_next);
+                        break;
+                    },
+                }
+            }
+        }
+
+        const io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
+        return switch (IoDriverState.fromUsize(io_driver)) {
+            .init => @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver)),
+            .crashed => null,
+            .uninit => unreachable,
+            .creating => unreachable,
         };
     }
 
@@ -232,6 +339,7 @@ pub const Task = struct {
     const Scheduler = struct {
         core_pool: Pool,
         blocking_pool: Pool,
+        io_driver: usize,
         active_pools: usize align(sync.CACHE_ALIGN),
 
         fn runUsing(all_workers: []Worker, core_workers: usize, task: *Task) !void {
@@ -242,6 +350,7 @@ pub const Task = struct {
             try self.core_pool.init(workers, false);
             try self.blocking_pool.init(blocking_workers, true);
             self.active_pools = 0;
+            self.io_driver = IoDriverState.uninit.toUsize(0);
 
             self.core_pool.push(Batch.from(task));
             self.core_pool.resumeThread(.{ .is_main_thread = true });

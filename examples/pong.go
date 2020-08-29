@@ -24,8 +24,8 @@ func main() {
 
 	for i := 0; i < num_tasks; i++ {
 		go func(){
-			c1 := make(chan byte, 1)
-			c2 := make(chan byte, 1)
+			c1 := make(chan byte)
+			c2 := make(chan byte)
 
 			go func(){
 				x := <- c1

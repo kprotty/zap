@@ -116,10 +116,14 @@ pub fn Channel(comptime T: type) type {
         getters: Waiter.Queue = Waiter.Queue{},
         head: usize = 0,
         tail: usize = 0,
-        buffer_ptr: ?[*]T,
+        buffer_ptr: [*]T,
         buffer_len: usize,
 
+        const CLOSED = @intToPtr([*]T, std.mem.alignBackward(std.math.maxInt(usize), @alignOf(T)));
+
         pub fn init(buffer: []T) Self {
+            if (buffer.ptr == CLOSED)
+                std.debug.panic("invalid buffer ptr", .{});
             return Self{
                 .buffer_ptr = buffer.ptr,
                 .buffer_len = buffer.len,
@@ -131,10 +135,13 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn close(self: *Self) void {
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
+                return;
+
             var held: Held = undefined;
             self.lock.acquire(&held);
 
-            self.buffer_ptr = null;
+            @atomicStore([*]T, &self.buffer_ptr, CLOSED, .Unordered);
 
             var waiters = Waiter.Queue{};
             waiters.consume(&self.putters);
@@ -153,27 +160,30 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn tryGet(self: *Self) error{Empty, Closed}!T {
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
+                return error.Closed;
+
             var held: Held = undefined;
             self.lock.acquire(&held);
             
             var batch = zap.Task.Batch{};
             var result: error{Empty, Closed}!T = undefined;
-            
-            if (self.buffer_ptr) |buffer_ptr| {
-                if (self.putters.pop()) |waiter| {
-                    batch.push(&waiter.task);
-                    result = waiter.item.some;
-                    waiter.item = Waiter.Item{ .none = {} };
 
-                } else if (self.tail == self.head) {
-                    result = error.Empty;
-
-                } else {
-                    result = buffer_ptr[self.head % self.buffer_len];
-                    self.head +%= 1;
-                }
-            } else {
+            if (self.buffer_ptr == CLOSED) {
                 result = error.Closed;
+
+            } else if (self.putters.pop()) |waiter| {
+                batch.push(&waiter.task);
+                waiter.item = Waiter.Item{ .none = {} };
+                result = waiter.item.some;
+
+            } else if (self.tail == self.head) {
+                result = error.Empty;
+
+            } else {
+                const item = self.buffer_ptr[self.head % self.buffer_len];
+                self.head +%= 1;
+                result = item;
             }
 
             if (self.lock.release(&held)) |unlock_task|
@@ -184,28 +194,30 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn tryPut(self: *Self, item: T) error{Full, Closed}!void {
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
+                return error.Closed;
+
             var held: Held = undefined;
             self.lock.acquire(&held);
             
             var batch = zap.Task.Batch{};
             var result: error{Full, Closed}!T = undefined;
 
-            if (self.buffer_ptr) |buffer_ptr| {
-                if (self.getters.pop()) |waiter| {
-                    batch.push(&waiter.task);
-                    result = {};
-                    waiter.item = Waiter.Item{ .some = item };
-
-                } else if (self.tail -% self.head >= self.buffer_len) {
-                    result = error.Full;
-
-                } else {
-                    buffer_ptr[self.tail % self.buffer_len] = item;
-                    self.tail +%= 1;
-                    result = {};
-                }
-            } else {
+            if (self.buffer_ptr == CLOSED) {
                 result = error.Closed;
+
+            } else if (self.getters.pop()) |waiter| {
+                batch.push(&waiter.task);
+                waiter.item = Waiter.Item{ .some = item };
+                result = {};
+
+            } else if (self.tail -% self.head >= self.buffer_len) {
+                result = error.Fill;
+
+            } else {
+                self.buffer_ptr[self.tail % self.buffer_len] = item;
+                self.tail +%= 1;
+                result = {};
             }
 
             if (self.lock.release(&held)) |unlock_task|
@@ -216,14 +228,17 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn put(self: *Self, item: T) error{Closed}!void {
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
+                return error.Closed;
+
             var held: Held = undefined;
             self.lock.acquire(&held);
-            
-            const buffer_ptr = self.buffer_ptr orelse {
+
+            if (self.buffer_ptr == CLOSED) {
                 if (self.lock.release(&held)) |unlock_task|
                     unlock_task.schedule();
                 return error.Closed;
-            };
+            }
 
             if (self.getters.pop()) |waiter| {
                 var batch = zap.Task.Batch{};
@@ -245,7 +260,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             if (self.tail -% self.head < self.buffer_len) {
-                buffer_ptr[self.tail % self.buffer_len] = item;
+                self.buffer_ptr[self.tail % self.buffer_len] = item;
                 self.tail +%= 1;
 
                 if (self.lock.release(&held)) |unlock_task|
@@ -275,14 +290,17 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn get(self: *Self) error{Closed}!T {
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
+                return error.Closed;
+
             var held: Held = undefined;
             self.lock.acquire(&held);
             
-            const buffer_ptr = self.buffer_ptr orelse {
+            if (self.buffer_ptr == CLOSED) {
                 if (self.lock.release(&held)) |unlock_task|
                     unlock_task.schedule();
                 return error.Closed;
-            };
+            }
 
             if (self.putters.pop()) |waiter| {
                 var batch = zap.Task.Batch{};
@@ -303,7 +321,7 @@ pub fn Channel(comptime T: type) type {
             }
 
             if (self.tail != self.head) {
-                const item = buffer_ptr[self.head % self.buffer_len];
+                const item = self.buffer_ptr[self.head % self.buffer_len];
                 self.head +%= 1;
 
                 if (self.lock.release(&held)) |unlock_task|

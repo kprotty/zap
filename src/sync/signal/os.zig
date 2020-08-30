@@ -13,6 +13,12 @@
 // limitations under the License.
 
 const std = @import("std");
+const zap = @import("../../zap.zig");
+
+fn spinLoopHint(iter: usize) void {
+    const spin = @as(usize, 1) << @intCast(std.math.Log2Int(usize), iter);
+    zap.sync.spinLoopHint(spin);
+}
 
 pub const Signal = 
     if (std.builtin.os.tag == .windows)
@@ -63,8 +69,17 @@ const PosixSignal = extern struct {
         self.state = .waiting;
     }
 
-    pub fn yield() void {
-        std.os.sched_yield() catch unreachable;
+    pub fn yield(iter: usize) bool {
+        if (iter > 10)
+            return false;
+
+        if (iter <= 3) {
+            spinLoopHint(iter);
+        } else {
+            std.os.sched_yield() catch unreachable;
+        }
+
+        return true;
     }
 
     const pthread_t = extern struct {
@@ -170,6 +185,13 @@ const WindowsSignal = extern struct {
     }
 
     pub fn yield() void {
-        windows.kernel32.Sleep(1);
+        if (iter > 10)
+            return false;
+
+        if (iter <= 3) {
+            spinLoopHint(iter);
+        } else {
+            windows.kernel32.Sleep(1);
+        } 
     }
 };

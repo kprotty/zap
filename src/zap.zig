@@ -36,15 +36,27 @@ pub const sync = struct {
         }
     }
 
-    pub const os = withNamespace("./sync/os");
-    pub const task = withNamespace("./sync/task");
+    pub const core = struct {
+        pub const Lock = @import("./sync/lock.zig").Lock;
+        pub const Channel = @import("./sync/channel.zig").Channel;
+    };
 
-    fn withNamespace(comptime namespace: []const u8) type {
+    pub const os = withSignal(@import("./sync/signal/os.zig").Signal);
+    pub const task = withSignal(@import("./sync/signal/task.zig").Signal);
+
+    fn withSignal(comptime CoreSignal: type) type {
         return struct {
-            pub const Lock = @import(namespace ++ "/lock.zig").Lock;
-            pub const Signal = @import(namespace ++ "/signal.zig").Signal;
-            pub const OneShot = @import(namespace ++ "/oneshot.zig").OneShot;
-            pub const Channel = @import(namespace ++ "/channel.zig").Channel;
+            pub const Signal = CoreSignal;
+
+            pub const Lock = core.Lock(Signal);
+
+            pub fn Channel(comptime T: type) type {
+                return core.Channel(.{
+                    .Buffer = T,
+                    .Lock = Lock,
+                    .Signal = Signal,
+                });
+            }
         };
     }
 };

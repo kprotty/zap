@@ -128,7 +128,7 @@ pub const Task = struct {
                             IoDriverState.creating.toUsize(@ptrToInt(&task)),
                             .Release,
                             .Monotonic,
-                        ) orelse break
+                        ) orelse break;
                     },
                     .init, .crashed => {
                         if (thread.scheduleNext(&task)) |old_next|

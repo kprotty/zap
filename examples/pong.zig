@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const zap = @import("zap");
+const Channel = zap.sync.task.Channel;
 
 const num_tasks = 100 * 1000;
 
@@ -47,9 +48,8 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         batch.push(&task);
     }
 
-    const OneShot = zap.sync.task.OneShot;
     const Pong = struct {
-        fn run(c1: *OneShot(u8), c2: *OneShot(u8)) void {
+        fn run(c1: *Channel(u8), c2: *Channel(u8)) void {
             suspend {
                 var task = zap.Task.init(@frame());
                 task.schedule();
@@ -61,8 +61,8 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         }
     };
 
-    var c1 = OneShot(u8){};
-    var c2 = OneShot(u8){};
+    var c1 = Channel(u8).init(&[0]u8{});
+    var c2 = Channel(u8).init(&[0]u8{});
 
     var pong = async Pong.run(&c1, &c2);
     c1.put(0) catch unreachable;

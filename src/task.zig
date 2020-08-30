@@ -80,7 +80,7 @@ pub const Task = struct {
 
         suspend {
             var task = zap.Task.init(@frame());
-            var io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
+            var io_driver = @atomicLoad(usize, io_driver_ptr, .Monotonic);
 
             while (true) {
                 switch (IoDriverState.fromUsize(io_driver)) {
@@ -91,7 +91,7 @@ pub const Task = struct {
                             io_driver,
                             IoDriverState.creating.toUsize(0),
                             .Acquire,
-                            .Acquire,
+                            .Monotonic,
                         )) |updated_io_driver_ptr| {
                             io_driver = updated_io_driver_ptr;
                             continue;
@@ -127,7 +127,7 @@ pub const Task = struct {
                             io_driver,
                             IoDriverState.creating.toUsize(@ptrToInt(&task)),
                             .Release,
-                            .Acquire,
+                            .Monotonic,
                         ) orelse break
                     },
                     .init, .crashed => {

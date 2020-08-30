@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const zap = @import("zap");
+const WaitGroup = zap.sync.task.WaitGroup;
 
 const num_tasks = 100 * 1000;
 const num_yields = 200;
@@ -27,22 +28,18 @@ fn asyncMain() !void {
     const frames = try allocator.alloc(@Frame(asyncWorker), num_tasks);
     defer allocator.free(frames);
 
-    var counter: usize = num_tasks;
-    var event = zap.Task.init(@frame());
-    
-    suspend {
-        var batch = zap.Task.Batch{};
-        for (frames) |*frame|
-            frame.* = async asyncWorker(&batch, &event, &counter);
-        batch.schedule();
-    }
+    var wait_group = WaitGroup{};
+    var batch = zap.Task.Batch{};
 
-    const completed = num_tasks - @atomicLoad(usize, &counter, .Monotonic);
-    if (completed != num_tasks)
-        std.debug.panic("Only {}/{} tasks completed\n", .{completed, num_tasks});
+    wait_group.add(num_tasks);
+    for (frames) |*frame|
+        frame.* = async asyncWorker(&batch, &wait_group);
+
+    batch.schedule();
+    wait_group.wait();
 }
 
-fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
+fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
     suspend {
         var task = zap.Task.init(@frame());
         batch.push(&task);
@@ -53,9 +50,5 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         zap.Task.yield();
     }
 
-    suspend {
-        const completed = @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
-        if (completed - 1 == 0)
-            event.scheduleNext();
-    }
+    wait_group.done();
 }

@@ -15,6 +15,7 @@
 const std = @import("std");
 const zap = @import("zap");
 const Channel = zap.sync.task.Channel;
+const WaitGroup = zap.sync.task.WaitGroup;
 
 const num_tasks = 100 * 1000;
 
@@ -27,22 +28,18 @@ fn asyncMain() !void {
     const frames = try allocator.alloc(@Frame(asyncWorker), num_tasks);
     defer allocator.free(frames);
 
-    var counter: usize = 0;
-    var event = zap.Task.init(@frame());
+    var wait_group = WaitGroup{};
+    var batch = zap.Task.Batch{};
     
-    suspend {
-        var batch = zap.Task.Batch{};
-        for (frames) |*frame|
-            frame.* = async asyncWorker(&batch, &event, &counter);
-        batch.schedule();
-    }
+    wait_group.add(num_tasks);
+    for (frames) |*frame|
+        frame.* = async asyncWorker(&batch, &wait_group);
 
-    const completed = @atomicLoad(usize, &counter, .Monotonic);
-    if (completed != num_tasks)
-        std.debug.panic("Only {}/{} tasks completed\n", .{completed, num_tasks});
+    batch.schedule();
+    wait_group.wait();
 }
 
-fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
+fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
     suspend {
         var task = zap.Task.init(@frame());
         batch.push(&task);
@@ -70,9 +67,5 @@ fn asyncWorker(batch: *zap.Task.Batch, event: *zap.Task, counter: *usize) void {
         std.debug.panic("invalid receive from c2", .{});
     _ = await pong;
 
-    suspend {
-        const completed = @atomicRmw(usize, counter, .Add, 1, .Monotonic);
-        if (completed + 1 == num_tasks)
-            event.scheduleNext();
-    }
+    wait_group.done();
 }

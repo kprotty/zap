@@ -16,30 +16,26 @@ package main
 
 import (
 	"time"
-	"sync/atomic"
+	"sync"
 )
 
 const num_tasks = 100 * 1000
 const num_yields = 200
 
 func main() {
-	var counter uintptr = num_tasks
-	event := make(chan struct{})
+	var wait_group sync.WaitGroup
 
+	wait_group.Add(num_tasks)
 	for i := 0; i < num_tasks; i++ {
+
 		go func(){
 			for j := 0; j < num_yields; j++ {
 				time.Sleep(1 * time.Nanosecond)
 			}
-
-			if atomic.AddUintptr(&counter, ^uintptr(0)) == 0 {
-				event <- struct{}{}
-			}
+			
+			wait_group.Done()
 		}()
 	}
 
-	<- event
-	if atomic.LoadUintptr(&counter) != 0 {
-		panic("all tasks did not complete")
-	}
+	wait_group.Wait()
 }

@@ -14,14 +14,14 @@
 
 package main
 
-import "sync/atomic"
+import "sync"
 
 const num_tasks = 100 * 1000
 
 func main() {
-	var counter uintptr = num_tasks
-	event := make(chan struct {})
+	var wait_group sync.WaitGroup
 
+	wait_group.Add(num_tasks);
 	for i := 0; i < num_tasks; i++ {
 		go func(){
 			c1 := make(chan byte)
@@ -41,14 +41,9 @@ func main() {
 				panic("invalid receive from c2")
 			}
 
-			if atomic.AddUintptr(&counter, ^uintptr(0)) == 0 {
-				event <- struct{}{}
-			}
+			wait_group.Done()
 		}()
 	}
 
-	<- event
-	if atomic.LoadUintptr(&counter) != 0 {
-		panic("all tasks did not complete")
-	}
+	wait_group.Wait()
 }

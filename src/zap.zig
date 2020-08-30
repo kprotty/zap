@@ -39,6 +39,7 @@ pub const sync = struct {
     pub const core = struct {
         pub const Lock = @import("./sync/lock.zig").Lock;
         pub const Channel = @import("./sync/channel.zig").Channel;
+        pub const WaitGroup = @import("./sync/wait_group.zig").WaitGroup;
     };
 
     pub const os = withSignal(@import("./sync/signal/os.zig").Signal);
@@ -57,6 +58,8 @@ pub const sync = struct {
                     .Signal = Signal,
                 });
             }
+
+            pub const WaitGroup = core.WaitGroup(Signal);
         };
     }
 };

@@ -44,7 +44,7 @@ pub const Buffer = extern struct {
 pub const Address = extern struct {
     inner: io.Address,
 
-    
+
 };
 
 pub const Message = extern struct {
@@ -162,25 +162,46 @@ pub const Socket = extern struct {
     pub fn sendmsg(self: *Socket, message: *const Message) !usize {
         return self.inner.sendmsg(message);
     }
+
+    pub fn prepareSendMsg(self: *Socket, message: *const Message) SendMsg {
+        
+    }
+
+    pub const SendMsg = extern struct {
+        socket: *Socket,
+        message: *const Message,
+        task: zap.Task,
+
+        pub fn poll(self: *SendMsg) Poll {
+
+        }
+
+        pub fn cancel(self: *SendMsg) bool {
+
+        }
+    };
 };
 
 pub const Driver = extern struct {
     inner: io.Driver,
 
-    pub const Error = error{NotInitialized}; 
-
     fn get() !*Driver {
-        return zap.Task.getIoDriver() orelse Error.NotInitialized;
+        return zap.Task.getIoDriver() orelse error.NotInitialized;
     }
 
-    pub fn alloc() !*Driver {
-        const inner = try io.Driver.alloc();
-        return @fieldParentPtr(Driver, "inner", inner);
+    pub fn init(self: *Driver) !*Driver {
+        try self.inner.init();
     }
 
-    pub fn free(self: *Driver) void {
-        self.inner.free();
+    pub fn deinit(self: *Driver) void {
+        self.inner.deinit();
     }
 
-    pub fn run(self: *Driver) 
+    pub fn poll(self: *Driver) zap.Task.Batch {
+        var batch = zap.Task.Batch{};
+
+        _ = self.inner.poll(&batch, null);
+
+        return batch;
+    }
 };

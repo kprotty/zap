@@ -16,7 +16,7 @@ const std = @import("std");
 const windows = std.os.windows;
 const zap = @import("../zap.zig");
 
-pub const Driver = extern struct {
+pub const Driver = struct {
     iocp: windows.HANDLE,
     timer_res: ?windows.ULONG,
 

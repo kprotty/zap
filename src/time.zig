@@ -13,9 +13,28 @@
 // limitations under the License.
 
 const std = @import("std");
+const zap = @import("./zap.zig");
 
-pub const Task = @import("./task.zig").Task;
+pub const os = struct {
+    pub usingnamespace core(zap.sync.os.Signal);
 
-pub const sync = @import("./sync.zig");
+    pub const now = nanotime;
+    pub const nanotime = @import("./time/clock.zig").nanotime;
+};
 
-pub const time = @import("./time.zig");
+pub const task = core(zap.sync.task.Signal);
+
+pub fn core(comptime Signal: type) type {
+    return struct {
+        pub fn sleep(delay_ns: u64) void {
+            var signal: Signal = undefined;
+            signal.init();
+
+            signal.timedWait(delay_ns) catch return signal.deinit();
+
+            unreachable;
+        }
+    };
+}
+
+

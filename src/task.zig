@@ -33,7 +33,7 @@ const IoDriverState = enum(u2) {
     }
 
     fn getPayload(value: usize) usize {
-        return payload & ~@as(usize, 0b11);
+        return value & ~@as(usize, 0b11);
     }
 };
 

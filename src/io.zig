@@ -16,7 +16,9 @@ const std = @import("std");
 const zap = @import("./zap.zig");
 
 pub const io = switch (std.builtin.os.tag) {
-    .windows => @import("./io/iocp.zig"),
+    .macosx, .ios, .watchos, .openbsd, .freebsd, .netbsd, .dragonfly => @import("./io/bsd.zig"),
+    .windows => @import("./io/windows.zig"),
+    .linux => @import("./io/linux.zig"),
     else => @compileError("OS not supported"),
 };
 
@@ -53,7 +55,7 @@ pub const Message = extern struct {
     pub fn from(
         address: ?[]u8,
         buffers: ?[]const Buffer,
-        control: ?const Buffer,
+        control: ?*const Buffer,
         flags: u32,
     ) Message {
         return _from(address, buffers, control, flags);
@@ -62,7 +64,7 @@ pub const Message = extern struct {
     pub fn fromConst(
         address: ?[]const u8,
         buffers: ?[]const Buffer,
-        control: ?const Buffer,
+        control: ?*const Buffer,
         flags: u32,
     ) Message {
         return _from(address, buffers, control, flags);
@@ -164,39 +166,18 @@ pub const Socket = extern struct {
     }
 };
 
-pub const Driver = extern struct {
-    inner: io.Driver,
+pub const Driver = struct {
+    state: usize, // TODO
 
     fn get() !*Driver {
         return zap.Task.getIoDriver() orelse error.NotInitialized;
     }
 
-    pub fn init(self: *Driver) !*Driver {
-        try self.inner.init();
+    pub fn alloc() ?*Driver {
+        return undefined; // TODO
     }
 
-    pub fn deinit(self: *Driver) void {
-        self.inner.deinit();
-    }
-
-    pub fn poll(self: *Driver) zap.Task.Batch {
-        var batch = zap.Task.Batch{};
-
-        _ = self.inner.poll(&batch, null);
-
-        return batch;
-    }
-
-    fn run(comptime Request: type, args: anytype) anytype {
-        var task = zap.Task.init(@frame());
-        args[0] = &task;
-
-        var req: Request = undefined;
-        @call(.{}, req.init, args);
-
-        const resp = req.run();
-        req.deinit();
-        
-        return resp;
+    pub fn free(self: *Driver) void {
+        return undefined; // TODO
     }
 };

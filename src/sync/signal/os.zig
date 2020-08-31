@@ -285,7 +285,7 @@ const PosixSignal = extern struct {
 
             switch (state) {
                 .empty => {},
-                .waiting => std.debug.assert(pthread_cond_wait(&self.cond, &self.mutex) == 0),
+                .waiting => std.debug.assert(pthread_cond_signal(&self.cond) == 0),
                 .notified => {},
             }
         }

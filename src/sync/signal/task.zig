@@ -29,7 +29,15 @@ pub const Signal = extern struct {
         self.* = undefined;
     }
 
-    pub fn notify(self: *Signal) void {
+    pub inline fn notify(self: *Signal) void {
+        return self.notifyFast(false);
+    }
+
+    pub inline fn notifyHandoff(self: *Signal) void {
+        return self.notifyFast(true);
+    }
+
+    fn notifyFast(self: *Signal, comptime handoff: bool) void {
         const state = @atomicRmw(
             usize,
             &self.state,
@@ -38,11 +46,27 @@ pub const Signal = extern struct {
             .Release,
         );
 
-        if (state == EMPTY or state == NOTIFIED)
-            return;
+        if (state > NOTIFIED)
+            self.notifySlow(state, handoff);
+    }
+
+    fn notifySlow(self: *Signal, state: usize, comptime handoff: bool) void {
+        @setCold(true);
 
         const task = @intToPtr(*zap.Task, state);
-        task.schedule();
+        if (!handoff)
+            return task.schedule();
+
+        suspend {
+            var me = zap.Task.init(@frame());
+            var batch = zap.Task.Batch.from(&me);
+
+            const thread = zap.Task.getCurrentThread();
+            if (thread.scheduleNext(task)) |old_next|
+                batch.pushFront(old_next);
+
+            thread.schedule(batch);
+        }
     }
 
     pub fn wait(self: *Signal) void {

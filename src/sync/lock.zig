@@ -118,14 +118,22 @@ pub fn Lock(comptime Signal: type) type {
             }
         }
 
-        pub fn release(self: *Self) void {
+        pub inline fn release(self: *Self) void {
+            return self.releaseFast(false);
+        }
+
+        pub inline fn releaseHandoff(self: *Self) void {
+            return self.releaseFast(true);
+        }
+
+        fn releaseFast(self: *Self, comptime handoff: bool) void {
             const state = @atomicRmw(usize, &self.state, .Sub, LOCKED, .Release);
 
             if ((state & WAITING != 0) and (state & WAKING == 0))
-                self.releaseSlow();
+                self.releaseSlow(handoff);
         }
 
-        fn releaseSlow(self: *Self) void {
+        fn releaseSlow(self: *Self, comptime handoff: bool) void {
             @setCold(true);
 
             var state = @atomicLoad(usize, &self.state, .Monotonic);
@@ -185,8 +193,9 @@ pub fn Lock(comptime Signal: type) type {
                     continue;
                 }
 
-                tail.signal.notify();
-                return;
+                if (handoff)
+                    return tail.signal.notifyHandoff();
+                return tail.signal.notify();
             }
         }
     };

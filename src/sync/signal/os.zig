@@ -51,6 +51,10 @@ const PosixSignal = extern struct {
         std.debug.assert(pthread_mutex_destroy(&self.mutex) == 0);
     }
 
+    pub inline fn notifyHandoff(self: *Signal) void {
+        return self.notify();
+    }
+
     pub fn notify(self: *Signal) void {
         std.debug.assert(pthread_mutex_lock(&self.mutex) == 0);
         defer std.debug.assert(pthread_mutex_unlock(&self.mutex) == 0);
@@ -115,6 +119,10 @@ const LinuxSignal = extern struct {
         self.* = undefined;
     }
 
+    pub inline fn notifyHandoff(self: *Signal) void {
+        return self.notify();
+    }
+
     pub fn notify(self: *Signal) void {
         @atomicStore(State, &self.state, .notified, .Release);
 
@@ -172,6 +180,10 @@ const WindowsSignal = extern struct {
 
     pub fn deinit(self: *Signal) void {
         self.getEvent().deinit();
+    }
+
+    pub inline fn notifyHandoff(self: *Signal) void {
+        return self.notify();
     }
 
     pub fn notify(self: *Signal) void {

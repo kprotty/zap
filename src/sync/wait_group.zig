@@ -94,10 +94,7 @@ pub fn WaitGroup(comptime Signal: type) type {
                     &waiter,
                     .Release,
                     .Acquire,
-                ) orelse {
-                    waiter.signal.wait();
-                    return;
-                };
+                ) orelse return waiter.signal.wait();
             }
         }
     };

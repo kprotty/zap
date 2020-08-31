@@ -15,7 +15,7 @@
 const std = @import("std");
 const zap = @import("./zap.zig");
 
-const io = switch (std.builtin.os.tag) {
+pub const io = switch (std.builtin.os.tag) {
     .windows => @import("./io/iocp.zig"),
     else => @compileError("OS not supported"),
 };
@@ -160,26 +160,8 @@ pub const Socket = extern struct {
     }
 
     pub fn sendmsg(self: *Socket, message: *const Message) !usize {
-        return self.inner.sendmsg(message);
+        @compileError("TODO");
     }
-
-    pub fn prepareSendMsg(self: *Socket, message: *const Message) SendMsg {
-        
-    }
-
-    pub const SendMsg = extern struct {
-        socket: *Socket,
-        message: *const Message,
-        task: zap.Task,
-
-        pub fn poll(self: *SendMsg) Poll {
-
-        }
-
-        pub fn cancel(self: *SendMsg) bool {
-
-        }
-    };
 };
 
 pub const Driver = extern struct {
@@ -203,5 +185,18 @@ pub const Driver = extern struct {
         _ = self.inner.poll(&batch, null);
 
         return batch;
+    }
+
+    fn run(comptime Request: type, args: anytype) anytype {
+        var task = zap.Task.init(@frame());
+        args[0] = &task;
+
+        var req: Request = undefined;
+        @call(.{}, req.init, args);
+
+        const resp = req.run();
+        req.deinit();
+        
+        return resp;
     }
 };

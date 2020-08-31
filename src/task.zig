@@ -20,7 +20,7 @@ const IoDriverState = enum(u2) {
     uninit = 0,
     creating = 1,
     init = 2,
-    crashed = 3,
+    failed = 3,
 
     fn fromUsize(value: usize) IoDriverState {
         const tag = @truncate(u2, value);
@@ -101,7 +101,7 @@ pub const Task = struct {
                         if (io.Driver.alloc()) |driver_ptr| {
                             new_payload = IoDriverState.init.toUsize(@ptrToInt(driver_ptr));
                         } else {
-                            new_payload = IoDriverState.crashed.toUsize(0);
+                            new_payload = IoDriverState.failed.toUsize(0);
                         }
                         io_driver = @atomicRmw(usize, io_driver_ptr, .Xchg, new_payload, .AcqRel);
 
@@ -130,7 +130,7 @@ pub const Task = struct {
                             .Monotonic,
                         ) orelse break;
                     },
-                    .init, .crashed => {
+                    .init, .failed => {
                         if (thread.scheduleNext(&task)) |old_next|
                             thread.schedule(old_next);
                         break;
@@ -142,7 +142,7 @@ pub const Task = struct {
         const io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
         return switch (IoDriverState.fromUsize(io_driver)) {
             .init => @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver)),
-            .crashed => null,
+            .failed => null,
             .uninit => unreachable,
             .creating => unreachable,
         };
@@ -361,6 +361,13 @@ pub const Task = struct {
             const active_pools = @atomicLoad(usize, &self.active_pools, .Monotonic);
             if (active_pools != 0)
                 std.debug.panic("Scheduler.deinit() with {} active pools", .{active_pools});
+
+            const io_driver = @atomicLoad(usize, &self.io_driver, .Acquire);
+            switch (IoDriverState.fromUsize(io_driver)) {
+                .creating => std.debug.panic("Scheduler.deinit() when IoDriver is initializing", .{}),
+                .init => @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver)).free(),
+                .uninit, .failed => {},
+            }
         }
 
         fn shutdown(self: *Scheduler) void {

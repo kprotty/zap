@@ -41,20 +41,41 @@ fn spinLoopHint() void {
     sync.spinLoopHint(@as(u1, 1));
 }
 
-pub const Task = struct {
+pub const Task = extern struct {
     next: ?*Task,
-    frame: usize,
+    continuation: usize,
 
     pub fn init(frame: anyframe) Task {
         return Task{
             .next = undefined,
-            .frame = @ptrToInt(frame),
+            .continuation = @ptrToInt(frame) | 1,
         };
     }
 
-    pub fn execute(self: *Task, thread: *Thread) void {
-        const frame = @intToPtr(anyframe, self.frame);
-        resume frame;
+    pub const Callback = fn(
+        *Task,
+        *Thread,
+    ) callconv(.C) void;
+
+    pub fn initCallback(callback: Callback) void {
+        comptime std.debug.assert(@alignOf(Callback) >= 2);
+        return Task{
+            .next = undefined,
+            .continuation = @ptrToInt(callback),
+        };
+    }
+
+    pub fn execute(
+        self: *Task,
+        thread: *Thread,
+    ) void {
+        @setRuntimeSafety(false);
+        
+        const ptr = self.continuation;
+
+        if (ptr & 1 == 0)
+            return @intToPtr(Callback, ptr)(self, thread);
+        resume @intToPtr(anyframe, ptr & ~@as(usize, 1));
     }
 
     pub fn getCurrentThread() *Thread {

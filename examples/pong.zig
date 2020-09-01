@@ -37,7 +37,8 @@ fn asyncMain() !void {
     batch.schedule();
 
     wait_group.wait();
-    await &frames[frames.len - 1];
+    for (frames) |*frame|
+        await frame;
 }
 
 fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {

@@ -58,7 +58,7 @@ pub const Signal = extern struct {
             return task.schedule();
 
         suspend {
-            var me = zap.Task.init(@frame());
+            var me = zap.Task.from(@frame());
             var batch = zap.Task.Batch.from(&me);
 
             const thread = zap.Task.getCurrentThread();
@@ -70,7 +70,7 @@ pub const Signal = extern struct {
     }
 
     pub fn wait(self: *Signal) void {
-        var task = zap.Task.init(@frame());
+        var task = zap.Task.from(@frame());
         
         suspend {
             if (@cmpxchgStrong(

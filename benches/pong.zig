@@ -43,14 +43,14 @@ fn asyncMain() !void {
 
 fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
     suspend {
-        var task = zap.Task.init(@frame());
+        var task = zap.Task.from(@frame());
         batch.push(&task);
     }
 
     const Pong = struct {
         fn run(c1: *Channel(u8), c2: *Channel(u8)) void {
             suspend {
-                var task = zap.Task.init(@frame());
+                var task = zap.Task.from(@frame());
                 task.schedule();
             }
 
@@ -60,8 +60,8 @@ fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
         }
     };
 
-    var c1 = Channel(u8).init(&[0]u8{});
-    var c2 = Channel(u8).init(&[0]u8{});
+    var c1 = Channel(u8).from(&[0]u8{});
+    var c2 = Channel(u8).from(&[0]u8{});
 
     var pong = async Pong.run(&c1, &c2);
     c1.put(0) catch unreachable;

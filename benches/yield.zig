@@ -43,7 +43,7 @@ fn asyncMain() !void {
 
 fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
     suspend {
-        var task = zap.Task.init(@frame());
+        var task = zap.Task.from(@frame());
         batch.push(&task);
     }
 

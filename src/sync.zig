@@ -34,28 +34,34 @@ pub fn spinLoopHint(iterations: anytype) void {
 }
 
 pub const core = struct {
-    pub const Lock = @import("./sync/lock.zig").Lock;
-    pub const Channel = @import("./sync/channel.zig").Channel;
-    pub const WaitGroup = @import("./sync/wait_group.zig").WaitGroup;
+    pub const Lock = @import("./sync/core/lock.zig").Lock;
+    pub const Channel = @import("./sync/core/channel.zig").Channel;
+    pub const WaitGroup = @import("./sync/core/wait_group.zig").WaitGroup;
 };
 
-pub const os = withSignal(@import("./sync/signal/os.zig").Signal);
-pub const task = withSignal(@import("./sync/signal/task.zig").Signal);
+pub const os = struct {
+    pub const Signal = @import("./sync/os/signal.zig").Signal;
 
-fn withSignal(comptime CoreSignal: type) type {
-    return struct {
-        pub const Signal = CoreSignal;
+    pub const Lock = core.Lock(Signal);
 
-        pub const Lock = core.Lock(Signal);
+    pub const WaitGroup = core.WaitGroup(Signal);
 
-        pub fn Channel(comptime T: type) type {
-            return core.Channel(.{
-                .Buffer = T,
-                .Lock = Lock,
-                .Signal = Signal,
-            });
-        }
+    pub fn Channel(comptime T: type) type {
+        return core.Channel(.{
+            .Buffer = T,
+            .Lock = Lock,
+            .Signal = Signal,
+        });
+    }
+};
 
-        pub const WaitGroup = core.WaitGroup(Signal);
-    };
-}
+pub const task = struct {
+    pub const Signal = @import("./sync/task/signal.zig").Signal;
+
+    pub const Lock = core.Lock(Signal);
+
+    pub const WaitGroup = core.WaitGroup(Signal);
+
+    pub const Channel = @import("./sync/task/channel.zig").Channel;
+    // pub fn Channel(comptime T: type) type { return core.Channel(.{.Buffer=T, .Lock=os.Lock, .Signal=Signal}); }
+};

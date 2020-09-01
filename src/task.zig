@@ -45,7 +45,8 @@ pub const Task = extern struct {
     next: ?*Task,
     continuation: usize,
 
-    pub fn init(frame: anyframe) Task {
+    pub fn from(frame: anyframe) Task {
+        comptime std.debug.assert(@alignOf(anyframe) >= 2);
         return Task{
             .next = undefined,
             .continuation = @ptrToInt(frame) | 1,
@@ -57,7 +58,7 @@ pub const Task = extern struct {
         *Thread,
     ) callconv(.C) void;
 
-    pub fn initCallback(callback: Callback) void {
+    pub fn fromCallback(callback: Callback) void {
         comptime std.debug.assert(@alignOf(Callback) >= 2);
         return Task{
             .next = undefined,
@@ -100,7 +101,7 @@ pub const Task = extern struct {
         const io_driver_ptr = &thread.getPool().getScheduler().io_driver;
 
         suspend {
-            var task = zap.Task.init(@frame());
+            var task = zap.Task.from(@frame());
             var io_driver = @atomicLoad(usize, io_driver_ptr, .Monotonic);
 
             while (true) {
@@ -173,7 +174,7 @@ pub const Task = extern struct {
         const Args = @typeOf(args);
         const Wrapper = struct {
             fn entry(self: *@Frame(func), func_args: Args, allocator: *std.mem.Allocator) void {
-                var task = Task.init(@frame());
+                var task = Task.from(@frame());
                 suspend task.schedule();
 
                 _ = @call(.{}, func, func_args);
@@ -204,7 +205,7 @@ pub const Task = extern struct {
             thread.runq_next = next_task;
         }
 
-        var task = Task.init(@frame());
+        var task = Task.from(@frame());
         suspend thread.schedule(Batch.from(&task));
     }
 
@@ -216,14 +217,14 @@ pub const Task = extern struct {
         const was_blocking = pool == blocking_pool;
 
         if (!was_blocking) {
-            task = Task.init(@frame());
+            task = Task.from(@frame());
             suspend blocking_pool.schedule(Batch.from(&task));
         }
 
         const result = @call(.{}, func, args);
 
         if (!was_blocking) {
-            task = Task.init(@frame());
+            task = Task.from(@frame());
             suspend pool.schedule(Batch.from(&task));
         }
 
@@ -314,7 +315,7 @@ pub const Task = extern struct {
         const ReturnType = @TypeOf(func).ReturnType;
         const Wrapper = struct {
             fn entry(func_args: Args, task_ptr: *Task, result_ptr: *?ReturnType) void {
-                suspend task_ptr.* = Task.init(@frame());
+                suspend task_ptr.* = Task.from(@frame());
                 const result = @call(.{}, func, func_args);
                 suspend result_ptr.* = result;
             }

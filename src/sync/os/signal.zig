@@ -170,7 +170,7 @@ const WindowsSignal = extern struct {
         }
     }
 
-    pub fn yield() void {
+    pub fn yield(iter: usize) bool {
         if (iter > 10)
             return false;
 
@@ -179,6 +179,8 @@ const WindowsSignal = extern struct {
         } else {
             windows.kernel32.Sleep(1);
         } 
+
+        return true;
     }
 
     extern "NtDll" fn NtAlertThreadByThreadId(
@@ -341,8 +343,8 @@ const LinuxSignal = extern struct {
         return true;
     }
 
-    pub fn yield() void {
-        PosixSignal.yield();
+    pub fn yield(iter: usize) bool {
+        return PosixSignal.yield(iter);
     }
 };
 

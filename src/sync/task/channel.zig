@@ -13,21 +13,16 @@
 // limitations under the License.
 
 const std = @import("std");
+const zap = @import("../../zap.zig");
 
-pub fn Channel(comptime config: anytype) type {
-    const T = config.Buffer;
-    const Signal = config.Signal;
-    const Lock = 
-        if (@hasField(@TypeOf(config), "Lock")) config.Lock
-        else @import("./lock.zig").Lock(Signal);
-
+pub fn Channel(comptime T: type) type {
     return struct {
         const Self = @This();
 
         const Waiter = struct {
             next: ?*Waiter,
             last: *Waiter,
-            signal: Signal,
+            task: zap.Task,
             item: Item,
 
             const Item = union(enum) {
@@ -69,7 +64,7 @@ pub fn Channel(comptime config: anytype) type {
             };
         };
 
-        lock: Lock = Lock{},
+        lock: zap.sync.os.Lock = zap.sync.os.Lock{},
         putters: Waiter.Queue = Waiter.Queue{},
         getters: Waiter.Queue = Waiter.Queue{},
         head: usize = 0,
@@ -79,7 +74,7 @@ pub fn Channel(comptime config: anytype) type {
 
         const CLOSED = @intToPtr([*]T, std.mem.alignBackward(std.math.maxInt(usize), @alignOf(T)));
 
-        pub fn init(buffer: []T) Self {
+        pub fn from(buffer: []T) Self {
             if (buffer.ptr == CLOSED)
                 std.debug.panic("invalid buffer ptr", .{});
             return Self{
@@ -88,13 +83,12 @@ pub fn Channel(comptime config: anytype) type {
             };
         }
 
-        pub fn deinit(self: *Self) void {
-            self.close();
-        }
-
         pub fn close(self: *Self) void {
-            if (@atomicLoad([*]T, &self.buffer_ptr, .Acquire) == CLOSED)
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED) {
                 return;
+            } else {
+                @atomicStore([*]T, &self.buffer_ptr, CLOSED, .Unordered);
+            }
 
             var waiters = Waiter.Queue{};
             {
@@ -103,49 +97,51 @@ pub fn Channel(comptime config: anytype) type {
 
                 waiters.consume(&self.putters);
                 waiters.consume(&self.getters);
-
-                @atomicStore([*]T, &self.buffer_ptr, CLOSED, .Release);
             }
 
+            var batch = zap.Task.Batch{};
             while (waiters.pop()) |waiter| {
+                batch.push(&waiter.task);
                 waiter.item = Waiter.Item{ .closed = {} };
-                waiter.signal.notify();
             }
+            batch.schedule();
         }
 
         pub fn put(self: *Self, item: T) error{Closed}!void {
-            if (@atomicLoad([*]T, &self.buffer_ptr, .Acquire) == CLOSED)
+            if (@atomicLoad([*]T, &self.buffer_ptr, .Unordered) == CLOSED)
                 return error.Closed;
 
             self.lock.acquire();
 
-            if (self.buffer_ptr == CLOSED) {
+            const buffer_ptr = @atomicLoad([*]T, &self.buffer_ptr, .Unordered);
+            if (buffer_ptr == CLOSED) {
                 self.lock.release();
                 return error.Closed;
             }
 
             if (self.getters.pop()) |waiter| {
                 self.lock.release();
+
                 waiter.item = Waiter.Item{ .some = item };
-                waiter.signal.notify();
+                waiter.task.schedule();
                 return;
             }
 
             if (self.tail -% self.head < self.buffer_len) {
-                self.buffer_ptr[self.tail % self.buffer_len] = item;
+                buffer_ptr[self.tail % self.buffer_len] = item;
                 self.tail +%= 1;
                 self.lock.release();
                 return;
             }
 
             var waiter: Waiter = undefined;
-            waiter.signal.init();
+            waiter.task = zap.Task.from(@frame());
             waiter.item = Waiter.Item{ .some = item };
             self.putters.push(&waiter);
-            self.lock.release();
 
-            waiter.signal.wait();
-            waiter.signal.deinit();
+            suspend {
+                self.lock.release();
+            }
 
             return switch (waiter.item) {
                 .some => unreachable,
@@ -160,40 +156,37 @@ pub fn Channel(comptime config: anytype) type {
 
             self.lock.acquire();
             
-            if (self.buffer_ptr == CLOSED) {
+            const buffer_ptr = @atomicLoad([*]T, &self.buffer_ptr, .Unordered);
+            if (buffer_ptr == CLOSED) {
                 self.lock.release();
                 return error.Closed;
             }
 
             if (self.putters.pop()) |waiter| {
                 self.lock.release();
-
-                const item = switch (waiter.item) {
-                    .some => |item| item,
-                    .none => unreachable,
-                    .closed => unreachable,
-                };
-
+                
+                const item = waiter.item.some;
                 waiter.item = Waiter.Item{ .none = {} };
-                waiter.signal.notify();
+                waiter.task.schedule();
+                
                 return item;
             }
 
             if (self.tail != self.head) {
-                const item = self.buffer_ptr[self.head % self.buffer_len];
+                const item = buffer_ptr[self.head % self.buffer_len];
                 self.head +%= 1;
                 self.lock.release();
                 return item;
             }
 
             var waiter: Waiter = undefined;
-            waiter.signal.init();
+            waiter.task = zap.Task.from(@frame());
             waiter.item = Waiter.Item{ .none = {} };
             self.getters.push(&waiter);
-            self.lock.release();
 
-            waiter.signal.wait();
-            waiter.signal.deinit();
+            suspend {
+                self.lock.release();
+            }
 
             return switch (waiter.item) {
                 .some => |item| item,

@@ -32,42 +32,142 @@ pub const Signal =
     else
         @compileError("OS not supported");
 
-// TODO: use NtKeyedEvent directly instead of going through std.ResetEvent
 const WindowsSignal = extern struct {
     const windows = std.os.windows;
-    
-    event: [@sizeOf(std.ResetEvent)]u8 align(@alignOf(std.ResetEvent)),
 
-    fn getEvent(self: *Signal) *std.ResetEvent {
-        return @ptrCast(*std.ResetEvent, &self.event);
-    }
+    const EMPTY: usize = 0;
+    const NOTIFIED: usize = 1;
+    
+    state: usize = EMPTY,
 
     pub fn init(self: *Signal) void {
-        self.getEvent().* = std.ResetEvent.init();
+        self.* = Signal{};
     }
 
     pub fn deinit(self: *Signal) void {
-        self.getEvent().deinit();
+        self.* = undefined;
     }
 
     pub inline fn notifyHandoff(self: *Signal) void {
-        return self.notify();
+        return self.notifyFast(true);
     }
 
-    pub fn notify(self: *Signal) void {
-        self.getEvent().set();
+    pub inline fn notify(self: *Signal) void {
+        return self.notifyFast(false);
+    }
+
+    fn notifyFast(self: *Signal, comptime handoff: bool) void {
+        const state = @atomicRmw(
+            usize,
+            &self.state,
+            .Xchg,
+            NOTIFIED,
+            .AcqRel,
+        );
+
+        if (state > NOTIFIED)
+            self.notifySlow(state, handoff);
+    }
+
+    fn notifySlow(self: *Signal, state: usize, comptime handoff: bool) void {
+        @setCold(true);
+
+        const tid_ptr = @intToPtr(*const windows.DWORD, state);
+        const tid = @intToPtr(windows.PVOID, tid_ptr.*);
+
+        const status = NtAlertThreadByThreadId(tid);
+        std.debug.assert(status == .SUCCESS);
     }
 
     pub fn wait(self: *Signal) void {
-        const event = self.getEvent();
-        event.wait();
-        event.reset();
+        std.debug.assert(self.waitFast(null));
     }
 
     pub fn timedWait(self: *Signal, timeout: u64) error{TimedOut}!void {
-        const event = self.getEvent();
-        event.timedWait(timeout) catch return error.TimedOut;
-        event.reset();
+        if (!self.waitFast(timeout))
+            return error.TimedOut;
+    }
+
+    fn waitFast(self: *Signal, timeout: ?u64) bool {
+        const state = @atomicLoad(usize, &self.state, .Acquire);
+
+        if ((state != NOTIFIED) and !self.waitSlow(state, timeout))
+            return false;
+
+        @atomicStore(usize, &self.state, EMPTY, .Monotonic);
+        return true;
+    }
+
+    fn waitSlow(self: *Signal, current_state: usize, timeout: ?u64) bool {
+        @setCold(true);
+
+        var state = current_state;
+        var thread_id = windows.kernel32.GetCurrentThreadId();
+        
+        while (true) {
+            if (state == NOTIFIED)
+                return true;
+            if (state != EMPTY)
+                std.debug.panic("multiple waiters on the same Signal", .{});
+            state = @cmpxchgWeak(
+                usize,
+                &self.state,
+                state,
+                @ptrToInt(&thread_id),
+                .Release,
+                .Acquire,
+            ) orelse break;
+        }
+
+        var deadline: ?u64 = null;
+        var ts: windows.LARGE_INTEGER = undefined;
+        var ts_ptr: ?*windows.LARGE_INTEGER = null;
+
+        while (true) {
+            if (timeout) |timeout_ns| {
+                var delay: u64 = undefined;
+                
+                if (deadline) |deadline_ns| {
+                    const now = nanotime();
+                    if (now >= deadline_ns) {
+                        return @cmpxchgStrong(
+                            usize,
+                            &self.state,
+                            @ptrToInt(&thread_id),
+                            EMPTY,
+                            .Acquire,
+                            .Acquire,
+                        ) != null;
+                    } else {
+                        delay = deadline_ns - now;
+                    }
+                } else {
+                    delay = timeout_ns;
+                    deadline = nanotime() + delay;
+                }
+
+                ts = @intCast(isize, delay);
+                ts = -@divFloor(ts, 100);
+                ts_ptr = &ts;
+            }
+
+            switch (NtWaitForAlertByThreadId(
+                @intToPtr(windows.PVOID, thread_id),
+                ts_ptr,
+            )) {
+                .SUCCESS => {},
+                .ALERTED => {},
+                .TIMEOUT => {},
+                .USER_APC => {},
+                else => unreachable,
+            }
+
+            state = @atomicLoad(usize, &self.state, .Acquire);
+            if (state == NOTIFIED)
+                return true;
+            if (state != @ptrToInt(&thread_id))
+                std.debug.panic("invalid state pointer when waiting", .{});
+        }
     }
 
     pub fn yield() void {
@@ -80,6 +180,15 @@ const WindowsSignal = extern struct {
             windows.kernel32.Sleep(1);
         } 
     }
+
+    extern "NtDll" fn NtAlertThreadByThreadId(
+        thread_id: windows.PVOID,
+    ) callconv(.Stdcall) windows.NTSTATUS;
+
+    extern "NtDll" fn NtWaitForAlertByThreadId(
+        thread_id: windows.PVOID,
+        timeout: ?*windows.LARGE_INTEGER,
+    ) callconv(.Stdcall) windows.NTSTATUS;
 };
 
 const LinuxSignal = extern struct {

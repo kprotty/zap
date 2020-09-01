@@ -70,8 +70,51 @@ pub const Signal = extern struct {
     }
 
     pub fn wait(self: *Signal) void {
-        var task = zap.Task.from(@frame());
+        std.debug.assert(self.tryWait(null));
+    }
+
+    pub fn timedWait(self: *Signal, timeout: u64) error{TimedOut}!void {
+        if (!self.tryWait(timeout))
+            return error.TimedOut;
+    }
+
+    fn tryWait(self: *Signal, timeout: ?u64) bool {
+        var deadline: ?u64 = null;
+        if (timeout) |timeout_ns| {
+            if (timeout_ns == 0)
+                return false;
+            deadline = zap.time.os.nanotime() + timeout_ns;
+        }
         
+        const OnTimeout = struct {
+            fn run(task: *zap.Task, signal: *Signal) void {
+                suspend task.* = zap.Task.from(@frame());
+
+                var state = @atomicLoad(usize, &signal.state, .Monotonic);
+                while (true) {
+                    if (state == EMPTY or state == NOTIFIED)
+                        return;
+                    state = @cmpxchgWeak(
+                        usize,
+                        &signal.state,
+                        state,
+                        EMPTY,
+                        .Acquire,
+                        .Monotonic,
+                    ) orelse break;
+                }
+
+                @setRuntimeSafety(false);
+                const waiter = @intToPtr(*zap.Task, state);
+                waiter.schedule();
+            }
+        };
+
+        var task = zap.Task.from(@frame());
+        var frame_task: zap.Task = undefined;
+        var frame: @Frame(OnTimeout.run) = undefined;
+        var timer: zap.Task.Reactor.Timer = undefined;
+
         suspend {
             if (@cmpxchgStrong(
                 usize,
@@ -80,18 +123,27 @@ pub const Signal = extern struct {
                 @ptrToInt(&task),
                 .Release,
                 .Acquire,
-            )) |state| {
-                if (state != NOTIFIED)
-                    std.debug.panic("multiple waiters on the same signal", .{});
+            )) |_| {
+                deadline = null;
                 task.scheduleNext();
+            } else if (deadline) |deadline_ns| {
+                frame = async OnTimeout.run(&frame_task, self);
+                timer.scheduleAfter(&frame_task, deadline_ns);
             }
         }
 
-        const state = @atomicLoad(usize, &self.state, .Acquire);
-        if (state != NOTIFIED)
-            std.debug.panic("waiter woken up when not notified", .{});
+        if (deadline != null and !timer.cancel()) {
+            await frame;
+        }
 
+        const state = @atomicLoad(usize, &self.state, .Acquire);
+        if (state == EMPTY)
+            return false;
+
+        if (state != NOTIFIED)
+            std.debug.panic("Signal waiter scheduled when not notified", .{});
         @atomicStore(usize, &self.state, EMPTY, .Monotonic);
+        return true;
     }
 
     pub fn yield(iter: usize) bool {

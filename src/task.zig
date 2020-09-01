@@ -13,32 +13,14 @@
 // limitations under the License.
 
 const std = @import("std");
-const io = @import("./io.zig");
-const sync = @import("./zap.zig").sync;
+const zap = @import("./zap.zig");
 
-const IoDriverState = enum(u2) {
-    uninit = 0,
-    creating = 1,
-    init = 2,
-    failed = 3,
+const Signal = zap.sync.os.Signal;
 
-    fn fromUsize(value: usize) IoDriverState {
-        const tag = @truncate(u2, value);
-        return @intToEnum(IoDriverState, tag);
-    }
-
-    fn toUsize(self: IoDriverState, payload: usize) usize {
-        std.debug.assert(payload & 0b11 == 0);
-        return @enumToInt(self) | payload;
-    }
-
-    fn getPayload(value: usize) usize {
-        return value & ~@as(usize, 0b11);
-    }
-};
+const CACHE_ALIGN = zap.sync.CACHE_ALIGN;
 
 fn spinLoopHint() void {
-    sync.spinLoopHint(@as(u1, 1));
+    zap.sync.spinLoopHint(@as(u1, 1));
 }
 
 pub const Task = extern struct {
@@ -58,7 +40,7 @@ pub const Task = extern struct {
         *Thread,
     ) callconv(.C) void;
 
-    pub fn fromCallback(callback: Callback) void {
+    pub fn fromCallback(callback: Callback) Task {
         comptime std.debug.assert(@alignOf(Callback) >= 2);
         return Task{
             .next = undefined,
@@ -82,91 +64,6 @@ pub const Task = extern struct {
     pub fn getCurrentThread() *Thread {
         return Thread.getCurrent() orelse {
             std.debug.panic("Task.getCurrentThread() from outside the Thread", .{});
-        };
-    }
-
-    pub fn getIoDriver() ?*io.Driver {
-        const thread = getCurrentThread();
-        const io_driver_ptr = &thread.getPool().getScheduler().io_driver;
-        
-        var io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
-        if (IoDriverState.fromUsize(io_driver) == .init)
-            return @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver));
-
-        return getIoDriverSlow(thread);
-    }
-
-    fn getIoDriverSlow(thread: *Thread) ?*io.Driver {
-        @setCold(true);
-        const io_driver_ptr = &thread.getPool().getScheduler().io_driver;
-
-        suspend {
-            var task = zap.Task.from(@frame());
-            var io_driver = @atomicLoad(usize, io_driver_ptr, .Monotonic);
-
-            while (true) {
-                switch (IoDriverState.fromUsize(io_driver)) {
-                    .uninit => {
-                        if (@cmpxchgWeak(
-                            usize,
-                            io_driver_ptr,
-                            io_driver,
-                            IoDriverState.creating.toUsize(0),
-                            .Acquire,
-                            .Monotonic,
-                        )) |updated_io_driver_ptr| {
-                            io_driver = updated_io_driver_ptr;
-                            continue;
-                        }
-
-                        var new_payload: usize = undefined;
-                        if (io.Driver.alloc()) |driver_ptr| {
-                            new_payload = IoDriverState.init.toUsize(@ptrToInt(driver_ptr));
-                        } else {
-                            new_payload = IoDriverState.failed.toUsize(0);
-                        }
-                        io_driver = @atomicRmw(usize, io_driver_ptr, .Xchg, new_payload, .AcqRel);
-
-                        var batch = Batch{};
-                        var waiting_tasks = IoDriverState.getPayload(io_driver);
-                        while (waiting_tasks) |waiting_task| {
-                            const next = waiting_task.next;
-                            batch.pushFront(waiting_task);
-                            waiting_tasks = next;
-                        }
-
-                        if (thread.scheduleNext(&task)) |old_next|
-                            batch.pushFront(old_next);
-
-                        thread.schedule(batch);
-                        break;
-                    },
-                    .creating => {
-                        task.next = @intToPtr(?*zap.Task, IoDriverState.getPayload(io_driver));
-                        io_driver = @cmpxchgWeak(
-                            usize,
-                            io_driver_ptr,
-                            io_driver,
-                            IoDriverState.creating.toUsize(@ptrToInt(&task)),
-                            .Release,
-                            .Monotonic,
-                        ) orelse break;
-                    },
-                    .init, .failed => {
-                        if (thread.scheduleNext(&task)) |old_next|
-                            thread.schedule(old_next);
-                        break;
-                    },
-                }
-            }
-        }
-
-        const io_driver = @atomicLoad(usize, io_driver_ptr, .Acquire);
-        return switch (IoDriverState.fromUsize(io_driver)) {
-            .init => @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver)),
-            .failed => null,
-            .uninit => unreachable,
-            .creating => unreachable,
         };
     }
 
@@ -358,11 +255,11 @@ pub const Task = extern struct {
         return Scheduler.runUsing(workers, num_threads, self);
     }
 
-    const Scheduler = struct {
+    pub const Scheduler = struct {
         core_pool: Pool,
         blocking_pool: Pool,
-        io_driver: usize,
-        active_pools: usize align(sync.CACHE_ALIGN),
+        active_pools: usize align(CACHE_ALIGN),
+        reactor: Reactor,
 
         fn runUsing(all_workers: []Worker, core_workers: usize, task: *Task) !void {
             const workers = all_workers[0..core_workers];
@@ -372,7 +269,9 @@ pub const Task = extern struct {
             try self.core_pool.init(workers, false);
             try self.blocking_pool.init(blocking_workers, true);
             self.active_pools = 0;
-            self.io_driver = IoDriverState.uninit.toUsize(0);
+
+            self.reactor.init();
+            defer self.reactor.deinit();
 
             self.core_pool.push(Batch.from(task));
             self.core_pool.resumeThread(.{ .is_main_thread = true });
@@ -383,13 +282,6 @@ pub const Task = extern struct {
             const active_pools = @atomicLoad(usize, &self.active_pools, .Monotonic);
             if (active_pools != 0)
                 std.debug.panic("Scheduler.deinit() with {} active pools", .{active_pools});
-
-            const io_driver = @atomicLoad(usize, &self.io_driver, .Acquire);
-            switch (IoDriverState.fromUsize(io_driver)) {
-                .creating => std.debug.panic("Scheduler.deinit() when IoDriver is initializing", .{}),
-                .init => @intToPtr(*io.Driver, IoDriverState.getPayload(io_driver)).free(),
-                .uninit, .failed => {},
-            }
         }
 
         fn shutdown(self: *Scheduler) void {
@@ -398,12 +290,249 @@ pub const Task = extern struct {
         }
     };
 
+    pub const Reactor = struct {
+        task: Task,
+        state: State,
+        started: u64,
+        run_state: RunState,
+        lock: zap.sync.os.Lock,
+        queue: zap.time.TimeoutQueue,
+        signal: Signal,
+
+        const State = enum(u8) {
+            uninit,
+            init,
+            failed,
+        };
+
+        const RunState = enum(u8) {
+            idle,
+            running,
+            notified,
+        };
+
+        fn init(self: *Reactor) void {
+            self.state = .uninit;
+            self.lock = zap.sync.os.Lock{};
+        }
+
+        fn deinit(self: *Reactor) void {
+            switch (@atomicLoad(State, &self.state, .Acquire)) {
+                .uninit, .failed => return,
+                .init => self.destroy(),
+            }
+        }
+
+        pub fn get(self: *Reactor) *Reactor {
+            if (@atomicLoad(State, &self.state, .Acquire) == .init)
+                return self;
+            return self.getSlow() orelse {
+                std.debug.panic("Reactor.init() failed\n", .{});
+            };
+        }
+
+        fn getSlow(self: *Reactor) ?*Reactor {
+            @setCold(true);
+
+            var state = @atomicLoad(State, &self.state, .Acquire);
+            while (true) {
+                switch (state) {
+                    .uninit => {
+                        self.lock.acquire();
+                        defer self.lock.release();
+
+                        state = @atomicLoad(State, &self.state, .Acquire);
+                        if (state != .uninit)
+                            continue;
+
+                        if (self.create()) |_| {
+                            state = .init;
+                        } else |_| {
+                            state = .failed;
+                        }
+
+                        @atomicStore(State, &self.state, state, .Release);
+                    },
+                    .init => return self,
+                    .failed => return null,
+                }
+            }
+        }
+
+        fn create(self: *Reactor) !void {
+            self.started = Signal.nanotime();
+            self.queue.init();
+            self.signal.init();
+        }
+
+        fn destroy(self: *Reactor) void {
+            const run_state = @atomicLoad(RunState, &self.run_state, .Monotonic);
+            if (run_state != .idle)
+                std.debug.panic("Reactor still active with run_state = {}\n", .{run_state});
+
+            self.queue.deinit();
+            self.signal.deinit();
+        }
+
+        fn getScheduler(self: *Reactor) *Scheduler {
+            return @fieldParentPtr(Scheduler, "reactor", self);
+        }
+
+        fn startRunning(task: *Task, thread: *Thread) callconv(.C) void {
+            const self = @fieldParentPtr(Reactor, "task", task);
+            return self.run();
+        }
+
+        fn run(self: *Reactor) void {
+            while (true) {
+                var wait_for: ?u64 = null;
+                var batch = Task.Batch{};
+                
+                {
+                    self.lock.acquire();
+                    defer self.lock.release();
+
+                    const ticks = Signal.nanotime() - self.started;
+                    self.queue.advance(ticks);
+
+                    while (self.queue.poll()) |poll| {
+                        switch (poll) {
+                            .expired => |entry| {
+                                const timer = @fieldParentPtr(Timer, "entry", entry);
+                                batch.push(timer.task);
+                            },
+                            .wait_for => |delay| {
+                                wait_for = delay;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!batch.isEmpty()) {
+                    const scheduler = self.getScheduler();
+                    scheduler.core_pool.schedule(batch);
+                    continue;
+                }
+
+                if (wait_for) |delay| {
+                    self.signal.timedWait(delay) catch {};
+                    continue;
+                }
+
+                var reschedule: bool = undefined;
+                var run_state = @atomicLoad(RunState, &self.run_state, .Monotonic);
+
+                while (true) {
+                    var new_run_state: RunState = undefined;
+                    switch (run_state) {
+                        .idle => {
+                            std.debug.panic("Reactor marked idle while still running", .{});
+                        },
+                        .running => {
+                            reschedule = false;
+                            new_run_state = .idle;
+                        },
+                        .notified => {
+                            reschedule = true;
+                            new_run_state = .running;
+                        },
+                    }
+                    run_state = @cmpxchgWeak(
+                        RunState,
+                        &self.run_state,
+                        run_state,
+                        new_run_state,
+                        .Acquire,
+                        .Monotonic,
+                    ) orelse break;
+                }
+
+                if (!reschedule)
+                    break;
+            }
+        }
+
+        fn notify(self: *Reactor) void {
+            var reschedule = false;
+            var run_state = @atomicLoad(RunState, &self.run_state, .Monotonic);
+
+            while (true) {
+                var new_run_state: RunState = undefined;
+                switch (run_state) {
+                    .idle => {
+                        reschedule = true;
+                        new_run_state = .running;
+                    },
+                    .running => {
+                        reschedule = false;
+                        new_run_state = .notified;
+                    },
+                    else => return,
+                } 
+                run_state = @cmpxchgWeak(
+                    RunState,
+                    &self.run_state,
+                    run_state,
+                    new_run_state,
+                    .Release,
+                    .Monotonic,
+                ) orelse break;
+            }
+
+            if (!reschedule) {
+                self.signal.notify();
+                return;
+            }
+
+            const scheduler = self.getScheduler();
+            self.task = Task.fromCallback(startRunning);
+
+            const batch = Task.Batch.from(&self.task);
+            scheduler.blocking_pool.schedule(batch);
+        }
+
+        pub const Timer = struct {            
+            task: *Task,
+            reactor: *Reactor,
+            entry: zap.time.TimeoutQueue.Entry,
+
+            pub fn scheduleAfter(self: *Timer, task: *Task, deadline: u64) void {
+                const thread = Task.getCurrentThread();
+                self.reactor = thread.getPool().getScheduler().reactor.get();
+                self.task = task;
+
+                self.reactor.lock.acquire();
+
+                const now = Signal.nanotime();
+                var expired = now >= deadline;
+                if (!expired)
+                    self.reactor.queue.insert(&self.entry, deadline - now);
+
+                self.reactor.lock.release();
+                
+                if (expired) {
+                    thread.schedule(Task.Batch.from(task));
+                } else {
+                    self.reactor.notify();
+                }
+            }
+
+            pub fn cancel(self: *Timer) bool {
+                self.reactor.lock.acquire();
+                defer self.reactor.lock.release();
+
+                return self.reactor.queue.remove(&self.entry);
+            }
+        };
+    };
+
     pub const Pool = extern struct {
         workers_ptr: [*]Worker,
         workers_len: usize,
-        run_queue: ?*Task align(sync.CACHE_ALIGN),
-        idle_queue: usize align(sync.CACHE_ALIGN),
-        active_threads: usize align(sync.CACHE_ALIGN),
+        run_queue: ?*Task align(CACHE_ALIGN),
+        idle_queue: usize align(CACHE_ALIGN),
+        active_threads: usize align(CACHE_ALIGN),
 
         const IDLE_MARKED = 1;
         const IDLE_SHUTDOWN = ~@as(usize, 0);
@@ -851,12 +980,12 @@ pub const Task = extern struct {
 
     const Thread = extern struct {
         runq_head: usize,
-        runq_tail: usize align(sync.CACHE_ALIGN),
-        runq_lifo: ?*Task align(sync.CACHE_ALIGN),
-        runq_overflow: ?*Task align(sync.CACHE_ALIGN),
-        runq_buffer: [256]*Task align(sync.CACHE_ALIGN),
-        signal: sync.os.Signal,
-        runq_next: ?*Task align(sync.CACHE_ALIGN),
+        runq_tail: usize align(CACHE_ALIGN),
+        runq_lifo: ?*Task align(CACHE_ALIGN),
+        runq_overflow: ?*Task align(CACHE_ALIGN),
+        runq_buffer: [256]*Task align(CACHE_ALIGN),
+        signal: Signal,
+        runq_next: ?*Task align(CACHE_ALIGN),
         handle: ?*std.Thread,
         ptr: usize,
         worker: usize,

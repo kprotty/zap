@@ -15,7 +15,7 @@
 const std = @import("std");
 const zap = @import("../../zap.zig");
 
-const nanotime = zap.time.os.nanotime;
+const os_nanotime = @import("../../time/clock.zig").nanotime;
 
 fn spinLoopHint(iter: usize) void {
     const spin = @as(usize, 1) << @intCast(std.math.Log2Int(usize), iter);
@@ -128,7 +128,7 @@ const WindowsSignal = extern struct {
                 var delay: u64 = undefined;
                 
                 if (deadline) |deadline_ns| {
-                    const now = nanotime();
+                    const now = os_nanotime();
                     if (now >= deadline_ns) {
                         return @cmpxchgStrong(
                             usize,
@@ -143,7 +143,7 @@ const WindowsSignal = extern struct {
                     }
                 } else {
                     delay = timeout_ns;
-                    deadline = nanotime() + delay;
+                    deadline = os_nanotime() + delay;
                 }
 
                 ts = @intCast(isize, delay);
@@ -181,6 +181,10 @@ const WindowsSignal = extern struct {
         } 
 
         return true;
+    }
+
+    pub fn nanotime() u64 {
+        return os_nanotime();
     }
 
     extern "NtDll" fn NtAlertThreadByThreadId(
@@ -294,11 +298,11 @@ const LinuxSignal = extern struct {
 
         var deadline: ?u64 = null;
         if (timeout) |timeout_ns|
-            deadline = nanotime() + timeout_ns;
+            deadline = os_nanotime() + timeout_ns;
         
         while (true) {
             if (deadline) |deadline_ns| {
-                const now = nanotime();
+                const now = os_nanotime();
 
                 if (now >= deadline_ns) {
                     return @cmpxchgStrong(
@@ -345,6 +349,10 @@ const LinuxSignal = extern struct {
 
     pub fn yield(iter: usize) bool {
         return PosixSignal.yield(iter);
+    }
+
+    pub fn nanotime() u64 {
+        return PosixSignal.nanotime();
     }
 };
 
@@ -428,7 +436,7 @@ const PosixSignal = extern struct {
                     };
 
                     const now = timestamp();
-                    if (now <= deadline_ns) {
+                    if (now >= deadline_ns) {
                         self.state = .empty;
                         return false;
                     }
@@ -599,6 +607,10 @@ const PosixSignal = extern struct {
         }
 
         return true;
+    }
+
+    pub fn nanotime() u64 {
+        return os_nanotime();
     }
 
     const pthread_key_t = usize;

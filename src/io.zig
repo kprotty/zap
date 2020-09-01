@@ -167,17 +167,19 @@ pub const Socket = extern struct {
 };
 
 pub const Driver = struct {
-    state: usize, // TODO
+    timer_queue: zap.time.TimeoutQueue,
+    spawner: *zap.Task.Thread,
 
     fn get() !*Driver {
         return zap.Task.getIoDriver() orelse error.NotInitialized;
     }
 
-    pub fn alloc() ?*Driver {
-        return undefined; // TODO
+    pub fn init(self: *Driver, spawner: *zap.Task.Thread) void {
+        self.timer_queue.init();
+        self.spawner = spawner;
     }
 
-    pub fn free(self: *Driver) void {
-        return undefined; // TODO
+    pub fn deinit(self: *Driver) void {
+        self.timer_queue.deinit();
     }
 };

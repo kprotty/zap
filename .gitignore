@@ -2,6 +2,7 @@
 
 !.gitignore
 
+!/aba
 !/loop
 !/original
 !/prototype

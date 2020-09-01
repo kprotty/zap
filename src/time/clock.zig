@@ -117,7 +117,8 @@ const WindowsClock = struct {
     }
 
     fn getScaled(frequency: Frequency, counter: u64) u64 {
-        return @divFloor(counter * std.time.ns_per_s, frequency);
+        const scaled = @divFloor(counter *% std.time.ns_per_s, frequency);
+        return scaled;
     }
 };
 
@@ -138,7 +139,7 @@ const DarwinClock = struct {
     }
 
     fn getScaled(frequency: Frequency, counter: u64) u64 {
-        return @divFloor(counter * frequency.numer, frequency.denom);
+        return @divFloor(counter *% frequency.numer, frequency.denom);
     }
 };
 

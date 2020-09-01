@@ -83,7 +83,7 @@ pub const Signal = extern struct {
         if (timeout) |timeout_ns| {
             if (timeout_ns == 0)
                 return false;
-            deadline = zap.time.os.nanotime() + timeout_ns;
+            deadline = nanotime() + timeout_ns;
         }
         
         const OnTimeout = struct {
@@ -153,5 +153,9 @@ pub const Signal = extern struct {
         const spin = @as(usize, 1) << @intCast(std.math.Log2Int(usize), iter);
         zap.sync.spinLoopHint(spin);
         return true;
+    }
+
+    pub fn nanotime() u64 {
+        return zap.sync.os.Signal.nanotime();
     }
 };

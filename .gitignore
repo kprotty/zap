@@ -4,6 +4,7 @@
 
 !/loop
 !/original
+!/prototype
 !/rewrite
 !/runtime
 !/rust

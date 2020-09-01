@@ -1,0 +1,26 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2018"
+authors = ["kprotty"]
+
+[dependencies]
+futures = "*"
+tokio = { version = "*", features = ["rt-threaded", "sync", "macros"] }
+
+[[bin]]
+name = "spawn"
+path = "./spawn.rs"
+
+[[bin]]
+name = "yield"
+path = "./yield.rs"
+
+[[bin]]
+name = "sieve"
+path = "./sieve.rs"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1

@@ -852,6 +852,7 @@ pub const Task = extern struct {
     const Thread = extern struct {
         runq_head: usize,
         runq_tail: usize align(sync.CACHE_ALIGN),
+        runq_lifo: ?*Task align(sync.CACHE_ALIGN),
         runq_overflow: ?*Task align(sync.CACHE_ALIGN),
         runq_buffer: [256]*Task align(sync.CACHE_ALIGN),
         signal: sync.os.Signal,
@@ -879,6 +880,7 @@ pub const Task = extern struct {
             var self = Thread{
                 .runq_head = 0,
                 .runq_tail = 0,
+                .runq_lifo = null,
                 .runq_overflow = null,
                 .runq_buffer = undefined,
                 .runq_next = null,
@@ -948,6 +950,10 @@ pub const Task = extern struct {
             const runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
             if (runq_overflow != null)
                 std.debug.panic("Thread.deinit() on worker {} when runq overflow not empty", .{worker});
+        
+            const runq_lifo = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
+            if (runq_lifo != null)
+                std.debug.panic("Thread.deinit() on worker {} when runq lifo slot not empty", .{worker});
         }
 
         fn shutdown(self: *Thread) void {
@@ -999,6 +1005,11 @@ pub const Task = extern struct {
             var tasks = batch;
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+
+            if (tasks.pop()) |task| {
+                if (@atomicRmw(?*Task, &self.runq_lifo, .Xchg, task, .AcqRel)) |old_lifo|
+                    tasks.pushFront(old_lifo);
+            }
 
             while (!tasks.isEmpty()) {
                 const size = tail -% head;
@@ -1147,10 +1158,20 @@ pub const Task = extern struct {
         }
 
         fn pollLocal(self: *Thread) ?*Task {
+            if (@atomicLoad(?*Task, &self.runq_lifo, .Monotonic)) |task| {
+                _ = @cmpxchgStrong(
+                    ?*Task,
+                    &self.runq_lifo,
+                    task,
+                    null,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return task;
+            }
+
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
             while (true) {
-
                 const size = tail -% head;
                 if (size > self.runq_buffer.len)
                     std.debug.panic("Thread.pollLocal() on worker {} with invalid runq size of {}", .{self.worker, size});
@@ -1237,6 +1258,22 @@ pub const Task = extern struct {
 
                 size = size - (size / 2);
                 if (size == 0) {
+                    if (@atomicLoad(?*Task, &target.runq_lifo, .Monotonic)) |task| {
+                        spinLoopHint();
+                        _ = @cmpxchgWeak(
+                            ?*Task,
+                            &target.runq_lifo,
+                            task,
+                            null,
+                            .Acquire,
+                            .Monotonic,
+                        ) orelse return task;
+
+                        spinLoopHint();
+                        target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                        continue;
+                    }
+
                     const task = @atomicLoad(?*Task, &target.runq_overflow, .Monotonic) orelse break;
 
                     if (@cmpxchgWeak(

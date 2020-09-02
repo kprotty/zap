@@ -297,13 +297,16 @@ pub fn TimeoutWheel(
                     pending_slots = ~@as(wheel_t, 0);
                 } else {
                     const _elapsed = @truncate(wheel_slot_t, elapsed >> wheel_offset);
+                    const _rot = (@as(wheel_t, 1) << _elapsed) - 1;
 
-                    const oslot = self.curtime >> wheel_offset;
+                    const oslot = @truncate(wheel_slot_t, self.curtime >> wheel_offset);
                     // https://github.com/ziglang/zig/issues/1739
-                    pending_slots = rotl(wheel_t, (@as(wheel_t, 1) << _elapsed) - 1, @intCast(wheel_t, oslot));
+                    pending_slots = rotl(wheel_t, _rot, @intCast(wheel_t, oslot));
 
                     const nslot = @truncate(wheel_slot_t, curtime >> wheel_offset);
                     // https://github.com/ziglang/zig/issues/1739
+                    const _rotl = rotl(wheel_t, _rot, @intCast(wheel_t, nslot));
+                    pending_slots |= rotr(wheel_t, _rotl, @intCast(wheel_t, _elapsed));
                     pending_slots |= @as(wheel_t, 1) << nslot;
                 }
 

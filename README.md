@@ -16,7 +16,7 @@ This includes a few notable features:
 - [x] Supports Zig `async/await`
 - [ ] NUMA aware scheduler
 - [ ] OS-agnostic scheduler
-- [ ] Userspace async timers
+- [x] Userspace async timers
 - [ ] Standard async IO:
   - [ ] Sockets
   - [ ] Files

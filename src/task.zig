@@ -293,7 +293,7 @@ pub const Task = extern struct {
     pub const Reactor = struct {
         task: Task,
         state: State,
-        started: u64,
+        last_polled: u64,
         run_state: RunState,
         lock: zap.sync.os.Lock,
         queue: zap.time.TimeoutQueue,
@@ -360,7 +360,7 @@ pub const Task = extern struct {
         }
 
         fn create(self: *Reactor) !void {
-            self.started = Signal.nanotime();
+            self.last_polled = Signal.nanotime();
             self.run_state = .idle;
 
             self.queue.init();
@@ -387,19 +387,20 @@ pub const Task = extern struct {
 
         fn run(self: *Reactor) void {
             while (true) {
-                var wait_for: ?u64 = null;
                 var batch = Task.Batch{};
+                var wait_for: ?u64 = null;
+                var reschedule: bool = false;
                 
                 {
                     self.lock.acquire();
                     defer self.lock.release();
 
                     const now = Signal.nanotime();
-                    const ticks = now - self.started;
+                    const ticks = now - self.last_polled;
+                    self.last_polled = now;
                     self.queue.advance(ticks);
 
                     while (self.queue.poll()) |poll| {
-                        std.debug.warn("reactor polled {}\n", .{poll});
                         switch (poll) {
                             .expired => |entry| {
                                 const timer = @fieldParentPtr(Timer, "entry", entry);
@@ -416,41 +417,40 @@ pub const Task = extern struct {
                 if (!batch.isEmpty()) {
                     const scheduler = self.getScheduler();
                     scheduler.core_pool.schedule(batch);
-                    continue;
+                    batch = zap.Task.Batch{};
+                    reschedule = true;
                 }
 
                 if (wait_for) |delay| {
-                    std.debug.warn("waiting {}ms\n", .{delay / std.time.ns_per_ms});
                     self.signal.timedWait(delay) catch {};
-                    continue;
+                    reschedule = true;
                 }
 
-                var reschedule: bool = undefined;
+                if (reschedule)
+                    continue;
+                
                 var run_state = @atomicLoad(RunState, &self.run_state, .Monotonic);
-
                 while (true) {
-                    var new_run_state: RunState = undefined;
                     switch (run_state) {
                         .idle => {
                             std.debug.panic("Reactor marked idle while still running", .{});
                         },
                         .running => {
-                            reschedule = false;
-                            new_run_state = .idle;
+                            run_state = @cmpxchgWeak(
+                                RunState,
+                                &self.run_state,
+                                run_state,
+                                .idle,
+                                .Monotonic,
+                                .Monotonic,
+                            ) orelse break;
                         },
                         .notified => {
                             reschedule = true;
-                            new_run_state = .running;
+                            @atomicStore(RunState, &self.run_state, .running, .Monotonic);
+                            break;
                         },
                     }
-                    run_state = @cmpxchgWeak(
-                        RunState,
-                        &self.run_state,
-                        run_state,
-                        new_run_state,
-                        .Acquire,
-                        .Monotonic,
-                    ) orelse break;
                 }
 
                 if (!reschedule)
@@ -532,7 +532,7 @@ pub const Task = extern struct {
                 };
 
                 if (removed)
-                    self.reactor.notify();
+                    self.reactor.signal.notify();
 
                 return removed;
             }

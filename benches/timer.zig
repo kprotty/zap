@@ -14,40 +14,37 @@
 
 const std = @import("std");
 const zap = @import("zap");
-const Signal = zap.sync.task.Signal;
+const WaitGroup = zap.sync.task.WaitGroup;
 
 pub fn main() !void {
     try (try (zap.Task.runAsync(.{}, asyncMain, .{})));
 }
 
 fn asyncMain() !void {
-    var signal: Signal = undefined;
-    signal.init();
-    defer signal.deinit();
+    const allocator = zap.Task.getAllocator();
+    const frames = try allocator.alloc(@Frame(waiter), 5);
+    defer allocator.free(frames);
 
-    var cancel_frame = async canceller(&signal);
-
-    std.debug.warn("waiting on signal\n", .{});
-    const notified = signal.timedWait(3 * std.time.ns_per_s);
-
-    if (notified) |_| {
-        std.debug.warn("signal was notified\n", .{});
-    } else |_| {
-        std.debug.warn("signal timed out\n", .{});
+    var wait_group = WaitGroup{};
+    for (frames) |*frame, id| {
+        wait_group.add(1);
+        frame.* = async waiter(&wait_group, id + 1, 1 * std.time.ns_per_s);
     }
 
-    await cancel_frame;
+    wait_group.wait();
+    for (frames) |*frame|
+        await frame;
 }
 
-fn canceller(signal: *Signal) void {
+fn waiter(wait_group: *WaitGroup, id: usize, sleep_for: u64) void {
     suspend {
         var task = zap.Task.from(@frame());
         task.schedule();
     }
 
-    std.debug.warn("sleeping to notify\n", .{});
-    zap.time.task.sleep(1 * std.time.ns_per_s);
+    std.debug.warn("{} sleeping for {}ms\n", .{id, sleep_for / std.time.ns_per_ms});
+    zap.time.task.sleep(sleep_for);
 
-    std.debug.warn("cancelling\n", .{});
-    // signal.notify();
+    std.debug.warn("{} woke up\n", .{id});
+    wait_group.done();
 }

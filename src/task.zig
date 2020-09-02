@@ -75,20 +75,6 @@ pub const Task = extern struct {
         }
     }
 
-    pub fn spawn(allocator: *std.mem.Allocator, comptime func: anytype, args: anytype) !void {
-        const Args = @typeOf(args);
-        const Wrapper = struct {
-            fn entry(self: *@Frame(func), func_args: Args, allocator: *std.mem.Allocator) void {
-                Task.runConcurrently();
-                _ = @call(.{}, func, func_args);
-                suspend allocator.destroy(self);
-            }
-        };
-
-        const frame = try allocator.create(@Frame(func));
-        frame.* = Wrapper.entry(frame, args, allocator);
-    }
-
     pub fn schedule(self: *Task) void {
         return Batch.from(self).schedule();
     }

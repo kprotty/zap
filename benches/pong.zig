@@ -49,11 +49,8 @@ fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
 
     const Pong = struct {
         fn run(c1: *Channel(u8), c2: *Channel(u8)) void {
-            suspend {
-                var task = zap.Task.from(@frame());
-                task.schedule();
-            }
-
+            zap.Task.runConcurrently();
+            
             if ((c1.get() catch unreachable) != 0)
                 std.debug.panic("invalid receive from c1", .{});
             c2.put(1) catch unreachable;

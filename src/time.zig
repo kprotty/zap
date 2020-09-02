@@ -22,7 +22,6 @@ pub const task = core(zap.sync.task.Signal);
 
 pub fn core(comptime Signal: type) type {
     return struct {
-        pub const now = nanotime;
         pub const nanotime = Signal.nanotime;
 
         pub fn sleep(delay_ns: u64) void {
@@ -33,6 +32,29 @@ pub fn core(comptime Signal: type) type {
 
             unreachable;
         }
+
+        pub const Timer = extern struct {
+            started: u64,
+
+            pub fn start() Timer {
+                return Timer{ .started = nanotime() };
+            }
+
+            pub fn read(self: Timer) u64 {
+                return nanotime() - self.started;
+            }
+
+            pub fn reset(self: *Timer) void {
+                self.started = nanotime();
+            }
+
+            pub fn lap(self: *Timer) u64 {
+                const now = nanotime();
+                const lap_time = now - self.started;
+                self.started = now;
+                return lap_time;
+            }
+        };
     };
 }
 

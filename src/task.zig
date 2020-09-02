@@ -67,15 +67,19 @@ pub const Task = extern struct {
         };
     }
 
+    pub fn runConcurrently() void {
+        suspend {
+            var task = Task.from(@frame());
+            task.schedule();
+        }
+    }
+
     pub fn spawn(allocator: *std.mem.Allocator, comptime func: anytype, args: anytype) !void {
         const Args = @typeOf(args);
         const Wrapper = struct {
             fn entry(self: *@Frame(func), func_args: Args, allocator: *std.mem.Allocator) void {
-                var task = Task.from(@frame());
-                suspend task.schedule();
-
+                Task.runConcurrently();
                 _ = @call(.{}, func, func_args);
-
                 suspend allocator.destroy(self);
             }
         };
@@ -422,7 +426,11 @@ pub const Task = extern struct {
                 }
 
                 if (wait_for) |delay| {
-                    self.signal.timedWait(delay) catch {};
+                    switch (@atomicLoad(RunState, &self.run_state, .Acquire)) {
+                        .idle => std.debug.panic("Reactor is idle when polling\n", .{}),
+                        .running => self.signal.timedWait(delay) catch {},
+                        .notified => @atomicStore(RunState, &self.run_state, .running, .Monotonic),
+                    }
                     reschedule = true;
                 }
 
@@ -532,7 +540,7 @@ pub const Task = extern struct {
                 };
 
                 if (removed)
-                    self.reactor.signal.notify();
+                    self.reactor.notify();
 
                 return removed;
             }

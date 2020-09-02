@@ -29,13 +29,17 @@ pub const TimeoutQueue = struct {
         self.wheel.reset();
     }
 
+    pub fn hasPending(self: *TimeoutQueue) bool {
+        return self.wheel.expired() or self.wheel.pending();
+    }
+
     pub const Entry = struct {
         timeout: TimeoutWheel.Timeout,
     };
 
     pub fn insert(self: *TimeoutQueue, entry: *Entry, expires_in: u64) void {
         entry.* = Entry{ .timeout = TimeoutWheel.Timeout.init(null) };
-        self.wheel.add(&entry.timeout, expires_in / std.time.ns_per_ms);
+        self.wheel.add(&entry.timeout, expires_in);
     }
 
     pub fn remove(self: *TimeoutQueue, entry: *Entry) bool {
@@ -50,7 +54,7 @@ pub const TimeoutQueue = struct {
     }
 
     pub fn advance(self: *TimeoutQueue, ticks: u64) void {
-        self.wheel.step(ticks / std.time.ns_per_ms);
+        self.wheel.step(ticks);
     }
 
     pub const Poll = union(enum) {
@@ -64,7 +68,7 @@ pub const TimeoutQueue = struct {
 
         const expires_in = self.wheel.timeout();
         if (expires_in != 0)
-            return Poll{ .wait_for = expires_in * std.time.ns_per_ms };
+            return Poll{ .wait_for = expires_in };
 
         return null;
     }

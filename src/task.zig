@@ -361,6 +361,8 @@ pub const Task = extern struct {
 
         fn create(self: *Reactor) !void {
             self.started = Signal.nanotime();
+            self.run_state = .idle;
+
             self.queue.init();
             self.signal.init();
         }
@@ -392,10 +394,12 @@ pub const Task = extern struct {
                     self.lock.acquire();
                     defer self.lock.release();
 
-                    const ticks = Signal.nanotime() - self.started;
+                    const now = Signal.nanotime();
+                    const ticks = now - self.started;
                     self.queue.advance(ticks);
 
                     while (self.queue.poll()) |poll| {
+                        std.debug.warn("reactor polled {}\n", .{poll});
                         switch (poll) {
                             .expired => |entry| {
                                 const timer = @fieldParentPtr(Timer, "entry", entry);
@@ -404,7 +408,7 @@ pub const Task = extern struct {
                             .wait_for => |delay| {
                                 wait_for = delay;
                                 break;
-                            }
+                            },
                         }
                     }
                 }
@@ -416,6 +420,7 @@ pub const Task = extern struct {
                 }
 
                 if (wait_for) |delay| {
+                    std.debug.warn("waiting {}ms\n", .{delay / std.time.ns_per_ms});
                     self.signal.timedWait(delay) catch {};
                     continue;
                 }
@@ -506,8 +511,9 @@ pub const Task = extern struct {
 
                 const now = Signal.nanotime();
                 var expired = now >= deadline;
-                if (!expired)
+                if (!expired) {
                     self.reactor.queue.insert(&self.entry, deadline - now);
+                }
 
                 self.reactor.lock.release();
                 
@@ -519,10 +525,16 @@ pub const Task = extern struct {
             }
 
             pub fn cancel(self: *Timer) bool {
-                self.reactor.lock.acquire();
-                defer self.reactor.lock.release();
+                const removed = blk: {
+                    self.reactor.lock.acquire();
+                    defer self.reactor.lock.release();
+                    break :blk self.reactor.queue.remove(&self.entry);
+                };
 
-                return self.reactor.queue.remove(&self.entry);
+                if (removed)
+                    self.reactor.notify();
+
+                return removed;
             }
         };
     };

@@ -53,6 +53,7 @@ const OsTime = struct {
     }
 
     var last_now: u64 = 0;
+    var first_now: u64 = 0;
     var lock = zap.sync.os.Lock{};
 
     inline fn nanotime() u64 {
@@ -69,6 +70,10 @@ const OsTime = struct {
                 } else {
                     last_now = now;
                 }
+
+                if (first_now == 0)
+                    first_now = now;
+                now = now -% first_now;
 
             } else {
                 var last = @atomicLoad(u64, &last_now, .Monotonic);
@@ -87,6 +92,20 @@ const OsTime = struct {
                         ) orelse break;
                     }
                 }
+
+                var first = @atomicLoad(u64, &first_now, .Monotonic);
+                if (first == 0) {
+                    first = @cmpxchgStrong(
+                        u64,
+                        &first_now,
+                        0,
+                        now,
+                        .Monotonic,
+                        .Monotonic,
+                    ) orelse now;
+                }
+
+                now = now -% first;
             }
         }
 

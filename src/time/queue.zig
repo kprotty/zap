@@ -16,7 +16,7 @@ const std = @import("std");
 const zap = @import("../zap.zig");
 
 const zig_timeout_wheel = @import("./zig-timeout-wheel.zig");
-const TimeoutWheel = zig_timeout_wheel.TimeoutWheel(u64, 6, 4, .NoIntervals, .AllowRelative);
+const TimeoutWheel = zig_timeout_wheel.TimeoutWheel(u64, 6, 6, .NoIntervals, .AllowRelative);
 
 pub const TimeoutQueue = struct {
     wheel: TimeoutWheel,
@@ -34,7 +34,8 @@ pub const TimeoutQueue = struct {
     };
 
     pub fn insert(self: *TimeoutQueue, entry: *Entry, expires_in: u64) void {
-        self.wheel.add(&entry.timeout, expires_in);
+        entry.* = Entry{ .timeout = TimeoutWheel.Timeout.init(null) };
+        self.wheel.add(&entry.timeout, expires_in / std.time.ns_per_ms);
     }
 
     pub fn remove(self: *TimeoutQueue, entry: *Entry) bool {
@@ -49,7 +50,7 @@ pub const TimeoutQueue = struct {
     }
 
     pub fn advance(self: *TimeoutQueue, ticks: u64) void {
-        self.wheel.step(ticks);
+        self.wheel.step(ticks / std.time.ns_per_ms);
     }
 
     pub const Poll = union(enum) {
@@ -63,7 +64,7 @@ pub const TimeoutQueue = struct {
 
         const expires_in = self.wheel.timeout();
         if (expires_in != 0)
-            return Poll{ .wait_for = expires_in };
+            return Poll{ .wait_for = expires_in * std.time.ns_per_ms };
 
         return null;
     }

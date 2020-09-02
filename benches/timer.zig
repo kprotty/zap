@@ -14,11 +14,40 @@
 
 const std = @import("std");
 const zap = @import("zap");
+const Signal = zap.sync.task.Signal;
 
 pub fn main() !void {
     try (try (zap.Task.runAsync(.{}, asyncMain, .{})));
 }
 
 fn asyncMain() !void {
-    zap.time.task.sleep(2 * std.time.ns_per_s);
+    var signal: Signal = undefined;
+    signal.init();
+    defer signal.deinit();
+
+    var cancel_frame = async canceller(&signal);
+
+    std.debug.warn("waiting on signal\n", .{});
+    const notified = signal.timedWait(3 * std.time.ns_per_s);
+
+    if (notified) |_| {
+        std.debug.warn("signal was notified\n", .{});
+    } else |_| {
+        std.debug.warn("signal timed out\n", .{});
+    }
+
+    await cancel_frame;
+}
+
+fn canceller(signal: *Signal) void {
+    suspend {
+        var task = zap.Task.from(@frame());
+        task.schedule();
+    }
+
+    std.debug.warn("sleeping to notify\n", .{});
+    zap.time.task.sleep(1 * std.time.ns_per_s);
+
+    std.debug.warn("cancelling\n", .{});
+    // signal.notify();
 }

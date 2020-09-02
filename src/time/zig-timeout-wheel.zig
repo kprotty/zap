@@ -9,7 +9,7 @@ const rotl = std.math.rotl;
 const rotr = std.math.rotr;
 
 fn fls(n: anytype) usize {
-    return @TypeOf(n).bit_count - @clz(@TypeOf(n), n);
+    return @TypeOf(n).bit_count - @clz(usize, n);
 }
 
 fn ctz(x: anytype) @TypeOf(x) {
@@ -234,7 +234,7 @@ pub fn TimeoutWheel(
 
         fn timeout_wheel(t: timeout_t) wheel_num_t {
             assert(t > 0); // must be called with timeout != 0, so fls input is nonzero
-            return @intCast(wheel_num_t, (@intCast(std.math.Log2Int(timeout_t), fls(std.math.min(t, std.math.maxInt(timeout_t)))) - 1) / wheel_bit);
+            return @truncate(wheel_num_t, (@intCast(std.math.Log2Int(timeout_t), fls(std.math.min(t, std.math.maxInt(timeout_t)))) - 1) / wheel_bit);
         }
 
         fn timeout_slot(wheel: wheel_num_t, expires: timeout_t) wheel_slot_t {
@@ -372,11 +372,11 @@ pub fn TimeoutWheel(
 
             var interval = ~@as(timeout_t, 0);
             var relmask: timeout_t = 0;
+            var has_timeout = false;
 
             for (self.pendingWheels) |slot_mask, wheel| {
                 if (slot_mask != 0) {
                     const slot = @truncate(wheel_slot_t, self.curtime >> (@intCast(std.math.Log2Int(timeout_t), wheel) * wheel_bit));
-
                     var _timeout: timeout_t = undefined;
 
                     {
@@ -392,12 +392,15 @@ pub fn TimeoutWheel(
                     // reduce by how much lower wheels have progressed
 
                     interval = std.math.min(_timeout, interval);
+                    has_timeout = true;
                 }
 
                 relmask <<= wheel_bit;
                 relmask |= wheel_mask;
             }
 
+            if (!has_timeout)
+                return 0;
             return interval;
         }
 

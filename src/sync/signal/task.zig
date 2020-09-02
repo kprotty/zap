@@ -132,8 +132,10 @@ pub const Signal = extern struct {
             }
         }
 
-        if (deadline != null and !timer.cancel()) {
-            await frame;
+        if (deadline != null) {
+            if (!timer.cancel()) {
+                await frame;
+            }
         }
 
         const state = @atomicLoad(usize, &self.state, .Acquire);

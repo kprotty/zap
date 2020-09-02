@@ -372,7 +372,11 @@ pub const Task = extern struct {
             };
         }
 
-        fn poll(self: *Reactor, block: bool) ?Task.Batch {
+        fn poll(self: *Reactor, comptime block: bool) ?Task.Batch {
+            if (!block and !std.builtin.single_threaded)
+                @compileError("Reactor is always polled with blocking intent on non-single-threaded builds");
+
+            self.lock.acquire();
             while (true) {
                 var expire_delay: ?u64 = null;
                 var batch = self.io_driver.poll() orelse Task.Batch{};
@@ -397,13 +401,13 @@ pub const Task = extern struct {
                     }
                 }
 
-                if (!batch.isEmpty() or !block)
-                    return batch;
-
                 self.lock.release();
 
-                var reschedule = false;
+                if (!batch.isEmpty() or !block) {
+                    return batch;
+                }
 
+                var reschedule = false;
                 if (self.io_driver.hasPending() or (expire_delay != null)) {
                     self.io_driver.wait(expire_delay);
                     reschedule = true;
@@ -446,7 +450,7 @@ pub const Task = extern struct {
         fn notify(self: *Reactor) void {
             if (std.builtin.single_threaded)
                 return;
-                
+
             var reschedule = false;
             var poll_state = @atomicLoad(PollState, &self.poll_state, .Monotonic);
 
@@ -485,11 +489,7 @@ pub const Task = extern struct {
                 fn startPoll(task: *Task, thread: *Thread) callconv(.C) void {
                     const reactor = @fieldParentPtr(Reactor, "task", task);
                     const core_pool = &thread.getPool().getScheduler().core_pool;
-
-                    while (true) {
-                        reactor.lock.acquire();
-                        const batch = reactor.poll(true) orelse break;
-                        reactor.lock.release();
+                    while (reactor.poll(true)) |batch| {
                         core_pool.schedule(batch);
                     }
                 }
@@ -1356,21 +1356,14 @@ pub const Task = extern struct {
             return null;
         }
 
-        fn pollReactor(self: *Thread, blocking: bool) ?*Task {
+        fn pollReactor(self: *Thread, comptime blocking: bool) ?*Task {
             if (!std.builtin.single_threaded)
                 @compileError("Reactor is polled in blocking pool for non single-threaded builds");
 
             const reactor = self.getPool().getScheduler().reactor.tryGet() orelse return null;
-
-            var batch = blk: {
-                reactor.lock.acquire();
-                const ready = reactor.poll(blocking);
-                if (!blocking or (ready != null))
-                    reactor.lock.release();
-                break :blk ready orelse return null;
-            };
-
+            var batch = reactor.poll(blocking) orelse return null;
             const task = batch.pop() orelse return null;
+
             if (!batch.isEmpty())
                 self.push(batch);
 

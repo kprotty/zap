@@ -376,32 +376,34 @@ pub const Task = extern struct {
             if (!block and !std.builtin.single_threaded)
                 @compileError("Reactor is always polled with blocking intent on non-single-threaded builds");
 
-            self.lock.acquire();
             while (true) {
                 var expire_delay: ?u64 = null;
                 var batch = self.io_driver.poll() orelse Task.Batch{};
-                
-                if (self.queue.hasPending()) {
-                    const old_last_poll = self.last_poll;
-                    self.last_poll = Signal.nanotime();
-                    const ticks = (self.last_poll - old_last_poll) / std.time.ns_per_ms;
-                    self.queue.advance(ticks);
 
-                    while (self.queue.poll()) |timer_poll| {
-                        switch (timer_poll) {
-                            .expired => |entry| {
-                                const timer = @fieldParentPtr(Timer, "entry", entry);
-                                batch.push(timer.task);
-                            },
-                            .wait_for => |delay_ms| {
-                                expire_delay = delay_ms * std.time.ns_per_ms;
-                                break;
+                {
+                    self.lock.acquire();
+                    defer self.lock.release();
+                
+                    if (self.queue.hasPending()) {
+                        const old_last_poll = self.last_poll;
+                        self.last_poll = Signal.nanotime();
+                        const ticks = (self.last_poll - old_last_poll) / std.time.ns_per_ms;
+                        self.queue.advance(ticks);
+
+                        while (self.queue.poll()) |timer_poll| {
+                            switch (timer_poll) {
+                                .expired => |entry| {
+                                    const timer = @fieldParentPtr(Timer, "entry", entry);
+                                    batch.push(timer.task);
+                                },
+                                .wait_for => |delay_ms| {
+                                    expire_delay = delay_ms * std.time.ns_per_ms;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-
-                self.lock.release();
 
                 if (!batch.isEmpty() or !block) {
                     return batch;
@@ -439,11 +441,8 @@ pub const Task = extern struct {
                     }
                 }
 
-                if (reschedule) {
-                    self.lock.acquire();
-                } else {
+                if (!reschedule)
                     return null;
-                }
             }
         }
 

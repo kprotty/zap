@@ -14,7 +14,39 @@
 
 const std = @import("std");
 
+const SingleThreadedLock = extern struct {
+    const Self = @This();
+    const runtime_safety = std.debug.runtime_safety;
+
+    is_locked: if (runtime_safety) bool else void = if (runtime_safety) false else {},
+
+    pub fn tryAcquire(self: *Self) bool {
+        if (runtime_safety) {
+            if (self.is_locked)
+                return false;
+            self.is_locked = true;
+        }
+        return true;
+    }
+
+    pub fn acquire(self: *Self) void {
+        if (!self.tryAcquire())
+            std.debug.panic("dead locked\n", .{});
+    }
+
+    pub fn release(self: *Self) void {
+        if (runtime_safety) {
+            if (!self.is_locked)
+                std.debug.panic("release when unlocked\n", .{});
+            self.is_locked = false;
+        }
+    }
+};
+
 pub fn Lock(comptime Signal: type) type {
+    if (std.builtin.single_threaded)
+        return SingleThreadedLock;
+
     return extern struct {
         const Self = @This();
 
@@ -32,16 +64,41 @@ pub fn Lock(comptime Signal: type) type {
 
         state: usize = UNLOCKED,
 
-        pub fn acquire(self: *Self) void {
-            const acquired = switch (std.builtin.arch) {
-                // on x86, unlike cmpxchg, bts doesnt require a register setup for the value
-                // which results in a slightly smaller hit on the i-cache. 
-                .i386, .x86_64 => asm volatile(
+        const is_x86 = switch (std.builtin.arch) {
+            .i386, .x86_64 => true,
+            else => false,
+        };
+
+        pub fn tryAcquire(self: *Self) bool {
+            // on x86, unlike cmpxchg, bts doesnt require a register setup for the value
+            // which results in a slightly smaller hit on the i-cache. 
+            if (is_x86) {
+                return asm volatile(
                     "lock btsl $0, %[ptr]"
                     : [ret] "={@ccc}" (-> u8),
                     : [ptr] "*m" (&self.state)
                     : "cc", "memory"
-                ) == 0,
+                ) == 0;
+            }
+
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
+            while (true) {
+                if (state & LOCKED != 0)
+                    return false;
+                state = @cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    state,
+                    state | LOCKED,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return true;
+            }
+        }
+
+        pub fn acquire(self: *Self) void {
+            const acquired = switch (is_x86) {
+                true => self.tryAcquire(),
                 else => @cmpxchgWeak(
                     usize,
                     &self.state,

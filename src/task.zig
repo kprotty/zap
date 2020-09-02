@@ -67,6 +67,7 @@ pub const Task = extern struct {
         };
     }
 
+    pub const wakeMeUpInside = runConcurrently;
     pub fn runConcurrently() void {
         suspend {
             var task = Task.from(@frame());

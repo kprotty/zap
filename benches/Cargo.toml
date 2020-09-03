@@ -5,7 +5,7 @@ edition = "2018"
 authors = ["kprotty"]
 
 [dependencies]
-tokio = { version = "0.2", features = ["rt-threaded", "sync", "macros"] }
+tokio = { version = "0.2", features = ["rt-threaded", "sync", "macros", "time"] }
 
 [[bin]]
 name = "yield"

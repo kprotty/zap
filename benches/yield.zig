@@ -49,7 +49,8 @@ fn asyncWorker(batch: *zap.Task.Batch, wait_group: *WaitGroup) void {
 
     var i: usize = num_yields;
     while (i != 0) : (i -= 1) {
-        zap.Task.yield();
+        //zap.Task.yield();
+        zap.time.task.sleep(1 * std.time.ns_per_ms);
     }
 
     wait_group.done();

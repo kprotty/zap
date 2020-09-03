@@ -30,7 +30,7 @@ func main() {
 
 		go func(){
 			for j := 0; j < num_yields; j++ {
-				time.Sleep(1 * time.Nanosecond)
+				time.Sleep(1 * time.Millisecond)
 			}
 			
 			wait_group.Done()

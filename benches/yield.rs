@@ -28,7 +28,8 @@ async fn main() {
         
         tokio::spawn(async move {
             for _ in 0..NUM_YIELDS {
-                tokio::task::yield_now().await;
+                //tokio::task::yield_now().await;
+                tokio::time::delay_for(std::time::Duration::from_millis(1)).await;
             }
             
             if counter.fetch_sub(1, Ordering::Relaxed) - 1 == 0 {

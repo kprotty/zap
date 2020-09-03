@@ -287,6 +287,8 @@ pub const Task = extern struct {
     };
 
     pub const Reactor = struct {
+        pub const resolution = std.time.ns_per_ms;
+
         const Lock = zap.sync.core.Lock(Signal);
 
         const State = enum(u8) {
@@ -387,17 +389,17 @@ pub const Task = extern struct {
                     if (self.queue.hasPending()) {
                         const old_last_poll = self.last_poll;
                         self.last_poll = Signal.nanotime();
-                        const ticks = (self.last_poll - old_last_poll) / std.time.ns_per_ms;
+                        const ticks = (self.last_poll - old_last_poll) / Reactor.resolution;
                         self.queue.advance(ticks);
 
                         while (self.queue.poll()) |timer_poll| {
                             switch (timer_poll) {
                                 .expired => |entry| {
                                     const timer = @fieldParentPtr(Timer, "entry", entry);
-                                    batch.push(timer.task);
+                                    batch.push(timer.task.?);
                                 },
                                 .wait_for => |delay_ms| {
-                                    expire_delay = delay_ms * std.time.ns_per_ms;
+                                    expire_delay = delay_ms * Reactor.resolution;
                                     break;
                                 }
                             }
@@ -542,12 +544,10 @@ pub const Task = extern struct {
         };
 
         pub const Timer = struct {            
-            task: *Task,
-            entry: zap.time.TimeoutQueue.Entry,
+            task: ?*Task = null,
+            entry: zap.time.TimeoutQueue.Entry = undefined,
 
             pub fn scheduleAfter(self: *Timer, task: *Task, deadline: u64) void {
-                self.task = task;
-
                 const thread = Task.getCurrentThread();
                 const reactor = thread.getPool().getScheduler().reactor.get();
 
@@ -555,20 +555,21 @@ pub const Task = extern struct {
                     reactor.lock.acquire();
                     defer reactor.lock.release();
 
-                    const now_ms = Signal.nanotime() / std.time.ns_per_ms; 
-                    const deadline_ms = deadline / std.time.ns_per_ms;
+                    const now_ms = Signal.nanotime() / Reactor.resolution; 
+                    const deadline_ms = deadline / Reactor.resolution;
                     const expired = now_ms >= deadline_ms;
 
                     if (!expired) {
                         const delay_ms = deadline_ms - now_ms;
                         reactor.queue.insert(&self.entry, delay_ms);
+                        @atomicStore(?*Task, &self.task, task, .Unordered);
                     }
 
                     break :blk expired;
                 };
 
                 if (expired) {
-                    thread.schedule(Task.Batch.from(self.task));
+                    thread.schedule(Task.Batch.from(task));
                 } else {
                     reactor.notify();
                 }
@@ -578,9 +579,17 @@ pub const Task = extern struct {
                 const thread = Task.getCurrentThread();
                 const reactor = thread.getPool().getScheduler().reactor.get();
 
+                if (@atomicLoad(?*Task, &self.task, .Unordered) != null)
+                    return false;
+
                 const removed = blk: {
                     reactor.lock.acquire();
                     defer reactor.lock.release();
+
+                    if (self.task == null)
+                        break :blk false;
+
+                    self.task = null;
                     break :blk reactor.queue.remove(&self.entry);
                 };
 
@@ -1578,10 +1587,11 @@ pub const Task = extern struct {
                     var heap = std.heap.HeapAllocator.init();
                 }.heap.allocator);
             }
-
-            return &(struct {
-                var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            }.gpa.allocator);
+            
+            return std.heap.page_allocator;
+            // return &(struct {
+            //    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            // }.gpa.allocator);
         }
     };
 };

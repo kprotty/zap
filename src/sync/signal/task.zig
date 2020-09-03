@@ -81,7 +81,7 @@ pub const Signal = extern struct {
     fn tryWait(self: *Signal, timeout: ?u64) bool {
         var deadline: ?u64 = null;
         if (timeout) |timeout_ns| {
-            if (timeout_ns == 0)
+            if (timeout_ns < zap.Task.Reactor.resolution)
                 return false;
             deadline = nanotime() + timeout_ns;
         }
@@ -113,7 +113,7 @@ pub const Signal = extern struct {
         var task = zap.Task.from(@frame());
         var frame_task: zap.Task = undefined;
         var frame: @Frame(OnTimeout.run) = undefined;
-        var timer: zap.Task.Reactor.Timer = undefined;
+        var timer = zap.Task.Reactor.Timer{};
 
         suspend {
             if (@cmpxchgStrong(

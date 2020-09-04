@@ -15,7 +15,3 @@
 const std = @import("std");
 
 pub const Task = @import("./task.zig").Task;
-
-pub const sync = @import("./sync.zig");
-
-pub const time = @import("./time.zig");

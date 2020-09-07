@@ -100,40 +100,35 @@ pub const Task = extern struct {
 };
 
 pub const Thread = extern struct {
-    runq_head: usize,
-    runq_tail: usize,
-    runq_overflow: ?*Task,
-    runq_buffer: [256]*Task,
-    runq_local: ?*Task,
-    pool: *Pool,
+    runq_head: usize = 0,
+    runq_tail: usize = 0,
+    runq_overflow: ?*Task = null,
+    runq_buffer: [256]*Task = undefined,
+    local_head: *Task,
+    local_tail: Task,
+    worker: *Worker,
+    ptr: usize,
+    
+    pub fn init(self: *Thread, worker: *Worker) void {
+        self.* = Thread{
+            .local_head = &self.local_tail,
+            .local_tail = Task{
+                .next = null,
+                .continuation = @ptrToInt(&self.local_tail),
+            },
+            .worker = worker,
+            .ptr = @ptrToInt(pool),
+        };
+    }
+
+    pub fn pushLocal(self: *Therad, batch: Task.Batch) void {
+        if (batch.isEmpty())
+            return;
+        self.pushOnlyLocal(batch.head, batch.tail);
+    }
 
     pub fn push(self: *Thread, tasks: Task.Batch) void {
         var batch = tasks;
-
-        {
-            const task = batch.pop() orelse return;
-            var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-            while (true) {
-
-                const old_next = runq_next orelse {
-                    @atomicStore(?*Task, &self.runq_next, task, .Release);
-                    break;
-                };
-
-                run_queue = @cmpxchgWeak(
-                    ?*Task,
-                    &self.runq_next,
-                    old_next,
-                    task,
-                    .Release,
-                    .Monotonic,
-                ) orelse {
-                    batch.pushFront(old_next);
-                    break;
-                };
-            }
-        }
-
         var tail = self.runq_tail;
         var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
         while (!batch.isEmpty()) {
@@ -162,7 +157,7 @@ pub const Thread = extern struct {
                 &self.runq_head,
                 head,
                 new_head,
-                .Monotonic,
+                .Acquire,
                 .Monotonic,
             )) |updated_head| {
                 head = updated_head;
@@ -233,17 +228,56 @@ pub const Thread = extern struct {
         }
     }
 
+    fn pushOnlyLocal(self: *Thread, head: ?*Task, tail: *Task) void {
+        const prev = @atomicRmw(*Task, &self.local_head, .Xchg, tail, .AcqRel);
+        @atomicStore(?*Task, &prev.next, head, .Release);
+    }
+
+    fn pollOnlyLocal(self: *Thread) ?*Task {
+        @setRuntimeSafety(false);
+        const stub_ptr = &self.local_runq;
+        const tail_ptr = @ptrCast(**Task, &self.local_runq.continuation);
+        
+        var tail = tail_ptr.*;
+        var next = @atomicLoad(?*Task, &tail.next, .Acquire);
+
+        if (tail == stub_ptr) {
+            tail = next orelse break :blk;
+            tail_ptr.* = tail;
+            next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        }
+
+        if (next) |new_tail| {
+            tail_ptr.* = new_tail;
+            return tail;
+        }
+
+        var wait_on_push: u4 = 8;
+        while (true) {
+            const head = @atomicLoad(*Task, &self.local_head, .Monotonic);
+            if (tail == head)
+                break;
+            if (wait_on_push == 0)
+                return null;
+            wait_on_push -= 1;
+            spinLoopHint();
+        }
+
+        stub_ptr.next = null;
+        self.pushOnlyLocal(stub_ptr, stub_ptr);
+
+        next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        if (next) |new_tail| {
+            tail_ptr.* = new_tail;
+            return tail;
+        }
+
+        return null;
+    }
+
     pub fn pollLocal(self: *Thread) ?*Task {
-        var runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-        while (runq_next) |task| {
-            runq_next = @cmpxchgWeak(
-                ?*Task,
-                &self.runq_next,
-                runq_next,
-                null,
-                .Monotonic,
-                .Monotonic,
-            ) orelse return task;
+        if (self.pollOnlyLocal()) |task| {
+            return task;
         }
 
         var tail = self.runq_tail;
@@ -261,7 +295,7 @@ pub const Thread = extern struct {
                 &self.runq_head,
                 head,
                 head +% 1,
-                .Monotonic,
+                .Acquire,
                 .Monotonic,
             ) orelse {
                 const buffer_ptr = &self.runq_buffer[head % self.runq_buffer.len];
@@ -276,12 +310,16 @@ pub const Thread = extern struct {
                 &self.runq_overflow,
                 task,
                 null,
-                .Monotonic,
+                .Acquire,
                 .Monotonic,
             ) orelse {
                 self.inject(task.next);
                 return task;
             };
+        }
+
+        if (self.pollOnlyLocal()) |task| {
+            return task;
         }
 
         return null;
@@ -358,15 +396,6 @@ pub const Thread = extern struct {
                         self.inject(task.next);
                         return task;
                     };
-                } else if (@atomicLoad(?*Task, &target.runq_next, .Monotonic)) |task| {
-                    _ = @cmpxchgWeak(
-                        ?*Task,
-                        &target.runq_next,
-                        task,
-                        null,
-                        .Acquire,
-                        .Monotonic,
-                    ) orelse return task;
                 } else {
                     break;
                 }
@@ -420,24 +449,28 @@ pub const Pool = extern struct {
     local_runq: ?*Task,
     shared_runq: ?*Task,
     idle_queue: usize,
-    active_threads: usize,
 
     const IDLE_MARKED = 1;
     const IDLE_SHUTDOWN = ~@as(usize, 0);
+    
+    const MAX_WORKERS = (std.math.maxInt(u32) >> 8) - 1;
 
     fn init(self: *Pool, worker_count: u32, is_blocking: bool) void {
-        const num_workers = std.math.min(worker_count, ~@as(u32, 0) >> 1);
+        const num_workers = std.math.min(worker_count, MAX_WORKERS);
+
         self.* = Pool{
             .num_workers = (num_workers << 1) | @boolToInt(is_blocking),
             .local_runq = null,
             .shared_runq = null,
             .idle_queue = 0,
-            .active_threads = 0,
         };
-
-        for (self.getWorkers()) |*worker, index| {
-            @compileError("TODO");
-        }
+        
+        self.idle_queue = blk: {
+            const workers = self.getWorkers();
+            for (workers) |*worker, index|
+                worker.ptr = (Worker.Ptr{ .idle = index }).toUsize();
+            break :blk ((workers.len + 1) << 8);
+        };
     }
 
     fn deinit(self: *Pool) void {
@@ -452,10 +485,6 @@ pub const Pool = extern struct {
         const idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
         if (idle_queue != IDLE_SHUTDOWN)
             std.debug.panic("Pool.deinit() when idle_queue is not shutdown", .{});
-
-        const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
-        if (active_threads != 0)
-            std.debug.panic("Pool.deinit() when active_threads = {}", .{active_threads});
     }
 
     pub fn isBlocking(self: Pool) bool {
@@ -507,17 +536,272 @@ pub const Pool = extern struct {
             ) orelse break;
         }
     }
+
+    pub const Schedule = struct {
+        pool: usize,
+        ptr: usize,
+
+        pub const Result = union(enum) {
+            notified: void,
+            spawned: *Worker,
+            resumed: *Thread,
+        };
+
+        fn from(
+            pool: *Pool,
+            result: Result,
+            first_in_node: bool,
+            first_in_scheduler: bool,
+        ) Schedule {
+            return Schedule{
+                .pool = @ptrToInt(pool)
+                    | (@boolToInt(first_in_node) << 1)
+                    | (@boolToInt(first_in_scheduler) << 0),
+                .ptr = switch (result) {
+                    .notified => 0,
+                    .spawned => |worker| @ptrToInt(worker) | 1,
+                    .resumed => |thread| @ptrToInt(thread),
+                },
+            };
+        }
+
+        pub fn wasFirstInNode(self: Schedule) bool {
+            return (self.pool & (1 << 1)) != 0;
+        }
+
+        pub fn wasFirstInScheduler(self: Schedule) bool {
+            return (self.pool & (1 << 0)) != 0;
+        }
+
+        pub fn getPool(self: Schedule) *Pool {
+            @setRuntimeSafety(false);
+            return @intToPtr(*Pool, self.pool & ~@as(usize, 0b11)); 
+        }
+
+        pub fn getResult(self: Schedule) Result {
+            @setRuntimeSafety(false);
+            if (self.ptr == 0)
+                return Result{ .notified = {} };
+            if (self.ptr & 1 != 0)
+                return Result{ .spawned = @intToPtr(*Worker, self.ptr & ~@as(usize, 1)) };
+            return Result{ .resumed = @intToPtr(*Thread, self.ptr) };
+        }
+
+        pub fn undo(self: Schedule) void {
+            return self.getPool().undoResumeThread(self.getResult());
+        }
+    };
+
+    pub fn tryResumeThread(self: *Pool) ?Schedule {
+        return self.resumeThread(.{ .check_remote = true });
+    }
+
+    pub fn tryResumeLocalThread(self: *Pool) ?Schedule {
+        return self.resumeThread(.{});
+    }
+
+    const ResumeOptions = struct {
+        was_waking: bool = false,
+        check_remote: bool = false,
+    };
+
+    fn resumeThread(self: *Pool, options: ResumeOptions) ?Schedule {
+        const workers = self.getWorkers();
+        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+
+        while (true) {
+            if (idle_queue == IDLE_SHUTDOWN)
+                std.debug.panic("Pool.resumeThread() when already shutdown", .{});
+
+            var worker_index = idle_queue >> 8;
+            var new_result: Schedule.Result = undefined;
+            var new_idle_queue = idle_queue & (~@as(u8, 0) << 1);
+
+            if (worker_index != 0) {
+                if (!options.was_waking and (idle_queue & IDLE_MARKED != 0))
+                    break;
+
+                worker_index -= 1;
+                const worker = &workers[worker_index];
+                const ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
+
+                switch (Worker.Ptr.fromUsize(ptr)) {
+                    .idle => |next_index| {
+                        new_result = Schedule.Result{ .spawned = worker };
+                        new_idle_queue = (next_index << 8) | @boolToInt(next_index != 0);
+                    },
+                    .spawning => {
+                        spinLoopHint();
+                        idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+                        continue;
+                    },
+                    .spawned => |thread| {
+                        const next_index = @atomicLoad(usize, &thread.ptr, .Unordered);
+                        if (next_index > MAX_WORKERS) {
+                            spinLoopHint();
+                            idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+                            continue;
+                        } else {
+                            new_result = Schedule.Result{ .resumed = thread };
+                            new_idle_queue = next_index | @boolToInt(next_index != 0);
+                        }
+                    },
+                    .shutdown => {
+                        std.debug.panic("Pool.resumeThread() when worker {} already shutdown", .{worker_index});
+                    },
+                }
+            } else if (idle_queue & IDLE_MARKED != 0) {
+                break;
+            } else {
+                new_result = Schedule.Result{ .notified = {} };
+                new_idle_queue |= IDLE_MARKED;
+            }
+
+            if (@cmpxchgWeak(
+                usize,
+                &self.idle_queue,
+                idle_queue,
+                new_idle_queue,
+                .Acquire,
+                .Acquire,
+            )) |updated_idle_queue| {
+                idle_queue = updated_idle_queue;
+                continue;
+            }
+
+            var was_notified = false;
+            switch (new_result) {
+                .notified => {
+                    was_notified = true;
+                },
+                .spawned => |worker| {
+                    const worker_ptr = (Worker.Ptr{ .spawning = pool }).toUsize();
+                    @atomicStore(usize, &worker.ptr, worker_ptr, .Release);
+                },
+                .resumed => |thread| {
+                    const thread_ptr = @ptrToInt(self) | @boolToInt(true);
+                    @atomicStore(usize, &thread.ptr, thread_ptr, .Unordered);
+                },
+            }
+
+            const node = self.getNode();
+            const first_in_node = !was_notified and blk: {
+                const active_threads = @atomicRmw(usize, &node.active_threads, .Add, 1, .Monotonic);
+                break :blk (active_threads == 0);
+            };
+            const first_in_scheduler = first_in_node and blk: {
+                const scheduler = node.getScheduler();
+                const active_nodes = @atomicRmw(usize, &scheduler.active_nodes, .Add, 1, .Monotonic);
+                break :blk (active_nodes == 1);
+            };
+
+            return Schedule.from(
+                self,
+                new_result,
+                first_in_node,
+                first_in_scheduler,
+            );
+        }
+
+        if (options.check_remote) {
+            const node = self.getNode();
+            const is_blocking = self.isBlocking();
+
+            var nodes = node.iter();
+            _ = nodes.next();
+            while (nodes.next()) |remote_node| {
+                const pool = switch (is_blocking) {
+                    true => &remote_node.blocking_pool,
+                    else => &remote_node.non_blocking_pool,
+                };
+                if (pool.tryResumeLocalThread()) |schedule|
+                    return scheudle;
+            }
+        }
+
+        return null;
+    }
+
+    fn undoResumeThread(self: *Pool, result: Schedule.Result) void {
+        switch (result) {
+            .notified => return,
+            .spawned, .resumed => {
+                const node = self.getNode();
+                if (@atomicRmw(usize, &node.active_threads, .Sub, 1, .Monotonic) == 0) {
+                    const scheduler = node.getScheduler();
+                    _ = @atomicRmw(usize, &scheduler.active_nodes, .Sub, 1, .Monotonic);
+                }
+            },
+        }
+
+        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+        while (true) {
+            if (idle_queue == IDLE_SHUTDOWN)
+                std.debug.panic("Pool.undoResumeThread() when already shutdown", .{});
+            if (idle_queue & IDLE_MARKED == 0)
+                std.debug.panic("Pool.undoResumeThread() when not waking", .{});
+
+            var worker_index = idle_queue >> 8;
+            var aba_tag = @truncate(u7, idle_queue >> 1);
+
+            switch () {
+                @compileError("TODO");
+            }
+
+            idle_queue = @cmpxchgWeak(
+                        usize,
+                        &self.idle_queue,
+                        idle_queue,
+                        (aba_tag +% 1) | (worker_index << 8),
+                        .Release,
+                        .Monotonic,
+                    ) orelse return;
+        }
+    }
 };
 
 pub const Worker = extern struct {
     ptr: usize,
+
+    const Ptr = union(enum) {
+        idle: u32,
+        spawning: *Pool,
+        spawned: *Thread,
+        shutdown: ?Thread.Handle,
+
+        fn fromUsize(value: usize) Ptr {
+            @setRuntimeSafety(false);
+            return switch (value & 0b11) {
+                0 => Ptr{ .idle = value >> 2 },
+                1 => Ptr{ .spawning = @intToPtr(*Pool, value & ~@as(usize, 0b11)) },
+                2 => Ptr{ .spawned = @intToPtr(*Thread, value & ~@as(usize, 0b11)) },
+                3 => Ptr{ .shutdowm = @intToPtr(?Thread.Handle, value & ~@as(usize, 0b11)) },
+            };
+        }
+        
+        fn toUsize(self: Ptr) usize {
+            return switch (self) {
+                .idle => |index| (index << 2) | 0,
+                .spawning => |pool| @ptrToInt(pool) | 1,
+                .spawned => |thread| @ptrToInt(thread) | 2,
+                .shutdown => |handle| @ptrToInt(handle) | 3,
+            };
+        }
+    };
 };
 
 pub const Node = extern struct {
+    active_threads: usize,
     non_blocking_pool: Pool,
     blocking_pool: Pool,
     workers: [*]Worker,
     next: ?*Node,
+
+    fn deinit(self: *Node) void {
+        const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
+        if (active_threads != 0)
+            std.debug.panic("Node.deinit() when active_threads = {}", .{active_threads});
+    }
 
     pub const Cluster = struct {
         head: ?*Node = null,
@@ -591,7 +875,7 @@ pub const Node = extern struct {
 
 pub const Scheduler = extern struct {
     cluster: Node.Cluster,
-    active_pools: usize,
+    active_nodes: usize,
 
     pub fn start(
         self: *Scheduler,
@@ -611,14 +895,14 @@ pub const Scheduler = extern struct {
         
         self.* = Scheduler{
             .cluster = cluster,
-            .active_pools = 0,
+            .active_nodes = 0,
         };
     }
 
     pub fn finish(self: *Scheduler) Thread.Handle.Iter {
-        const active_pools = @atomicLoad(usize, &self.active_pools, .Monotonic);
-        if (active_pools != 0)
-            std.debug.panic("Scheduler.deinit() when {} pools are still active\n", .{active_pools});
+        const active_nodes = @atomicLoad(usize, &self.active_nodes, .Monotonic);
+        if (active_nodes != 0)
+            std.debug.panic("Scheduler.deinit() when {} Nodes are still active\n", .{active_nodes});
         
         var nodes = cluster.iter();
         while (nodes.next()) |node|

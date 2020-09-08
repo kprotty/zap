@@ -99,6 +99,24 @@ pub const Task = extern struct {
             self.head = task.next;
             return task;
         }
+
+        pub fn iter(self: Batch) Task.Iter {
+            return Task.Iter{ .current = self.head };
+        }
+    };
+
+    pub const Iter = extern struct {
+        current: ?*Task,
+
+        pub fn isEmpty(self: Iter) bool {
+            return self.current == null;
+        }
+
+        pub fn next(self: *Iter) ?*Task {
+            const task = self.current orelse return null;
+            self.current = task.next;
+            return task;
+        }
     };
 };
 
@@ -109,7 +127,7 @@ pub const Thread = extern struct {
     runq_buffer: [256]*Task = undefined,
     local_head: *Task,
     local_tail: Task,
-    pool: *Pool,
+    node: *Node,
     next_index: usize,
     worker_index: usize,
 
@@ -128,17 +146,18 @@ pub const Thread = extern struct {
         }
 
         pub const Iter = extern struct {
-            pool: *Pool,
+            node: *Node,
             index: usize = 0,
 
             pub fn next(self: *Iter) ?Handle {
-                const workers = self.pool.getWorkers();
+                const workers = self.node.getWorkers();
                 
                 while (self.index < workers.len) : (self.index += 1) {
                     const worker_ptr = Atomic.load(&workers[self.index].ptr, .acquire);
                     switch (Worker.Ptr.fromUsize(worker_ptr)) {
                         .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
                         .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
+                        @compileError("TODO"),
                     }
                 }
 
@@ -148,7 +167,7 @@ pub const Thread = extern struct {
     };
 
     pub const Iter = extern struct {
-        pool: *Pool,
+        node: *Node,
         index: usize = 0,
 
         pub fn next(self: *Iter) ?*Thread {
@@ -158,9 +177,9 @@ pub const Thread = extern struct {
     
     pub fn init(self: *Thread, worker: *Worker) void {
         var worker_ptr = Atomic.load(&worker.ptr, .acquire);
-        const pool = switch (Worker.Ptr.fromUsize(worker_ptr)) {
+        const node = switch (Worker.Ptr.fromUsize(worker_ptr)) {
             .idle => std.debug.panic("Thread.init() when worker still idle", .{}),
-            .spawning => |pool| pool,
+            .spawning => |node| node,
             .spawned => std.debug.panic("Thread.init() when worker already has a thread", .{}),
             .shutdown => std.debug.panic("Thread.init() when worker is shutdown", .{}),
         };
@@ -171,23 +190,17 @@ pub const Thread = extern struct {
                 .next = null,
                 .continuation = @ptrToInt(&self.local_tail),
             },
-            .pool = pool,
+            .node = node,
             .next_index = THREAD_WAKING,
-            .worker_index = toWorkerIndex(pool.getWorkers(), worker),
+            .worker_index = toWorkerIndex(node.getWorkers(), worker),
         };
 
         worker_ptr = (Worker.Ptr{ .spawned = self }).toUsize();
         Atomic.store(&worker.ptr, worker_ptr, .release);
     }
 
-    pub fn getPool(self: Thread) *Pool {
-        return self.pool;
-    }
-
-    pub fn pushLocal(self: *Therad, batch: Task.Batch) void {
-        if (batch.isEmpty())
-            return;
-        self.pushOnlyLocal(batch.head, batch.tail);
+    pub fn getNode(self: Thread) *Node {
+        return self.node;
     }
 
     fn readBuffer(self: *const Thread, index: usize) *Task {
@@ -198,6 +211,12 @@ pub const Thread = extern struct {
     fn writeBuffer(self: *Thread, index: usize, task: *Task) void {
         const buffer_ptr = &self.runq_buffer[index % self.runq_buffer.len];
         return Atomic.store(buffer_ptr, task, .unordered);
+    }
+
+    pub fn pushLocal(self: *Therad, batch: Task.Batch) void {
+        if (batch.isEmpty())
+            return;
+        self.pushOnlyLocal(batch.head, batch.tail);
     }
 
     pub fn push(self: *Thread, tasks: Task.Batch) void {
@@ -267,7 +286,7 @@ pub const Thread = extern struct {
     }
 
     fn inject(self: *Thread, run_queue: ?*Task) void {
-        var runq: ?*Task = runq_queue orelse return;
+        var runq = Task.Iter{ .current = runq_queue orelse return };
         var tail = self.runq_tail;
         var head = Atomic.load(&self.runq_head, .relaxed);
 
@@ -279,14 +298,13 @@ pub const Thread = extern struct {
 
         var remaining: usize = self.runq_buffer.len;
         while (remaining != 0) : (remaining -= 1) {
-            const task = runq orelse break;
+            const task = runq.next() orelse break;
             self.writeBuffer(tail, task);
-            runq = task.next;
             tail +%= 1;
         }
 
         Atomic.store(&self.runq_tail, tail, .release);
-        if (runq == null)
+        if (runq.isEmpty())
             return;
 
         const runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
@@ -409,13 +427,13 @@ pub const Thread = extern struct {
         }
     }
 
-    pub fn pollGlobal(noalias self: *Thread, noalias pool: *Pool) ?*Task {
-        if (pool == self.getPool()) {
-            if (self.pollOnlyGlobal(&pool.local_runq)) |task|
+    pub fn pollGlobal(noalias self: *Thread, noalias node: *Node) ?*Task {
+        if (node == self.getNode()) {
+            if (self.pollOnlyGlobal(&node.local_runq)) |task|
                 return task;
         }
 
-        if (self.pollOnlyGlobal(&pool.shared_runq)) |task| {
+        if (self.pollOnlyGlobal(&node.shared_runq)) |task| {
             return task;
         }
 
@@ -503,27 +521,64 @@ pub const Thread = extern struct {
     }
 };
 
-pub const Pool = extern struct {
-    num_workers: u32,
+pub const Worker = extern struct {
+    ptr: usize,
+
+    pub const alignment = Ptr.MASK + 1;
+
+    const Ptr = union(enum) {
+        idle: u32,
+        spawning: *Node,
+        spawned: *Thread,
+        shutdown: ?Thread.Handle.Ptr,
+
+        const MASK = 0b11;
+
+        fn fromUsize(value: usize) Ptr {
+            @setRuntimeSafety(false);
+            return switch (value & MASK) {
+                0 => Ptr{ .idle = value >> @popCount(u2, MASK) },
+                1 => Ptr{ .spawning = @intToPtr(*Node, value & ~@as(usize, MASK)) },
+                2 => Ptr{ .spawned = @intToPtr(*Thread, value & ~@as(usize, MASK)) },
+                3 => Ptr{ .shutdowm = @intToPtr(?Thread.Handle.Ptr, value & ~@as(usize, MASK)) },
+            };
+        }
+        
+        fn toUsize(self: Ptr) usize {
+            return switch (self) {
+                .idle => |index| (index << @popCount(u2, MASK)) | 0,
+                .spawning => |node| @ptrToInt(node) | 1,
+                .spawned => |thread| @ptrToInt(thread) | 2,
+                .shutdown => |handle| @ptrToInt(handle) | 3,
+            };
+        }
+    };
+};
+
+pub const Node = extern struct {
+    next: ?*Node,
+    scheduler: *Scheduler,
+    workers_ptr: [*]Worker,
+    workers_len: u32,
     local_runq: ?*Task,
     shared_runq: ?*Task,
     idle_queue: usize,
+    active_threads: usize,
 
     const IDLE_MARKED = 1;
     const IDLE_SHUTDOWN = ~@as(usize, 0);
-    
     const MAX_WORKERS = (std.math.maxInt(u32) >> 8) - 1;
 
-    fn init(self: *Pool, worker_count: u32, is_blocking: bool) void {
-        const num_workers = std.math.min(worker_count, MAX_WORKERS);
+    pub fn setup(self: *Node, workers: []Worker) !void {
+        self.next = self;
+        self.workers_ptr = workers.ptr;
+        self.workers_len = @intCast(u32, std.math.min(workers.len, MAX_WORKERS));
+    }
 
-        self.* = Pool{
-            .num_workers = (num_workers << 1) | @boolToInt(is_blocking),
-            .local_runq = null,
-            .shared_runq = null,
-            .idle_queue = 0,
-        };
-        
+    fn init(self: *Node, scheduler: *Scheduler) void {
+        self.scheduler = scheduler;
+        self.local_runq = null;
+        self.shared_runq = null;
         self.idle_queue = blk: {
             const workers = self.getWorkers();
             for (workers) |*worker, index|
@@ -532,18 +587,54 @@ pub const Pool = extern struct {
         };
     }
 
-    fn deinit(self: *Pool) void {
+    fn deinit(self: *Node) void {
+        const active_threads = Atomic.load(&self.active_threads, .relaxed);
+        if (active_threads != 0)
+            std.debug.panic("Node.deinit() when active_threads = {}", .{active_threads});
+
         const local_runq = Atomic.load(&self.local_runq, .relaxed);
         if (local_runq != null)
-            std.debug.panic("Pool.deinit() when local_runq is not empty", .{});
+            std.debug.panic("Node.deinit() when local_runq is not empty", .{});
 
         const shared_runq = Atomic.load(&self.shared_runq, .relaxed);
         if (shared_runq != null)
-            std.debug.panic("Pool.deinit() when shared_runq is not empty", .{});
+            std.debug.panic("Node.deinit() when shared_runq is not empty", .{});
 
         const idle_queue = Atomic.load(&self.idle_queue, .relaxed);
         if (idle_queue != IDLE_SHUTDOWN)
-            std.debug.panic("Pool.deinit() when idle_queue is not shutdown", .{});
+            std.debug.panic("Node.deinit() when idle_queue is not shutdown", .{});
+    }
+
+    pub const Iter = extern struct {
+        start: *Node,
+        current: ?*Node,
+
+        pub fn isEmpty(self: Iter) bool {
+            return self.current == null;
+        }
+
+        pub fn next(self: *Iter) ?*Node {
+            const node = self.current orelse return null;
+            self.current = node.next;
+            if (self.current == self.start)
+                self.current = null;
+            return node;
+        }
+    };
+
+    pub fn iter(self: *Node) Iter {
+        return Iter{
+            .start = self,
+            .current = self,
+        };
+    }
+
+    pub fn getScheduler(self: Node) *Scheduler {
+        return self.scheduler;
+    }
+
+    pub fn getWorkers(self: *Node) []Worker {
+        return self.workers_ptr[0..self.workers_len];
     }
 
     fn toWorkerIndex(workers: []Worker, worker: *Worker) usize {
@@ -552,40 +643,16 @@ pub const Pool = extern struct {
         const end = base + (workers.len * @sizeOf(Worker));
 
         if (ptr < base or ptr >= end)
-            std.debug.panic("Pool.toWorkerIndex() with invalid worker\n", .{});
+            std.debug.panic("Node.toWorkerIndex() with invalid worker\n", .{});
 
         return (ptr - base) / @sizeOf(Worker);
     }
 
-    pub fn isBlocking(self: Pool) bool {
-        return self.num_workers & 1 != 0;
-    }
-
-    pub fn getNode(self: *Pool) *Node {
-        if (self.isBlocking())
-            return @fieldParentPtr(Node, "blocking_pool", self);
-        return @fieldParentPtr(Node, "non_blocking_pool", self);
-    }
-
-    pub fn getWorkers(self: *Pool) []Worker {
-        const num_workers = self.num_workers;
-        const workers_len = num_workers >> 1;
-
-        if (num_workers & 1 == 0) {
-            const node = @fieldParentPtr(Node, "non_blocking_pool", self);
-            return node.workers[0..workers_len];
-        }
-
-        const node = @fieldParentPtr(Node, "blocking_pool", self);
-        const non_blocking_workers_len = node.non_blocking_pool.num_workers >> 1;
-        return node.workers[non_blocking_workers_len..][0..workers_len];
-    }
-
-    pub fn push(self: *Pool, batch: Task.Batch) void {
+    pub fn push(self: *Node, batch: Task.Batch) void {
         return self.pushBatch(&self.shared_runq, batch);
     }
 
-    pub fn pushLocal(self: *Pool, batch: Task.Batch) void {
+    pub fn pushLocal(self: *Node, batch: Task.Batch) void {
         return self.pushBatch(&self.local_runq, batch);
     }
 
@@ -608,7 +675,7 @@ pub const Pool = extern struct {
     }
 
     pub const Schedule = struct {
-        pool: usize,
+        node: usize,
         ptr: usize,
 
         pub const Result = union(enum) {
@@ -618,13 +685,13 @@ pub const Pool = extern struct {
         };
 
         fn from(
-            pool: *Pool,
+            node: *Node,
             result: Result,
             first_in_node: bool,
             first_in_scheduler: bool,
         ) Schedule {
             return Schedule{
-                .pool = @ptrToInt(pool)
+                .node = @ptrToInt(node)
                     | (@boolToInt(first_in_node) << 1)
                     | (@boolToInt(first_in_scheduler) << 0),
                 .ptr = switch (result) {
@@ -636,16 +703,16 @@ pub const Pool = extern struct {
         }
 
         pub fn wasFirstInNode(self: Schedule) bool {
-            return (self.pool & (1 << 1)) != 0;
+            return (self.node & (1 << 1)) != 0;
         }
 
         pub fn wasFirstInScheduler(self: Schedule) bool {
-            return (self.pool & (1 << 0)) != 0;
+            return (self.node & (1 << 0)) != 0;
         }
 
-        pub fn getPool(self: Schedule) *Pool {
+        pub fn getNode(self: Schedule) *Node {
             @setRuntimeSafety(false);
-            return @intToPtr(*Pool, self.pool & ~@as(usize, 0b11)); 
+            return @intToPtr(*Node, self.node & ~@as(usize, 0b11)); 
         }
 
         pub fn getResult(self: Schedule) Result {
@@ -658,15 +725,15 @@ pub const Pool = extern struct {
         }
 
         pub fn undo(self: Schedule) void {
-            return self.getPool().undoResumeThread(self.getResult());
+            return self.getNode().undoResumeThread(self.getResult());
         }
     };
 
-    pub fn tryResumeThread(self: *Pool) ?Schedule {
+    pub fn tryResumeThread(self: *Node) ?Schedule {
         return self.resumeThread(.{ .check_remote = true });
     }
 
-    pub fn tryResumeLocalThread(self: *Pool) ?Schedule {
+    pub fn tryResumeLocalThread(self: *Node) ?Schedule {
         return self.resumeThread(.{});
     }
 
@@ -675,13 +742,13 @@ pub const Pool = extern struct {
         check_remote: bool = false,
     };
 
-    fn resumeThread(self: *Pool, options: ResumeOptions) ?Schedule {
+    fn resumeThread(self: *Node, options: ResumeOptions) ?Schedule {
         const workers = self.getWorkers();
         var idle_queue = Atomic.load(&self.idle_queue, .acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
-                std.debug.panic("Pool.resumeThread() when already shutdown", .{});
+                std.debug.panic("Node.resumeThread() when already shutdown", .{});
 
             var worker_index = idle_queue >> 8;
             var new_result: Schedule.Result = undefined;
@@ -711,7 +778,7 @@ pub const Pool = extern struct {
                         new_idle_queue = next_index | @boolToInt(next_index != 0);
                     },
                     .shutdown => {
-                        std.debug.panic("Pool.resumeThread() when worker {} already shutdown", .{worker_index});
+                        std.debug.panic("Node.resumeThread() when worker {} already shutdown", .{worker_index});
                     },
                 }
             } else if (idle_queue & IDLE_MARKED != 0) {
@@ -738,7 +805,7 @@ pub const Pool = extern struct {
                     return Schedule.from(self, new_result, false, false);
                 },
                 .spawned => |worker| {
-                    const worker_ptr = (Worker.Ptr{ .spawning = pool }).toUsize();
+                    const worker_ptr = (Worker.Ptr{ .spawning = node }).toUsize();
                     Atomic.store(&worker.ptr, worker_ptr, .release);
                 },
                 .resumed => |thread| {
@@ -753,13 +820,12 @@ pub const Pool = extern struct {
                 },
             }
 
-            const node = self.getNode();
             const first_in_node = blk: {
-                const active_threads = Atomic.update(&node.active_threads, .add, 1, .relaxed);
+                const active_threads = Atomic.update(&self.active_threads, .add, 1, .relaxed);
                 break :blk (active_threads == 0);
             };
             const first_in_scheduler = first_in_node and blk: {
-                const scheduler = node.getScheduler();
+                const scheduler = self.getScheduler();
                 const active_nodes = Atomic.update(&scheduler.active_nodes, .add, 1, .relaxed);
                 break :blk (active_nodes == 1);
             };
@@ -773,31 +839,24 @@ pub const Pool = extern struct {
         }
 
         if (options.check_remote) {
-            const node = self.getNode();
-            const is_blocking = self.isBlocking();
-
-            var nodes = node.iter();
+            var nodes = self.iter();
             _ = nodes.next();
             while (nodes.next()) |remote_node| {
-                const pool = switch (is_blocking) {
-                    true => &remote_node.blocking_pool,
-                    else => &remote_node.non_blocking_pool,
-                };
-                if (pool.tryResumeLocalThread()) |schedule|
+                if (remote_node.tryResumeLocalThread()) |schedule| {
                     return scheudle;
+                }
             }
         }
 
         return null;
     }
 
-    fn undoResumeThread(self: *Pool, result: Schedule.Result) void {
+    fn undoResumeThread(self: *Node, result: Schedule.Result) void {
         switch (result) {
             .notified => return,
             .spawned, .resumed => {
-                const node = self.getNode();
-                if (Atomic.update(&node.active_threads, .sub, 1, .relaxed) == 0) {
-                    const scheduler = node.getScheduler();
+                if (Atomic.update(&self.active_threads, .sub, 1, .relaxed) == 0) {
+                    const scheduler = self.getScheduler();
                     _ = Atomic.update(&scheduler.active_nodes, .sub, 1, .relaxed);
                 }
             },
@@ -808,9 +867,9 @@ pub const Pool = extern struct {
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
-                std.debug.panic("Pool.undoResumeThread() when already shutdown", .{});
+                std.debug.panic("Node.undoResumeThread() when already shutdown", .{});
             if (idle_queue & IDLE_MARKED == 0)
-                std.debug.panic("Pool.undoResumeThread() when not waking", .{});
+                std.debug.panic("Node.undoResumeThread() when not waking", .{});
 
             var next_index = idle_queue >> 8;
             var aba_tag = @truncate(u7, idle_queue >> 1);
@@ -825,9 +884,9 @@ pub const Pool = extern struct {
                 .resumed => |thread| blk: {
                     const index = Atomic.load(&thread.next_index, .unordered);
                     if (index & Thread.IS_SUSPENDED != 0)
-                        std.debug.panic("Pool.undoResumeThread() when thread still suspended", .{});
+                        std.debug.panic("Node.undoResumeThread() when thread still suspended", .{});
                     if (index & Thread.IS_WAKING == 0)
-                        std.debug.panic("Pool.undoResumeThread() when thread is not waking", .{});
+                        std.debug.panic("Node.undoResumeThread() when thread is not waking", .{});
 
                     next_index = (next_index << Thread.INDEX_SHIFT) | Thread.IS_SUSPENDED;
                     Atomic.store(&thread.next_index, next_index, .unordered);
@@ -857,7 +916,7 @@ pub const Pool = extern struct {
         };
     };
 
-    pub fn suspendThread(noalias self: *Pool, noalias thread: *Thread) Suspended {
+    pub fn suspendThread(noalias self: *Node, noalias thread: *Thread) Suspended {
         const workers = self.getWorkers();
         const worker_index = thread.worker_index + 1;
         const worker = &workers[worker_index - 1];
@@ -870,7 +929,7 @@ pub const Pool = extern struct {
         var idle_queue = Atomic.load(&self.idle_queue, .relaxed);
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
-                std.debug.panic("Pool.suspendThread() when already shutdown", .{});
+                std.debug.panic("Node.suspendThread() when already shutdown", .{});
 
             next_index = idle_queue >> 8;
             const aba_tag = @truncate(u7, idle_queue >> 1);
@@ -905,13 +964,12 @@ pub const Pool = extern struct {
                 return Suspend{ .notified = {} };
             }
 
-            const node = self.getNode();
             const last_in_node = blk: {
-                const active_threads = Atomic.update(&node.active_threads, .sub, 1, .relaxed);
+                const active_threads = Atomic.update(&self.active_threads, .sub, 1, .relaxed);
                 break :blk (active_threads == 1);
             };
             const last_in_scheduler = last_in_node and blk: {
-                const scheduler = node.getScheduler();
+                const scheduler = self.getScheduler();
                 const active_nodes = Atomic.update(&scheduler.active_nodes, .sub, 1, .relaxed);
                 break :blk (active_nodes == 1);
             };
@@ -923,80 +981,6 @@ pub const Pool = extern struct {
                 },
             };
         }
-    }
-};
-
-pub const Worker = extern struct {
-    ptr: usize,
-
-    pub const alignment = Ptr.MASK + 1;
-
-    const Ptr = union(enum) {
-        idle: u32,
-        spawning: *Pool,
-        spawned: *Thread,
-        shutdown: ?Thread.Handle.Ptr,
-
-        const MASK = 0b11;
-
-        fn fromUsize(value: usize) Ptr {
-            @setRuntimeSafety(false);
-            return switch (value & MASK) {
-                0 => Ptr{ .idle = value >> @popCount(u2, MASK) },
-                1 => Ptr{ .spawning = @intToPtr(*Pool, value & ~@as(usize, MASK)) },
-                2 => Ptr{ .spawned = @intToPtr(*Thread, value & ~@as(usize, MASK)) },
-                3 => Ptr{ .shutdowm = @intToPtr(?Thread.Handle.Ptr, value & ~@as(usize, MASK)) },
-            };
-        }
-        
-        fn toUsize(self: Ptr) usize {
-            return switch (self) {
-                .idle => |index| (index << @popCount(u2, MASK)) | 0,
-                .spawning => |pool| @ptrToInt(pool) | 1,
-                .spawned => |thread| @ptrToInt(thread) | 2,
-                .shutdown => |handle| @ptrToInt(handle) | 3,
-            };
-        }
-    };
-};
-
-pub const Node = extern struct {
-    active_threads: usize,
-    non_blocking_pool: Pool,
-    blocking_pool: Pool,
-    workers: [*]Worker,
-    next: ?*Node,
-    scheduler: *Scheduler,
-
-    pub fn setup(self: *Node, workers: []Worker, non_blocking_workers: u32) !void {
-        const blocking_workers = blk: {
-            if (non_blocking_workers == 0 or workers.len == 0)
-                return error.EmptyWorkers;
-            break :blk (workers.len - non_blocking_workers);
-        };
-
-        self.next = self;
-        self.workers = workers.ptr;
-        self.blocking_pool.init(blocking_workers, true);
-        self.non_blocking_pool.init(non_blocking_workers, false);
-    }
-
-    fn init(self: *Node, scheduler: *Scheduler) void {
-        self.active_threads = 0;
-        self.scheduler = scheduler;
-    }
-
-    fn deinit(self: *Node) void {
-        const active_threads = Atomic.load(&self.active_threads, .relaxed);
-        if (active_threads != 0)
-            std.debug.panic("Node.deinit() when active_threads = {}", .{active_threads});
-
-        self.blocking_pool.deinit();
-        self.non_blocking_pool.deinit();
-    }
-
-    pub fn getScheduler(self: Node) *Scheduler {
-        return self.scheduler;
     }
 
     pub const Cluster = struct {
@@ -1066,6 +1050,13 @@ pub const Node = extern struct {
             node.next = node;
             return node;
         }
+
+        pub fn iter(self: Cluster) Node.Iter {
+            return Node.Iter{
+                .start = self.head orelse undefined,
+                .current = self.head,
+            };
+        }
     };
 };
 
@@ -1082,7 +1073,7 @@ pub const Scheduler = extern struct {
         var has_start_node = false;
 
         while (nodes.next()) |node| {
-            has_start_node = has_start_or or (node == start_node);
+            has_start_node = has_start_node or (node == start_node);
             try node.init(self);
         }
 

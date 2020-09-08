@@ -14,21 +14,4 @@
 
 const std = @import("std");
 
-pub const CACHE_ALIGN = switch (std.builtin.arch) {
-    .arm, .armeb, .mips, .mipsel, .mips64, .mips64el, .riscv64 => 32,
-    .aarch64, .wasm32, .wasm64, .i386, .x86_64 => 64,
-    .powerpc64 => 128,
-    .s390x => 256,
-    else => @alignOf(usize), 
-};
-
-pub fn spinLoopHint(iterations: anytype) void {
-    var i = iterations;
-    while (i > 0) : (i -= 1) {
-        switch (std.builtin.arch) {
-            .i386, .x86_64 => asm volatile("pause" ::: "memory"),
-            .arm, .aarch64 => asm volatile("yield" ::: "memory"),
-            else => {},
-        }
-    }
-}
+pub const Atomic = @import("./sync/atomic.zig");

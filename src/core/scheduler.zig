@@ -15,6 +15,9 @@
 const std = @import("std");
 const zap = @import("./zap");
 
+const Atomic = zap.sync.Atomic;
+const spinLoopHint = Atomic.spinLoopHint;
+
 pub const Task = extern struct {
     next: ?*Task = undefined,
     continuation: usize,
@@ -113,9 +116,48 @@ pub const Thread = extern struct {
     const IS_SUSPENDED = 1 << 0;
     const IS_WAKING = 1 << 1;
     const INDEX_SHIFT = 8;
+
+    pub const Handle = extern struct {
+        pub const Ptr = *const AlignedInt;
+        pub const AlignedInt = std.meta.Int()
+
+        fn from(token: usize) !Handle {
+            if (std.mem.alignForward(token, 4) != token)
+                error.Unaligned;
+            return Handle{ .token = token };
+        }
+
+        pub const Iter = extern struct {
+            pool: *Pool,
+            index: usize = 0,
+
+            pub fn next(self: *Iter) ?Handle {
+                const workers = self.pool.getWorkers();
+                
+                while (self.index < workers.len) : (self.index += 1) {
+                    const worker_ptr = Atomic.load(&workers[self.index].ptr, .acquire);
+                    switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                        .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
+                        .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
+                    }
+                }
+
+                return null;
+            }
+        };
+    };
+
+    pub const Iter = extern struct {
+        pool: *Pool,
+        index: usize = 0,
+
+        pub fn next(self: *Iter) ?*Thread {
+
+        }
+    };
     
     pub fn init(self: *Thread, worker: *Worker) void {
-        var worker_ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
+        var worker_ptr = Atomic.load(&worker.ptr, .acquire);
         const pool = switch (Worker.Ptr.fromUsize(worker_ptr)) {
             .idle => std.debug.panic("Thread.init() when worker still idle", .{}),
             .spawning => |pool| pool,
@@ -135,7 +177,7 @@ pub const Thread = extern struct {
         };
 
         worker_ptr = (Worker.Ptr{ .spawned = self }).toUsize();
-        @atomicStore(usize, &worker.ptr, worker_ptr, .Release);
+        Atomic.store(&worker.ptr, worker_ptr, .release);
     }
 
     pub fn getPool(self: Thread) *Pool {
@@ -148,10 +190,20 @@ pub const Thread = extern struct {
         self.pushOnlyLocal(batch.head, batch.tail);
     }
 
+    fn readBuffer(self: *const Thread, index: usize) *Task {
+        const buffer_ptr = &self.runq_buffer[index % self.runq_buffer.len];
+        return Atomic.load(buffer_ptr, .unordered);
+    }
+
+    fn writeBuffer(self: *Thread, index: usize, task: *Task) void {
+        const buffer_ptr = &self.runq_buffer[index % self.runq_buffer.len];
+        return Atomic.store(buffer_ptr, task, .unordered);
+    }
+
     pub fn push(self: *Thread, tasks: Task.Batch) void {
         var batch = tasks;
         var tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        var head = Atomic.load(&self.runq_head, .relaxed);
         while (!batch.isEmpty()) {
 
             const size = tail -% head;
@@ -162,24 +214,23 @@ pub const Thread = extern struct {
             if (remaining != 0) {
                 while (remaining != 0) : (remaining -= 1) {
                     const task = batch.pop() orelse break;
-                    const buffer_ptr = &self.runq_buffer[tail % self.runq_buffer.len];
-                    @atomicStore(*Task, buffer_ptr, task, .Unordered);
+                    self.writeBuffer(tail);
                     tail +%= 1;
                 }
 
-                @atomicStore(usize, &self.runq_tail, tail, .Release);
-                head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+                Atomic.store(&self.runq_tail, tail, .release);
+                head = Atomic.load(&self.runq_head, .relaxed);
                 continue;
             }
 
             const new_head = head +% (self.runq_buffer.len / 2);
-            if (@cmpxchgWeak(
-                usize,
+            if (Atomic.compareAndSwap(
+                .weak,
                 &self.runq_head,
                 head,
                 new_head,
-                .Acquire,
-                .Monotonic,
+                .acquire,
+                .relaxed,
             )) |updated_head| {
                 head = updated_head;
                 continue;
@@ -189,29 +240,27 @@ pub const Thread = extern struct {
             batch.pushFrontMany(blk: {
                 var overflowed = Task.Batch{};
                 while (head != new_head) : (head +%= 1) {
-                    const buffer_ptr = &self.runq_buffer[head % self.runq_buffer.len];
-                    const task = @atomicLoad(*Task, buffer_ptr, .Unordered);
-                    overflowed.push(task);
+                    overflowed.push(self.readBuffer(head));
                 }
                 break :blk overflowed;
             });
 
-            var runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+            var runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
             while (true) {
                 batch.tail.next = runq_overflow;
 
                 if (runq_overflow == null) {
-                    @atomicStore(?*Task, &self.runq_overflow, batch.head, .Release);
+                    Atomic.store(&self.runq_overflow, batch.head, .release);
                     break;
                 }
 
-                runq_overflow = @cmpxchgWeak(
-                    ?*Task,
+                runq_overflow = Atomic.compareAndSwap(
+                    .weak,
                     &self.runq_overflow,
                     runq_overflow,
                     batch.head,
-                    .Release,
-                    .Monotonic,
+                    .release,
+                    .relaxed,
                 ) orelse break;
             }
         }
@@ -220,7 +269,7 @@ pub const Thread = extern struct {
     fn inject(self: *Thread, run_queue: ?*Task) void {
         var runq: ?*Task = runq_queue orelse return;
         var tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        var head = Atomic.load(&self.runq_head, .relaxed);
 
         const size = tail -% head;
         if (size > self.runq_buffer.len)
@@ -231,27 +280,26 @@ pub const Thread = extern struct {
         var remaining: usize = self.runq_buffer.len;
         while (remaining != 0) : (remaining -= 1) {
             const task = runq orelse break;
-            const buffer_ptr = &self.runq_buffer[tail % self.runq_buffer.len];
-            @atomicStore(*Task, buffer_ptr, task, .Unordered);
+            self.writeBuffer(tail, task);
             runq = task.next;
             tail +%= 1;
         }
 
-        @atomicStore(usize, &self.runq_tail, tail, .Release);
+        Atomic.store(&self.runq_tail, tail, .release);
         if (runq == null)
             return;
 
-        const runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+        const runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
         if (runq_overflow != null) {
             std.debug.panic("Thread.inject() when runq overflow is not empty", .{});
         } else {
-            @atomicStore(?*Task, &self.runq_overflow, runq, .Release);
+            Atomic.store(&self.runq_overflow, runq, .release);
         }
     }
 
     fn pushOnlyLocal(self: *Thread, head: ?*Task, tail: *Task) void {
-        const prev = @atomicRmw(*Task, &self.local_head, .Xchg, tail, .AcqRel);
-        @atomicStore(?*Task, &prev.next, head, .Release);
+        const prev = Atomic.update(&self.local_head, .swap, tail, .acq_rel);
+        Atomic.store(&prev.next, head, .release);
     }
 
     fn pollOnlyLocal(self: *Thread) ?*Task {
@@ -260,12 +308,12 @@ pub const Thread = extern struct {
         const tail_ptr = @ptrCast(**Task, &self.local_runq.continuation);
         
         var tail = tail_ptr.*;
-        var next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        var next = Atomic.load(&tail.next, .acquire);
 
         if (tail == stub_ptr) {
             tail = next orelse break :blk;
             tail_ptr.* = tail;
-            next = @atomicLoad(?*Task, &tail.next, .Acquire);
+            next = Atomic.load(&tail.next, .acquire);
         }
 
         if (next) |new_tail| {
@@ -275,7 +323,7 @@ pub const Thread = extern struct {
 
         var wait_on_push: u4 = 8;
         while (true) {
-            const head = @atomicLoad(*Task, &self.local_head, .Monotonic);
+            const head = Atomic.load(&self.local_head, .relaxed);
             if (tail == head)
                 break;
             if (wait_on_push == 0)
@@ -287,7 +335,7 @@ pub const Thread = extern struct {
         stub_ptr.next = null;
         self.pushOnlyLocal(stub_ptr, stub_ptr);
 
-        next = @atomicLoad(?*Task, &tail.next, .Acquire);
+        next = Atomic.load(&tail.next, .acquire);
         if (next) |new_tail| {
             tail_ptr.* = new_tail;
             return tail;
@@ -302,7 +350,7 @@ pub const Thread = extern struct {
         }
 
         var tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        var head = Atomic.load(&self.runq_head, .relaxed);
         while (true) {
 
             const size = tail -% head;
@@ -311,28 +359,25 @@ pub const Thread = extern struct {
             if (size == 0)
                 break;
 
-            head = @cmpxchgWeak(
-                usize,
+            head = Atomic.compareAndSwap(
+                .weak,
                 &self.runq_head,
                 head,
                 head +% 1,
-                .Acquire,
-                .Monotonic,
-            ) orelse {
-                const buffer_ptr = &self.runq_buffer[head % self.runq_buffer.len];
-                return @atomicLoad(*Task, buffer_ptr, .Unordered);
-            };
+                .acquire,
+                .relaxed,
+            ) orelse return self.readBuffer(head);
         }
 
-        var runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+        var runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
         while (runq_overflow) |task| {
-            runq_overflow = @cmpxchgWeak(
-                usize,
+            runq_overflow = Atomic.compareAndSwap(
+                .weak,
                 &self.runq_overflow,
                 task,
                 null,
-                .Acquire,
-                .Monotonic,
+                .acquire,
+                .relaxed,
             ) orelse {
                 self.inject(task.next);
                 return task;
@@ -346,37 +391,32 @@ pub const Thread = extern struct {
         return null;
     }
 
-    pub fn pollGlobal(noalias self: *Thread, noalias pool: *Pool) ?*Task {
-        if (pool == self.pool) {
-            var run_queue = @atomicLoad(?*Task, &pool.local_runq, .Monotonic);
-            while (run_queue) |task| {
-                run_queue = @cmpxchgWeak(
-                    ?*Task,
-                    &pool.local_runq,
-                    run_queue,
-                    null,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse {
-                    self.inject(task.next);
-                    return task;
-                };
-            }
-        }
-
-        var run_queue = @atomicLoad(?*Task, &pool.shared_runq, .Monotonic);
-        while (run_queue) |task| {
-            run_queue = @cmpxchgWeak(
-                ?*Task,
-                &pool.shared_runq,
+    fn pollOnlyGlobal(noalias self: *Thread, noalias run_queue_ptr: *?*Task) ?*Task {
+        var run_queue = Atomic.load(run_queue_ptr, .relaxed);
+        while (true) {
+            const task = run_queue orelse return null;
+            run_queue = Atomic.compareAndSwap(
+                .weak,
+                run_queue_ptr,
                 run_queue,
                 null,
-                .Acquire,
-                .Monotonic,
+                .acquire,
+                .relaxed,
             ) orelse {
                 self.inject(task.next);
                 return task;
             };
+        }
+    }
+
+    pub fn pollGlobal(noalias self: *Thread, noalias pool: *Pool) ?*Task {
+        if (pool == self.getPool()) {
+            if (self.pollOnlyGlobal(&pool.local_runq)) |task|
+                return task;
+        }
+
+        if (self.pollOnlyGlobal(&pool.shared_runq)) |task| {
+            return task;
         }
 
         return null;
@@ -384,7 +424,7 @@ pub const Thread = extern struct {
 
     pub fn pollSteal(noalias self: *Thread, noalias target: *Thread) ?*Task {
         var tail = self.runq_tail;
-        var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+        var head = Atomic.load(&self.runq_head, .relaxed);
 
         const size = tail -% head;
         if (size > self.runq_buffer.len)
@@ -392,27 +432,27 @@ pub const Thread = extern struct {
         if (size != 0)
             std.debug.panic("Thread.pollSteal() when runq not empty with size of {}", .{size});
 
-        var target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+        var target_head = Atomic.load(&target.runq_head, .relaxed);
         while (true) {
-            const target_tail = @atomicLoad(usize, &target.runq_tail, .Acquire);
+            const target_tail = Atomic.load(&target.runq_tail, .acquire);
 
             const target_size = target_tail -% target_head;
             if (target_size > self.runq_buffer.len) {
                 spinLoopHint();
-                target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                target_head = Atomic.load(&target.runq_head, .relaxed);
                 continue;
             }
 
             var steal = target_size - (target_size / 2);
             if (steal == 0) {
-                if (@atomicLoad(?*Task, &target.runq_overflow, .Monotonic)) |task| {
-                    _ = @cmpxchgWeak(
-                        ?*Task,
+                if (Atomic.load(&target.runq_overflow, .relaxed)) |task| {
+                    _ = Atomic.compareAndSwap(
+                        .weak,
                         &target.runq_overflow,
                         task,
                         null,
-                        .Acquire,
-                        .Monotonic,
+                        .acquire,
+                        .relaxed,
                     ) orelse {
                         self.inject(task.next);
                         return task;
@@ -422,7 +462,7 @@ pub const Thread = extern struct {
                 }
 
                 spinLoopHint();
-                target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                target_head = Atomic.load(&target.runq_head, .relaxed);
                 continue;
             }
 
@@ -431,33 +471,31 @@ pub const Thread = extern struct {
             var first_task: ?*Task = null;
 
             while (steal != 0) : (steal -= 1) {
-                const target_buffer_ptr = &target.runq_buffer[new_target_head % target.runq_buffer.len];
-                const task = @atomicLoad(*Task, target_buffer_ptr, .Unordered);
+                const task = target.readBuffer(new_target_head);
                 new_target_head +%= 1;
 
                 if (first_task == null) {
                     first_task = task;
                 } else {
-                    const buffer_ptr = &self.runq_buffer[new_tail % self.runq_buffer.len];
-                    @atomicStore(*Task, buffer_ptr, task, .Unordered);
+                    self.writeBuffer(new_tail, task);
                     new_tail +%= 1;
                 }
             }
 
-            if (@cmpxchgWeak(
-                usize,
+            if (Atomic.compareAndSwap(
+                .weak,
                 &target.runq_head,
                 target_head,
                 new_target_head,
-                .Acquire,
-                .Monotonic,
+                .acquire,
+                .relaxed,
             )) |updated_target_head| {
                 target_head = updated_target_head;
                 continue;
             }
 
             if (new_tail != tail)
-                @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+                Atomic.store(&self.runq_tail, new_tail, .release);
             return first_task;
         }
 
@@ -495,15 +533,15 @@ pub const Pool = extern struct {
     }
 
     fn deinit(self: *Pool) void {
-        const local_runq = @atomicLoad(?*Task, &self.local_runq, .Monotonic);
+        const local_runq = Atomic.load(&self.local_runq, .relaxed);
         if (local_runq != null)
             std.debug.panic("Pool.deinit() when local_runq is not empty", .{});
 
-        const shared_runq = @atomicLoad(?*Task, &self.shared_runq, .Monotonic);
+        const shared_runq = Atomic.load(&self.shared_runq, .relaxed);
         if (shared_runq != null)
             std.debug.panic("Pool.deinit() when shared_runq is not empty", .{});
 
-        const idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+        const idle_queue = Atomic.load(&self.idle_queue, .relaxed);
         if (idle_queue != IDLE_SHUTDOWN)
             std.debug.panic("Pool.deinit() when idle_queue is not shutdown", .{});
     }
@@ -555,16 +593,16 @@ pub const Pool = extern struct {
         if (batch.isEmpty())
             return;
 
-        var run_queue = @atomicLoad(?*Task, run_queue_ptr, .Monotonic);
+        var run_queue = Atomic.load(run_queue_ptr, .relaxed);
         while (true) {
             batch.tail.next = run_queue;
-            run_queue = @cmpxchgWeak(
-                ?*Task,
+            run_queue = Atomic.compareAndSwap(
+                .weak
                 run_queue_ptr,
                 run_queue,
                 batch.head,
-                .Release,
-                .Monotonic,
+                .release,
+                .relaxed,
             ) orelse break;
         }
     }
@@ -639,7 +677,7 @@ pub const Pool = extern struct {
 
     fn resumeThread(self: *Pool, options: ResumeOptions) ?Schedule {
         const workers = self.getWorkers();
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+        var idle_queue = Atomic.load(&self.idle_queue, .acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
@@ -655,7 +693,7 @@ pub const Pool = extern struct {
 
                 worker_index -= 1;
                 const worker = &workers[worker_index];
-                const ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
+                const ptr = Atomic.load(&worker.ptr, .acquire);
 
                 switch (Worker.Ptr.fromUsize(ptr)) {
                     .idle => |next_index| {
@@ -664,11 +702,11 @@ pub const Pool = extern struct {
                     },
                     .spawning => {
                         spinLoopHint();
-                        idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+                        idle_queue = Atomic.load(&self.idle_queue, .acquire);
                         continue;
                     },
                     .spawned => |thread| {
-                        const next_index = @atomicLoad(usize, &thread.next_index, .Unordered) >> Thread.INDEX_SHIFT;
+                        const next_index = Atomic.load(&thread.next_index, .unordered) >> Thread.INDEX_SHIFT;
                         new_result = Schedule.Result{ .resumed = thread };
                         new_idle_queue = next_index | @boolToInt(next_index != 0);
                     },
@@ -701,15 +739,15 @@ pub const Pool = extern struct {
                 },
                 .spawned => |worker| {
                     const worker_ptr = (Worker.Ptr{ .spawning = pool }).toUsize();
-                    @atomicStore(usize, &worker.ptr, worker_ptr, .Release);
+                    Atomic.store(&worker.ptr, worker_ptr, .release);
                 },
                 .resumed => |thread| {
-                    const next_index = @atomicLoad(usize, &thread.next_index, .Unordered);
+                    const next_index = Atomic.load(&thread.next_index, .unordered);
                     if (next_index & Thread.IS_SUSPENDED != 0) {
-                        @atomicStore(usize, &thread.next_index, Thread.IS_WAKING, .Unordered);
+                        Atomic.store(&thread.next_index, Thread.IS_WAKING, .unordered);
                     } else {
                         spinLoopHint();
-                        idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+                        idle_queue = Atomic.load(&self.idle_queue, .acquire);
                         continue;
                     }  
                 },
@@ -717,12 +755,12 @@ pub const Pool = extern struct {
 
             const node = self.getNode();
             const first_in_node = blk: {
-                const active_threads = @atomicRmw(usize, &node.active_threads, .Add, 1, .Monotonic);
+                const active_threads = Atomic.update(&node.active_threads, .add, 1, .relaxed);
                 break :blk (active_threads == 0);
             };
             const first_in_scheduler = first_in_node and blk: {
                 const scheduler = node.getScheduler();
-                const active_nodes = @atomicRmw(usize, &scheduler.active_nodes, .Add, 1, .Monotonic);
+                const active_nodes = Atomic.update(&scheduler.active_nodes, .add, 1, .relaxed);
                 break :blk (active_nodes == 1);
             };
 
@@ -758,15 +796,15 @@ pub const Pool = extern struct {
             .notified => return,
             .spawned, .resumed => {
                 const node = self.getNode();
-                if (@atomicRmw(usize, &node.active_threads, .Sub, 1, .Monotonic) == 0) {
+                if (Atomic.update(&node.active_threads, .sub, 1, .relaxed) == 0) {
                     const scheduler = node.getScheduler();
-                    _ = @atomicRmw(usize, &scheduler.active_nodes, .Sub, 1, .Monotonic);
+                    _ = Atomic.update(&scheduler.active_nodes, .sub, 1, .relaxed);
                 }
             },
         }
 
         const workers = self.getWorkers();
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+        var idle_queue = Atomic.load(&self.idle_queue, .relaxed);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
@@ -781,29 +819,29 @@ pub const Pool = extern struct {
                 .notified => unreachable,
                 .spawned => |worker| blk: {
                     const worker_ptr = Worker.Ptr{ .idle = next_index };
-                    @atomicStore(usize, &worker.ptr, worker_ptr.toUsize(), .Monotonic);
+                    Atomic.store(&worker.ptr, worker_ptr.toUsize(), .relaxed);
                     break :blk toWorkerIndex(workers, worker);
                 },
                 .resumed => |thread| blk: {
-                    const index = @atomicLoad(usize, &thread.next_index, .Unordered);
+                    const index = Atomic.load(&thread.next_index, .unordered);
                     if (index & Thread.IS_SUSPENDED != 0)
                         std.debug.panic("Pool.undoResumeThread() when thread still suspended", .{});
                     if (index & Thread.IS_WAKING == 0)
                         std.debug.panic("Pool.undoResumeThread() when thread is not waking", .{});
 
                     next_index = (next_index << Thread.INDEX_SHIFT) | Thread.IS_SUSPENDED;
-                    @atomicStore(usize, &thread.next_index, next_index, .Unordered);
+                    Atomic.store(&thread.next_index, next_index, .unordered);
                     break :blk thread.worker_index;
                 },
             };
 
-            idle_queue = @cmpxchgWeak(
-                usize,
+            idle_queue = Atomic.compareAndSwap(
+                .weak,
                 &self.idle_queue,
                 idle_queue,
                 @as(usize, aba_tag +% 1) | (next_index << 8),
-                .Release,
-                .Monotonic,
+                .release,
+                .relaxed,
             ) orelse break;
         }
     }
@@ -824,12 +862,12 @@ pub const Pool = extern struct {
         const worker_index = thread.worker_index + 1;
         const worker = &workers[worker_index - 1];
 
-        var next_index = @atomicLoad(usize, &thread.next_index, .Unordered);
+        var next_index = Atomic.load(&thread.next_index, .unordered);
         const is_waking = next_index & Thread.IS_WAKING != 0;
         if (next_index & Thread.IS_SUSPENDED != 0)
             return Suspended{ .idle = {} };
 
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+        var idle_queue = Atomic.load(&self.idle_queue, .relaxed);
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN)
                 std.debug.panic("Pool.suspendThread() when already shutdown", .{});
@@ -846,16 +884,16 @@ pub const Pool = extern struct {
                 if (is_waking)
                     new_idle_queue &= ~@as(usize, IDLE_MARKED);
                 next_index = (next_index << Thread.INDEX_SHIFT) | Thread.IS_SUSPENDED;
-                @atomicStore(usize, &thread.next_index, next_index, .Unordered);
+                Atomic.store(&thread.next_index, next_index, .unordered);
             }
 
-            if (@cmpxchgWeak(
-                usize,
+            if (Atomic.compareAndSwap(
+                .weak,
                 &self.idle_queue,
                 idle_queue,
                 new_idle_queue,
-                .AcqRel,
-                .Monotonic,
+                .acq_rel,
+                .relaxed,
             )) |updated_idle_queue| {
                 idle_queue = updated_idle_queue;
                 continue;
@@ -863,18 +901,18 @@ pub const Pool = extern struct {
 
             if (notified) {
                 next_index = if (is_waking) Thread.IS_WAKING else 0;
-                @atomicStore(usize, &thread.next_index, next_index, .Unordered);
+                Atomic.store(&thread.next_index, next_index, .unordered);
                 return Suspend{ .notified = {} };
             }
 
             const node = self.getNode();
             const last_in_node = blk: {
-                const active_threads = @atomicRmw(usize, &node.active_threads, .Sub, 1, .Monotonic);
+                const active_threads = Atomic.update(&node.active_threads, .sub, 1, .relaxed);
                 break :blk (active_threads == 1);
             };
             const last_in_scheduler = last_in_node and blk: {
                 const scheduler = node.getScheduler();
-                const active_nodes = @atomicRmw(usize, &scheduler.active_nodes, .Sub, 1, .Monotonic);
+                const active_nodes = Atomic.update(&scheduler.active_nodes, .sub, 1, .relaxed);
                 break :blk (active_nodes == 1);
             };
 
@@ -891,25 +929,29 @@ pub const Pool = extern struct {
 pub const Worker = extern struct {
     ptr: usize,
 
+    pub const alignment = Ptr.MASK + 1;
+
     const Ptr = union(enum) {
         idle: u32,
         spawning: *Pool,
         spawned: *Thread,
-        shutdown: ?Thread.Handle,
+        shutdown: ?Thread.Handle.Ptr,
+
+        const MASK = 0b11;
 
         fn fromUsize(value: usize) Ptr {
             @setRuntimeSafety(false);
-            return switch (value & 0b11) {
-                0 => Ptr{ .idle = value >> 2 },
-                1 => Ptr{ .spawning = @intToPtr(*Pool, value & ~@as(usize, 0b11)) },
-                2 => Ptr{ .spawned = @intToPtr(*Thread, value & ~@as(usize, 0b11)) },
-                3 => Ptr{ .shutdowm = @intToPtr(?Thread.Handle, value & ~@as(usize, 0b11)) },
+            return switch (value & MASK) {
+                0 => Ptr{ .idle = value >> @popCount(u2, MASK) },
+                1 => Ptr{ .spawning = @intToPtr(*Pool, value & ~@as(usize, MASK)) },
+                2 => Ptr{ .spawned = @intToPtr(*Thread, value & ~@as(usize, MASK)) },
+                3 => Ptr{ .shutdowm = @intToPtr(?Thread.Handle.Ptr, value & ~@as(usize, MASK)) },
             };
         }
         
         fn toUsize(self: Ptr) usize {
             return switch (self) {
-                .idle => |index| (index << 2) | 0,
+                .idle => |index| (index << @popCount(u2, MASK)) | 0,
                 .spawning => |pool| @ptrToInt(pool) | 1,
                 .spawned => |thread| @ptrToInt(thread) | 2,
                 .shutdown => |handle| @ptrToInt(handle) | 3,
@@ -924,11 +966,37 @@ pub const Node = extern struct {
     blocking_pool: Pool,
     workers: [*]Worker,
     next: ?*Node,
+    scheduler: *Scheduler,
+
+    pub fn setup(self: *Node, workers: []Worker, non_blocking_workers: u32) !void {
+        const blocking_workers = blk: {
+            if (non_blocking_workers == 0 or workers.len == 0)
+                return error.EmptyWorkers;
+            break :blk (workers.len - non_blocking_workers);
+        };
+
+        self.next = self;
+        self.workers = workers.ptr;
+        self.blocking_pool.init(blocking_workers, true);
+        self.non_blocking_pool.init(non_blocking_workers, false);
+    }
+
+    fn init(self: *Node, scheduler: *Scheduler) void {
+        self.active_threads = 0;
+        self.scheduler = scheduler;
+    }
 
     fn deinit(self: *Node) void {
-        const active_threads = @atomicLoad(usize, &self.active_threads, .Monotonic);
+        const active_threads = Atomic.load(&self.active_threads, .relaxed);
         if (active_threads != 0)
             std.debug.panic("Node.deinit() when active_threads = {}", .{active_threads});
+
+        self.blocking_pool.deinit();
+        self.non_blocking_pool.deinit();
+    }
+
+    pub fn getScheduler(self: Node) *Scheduler {
+        return self.scheduler;
     }
 
     pub const Cluster = struct {
@@ -1028,7 +1096,7 @@ pub const Scheduler = extern struct {
     }
 
     pub fn finish(self: *Scheduler) Thread.Handle.Iter {
-        const active_nodes = @atomicLoad(usize, &self.active_nodes, .Monotonic);
+        const active_nodes = Atomic.load(&self.active_nodes, .relaxed);
         if (active_nodes != 0)
             std.debug.panic("Scheduler.deinit() when {} Nodes are still active\n", .{active_nodes});
         

@@ -14,5 +14,8 @@
 
 const std = @import("std");
 
-pub const Atomic = @import("./sync/atomic.zig");
+pub const sync = @import("./sync.zig");
 
+pub const TaskScheduler = @import("./scheduler.zig");
+
+pub const TaskExecutor = @import("./executor.zig").Executor;

@@ -245,8 +245,8 @@ pub const BitwiseOp = enum {
 };
 
 pub fn bitwise(
-    comptime operation: BitwiseOp,
     ptr: anytype,
+    comptime operation: BitwiseOp,
     bit: std.math.Log2Int(ValueOf(@TypeOf(ptr))),
     comptime ordering: Ordering,
 ) u1 {
@@ -302,3 +302,4 @@ pub fn bitwise(
         return @intCast(u1, asm_result);
     }
 }
+            

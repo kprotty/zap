@@ -14,4 +14,4 @@
 
 const std = @import("std");
 
-pub const Task = @import("./task.zig").Task;
+pub const core = @import("./core/core.zig");

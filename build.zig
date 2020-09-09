@@ -15,7 +15,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
-    const entry_point = "src/zap.zig";
+    const entry_point = "./src/zap.zig";
+    const entry_point_test = "./tests/zap.zig";
 
     const Options = struct {
         mode: std.builtin.Mode,
@@ -41,7 +42,11 @@ pub fn build(b: *std.build.Builder) void {
 
     // step to format code
     {
-        const format_step = b.addFmt(&[_][]const u8{ "src", "build.zig" });
+        const format_step = b.addFmt(&[_][]const u8{
+            "src",
+            "tests",
+            "build.zig",
+        });
 
         const step = b.step("fmt", "Format all code using zig fmt");
         step.dependOn(&format_step.step);
@@ -49,8 +54,9 @@ pub fn build(b: *std.build.Builder) void {
 
     // step to run tests
     {
-        const test_step = b.addTest(entry_point);
+        const test_step = b.addTest(entry_point_test);
         options.applyTo(test_step);
+        test_step.addPackagePath("zap", entry_point);
 
         const step = b.step("test", "Run all tests for zap");
         step.dependOn(&test_step.step);
@@ -61,10 +67,14 @@ pub fn build(b: *std.build.Builder) void {
         const docs_step = b.addSystemCommand(&[_][]const u8{
             b.zig_exe,
             "test",
-            entry_point,
+            entry_point_test,
             "-femit-docs",
             "-fno-emit-bin",
             "--output-dir",
+            "--pkg-begin",
+            "zap",
+            entry_point,
+            "--pkg-end",
             ".",
         });
 

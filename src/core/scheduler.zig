@@ -136,28 +136,34 @@ pub const Thread = extern struct {
     const INDEX_SHIFT = 8;
 
     pub const Handle = extern struct {
-        pub const Ptr = *const AlignedInt;
-        pub const AlignedInt = std.meta.Int()
-
-        fn from(token: usize) !Handle {
-            if (std.mem.alignForward(token, 4) != token)
-                error.Unaligned;
-            return Handle{ .token = token };
-        }
+        pub const Ptr = *const Int;
+        pub const Int = std.meta.Int(false, Worker.alignment * 8);
 
         pub const Iter = extern struct {
-            node: *Node,
-            index: usize = 0,
+            index: usize,
+            iter: Node.Iter,
+            node: ?*Node = null,
 
             pub fn next(self: *Iter) ?Handle {
-                const workers = self.node.getWorkers();
-                
-                while (self.index < workers.len) : (self.index += 1) {
+                const node = self.node orelse blk: {
+                    const node = self.iter.next() orelse return null;
+                    self.node = node;
+                    self.index = 0;
+                    break :blk node;
+                };
+
+                const workers = node.getWorkers();
+                while (self.index < workers.len) {
                     const worker_ptr = Atomic.load(&workers[self.index].ptr, .acquire);
+                    self.index += 1;
                     switch (Worker.Ptr.fromUsize(worker_ptr)) {
-                        .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
-                        .idle => std.debug.panic("Thread.Handle.Iter found idle worker {}", .{self.index}),
-                        @compileError("TODO"),
+                        .idle, .spawning, .spawned => {
+                            std.debug.panic("Thread.Handle.Iter found worker {} which wasn't shutdown", .{self.index});
+                        },
+                        .shutdown => |handle_ptr| {
+                            if (handle_ptr) |handle|
+                                return handle;
+                        },
                     }
                 }
 
@@ -664,7 +670,7 @@ pub const Node = extern struct {
         while (true) {
             batch.tail.next = run_queue;
             run_queue = Atomic.compareAndSwap(
-                .weak
+                .weak,
                 run_queue_ptr,
                 run_queue,
                 batch.head,
@@ -1091,12 +1097,12 @@ pub const Scheduler = extern struct {
         if (active_nodes != 0)
             std.debug.panic("Scheduler.deinit() when {} Nodes are still active\n", .{active_nodes});
         
-        var nodes = cluster.iter();
+        var nodes = self.cluster.iter();
         while (nodes.next()) |node|
             node.deinit();
 
         return Thread.Handle.Iter{
-
-        }
+            .iter = self.cluster.iter(),
+        };
     }
 };

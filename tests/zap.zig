@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-
-pub const Atomic = @import("./sync/atomic.zig");
-
+test "zap" {
+    _ = @import("./atomic.zig");
+}

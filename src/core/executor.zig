@@ -31,7 +31,7 @@ pub fn Executor(comptime Platform: type) type {
             }
 
             pub const Batch = struct {
-                inner: scheduler.Task.Batch = scheduler.Task.Batch{};
+                inner: scheduler.Task.Batch = scheduler.Task.Batch{},
 
                 pub fn isEmpty(self: Batch) bool {
                     return self.inner.isEmpty();

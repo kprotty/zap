@@ -14,4 +14,5 @@
 
 test "zap" {
     _ = @import("./atomic.zig");
+    _ = @import("./timer.zig");
 }

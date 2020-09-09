@@ -16,6 +16,8 @@ const std = @import("std");
 
 pub const sync = @import("./sync.zig");
 
+pub const Timer = @import("./timer.zig");
+
 pub const TaskScheduler = @import("./scheduler.zig");
 
 pub const TaskExecutor = @import("./executor.zig").Executor;

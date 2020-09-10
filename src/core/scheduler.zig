@@ -22,7 +22,7 @@ pub const Task = extern struct {
     next: ?*Task = undefined,
     continuation: usize,
 
-    pub const Callback = fn (*Task) callconv(.C) void;
+    pub const Callback = fn (*Task, *Thread) callconv(.C) void;
 
     pub fn fromFrame(frame: anyframe) Task {
         return Task{ .continuation = @ptrToInt(frame) };
@@ -32,11 +32,16 @@ pub const Task = extern struct {
         return Task{ .continuation = @ptrToInt(callback) | 1 };
     }
 
-    pub fn execute(self: *Task) void {
+    pub fn execute(self: *Task, thread: *Thread) void {
         @setRuntimeSafety(false);
-        if (self.continuation & 1 != 0)
-            return @intToPtr(Callback, self.continuation & ~@as(usize, 1))(self);
-        resume @intToPtr(anyframe, self.continuation);
+
+        if (self.continuation & 1 != 0) {
+            const callback = @intToPtr(Callback, self.continuation & ~@as(usize, 1));
+            return (callback)(self, thread);
+        }
+
+        const frame = @intToPtr(anyframe, self.continuation);
+        resume frame;
     }
 
     pub const Batch = struct {
@@ -130,6 +135,7 @@ pub const Thread = extern struct {
     node: *Node,
     next_index: usize,
     worker_index: usize,
+    handle_ptr: ?Handle.Ptr,
 
     const IS_SUSPENDED = 1 << 0;
     const IS_WAKING = 1 << 1;
@@ -158,7 +164,7 @@ pub const Thread = extern struct {
                     self.index += 1;
                     switch (Worker.Ptr.fromUsize(worker_ptr)) {
                         .idle, .spawning, .spawned => {
-                            std.debug.panic("Thread.Handle.Iter found worker {} which wasn't shutdown", .{self.index});
+                            std.debug.panic("Thread.Handle.Iter found worker {} which wasn't shutdown", .{self.index - 1});
                         },
                         .shutdown => |handle_ptr| {
                             if (handle_ptr) |handle|
@@ -177,11 +183,27 @@ pub const Thread = extern struct {
         index: usize = 0,
 
         pub fn next(self: *Iter) ?*Thread {
+            const workers = self.node.getWorkers();
 
+            while (self.index < workers.len) {
+                const worker_ptr = Atomic.load(&workers[self.index].ptr, .acquire);
+                self.index += 1;
+                switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                    .idle, .spawning => {},
+                    .spawned => |thread| {
+                        return thread;
+                    },
+                    .shutdown => {
+                        std.debug.panic("Thread.Iter found worker {} which was already shutdown", .{self.index - 1});
+                    },
+                }
+            }
+
+            return null;
         }
     };
     
-    pub fn init(self: *Thread, worker: *Worker) void {
+    pub fn init(self: *Thread, worker: *Worker, handle_ptr: ?Handle.Ptr) void {
         var worker_ptr = Atomic.load(&worker.ptr, .acquire);
         const node = switch (Worker.Ptr.fromUsize(worker_ptr)) {
             .idle => std.debug.panic("Thread.init() when worker still idle", .{}),
@@ -197,8 +219,9 @@ pub const Thread = extern struct {
                 .continuation = @ptrToInt(&self.local_tail),
             },
             .node = node,
-            .next_index = THREAD_WAKING,
+            .next_index = IS_WAKING,
             .worker_index = toWorkerIndex(node.getWorkers(), worker),
+            .handle_ptr = handle_ptr,
         };
 
         worker_ptr = (Worker.Ptr{ .spawned = self }).toUsize();
@@ -219,7 +242,7 @@ pub const Thread = extern struct {
         return Atomic.store(buffer_ptr, task, .unordered);
     }
 
-    pub fn pushLocal(self: *Therad, batch: Task.Batch) void {
+    pub fn pushLocal(self: *Thread, batch: Task.Batch) void {
         if (batch.isEmpty())
             return;
         self.pushOnlyLocal(batch.head, batch.tail);
@@ -987,6 +1010,65 @@ pub const Node = extern struct {
                 },
             };
         }
+    }
+
+    pub const ShutdownIter {
+        thread: ?*Thread = null,
+
+        fn push(self: *ShutdownIter, thread: *Thread) void {
+            thread.next_index = @ptrToInt(self.thread);
+            self.thread = thread;
+        }
+
+        pub fn next(self: *ShutdownIter) ?*Thread {
+            @setRuntimeSafety(false);
+            const thread = self.thread orelse return null;
+            self.thread = @intToPtr(?*Thread, thread.next_index);
+            return thread;
+        }
+    };
+
+    pub fn shutdown(self: *Node) ShutdownIter {
+        const idle_queue = Atomic.load(&idle_queue, .acquire);
+        Atomic.store(&idle_queue, IDLE_SHUTDOWN, .relaxed);
+        if (idle_queue == IDLE_SHUTDOWN)
+            std.debug.panic("Node.shutdown() when already shutdown", .{});
+
+        var shutdown_iter = ShutdownIter{};
+        const workers = self.getWorkers();
+        var worker_threads: usize = 0;
+
+        var worker_index = idle_queue >>= 8;
+        while (worker_index > 0) {
+            const worker = &workers[worker_index - 1];
+            const worker_ptr = Atomic.load(&worker.ptr, .acquire);
+            var worker_ptr_type = Worker.Ptr.fromUsize(worker_ptr);
+
+            switch (worker_ptr_type) {
+                .idle => |next_index| {
+                    worker_index = next_index;
+                    worker_ptr_type = Worker.Ptr{ .shutdown = null };
+                },
+                .spawned => |thread| {
+                    worker_index = Atomic.load(&thread.next_index, .unordered) >> Thread.INDEX_SHIFT;
+                    worker_ptr_type = Worker.Ptr{ .shutdown = thread.handle_ptr };
+                    shutdown_iter.push(thread);
+                },
+                .spawning => {
+                    std.debug.panic("Node.shutdown() found worker {} which is still spawning", .{worker_index - 1});
+                },
+                .shutdown => {
+                    std.debug.panic("Node.shutdown() found worker {} which is already shutdown", .{worker_index - 1});
+                },
+            }
+
+            worker_threads += 1;
+            Atomic.store(&worker.ptr, worker_ptr_type.toUsize(), .release);
+        }
+
+        if (worker_threads != workers.len)
+            std.debug.panic("Node.shutdown() did not see all workers ready to be shutdown", .{});
+        return shutdown_iter;
     }
 
     pub const Cluster = struct {

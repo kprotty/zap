@@ -168,7 +168,11 @@ pub fn Wheel(
         }
 
         pub fn remove(self: *Self, entry: *Entry) void {
-            const queue = entry.queue orelse return;
+            std.debug.assert(self.tryRemove(entry));
+        }
+
+        pub fn tryRemove(self: *Self, entry: *Entry) bool {
+            const queue = entry.queue orelse return false;
             const node = &entry.node;
 
             entry.queue = null;
@@ -180,6 +184,8 @@ pub fn Wheel(
                 const slot = index % wheel_len;
                 self.pending[wheel] &= ~(@as(wheel_t, 1) << cast(wheel_slot_t, slot));
             }
+
+            return true;
         }
         
         pub const expireAt = schedule;

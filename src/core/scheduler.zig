@@ -128,6 +128,7 @@ pub const Task = extern struct {
 pub const Thread = extern struct {
     runq_head: usize = 0,
     runq_tail: usize = 0,
+    runq_next: ?*Task = null,
     runq_overflow: ?*Task = null,
     runq_buffer: [256]*Task = undefined,
     local_head: *Task,
@@ -228,6 +229,11 @@ pub const Thread = extern struct {
         Atomic.store(&worker.ptr, worker_ptr, .release);
     }
 
+    pub fn deinit(self: *Thread) void {
+        if (self.pollLocal() != null)
+            std.debug.panic("Thread.deinit() when local run queue is not empty", .{});
+    }
+
     pub fn getNode(self: Thread) *Node {
         return self.node;
     }
@@ -250,6 +256,7 @@ pub const Thread = extern struct {
 
     pub fn push(self: *Thread, tasks: Task.Batch) void {
         var batch = tasks;
+
         var tail = self.runq_tail;
         var head = Atomic.load(&self.runq_head, .relaxed);
         while (!batch.isEmpty()) {
@@ -258,6 +265,13 @@ pub const Thread = extern struct {
             if (size > self.runq_buffer.len)
                 std.debug.panic("Thread.push() with invalid runq size of {}", .{size});
 
+            if (Atomic.load(&self.runq_next, .relaxed) == null) {
+                const task = batch.pop().?;
+                Atomic.store(&self.runq_next, task, .release);
+                spinLoopHint();
+                continue;
+            }
+
             var remaining = self.runq_buffer.len - size;
             if (remaining != 0) {
                 while (remaining != 0) : (remaining -= 1) {
@@ -265,8 +279,9 @@ pub const Thread = extern struct {
                     self.writeBuffer(tail);
                     tail +%= 1;
                 }
-
                 Atomic.store(&self.runq_tail, tail, .release);
+
+                spinLoopHint();
                 head = Atomic.load(&self.runq_head, .relaxed);
                 continue;
             }
@@ -314,7 +329,7 @@ pub const Thread = extern struct {
         }
     }
 
-    fn inject(self: *Thread, run_queue: ?*Task) void {
+    fn inject(self: *Thread, run_queue: ?*Task, injected: *bool) void {
         var runq = Task.Iter{ .current = runq_queue orelse return };
         var tail = self.runq_tail;
         var head = Atomic.load(&self.runq_head, .relaxed);
@@ -332,21 +347,93 @@ pub const Thread = extern struct {
             tail +%= 1;
         }
 
+        injected.* = true;
         Atomic.store(&self.runq_tail, tail, .release);
-        if (runq.isEmpty())
-            return;
-
-        const runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
-        if (runq_overflow != null) {
-            std.debug.panic("Thread.inject() when runq overflow is not empty", .{});
-        } else {
-            Atomic.store(&self.runq_overflow, runq, .release);
+        
+        if (!runq.isEmpty()) {
+            const runq_overflow = Atomic.load(&self.runq_overflow, .relaxed);
+            if (runq_overflow != null) {
+                std.debug.panic("Thread.inject() when runq overflow is not empty", .{});
+            } else {
+                Atomic.store(&self.runq_overflow, runq.next(), .release);
+            }
         }
     }
 
     fn pushOnlyLocal(self: *Thread, head: ?*Task, tail: *Task) void {
         const prev = Atomic.update(&self.local_head, .swap, tail, .acq_rel);
         Atomic.store(&prev.next, head, .release);
+    }
+
+    pub const Polled = struct {
+        task: ?*Task = null,
+        schedule: ?Node.Schedule = null,
+    };
+
+    pub fn poll(self: *Thread, rng: *std.rand.Random) Polled {
+        var injected = false;
+        var polled: Polled = undefined;
+        polled.task = self.pollTask(&injected, rng);
+
+        const is_waking = self.next_index & IS_WAKING != 0;
+        if (polled.task != null and (is_waking or injected)) {
+            polled.schedule = self.getNode().resumeThread(.{
+                .was_waking = is_waking,
+                .check_remote = true,
+            });
+
+            if (is_waking) {
+                const next_index = self.next_index & ~@as(usize, IS_WAKING);
+                Atomic.store(&self.next_index, next_index, .unordered);
+            }
+        }
+
+        return polled;
+    }
+
+    fn pollTask(self: *Thread, injected: *bool, rng: *std.rand.Random) ?*Task {
+        if (self.pollLocal(injected)) |task| {
+            return task;
+        }
+
+        var attempts: u8 = 2;
+        while (attempts != 0) : (attempts -= 1) {
+            
+            var seed = rng.int(usize);
+            var nodes = self.getNode().iter();
+            while (nodes.next()) |node| {
+                const workers = node.getWorkers();
+                
+                var iter = workers.len;
+                var index = seed % iter;
+                while (iter != 0) : (iter -= 1) {
+                    const worker_index = index;
+                    index = if (index == workers.len - 1) 0 else (index + 1);
+                    if (worker_index == self.worker_index)
+                        continue;
+
+                    const worker_ptr = Atomic.load(&workers[index].ptr, .acquire);
+                    switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                        .idle => {},
+                        .spawning => {},
+                        .spawned => |thread| {
+                            if (self.pollSteal(thread, injected)) |task| {
+                                return task;
+                            }
+                        },
+                        .shutdown => {
+                            std.debug.panic("Thread.poll() found worker {} which was shutdown", .{worker_index});
+                        },
+                    }
+                }
+
+                if (self.pollGlobal(node, injected)) |task| {
+                    return task;
+                }
+            }
+        }
+
+        return null;
     }
 
     fn pollOnlyLocal(self: *Thread) ?*Task {
@@ -391,9 +478,20 @@ pub const Thread = extern struct {
         return null;
     }
 
-    pub fn pollLocal(self: *Thread) ?*Task {
+    fn pollLocal(self: *Thread, injected: *bool) ?*Task {
         if (self.pollOnlyLocal()) |task| {
             return task;
+        }
+
+        var runq_next = Atomic.load(&self.runq_next, .relaxed);
+        while (runq_next) |task| {
+            runq_next = Atomic.compareAndSwap(
+                .weak,
+                runq_next,
+                null,
+                .acquire,
+                .relaxed,
+            ) orelse return task;
         }
 
         var tail = self.runq_tail;
@@ -426,7 +524,7 @@ pub const Thread = extern struct {
                 .acquire,
                 .relaxed,
             ) orelse {
-                self.inject(task.next);
+                self.inject(task.next, injected);
                 return task;
             };
         }
@@ -438,7 +536,7 @@ pub const Thread = extern struct {
         return null;
     }
 
-    fn pollOnlyGlobal(noalias self: *Thread, noalias run_queue_ptr: *?*Task) ?*Task {
+    fn pollOnlyGlobal(noalias self: *Thread, noalias run_queue_ptr: *?*Task, injected: *bool) ?*Task {
         var run_queue = Atomic.load(run_queue_ptr, .relaxed);
         while (true) {
             const task = run_queue orelse return null;
@@ -450,26 +548,26 @@ pub const Thread = extern struct {
                 .acquire,
                 .relaxed,
             ) orelse {
-                self.inject(task.next);
+                self.inject(task.next, injected);
                 return task;
             };
         }
     }
 
-    pub fn pollGlobal(noalias self: *Thread, noalias node: *Node) ?*Task {
+    fn pollGlobal(noalias self: *Thread, noalias node: *Node, injected: *bool) ?*Task {
         if (node == self.getNode()) {
-            if (self.pollOnlyGlobal(&node.local_runq)) |task|
+            if (self.pollOnlyGlobal(&node.local_runq, injected)) |task|
                 return task;
         }
 
-        if (self.pollOnlyGlobal(&node.shared_runq)) |task| {
+        if (self.pollOnlyGlobal(&node.shared_runq, injected)) |task| {
             return task;
         }
 
         return null;
     }
 
-    pub fn pollSteal(noalias self: *Thread, noalias target: *Thread) ?*Task {
+    fn pollSteal(noalias self: *Thread, noalias target: *Thread, injected: *bool) ?*Task {
         var tail = self.runq_tail;
         var head = Atomic.load(&self.runq_head, .relaxed);
 
@@ -501,9 +599,18 @@ pub const Thread = extern struct {
                         .acquire,
                         .relaxed,
                     ) orelse {
-                        self.inject(task.next);
+                        self.inject(task.next, injected);
                         return task;
                     };
+                } else if (Atomic.load(&target.runq_next, .relaxed)) |task| {
+                    _ = Atomic.compareAndSwap(
+                        .weak,
+                        &target.runq_next,
+                        task,
+                        null,
+                        .acquire,
+                        .relaxed,
+                    ) orelse return task;
                 } else {
                     break;
                 }
@@ -541,8 +648,11 @@ pub const Thread = extern struct {
                 continue;
             }
 
-            if (new_tail != tail)
+            if (new_tail != tail) {
+                injected.* = true;
                 Atomic.store(&self.runq_tail, new_tail, .release);
+            }
+
             return first_task;
         }
 

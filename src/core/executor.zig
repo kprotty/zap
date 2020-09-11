@@ -17,26 +17,21 @@ const zap = @import("../zap.zig");
 
 const core = zap.core.TaskScheduler;
 const Atomic = zap.core.sync.Atomic;
-const TimingWheel = zap.core.Timer.Wheel;
 
 pub fn Executor(comptime Platform: type) type {
-    return struct {
-        pub const Event = union(enum) {
-            thread_started: *Thread,
-            thread_stopped: *Thread,
-            task_suspend: TaskContext,
-            task_resumed: TaskContext,
-
-            pub const TaskContext = struct {
-                task: *Task,
-                thread: *Thread,
-            };
-
-            pub fn emit(self: Event) void {
-                Platform.onEvent(self);
-            }
+    const os = struct {
+        const Node = struct {
+            const Data = Platform.Node.Data;
         };
 
+        const Thread = struct {
+            const Handle = core.Thread.Handle.Ptr;
+            const Local = Platform.Thread.Local;
+            const Signal = Platform.Thread.Signal;
+        };
+    };
+
+    return struct {
         pub const Task = extern struct {
             inner: core.Task,
 
@@ -219,9 +214,10 @@ pub fn Executor(comptime Platform: type) type {
                             timeout: u64,
                         };
 
+                        const Entry = Thread.Timer.Entry;
                         const Waiting = extern struct {
                             has_entry: bool,
-                            entry: Thread.Timer.Entry,
+                            entry: Entry,
                         };
                     };
 
@@ -240,26 +236,107 @@ pub fn Executor(comptime Platform: type) type {
                         };
                     }
 
-                    fn timedOut(task: *Task, thread: *Thread) callconv(.C) void {
-                        const entry = 
+                    fn notify(self: *Future, thread: *Thread) void {
+                        var task: *Task = undefined;
+                        var state = Atomic.load(&self.state, .relaxed);
+
+                        while (true) {
+                            switch (State.get(state)) {
+                                .init => unreachable,
+                                .notified => unreachable,
+                                .cancelled => return,
+                                .waiting => {
+                                    task = @intToPtr(*Task, State.getPayload(state));
+                                    state = Atomic.compareAndSwap(
+                                        .weak,
+                                        state,
+                                        State.notified.toUsize(0),
+                                        .acquire,
+                                        .relaxed,
+                                    ) orelse break;
+                                },
+                            }
+                        }
+
+                        const waiter_ptr = &self.data.waiter;
+                        if (waiter_ptr.has_entry and !thread.timer.cancelScheduleAfter(waiter_ptr)) {
+                            state = Atomic.load(&self.state, .relaxed);
+                            while (true) {
+                                switch (State.get(state)) {
+                                    .init => unreachable,
+                                    .waiting => unreachable,
+                                    .cancelled => unreachable,
+                                    .notified => {
+                                        if (State.getPayload(state) != 0)
+                                            break;
+                                        state = Atomic.compareAndSwap(
+                                            .weak,
+                                            state,
+                                            State.notified.toUsize(@ptrToInt(task)),
+                                            .release,
+                                            .relaxed,
+                                        ) orelse return;
+                                    },
+                                }
+                            }
+                        }
+
+                        thread.schedule(Task.Batch.from(task));
                     }
 
-                    fn notify(self: *Future, thread: *Thread) void {
-                        // if from signal:
-                            // transtion waiting -> notified=0
-                                // if timeout running and failed to cancel it:
-                                    // transition notified=0 -> notified=task (from waiting)
-                                        // return as timedOut will wake up task
-                                    // notified=1
-                                        // fallthrough
-                                // wake up task (from waiting)
-                            // cancelled ? -> nothing
-                        // if from timedOut:
-                            // transition waiting -> cancelled
-                                // schedule task from waiting state
-                            // notified ? -> 
-                                // transition notified=task|0 -> notified=1:
-                                    // if notified task: schedule task from notified state
+                    fn timedOut(task: *Task, thread: *Thread) callconv(.C) void {
+                        const entry = Data.Entry.fromTask(task);
+                        const waiting_ptr = @fieldParentPtr(Data.Waiting, "entry", entry);
+                        const data_ptr = @ptrCast(*Data, waiting_ptr);
+                        const self = @fieldParentPtr(Future, "data", data_ptr);
+                        
+                        var waiter_task: ?*Task = null;
+                        var state = Atomic.load(&self.state, .relaxed);
+
+                        while (true) {
+                            switch (State.get(state)) {
+                                .init => unreachable,
+                                .cancelled => unreachable,
+                                .notified => break,
+                                .waiting => {
+                                    state = Atomic.compareAndSwap(
+                                        .weak,
+                                        state,
+                                        State.cancelled.toUsize(0),
+                                        .acquire,
+                                        .relaxed,
+                                    ) orelse {
+                                        @setRuntimeSafety(false);
+                                        waiter_task = @intToPtr(*Task, State.getPayload(state));
+                                        break;
+                                    };
+                                }
+                            }
+                        }
+
+                        const task = waiter_task orelse blk: {
+                            while (true) {
+                                switch (State.get(state)) {
+                                    .init => unreachable,
+                                    .waiting => unreachable,
+                                    .cancelled => unreachable,
+                                    .notified => {
+                                        state = Atomic.compareAndSwap(
+                                            .weak,
+                                            state,
+                                            State.notified.toUsize(1),
+                                            .acquire,
+                                            .relaxed,
+                                        ) orelse {
+                                            waiter_task = @intToPtr(?*Task, State.getPayload(state));
+                                            break :blk waiter_task orelse return;
+                                        };
+                                    },
+                                }
+                            }
+                        };
+
+                        thread.scheduleNext(task);                 
                     }
 
                     pub fn poll(self: *Future, context: Context) Poll {
@@ -280,7 +357,7 @@ pub fn Executor(comptime Platform: type) type {
                                     waiting_ptr.has_entry = timeout < INFINITE;
                                     if (waiting_ptr.has_entry) {
                                         const timeout_task = Task.fromCallback(Future.timedOut);
-                                        thread.scheduleAfter(&waiting_ptr.entry, timeout_task, timeout);
+                                        thread.timer.scheduleAfter(&waiting_ptr.entry, timeout_task, timeout);
                                     }
 
                                     self.state = State.waiting.toUsize(@ptrToInt(task));
@@ -294,7 +371,7 @@ pub fn Executor(comptime Platform: type) type {
                                     ) orelse return Poll{ .pending = {} };
 
                                     if (waiting_ptr.has_entry) {
-                                        if (!thread.cancelScheduleAfter(&waiting_ptr.entry))
+                                        if (!thread.timer.cancelScheduleAfter(&waiting_ptr.entry))
                                             std.debug.panic("timer already expired while thread is running", .{});
                                     }
 
@@ -331,20 +408,179 @@ pub fn Executor(comptime Platform: type) type {
 
         pub const Thread = extern struct {
             inner: core.Thread,
-            data: Platform.Thread.Data,
-            timer: 
+            next_task: ?*Task,
+            data: OsThreadData,
+            timer: Timer,
+            prng: RandGen,
 
-            var current: Platform.Thread.Local = Platform.Thread.Local{};
+            const RandGen = extern struct {
+                state: u64,
+                random: std.rand.Random,
+
+                fn init(seed: u64) RandGen {
+                    return RandGen{
+                        .state = seed,
+                        .random = std.rand.Random{ .fillFn = fill },
+                    };
+                }
+
+                fn fill(random: *std.rand.Random, buffer: []u8) void {
+                    var i: usize = 0;
+                    while (i < buffer.len) {
+                        self.state ^= self.state << 13;
+                        self.state ^= self.state >> 7;
+                        self.state ^= self.state << 17;
+                        const chunk = @bitCast([@sizeOf(u64)]u8, self.state);
+                        const size = std.math.min(buffer.len - i, chunk.len);
+                        @memcpy(buffer[0..].ptr, chunk[0..].ptr, size);
+                        i += size;
+                    }
+                }
+            };
+
+            const Timer = extern struct {
+                const resolution = std.time.ns_per_ms;
+                const Wheel = zap.core.Timer.Wheel(6, 8);
+                const Entry = extern struct {
+                    inner: Wheel.Entry,
+                    task: Task,
+                };
+
+                lock: os.Thread.Lock,
+                wheel: Wheel,
+                active: usize,
+                started: u64,
+
+                fn init(self: *Timer) void {
+                    self.lock.init();
+                    self.wheel = Wheel{};
+                    self.active = 0;
+
+                    const thread = @fieldParentPtr(Thread, "timer", self);
+                    self.started = os.Thread.nanotime(&thread.data, thread.getHandle());
+                }
+
+                fn deinit(self: *Timer) void {
+                    self.lock.deinit();
+                    if (self.active != 0)
+                        std.debug.panic("Timer.deinit() with pending tasks", .{});
+                }
+
+                fn scheduleAfter(self: *Timer, entry: *Entry, task: Task, delay_ns: u64) void {
+                    self.lock.acquire();
+                    defer self.lock.release();
+
+                    entry.task = task;
+                    self.wheel.add(&entry.inner, delay_ns / resolution);
+                    self.active += 1;
+                }
+                
+                fn cancelScheduleAfter(self: *Timer, entry: *Entry) bool {
+                    self.lock.acquire();
+                    defer self.lock.release();
+
+                    if (self.wheel.tryRemove(&entry.inner)) {
+                        Atomic.store(&self.active, self.active - 1, .unordered);
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                const Poll = struct {
+                    wait_for: u64 = 0,
+                    expired: Batch = Batch{},
+                };
+
+                fn poll(self; *Timer) ?Poll {
+                    if (Atomic.load(&self.active, .unordered) == 0)
+                        return null;
+
+                    self.lock.acquire();
+                    defer self.lock.release();
+
+                    if (self.active == 0)
+                        std.debug.panic("polled timer when no active tasks were found\n", .{});
+
+                    const thread = @fieldParentPtr(Thread, "timer", self);
+                    const now = os.Thread.nanotime(&thread.data, thread.getHandle());
+                    self.wheel.advance(now -% self.started);
+
+                    var poll_result = Poll{};
+                    while (self.wheel.poll()) |polled| {
+                        switch (polled) {
+                            .wait_for => {
+                                poll_result.wait_for = wait_for * resolution;
+                                break;
+                            },
+                            .expired => |inner_entry| {
+                                const entry = @fieldParentPtr(Entry, "inner", inner_entry);
+                                poll_result.expired.push(&entry.task);
+                                self.active -= 1;
+                            },
+                        }
+                    }
+
+                    return poll_result;
+                }
+            };
+
+            var current: OsThreadLocal = OsThreadLocal{};
 
             pub fn run(
-                worker: *Worker,
-                handle: ?core.Thread.Handle.Ptr,
-                data: Platform.Thread.Data,
+                parameter: usize,
+                handle: ?OsThreadHandle,
+                data: OsThreadData,
             ) void {
+                const worker = @intToPtr(*Worker, parameter);
                 var self = Thread{
                     .inner = undefined,
                     .data = data,
+                    .timer = undefined,
+                    .prng = RandGen.init(parameter),
                 };
+
+                self.timer.init();
+                defer self.timer.deinit();
+
+                self.inner.init(worker, handle);
+                defer self.inner.deinit();
+
+                const old_current = current.get();
+                current.set(@ptrToInt(&self));
+                defer current.set(old_current);
+
+                while (true) {
+                    while (self.poll()) |task| {
+                        task.execute(self);
+                    }
+                }
+            }
+
+            fn poll(self: *Thread) ?*Task {
+                if (self.next_task) |next_task| {
+                    const task = next_task;
+                    self.next_task = null;
+                    return task;
+                }
+
+                var next_timeout: ?u64 = null;
+                if (self.timer.poll()) |polled| {
+                    next_timeout = polled.wait_for;
+                    var batch = polled.batch;
+                    if (batch.pop()) |task| {
+                        self.schedule(batch);
+                        return task;
+                    }
+                }
+
+                const polled = self.inner.poll(&self.prng.random);
+                if (polled.schedule) |scheduled|
+                    Node.wake(scheduled);
+                if (polled.task) |task|
+                    return task;
+
+                return null;
             }
 
             pub fn getCurrent() *Thread {
@@ -370,6 +606,12 @@ pub fn Executor(comptime Platform: type) type {
                 self.notify();
             }
 
+            pub fn scheduleNext(self: *Thread, task: *Task) void {
+                if (self.next_task) |old_next|
+                    self.schedule(Batch.from(old_next));
+                self.next_task = task;
+            }
+
             fn notify(self: *Thread) void {
 
             }
@@ -379,7 +621,7 @@ pub fn Executor(comptime Platform: type) type {
 
         pub const Node = extern struct {
             inner: core.Node,
-            data: Platform.Node.Data,
+            data: OsNodeData,
 
             pub fn schedule(self: *Node, batch: Batch) void {
                 self.inner.push(batch.inner);
@@ -389,12 +631,32 @@ pub fn Executor(comptime Platform: type) type {
             pub fn scheduleLocally(self: *Node, batch: Batch) void {
                 self.inner.pushLocal(batch.inner);
                 if (self.inner.tryResumeLocalThread()) |schedule|
-                    self.wake(schedule);
+                    wake(schedule);
             }
 
             fn resumeThread(self: *Node) void {
                 if (self.inner.tryResumeThread()) |schedule|
-                    self.wake(schedule);
+                    wake(schedule);
+            }
+
+            fn wake(schedule: core.Node.Schedule) void {
+                const node = schedule.getNode();
+                switch (schedule.getResult()) {
+                    .notified => {},
+                    .resumed => |inner_thread| {
+                        const thread = @fieldParentPtr(Thread, "inner", inner_thread);
+                        thread.notify();
+                    },
+                    .spawned => |worker| {
+                        if (!os.Thread.spawn(
+                            &node.data,
+                            @ptrToInt(worker),
+                            Thread.run,
+                        )) {
+                            schedule.undo();
+                        }
+                    },
+                }
             }
         };
     };

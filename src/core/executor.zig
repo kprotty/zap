@@ -45,6 +45,14 @@ pub fn Executor(comptime Platform: type) type {
             if (@hasDecl(Platform, "ThreadLocal")) Platform.ThreadLocal
             else DefaultPlatform.ThreadLocal;
 
+        const SystemThread =
+            if (@hasDecl(Platform, "Thread")) Platform.Thread
+            else DefaultPlatform.Thread;
+
+        const SystemNode = 
+            if (@hasDecl(Platform, "Node")) Platform.Node
+            else DefaultPlatform.Node;
+
         pub const Task = extern struct {
             next: ?*Task = undefined,
             continuation: usize,
@@ -195,16 +203,16 @@ pub fn Executor(comptime Platform: type) type {
             runq_tail: AtomicUsize align(cache_line) = AtomicUsize.init(0),
             runq_buffer: [task_buffer_size]AtomicUsize align(cache_line) = undefined,
             runq_owned: ?*Task = null,
-            ptr: AtomicUsize,
+            next_ptr: AtomicUsize = AtomicUsize.init(0),
+            node_ptr: usize,
+            worker_index: usize,
+            handle: ?Handle,
             xorshift: usize,
             event: Event,
 
             const IS_SHUTDOWN = 0;
             const IS_WAKING = 1 << 0;
             const DID_INJECT = 1 << 1;
-            const IS_SUSPENDED = 1 << 2;
-
-            pub const Handle = *const u32;
 
             var tls_current: ThreadLocal = ThreadLocal{};
 
@@ -218,6 +226,8 @@ pub fn Executor(comptime Platform: type) type {
                 return @intToPtr(*Thread, ptr);
             }
 
+            pub const Handle = *SystemThread;
+
             pub fn run(handle: ?Handle, worker: *Worker) void {
                 var worker_ptr = worker.ptr.loadAcquire();
                 const node = switch (Worker.Ptr.fromUsize(worker_ptr))  {
@@ -228,7 +238,8 @@ pub fn Executor(comptime Platform: type) type {
                 };
 
                 var self = Thread{
-                    .node_ptr = AtomicUsize.init(@ptrToInt(node) | IS_WAKING),
+                    .handle = handle,
+                    .node_ptr = @ptrToInt(node) | IS_WAKING,
                     .xorshift = @ptrToInt(worker) * 31,
                     .event = undefined,
                 };
@@ -253,36 +264,36 @@ pub fn Executor(comptime Platform: type) type {
             }
 
             pub fn getNode(self: Thread) *Node {
-                const alignment = (IS_WAKING | IS_SUSPENDED | DID_INJECT) + 1;
+                const alignment = (IS_WAKING | DID_INJECT) + 1;
                 if (@alignOf(Node) < alignment)
                     @compileError("Node alignment unsupported");
 
-                const ptr = self.ptr.get();
-                if (is_debug and (ptr & IS_SUSPENDED != 0))
-                    panic("Thread.getNode() when suspended", .{});
-
                 @setRuntimeSafety(false);
-                return @intToPtr(*Node, ptr & ~@as(usize, 0b11));
+                const ptr = self.node_ptr.loadUnordered();
+                return @intToPtr(*Node, ptr & ~@as(usize, alignment - 1));
             }
 
             fn isShutdown(self: Thread) bool {
-                return self.ptr.get() == IS_SHUTDOWN;
+                return self.node_ptr.loadUnordered() == IS_SHUTDOWN;
             }
 
             fn shutdown(self: *Thread) void {
-                self.ptr.set(IS_SHUTDOWN);
+                self.node_ptr.storeUnordered(IS_SHUTDOWN);
             }
 
             fn poll(self: *Thread) ?*Task {
                 const task = self.findTask() orelse return null;
 
-                const is_waking = self.node_ptr & IS_WAKING != 0;
-                const did_inject = self.node_ptr & DID_INJECT != 0;
-                self.node_ptr &= ~@as(usize, IS_WAKING | DID_INJECT);
+                var node_ptr = self.node_ptr.loadUnordered();
+                const is_waking = node_ptr & IS_WAKING != 0;
+                const did_inject = node_ptr & DID_INJECT != 0;
+
+                node_ptr &= ~@as(usize, IS_WAKING | DID_INJECT);
+                self.node_ptr.storeUnordered(node_ptr);
+                const node = @intToPtr(*Node, node_ptr);
 
                 if (is_waking or did_inject) {
-                    const node = self.getNode();
-                    node.resumeThread(.{ .was_waking = is_waking });
+                    _ = node.tryResumeThread(.{ .was_waking = is_waking });
                 }
 
                 return task;
@@ -315,20 +326,21 @@ pub fn Executor(comptime Platform: type) type {
 
                     var nodes = self.getNode().iter();
                     while (nodes.next()) |node| {
-                        const num_workers = node.workers_len;
+                        const workers = node.getWorkers();
 
-                        var index = self.xorshift % num_workers;
-                        var iter = num_workers;
+                        var index = self.xorshift % workers.len;
+                        var iter = workers.len;
                         while (iter != 0) : (iter -= 1) {
                             const worker_index = index;
-                            index = if (index == num_workers - 1) 0 else (index + 1);
+                            index = if (index == workers.len - 1) 0 else (index + 1);
 
-                            const worker = &node.workers_ptr[worker_index];
-                            const worker_ptr = worker.ptr.loadAcquire();
+                            const worker_ptr = workers[worker_index].ptr.loadAcquire();
                             switch (Worker.Ptr.fromUsize(worker_ptr)) {
                                 .idle => {},
                                 .spawning => {},
                                 .thread => |thread| {
+                                    if (self == thread)
+                                        continue;
                                     if (self.steal(Target{ .shared = thread }, is_desperate)) |task| {
                                         return task;
                                     }
@@ -363,7 +375,7 @@ pub fn Executor(comptime Platform: type) type {
                 switch (affinity) {
                     .next => {},
                     .local => self.notify(),
-                    .shared => self.getNode().resumeThread(.{}),
+                    .shared => _ = self.getNode().tryResumeThread(.{}),
                 }
             }
 
@@ -618,10 +630,11 @@ pub fn Executor(comptime Platform: type) type {
                             target_head = updated_target_head;
                             continue;
                         }
-
-                        self.node_ptr |= DID_INJECT;
+                        
                         if (new_tail != tail)
                             self.runq_tail.storeRelease(new_tail);
+
+                        self.markInjected();
                         return task;
                     }
 
@@ -633,8 +646,13 @@ pub fn Executor(comptime Platform: type) type {
                 return null;
             }
 
-            fn inject(self: *Thread, stack: ?*Task) void {
-                var runq = stack orelse return;
+            fn markInjected(self: *Thread) void {
+                const node_ptr = self.node_ptr.loadUnordered();
+                self.node_ptr.storeUnordered(node_ptr | DID_INJECT);
+            }
+
+            fn inject(self: *Thread, runq_stack: ?*Task) void {
+                var runq = runq_stack orelse return;
 
                 var tail = self.runq_tail.get();
                 if (is_debug) {
@@ -651,8 +669,8 @@ pub fn Executor(comptime Platform: type) type {
                     tail +%= 1;
                 }
 
-                self.node_ptr |= DID_INJECT;
                 self.runq_tail.storeRelease(tail);
+                self.markInjected();
 
                 if (runq != null) {
                     if (is_debug) {
@@ -725,6 +743,7 @@ pub fn Executor(comptime Platform: type) type {
 
         pub const Node = extern struct {
             next: ?*Node,
+            handle: ?Handle,
             scheduler: *Scheduler,
             workers_ptr: [*]Worker,
             workers_len: usize,
@@ -732,6 +751,64 @@ pub fn Executor(comptime Platform: type) type {
             runq_shared: AtomicUsize,
             idle_queue: AtomicUsize align(cache_align),
             active_threads: AtomicUsize,
+
+            const IDLE_MARKED = 1;
+            const IDLE_SHUTDOWN = ~@as(usize, 0);
+
+            pub const Handle = *SystemNode;
+
+            pub fn create(handle: ?Handle, workers: []Worker) Node {
+                var self: Node = undefined;
+                self.workers_ptr = workers.ptr;
+                self.workers_len = std.math.min(workers.len, Worker.max);
+                return self;
+            }
+
+            fn init(self: *Node, scheduler: *Scheduler) void {
+                self.next = self;
+                self.scheduler = scheduler;
+                self.runq_local = AtomicUsize.init(0);
+                self.runq_shared = AtomicUsize.init(0);
+                self.active_threads = AtomicUsize.init(0);
+                self.idle_queue = AtomicUsize.init(self.getWorkers().len << 8);
+
+                for (self.getWorkers()) |*worker, index| {
+                    const worker_ptr_type = Worker.Ptr{ .idle = index };
+                    worker.ptr.set(worker_ptr_type.toUsize());
+                }
+            }
+
+            fn deinit(self: *Node) void {
+                defer self.* = undefined;
+
+                if (is_debug) {
+                    if (self.runq_local.load() != 0)
+                        panic("Node.deinit() with local runq is not empty", .{});
+
+                    if (self.runq_shared.load() != 0)
+                        panic("Node.deinit() with shared runq is not empty", .{});
+
+                    if (self.idle_queue.load() != IDLE_SHUTDOWN)
+                        panic("Node.deinit() with idle queue is not shutdown", .{});
+
+                    const active_threads = self.active_threads.load();
+                    if (active_threads != 0)
+                        panic("Node.deinit() with {} active threads", .{active_threads});
+                }
+
+                for (self.getWorkers()) |*worker, worker_index| {
+                    const worker_ptr = worker.ptr.loadAcquire();
+                    switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                        .idle, .spawning, .running => {
+                            panic("Node.deinit() when worker {} not shutdown", .{worker_index});
+                        },
+                        .shutdown => |handle| {
+                            const thread_handle = handle orelse continue;
+                            SystemThread.join(&self.handle, thread_handle);
+                        },
+                    }
+                }
+            }
 
             pub fn getScheduler(self: Node) *Scheduler {
                 return self.scheduler;
@@ -751,7 +828,7 @@ pub fn Executor(comptime Platform: type) type {
                     return;
 
                 self.push(batch, affinity);
-                self.resumeThread(.{});
+                _ = self.tryResumeThread(.{ .only_local = affinity == .local });
             }
 
             fn push(self: *Node, batch: Task.Batch, affinity: Affinity) void {
@@ -773,19 +850,222 @@ pub fn Executor(comptime Platform: type) type {
                 }
             }
 
+            const ResumeOptions = struct {
+                use_caller: bool = false,
+                was_waking: bool = false,
+                only_local: bool = false,
+            };
+
+            fn tryResumeThread(self: *Node, options: ResumeOptions) bool {
+                if (!options.only_local) {
+                    var remote_options = options;
+                    remote_options.only_local = true;
+
+                    var nodes = self.iter();
+                    while (nodes.next()) |node| {
+                        if (node.tryResumeThread(remote_options))
+                            return true;
+                    }
+
+                    return false;
+                }
+
+                const workers = self.getWorkers();
+                var idle_queue = self.idle_queue.loadAcquire();
+
+                while (true) {
+                    if (is_debug and (idle_queue == IDLE_SHUTDOWN))
+                        panic("Node.tryResumeThread() when already shutdown", .{});
+
+                    var resume_ptr: usize = 0;
+                    var worker_index: usize = undefined;
+                    const idle_worker_index = idle_queue >> 8;
+                    const aba_tag = @truncate(u7, idle_queue >> 1);
+                    var new_idle_queue = @as(usize, aba_tag) << 1;
+
+                    if (idle_worker_index != 0) {
+                        if (!options.was_waking and (idle_queue & IDLE_MARKED != 0))
+                            break;
+
+                        worker_index = idle_worker_index - 1;
+                        const worker = &workers[worker_index];
+                        const worker_ptr = worker.ptr.loadAcquire();
+
+                        switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                            .idle => |next_worker_index| {
+                                const idle_marked = if (next_worker_index != 0) IDLE_MARKED else 0;
+                                new_idle_queue |= (next_worker_index << 8) | idle_marked;
+                                resume_ptr = @ptrToInt(worker) | (1 << 0);
+                            },
+                            .spawning => {
+                                idle_queue = self.idle_queue.loadAcquire();
+                                continue;
+                            },
+                            .running => |thread| {
+                                const next_worker_index = thread.next_ptr.loadUnordered();
+                                if (is_debug and (next_worker_index > workers.len))
+                                    panic("Node.tryResumeThread() found worker {} with invalid next_ptr", .{worker_index});
+                                
+                                const idle_marked = if (next_worker_index != 0) IDLE_MARKED else 0;
+                                new_idle_queue |= (next_worker_index << 8) | idle_marked;
+                                resume_ptr = @ptrToInt(thread) | (1 << 1);
+                            },
+                            .shutdown => {
+                                panic("Node.tryResumeThread() found worker {} already shutdown", .{worker_index});
+                            },
+                        }
+
+                    } else if (idle_queue & IDLE_MARKED != 0) {
+                        break;
+
+                    } else {
+                        new_idle_queue |= IDLE_MARKED;
+                    }
+
+                    if (self.idle_queue.compareAndSwapAcquireRelease(
+                        idle_queue,
+                        new_idle_queue,
+                    )) |updated_idle_queue| {
+                        idle_queue = updated_idle_queue;
+                        continue;
+                    }
+
+                    if (resume_ptr == 0)
+                        return true;
+
+                    const scheduler = self.getScheduler();
+                    var active_threads = self.active_threads.fetchAdd(1);
+                    if (active_threads == 0) {
+                        _ = scheduler.active_nodes.fetchAdd(1);   
+                    }
+
+                    var worker: *Worker = undefined;
+                    switch ((resume_ptr >> 1) & 1) {
+                        0 => {
+                            worker = @intToPtr(*Worker, resume_ptr & ~@as(usize, 0b11));
+                            const worker_ptr_type = Worker.Ptr{ .spawning = self };
+                            worker.ptr.storeRelease(worker_ptr_type.toUsize());
+
+                            if (options.use_caller) {
+                                Thread.run(null, worker);
+                                return true;
+                            }
+
+                            if (SystemThread.spawn(&self.handle, worker, Thread.run)) {
+                                return true;
+                            }
+                        },
+                        1 => {
+                            const thread = @intToPtr(*Thread, resume_ptr & ~@as(usize, 0b11));
+                            thread.notify();
+                            return true;
+                        },
+                        else => {
+                            unreachable;
+                        },
+                    }
+
+                    active_threads = self.active_threads.fetchAdd(@bitCast(usize, @as(isize, -1)));
+                    if (active_threads == 1) {
+                        _ = scheduler.active_nodes.fetchSub(1);
+                    }
+
+                    idle_queue = self.idle_queue.load();
+                    while (true) {
+                        if (is_debug and (idle_queue == IDLE_SHUTDOWN))
+                            panic("Node.undoResumeThread() when already shutdown", .{});
+                    
+                        const next_worker_index = idle_queue >> 8;
+                        const aba_tag = @truncate(u7, idle_queue >> 1);
+                        const new_idle_queue = (worker_index << 8) | (@as(usize, aba_tag +% 1) << 1);
+
+                        const worker_ptr_type = Worker.Ptr{ .idle = next_worker_index };
+                        worker.ptr.store(worker_ptr_type.toUsize());
+
+                        idle_queue = self.idle_queue.compareAndSwapRelease(
+                            idle_queue,
+                            new_idle_queue,
+                        ) orelse break;
+                    }
+                }
+
+                return false;
+            }
+
+            fn suspendThread(self: *Node, thread: *Thread) void {
+
+            }
+
+            fn shutdown(self: *Node) void {
+                var idle_queue = self.idle_queue.loadAcquire();
+                self.idle_queue.store(IDLE_SHUTDOWN);
+
+                if (is_debug and idle_queue == IDLE_SHUTDOWN)
+                    panic("Node.shutdown() when already shutdown", .{});
+
+                var idle_threads: ?*Thread = null;
+                var found_workers: usize = 0;
+                var idle_worker_index = idle_queue >> 8;
+                const workers = self.getWorkers();
+
+                while (idle_worker_index != 0) {
+                    const worker_index = idle_worker_index - 1;
+                    const worker = &workers[worker_index];
+                    const worker_ptr = workers.ptr.loadAcquire();
+                    found_workers += 1;
+
+                    switch (Worker.Ptr.fromUsize(worker_ptr)) {
+                        .idle => |next_index| {
+                            idle_worker_index = next_index;
+                            if (is_debug and (idle_worker_index > workers.len))
+                                panic("Node.shutdown() found invalid next index on worker {}", .{worker_index});
+
+                            const worker_ptr_type = Worker.Ptr{ .shutdown = null };
+                            worker.ptr.store(worker_ptr_type.toUsize());
+                        },
+                        .spawning => {
+                            panic("Node.shutdown() when worker {} is still spawning", .{worker_index});
+                        },
+                        .running => |thread| {
+                            idle_worker_index = thread.next_ptr.loadUnordered();
+                            if (is_debug and (idle_worker_index > workers.len))
+                                panic("Node.shutdown() found invalid next index on worker {}", .{worker_index});
+
+                            thread.next_ptr.storeUnordered(@ptrToInt(idle_threads));
+                            idle_threads = thread;
+
+                            const worker_ptr_type = Worker.Ptr{ .shutdown = thread.handle };
+                            worker.ptr.store(worker_ptr_type.toUsize());
+                        },
+                        .shutdown => {
+                            panic("Node.shutdown() when worker {} is already shutdown", .{worker_index});
+                        },
+                    }
+                }
+
+                if (found_workers < workers.len)
+                    panic("Node.shutdown() when not all workers are idle ({}/{})", .{found_workers, workers.len});
+
+                while (idle_threads) |idle_thread| {
+                    const thread = idle_thread;
+                    idle_thread = @intToPtr(?*Thread, thread.next_ptr.loadUnordered());
+                    thread.shutdown();
+                    thread.notify();
+                }
+            }
+
             pub const IterThreads = extern struct {
                 index: usize = 0,
                 node: *Node,
 
                 pub fn next(self: *IterThreads) ?*Thread {
-                    const workers_ptr = node.workers_ptr;
-                    const workers_len = node.workers_len;
+                    const workers = node.getWorkers();
 
-                    while (self.index < workers_len) {
+                    while (self.index < workers.len) {
                         const worker_index = self.index;
                         self.index += 1;
 
-                        const worker_ptr = workers_ptr[worker_index].ptr.loadAcquire();
+                        const worker_ptr = workers[worker_index].ptr.loadAcquire();
                         switch (Worker.Ptr.fromUsize(worker_ptr)) {
                             .idle => {},
                             .spawning => {},
@@ -906,47 +1186,39 @@ pub fn Executor(comptime Platform: type) type {
         pub const Scheduler = extern struct {
             active_nodes: AtomicUsize,
 
-            pub const Config = union(enum) {
-                smp: Smp,
-                numa: Numa,
-            };
-
-            fn ReturnTypeOf(comptime function: anytype) type {
-                return @typeInfo(@TypeOf(function)).Fn.ReturnType;
-            }
-
-            pub fn runAsync(
-                config: Config,
-                comptime asyncFn: anytype,
-                args: anytype,
-            ) !ReturnTypeOf(asyncFn) {
-                return config.withNuma(runAsyncWithNuma);
-            }
-
-            pub fn runAsync(
-                config: Config,
-                comptime asyncFn: anytype,
-                args: anytype,
-            ) !ReturnTypeOf(asyncFn) {
-                const Arguments = @TypeOf(args);
-                const ReturnType = ReturnTypeOf(asyncFn);
-                const Wrapper = struct {
-                    fn entry(
-                        fn_args: Arguments,
-                        task_ptr: *Task,
-                        result_ptr: *?ReturnType,
-                    ) void {
-                        suspend task_ptr.* = Task.init(@frame());
-                        const result = @call(.{}, asyncFn, fn_args);
-                        suspend result_ptr.* = result;
-                    }
+            pub fn run(
+                cluster: Node.Cluster,
+                start_node: *Node,
+                start_task: *Task,
+            ) void {
+                var self = Scheduler{
+                    .active_nodes = AtomicUsize.init(0),
                 };
 
-                var task: Task = undefined;
-                var result: ?ReturnType = null;
-                var frame = async Wrapper.entry(args, &task, &result);
+                var has_start_node = false;
+                var nodes = cluster.iter();
+                while (nodes.next()) |node| {
+                    has_start_node = has_start_node or (node == start_node);
+                    node.init(&self);
+                }
 
+                if (!has_start_node) {
+                    return;
+                } else {
+                    start_node.push(start_task.toBatch(), .local);
+                    _ = start_node.tryResumeThread(.{ .use_caller = true });
+                }
 
+                if (is_debug) {
+                    const active_nodes = self.active_nodes.load();
+                    if (active_nodes != 0)
+                        panic("Scheduler.deinit() with {} active nodes", .{active_nodes});
+                }
+
+                nodes = cluster.iter();
+                while (nodes.next()) |node| {
+                    node.deinit();
+                }
             }
         };
     };

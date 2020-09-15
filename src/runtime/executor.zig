@@ -14,55 +14,46 @@
 
 const std = @import("std");
 const zap = @import("../zap.zig");
-const platform = @import("./platform.zig");
 
-pub const Task = zap.core.Task;
-
-pub const Thread = extern struct {
-
-};
-
-pub const RunConfig = union(enum) {
+pub const Config = union(enum) {
     smp: Smp,
     numa: Numa,
 
-    pub fn default() RunConfig {
-        return RunConfig{ .smp = Smp{} };
+    const Smp = struct {
+        blocking_threads: usize = 16,
+        task_threads: usize = 0,
+        stack_size: usize = 0,
+    };
+
+    const Numa = struct {
+        cluster: Node.Cluster,
+        start_node: *Node,
+    };
+
+    pub fn default() Config {
+        return Config{ .smp = .{} };
     }
 
-    pub const Smp = struct {
-        pub const Config = struct {
-            threads: u32,
-            stack_size: u32,
-        };
+    fn ReturnTypeOf(comptime function: anytype) type {
+        return @typeInfo(@TypeOf(function)).Fn.ReturnType;
+    }
 
-        blocking: Config = Config{
-            .threads = 64,
-            .stack_size = 64 * 1024,
-        },
-        non_blocking: Config = Config{
-            .threads = 0,
-            .stack_size = 1 * 1024 * 1024,
-        },
-    };
-
-    pub const Numa = struct {
-        cluster: Node.Cluster,
-        start_index: u32,
-    };
-
-    pub fn runAsyncFn(
-        self: RunConfig,
+    pub fn runAsync(
+        self: Config,
         comptime asyncFn: anytype,
         args: anytype,
-    ) !@TypeOf(asyncFn).ReturnType {
-        const Args = @TypeOf(args);
-        const ReturnType = @TypeOf(asyncFn).ReturnType;
+    ) !ReturnTypeOf(asyncFn) {
+        const Arguments = @TypeOf(args);
+        const ReturnType = ReturnTypeOf(asyncFn);
         const Wrapper = struct {
-            fn entry(fn_args: Args, task_ptr: *Task, result_ptr: *?ReturnType) void {
-                suspend task_ptr.* = Task.fromFrame(@frame());
+            fn entry(
+                fn_args: Arguments,
+                task_ptr: *Task,
+                result_ptr: *?ReturnType,
+            ) void {
+                suspend task_ptr.* = Task.init(@frame());
                 const result = @call(.{}, asyncFn, fn_args);
-                result_ptr.* = result;
+                suspend result_ptr.* = result;
             }
         };
 
@@ -70,12 +61,12 @@ pub const RunConfig = union(enum) {
         var result: ?ReturnType = null;
         var frame = async Wrapper.entry(args, &task, &result);
 
-        try self.run(&task);
+        try run(self, &task);
 
         return result orelse error.DeadLocked;
     }
 
-    pub fn run(self: RunConfig, task: *Task) !void {
+    pub fn run(self: Config, task: *Task) !void {
         switch (self) {
             .numa => |numa_config| {
                 return runNuma(task, numa_config);
@@ -144,9 +135,9 @@ pub const RunConfig = union(enum) {
                     num_nodes += 1;
                 }
 
-                return runNuma(task, RunConfig.Numa{
+                return runNuma(task, Config.Numa{
                     .cluster = cluster,
-                    .start_index = nanotime() % num_nodes,
+                    .start_node = start_node,
                 });
             },
         }
@@ -156,3 +147,5 @@ pub const RunConfig = union(enum) {
         
     }
 };
+
+

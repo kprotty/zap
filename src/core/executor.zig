@@ -237,8 +237,23 @@ pub fn Executor(comptime Platform: type) type {
                     .shutdown => panic("Thread.run() started with worker already shutdown", .{}),
                 };
 
+                const node_alignment = (IS_WAKING | DID_INJECT) + 1;
+                if (@alignOf(Node) < node_alignment)
+                    @compileError("Unsupported Node type alignment");
+
+                const worker_index = blk: {
+                    const workers = node.getWorkers();
+                    const ptr = @ptrToInt(worker);
+                    const base = @ptrToInt(workers.ptr);
+                    const end = base + (@sizeOf(Worker) * workers.len);
+                    if (ptr < base or (ptr >= end))
+                        panic("Thread.run() with worker ptr not in node: {*}", .{worker});
+                    return (ptr - base) / @sizeOf(Worker);
+                };
+
                 var self = Thread{
                     .handle = handle,
+                    .worker_index = worker_index,
                     .node_ptr = @ptrToInt(node) | IS_WAKING,
                     .xorshift = @ptrToInt(worker) * 31,
                     .event = undefined,
@@ -264,10 +279,6 @@ pub fn Executor(comptime Platform: type) type {
             }
 
             pub fn getNode(self: Thread) *Node {
-                const alignment = (IS_WAKING | DID_INJECT) + 1;
-                if (@alignOf(Node) < alignment)
-                    @compileError("Node alignment unsupported");
-
                 @setRuntimeSafety(false);
                 const ptr = self.node_ptr.loadUnordered();
                 return @intToPtr(*Node, ptr & ~@as(usize, alignment - 1));
@@ -850,6 +861,61 @@ pub fn Executor(comptime Platform: type) type {
                 }
             }
 
+            const ActiveResult = struct {
+                of_node: bool = false,
+                of_scheduler: bool = false,
+            };
+
+            fn markActiveThread(self: *Node) ActiveResult {
+                return self.markActiveStatus(
+                    "Node.markActiveThread()",
+                    @as(usize, 1),
+                    @as(usize, 0),
+                );
+            }
+
+            fn markInactiveThread(self: *Node) ActiveResult {
+                return self.markActiveStatus(
+                    "Node.markInactiveThread()",
+                    @bitCast(usize, @as(isize, -1)),
+                    @as(usize, 1),
+                );
+            }
+
+            fn markActiveStatus(
+                self: *Node,
+                comptime debug_caller: []const u8,
+                comptime increment: usize,
+                comptime of_check: usize,
+            ) ActiveResult {
+                var result = ActiveResult{};
+
+                const node = self;
+                const active_threads = node.active_threads.fetchAdd(increment);
+                result.of_node = active_threads == of_check;
+
+                if (is_debug) {
+                    const new_active_threads = active_threads +% increment;
+                    if (new_active_threads > node.getWorkers().len)
+                        panic(debug_caller ++ ": active_threads count updated to {}", .{new_active_threads});
+                }
+                
+                if (result.of_node) {
+                    const scheduler = node.getScheduler();
+                    const active_nodes = scheduler.active_nodes.fetchAdd(increment);
+                    result.of_scheduler = active_nodes == of_check;
+
+                    if (is_debug) {
+                        const new_active_nodes = active_nodes +% increment;
+                        if (new_active_nodes > node.getWorkers().len)
+                            panic(debug_caller ++ ": active_nodes count updated to {}", .{new_active_nodes});
+                    }
+                }
+
+                return result;
+            }
+
+
             const ResumeOptions = struct {
                 use_caller: bool = false,
                 was_waking: bool = false,
@@ -933,12 +999,6 @@ pub fn Executor(comptime Platform: type) type {
                     if (resume_ptr == 0)
                         return true;
 
-                    const scheduler = self.getScheduler();
-                    var active_threads = self.active_threads.fetchAdd(1);
-                    if (active_threads == 0) {
-                        _ = scheduler.active_nodes.fetchAdd(1);   
-                    }
-
                     var worker: *Worker = undefined;
                     switch ((resume_ptr >> 1) & 1) {
                         0 => {
@@ -946,13 +1006,14 @@ pub fn Executor(comptime Platform: type) type {
                             const worker_ptr_type = Worker.Ptr{ .spawning = self };
                             worker.ptr.storeRelease(worker_ptr_type.toUsize());
 
+                            _ = node.markActiveThread();
                             if (options.use_caller) {
                                 Thread.run(null, worker);
                                 return true;
-                            }
-
-                            if (SystemThread.spawn(&self.handle, worker, Thread.run)) {
+                            } else if (SystemThread.spawn(&self.handle, worker, Thread.run)) {
                                 return true;
+                            } else {
+                                node.markInactiveThread();
                             }
                         },
                         1 => {
@@ -963,11 +1024,6 @@ pub fn Executor(comptime Platform: type) type {
                         else => {
                             unreachable;
                         },
-                    }
-
-                    active_threads = self.active_threads.fetchAdd(@bitCast(usize, @as(isize, -1)));
-                    if (active_threads == 1) {
-                        _ = scheduler.active_nodes.fetchSub(1);
                     }
 
                     idle_queue = self.idle_queue.load();
@@ -993,7 +1049,28 @@ pub fn Executor(comptime Platform: type) type {
             }
 
             fn suspendThread(self: *Node, thread: *Thread) void {
+                @compileError("TODO: move is_suspended to next_ptr");
 
+                const node_ptr = thread.node_ptr.loadUnordered();
+                if (node_ptr & IS_SUSPENDED != 0)
+                    return;
+
+                if (is_debug) {
+                    const node = @intToPtr(*Node, node_ptr & ~@as(usize, Thread.node_mask));
+                    if (self != node)
+                        panic("Node.suspendThread() when thread apart of different node", .{});
+                }
+
+                const worker_index = thread.worker_index;
+                const workers = self.getWorkers();
+                var idle_queue = self.idle_queue.load();
+
+                while (true) {
+                    if (is_debug and (idle_queue == IDLE_SHUTDOWN))
+                        panic("Node.suspendThread() when already shutdown", .{});
+
+                    
+                }
             }
 
             fn shutdown(self: *Node) void {
@@ -1185,6 +1262,7 @@ pub fn Executor(comptime Platform: type) type {
 
         pub const Scheduler = extern struct {
             active_nodes: AtomicUsize,
+            num_nodes: usize,
 
             pub fn run(
                 cluster: Node.Cluster,
@@ -1193,6 +1271,7 @@ pub fn Executor(comptime Platform: type) type {
             ) void {
                 var self = Scheduler{
                     .active_nodes = AtomicUsize.init(0),
+                    .num_nodes = 0,
                 };
 
                 var has_start_node = false;
@@ -1200,6 +1279,7 @@ pub fn Executor(comptime Platform: type) type {
                 while (nodes.next()) |node| {
                     has_start_node = has_start_node or (node == start_node);
                     node.init(&self);
+                    self.num_nodes += 1;
                 }
 
                 if (!has_start_node) {

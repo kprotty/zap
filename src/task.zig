@@ -666,7 +666,7 @@ pub const Task = extern struct {
 
                 if (!scheduler.suspendThread(&self))
                     return;
-                    
+
                 switch (@atomicLoad(u16, &self.worker_state, .Unordered)) {
                     IS_RUNNING => {}, // we consumed a notification left behind from a Scheduler.resumeThread()
                     IS_WAKING => {}, // we were woken up by someone calling Scheduler.resumeThread() 

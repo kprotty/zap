@@ -593,7 +593,7 @@ pub const Task = struct {
                 }
 
                 if (worker.thread != null) {
-                    worker.event.set();
+                    worker.event.wait();
                     return;
                 }
 
@@ -739,7 +739,7 @@ pub const Task = struct {
                     const target = self.target orelse blk: {
                         const target = @atomicLoad(?*Worker, &worker_pool.active_head, .Monotonic);
                         self.target = target;
-                        break :blk target.?;
+                        break :blk target orelse unreachable; // no active_head when trying to steal
                     };
 
                     self.target = target.next;
@@ -789,16 +789,20 @@ pub const Task = struct {
                         return null;
 
                     if (@atomicLoad(?*Task, &self.next, .Monotonic) == null) {
-                        const task = batch.pop().?;
+                        const task = batch.pop() orelse unreachable; // !batch.isEmpty() but failed pop
                         @atomicStore(?*Task, &self.next, task, .Release);
                         continue;
                     }
 
-                    const size = tail -% head;
+                    var size = tail -% head;
                     if (size < self.buffer.len) {
-                        @atomicStore(*Task, &self.buffer[tail % self.buffer.len], batch.pop().?, .Unordered);
-                        tail +%= 1;
+                        while (size < self.buffer.len) : (size += 1) {
+                            const task = batch.pop() orelse break;
+                            @atomicStore(*Task, &self.buffer[tail % self.buffer.len], task, .Unordered);
+                            tail +%= 1;
+                        }
                         @atomicStore(usize, &self.tail, tail, .Release);
+                        head = @atomicLoad(usize, &self.head, .Monotonic);
                         continue;
                     }
 
@@ -896,6 +900,7 @@ pub const Task = struct {
                     const first_task = @atomicLoad(*Task, &target.buffer[target_head % target.buffer.len], .Unordered);
                     var new_target_head = target_head +% 1;
                     var new_tail = tail;
+                    num_steal -= 1;
 
                     while (num_steal > 0) : (num_steal -= 1) {
                         const task = @atomicLoad(*Task, &target.buffer[new_target_head % target.buffer.len], .Unordered);

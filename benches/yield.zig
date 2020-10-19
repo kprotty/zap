@@ -1,5 +1,8 @@
 const std = @import("std");
-const zap = @import("./src/zap.zig");
+const zap = @import("zap");
+
+const num_tasks = 100_000;
+const num_yields = 200;
 
 pub fn main() !void {
     try (try zap.Task.run(.{}, asyncMain, .{}));
@@ -8,12 +11,11 @@ pub fn main() !void {
 fn asyncMain() callconv(.Async) !void {
     const allocator = std.heap.page_allocator;
 
-    const num_workers = 100;
-    const frames = try allocator.alloc(@Frame(worker), num_workers);
+    const frames = try allocator.alloc(@Frame(worker), num_tasks);
     defer allocator.free(frames);
 
     var batch = zap.Task.Batch{};
-    var remaining: usize = num_workers;
+    var remaining: usize = frames.len;
     var main_task = zap.Task.init(@frame());
 
     suspend {
@@ -21,6 +23,9 @@ fn asyncMain() callconv(.Async) !void {
             frame.* = async worker(&batch, &remaining, &main_task);
         batch.schedule();
     }
+
+    const remains = @atomicLoad(usize, &remaining, .Monotonic);
+    std.debug.assert(remains == 0);
 }
 
 fn worker(batch: *zap.Task.Batch, remaining_ptr: *usize, main_task: *zap.Task) void {
@@ -29,8 +34,8 @@ fn worker(batch: *zap.Task.Batch, remaining_ptr: *usize, main_task: *zap.Task) v
         batch.push(&task);
     }
 
-    var num_yields: usize = 100;
-    while (num_yields > 0) : (num_yields -= 1) {
+    var i: usize = num_yields;
+    while (i > 0) : (i -= 1) {
         zap.Task.yield();
     }
 

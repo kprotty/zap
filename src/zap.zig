@@ -70,7 +70,7 @@ pub const Task = struct {
 
         const num_threads = blk: {
             if (std.builtin.single_threaded) {
-                break :blk 1;
+                break :blk @as(usize, 1);
             } else if (config.threads > 0) {
                 break :blk config.threads;
             } else {
@@ -481,7 +481,9 @@ pub const Task = struct {
                         return;
                     }
 
-                    assert(!std.builtin.single_threaded);
+                    if (std.builtin.single_threaded)
+                        unreachable; // single threaded mode trying to spawn a thread
+                        
                     var spawner = Worker.Spawn.Spawner{};
                     spawn.state = .{ .spawning = {} };
 

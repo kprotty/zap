@@ -127,9 +127,7 @@ pub const Task = struct {
             const worker = Worker.current orelse {
                 std.debug.panic("Cannot schedule tasks from outside the thread pool", .{});
             };
-            
-            worker.push(self);
-            worker.scheduler.worker_pool.resumeWorker(.{});
+            worker.schedule(self);
         }
     };
 
@@ -143,11 +141,11 @@ pub const Task = struct {
             std.debug.panic("Cannot yield into a task from outside the thread pool", .{});
         };
 
-        suspend {
-            var task = Task.init(@frame());
-            worker.run_next = self;
-            worker.push(Batch.from(&task));
+        if (worker.run_next) |old_next| {
+            worker.schedule(Batch.from(old_next));
         }
+
+        worker.run_next = self;
     }
 
     pub fn yield() void {
@@ -541,8 +539,10 @@ pub const Task = struct {
                     self.is_waking = false;
                 }
 
+                worker.state = .suspended;
                 self.idle_queue.push(worker);
                 self.lock.release();
+
                 worker.event.wait();
             }
 
@@ -757,6 +757,14 @@ pub const Task = struct {
             }
 
             return null;
+        }
+
+        fn schedule(self: *Worker, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            self.push(batch);
+            self.scheduler.worker_pool.resumeWorker(.{});
         }
 
         fn push(self: *Worker, batch: Batch) void {

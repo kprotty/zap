@@ -289,7 +289,7 @@ pub const Task = extern struct {
     pub const Scheduler = struct {
         workers: []Worker,
         run_queue: ?*Task,
-        idle_queue: u32,
+        idle_queue: usize,
         
         fn run(task: *Task, workers: []Worker) void {
             // limit the workers so that they fit in Scheduler.idle_queue as indices
@@ -373,8 +373,9 @@ pub const Task = extern struct {
             }
         }
 
-        const IDLE_NOTIFIED = 1;
-        const IDLE_SHUTDOWN = std.math.maxInt(u32);
+        const IDLE_NOTIFIED = 1 << 16;
+        const IDLE_SHUTDOWN = std.math.maxInt(usize);
+        const AbaTag = std.meta.IntType(false, std.meta.bitCount(usize) - 17);
 
         const ResumeConfig = struct {
             use_caller: bool = false,
@@ -392,23 +393,32 @@ pub const Task = extern struct {
             var resume_type: ResumeType = undefined;
 
             while (true) : (spinLoopHint()) {
-                const idle_queue = @atomicLoad(u32, &self.idle_queue, .Acquire);
+                const idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
 
                 // bail if the scheduler is already shutdown
                 if (idle_queue == IDLE_SHUTDOWN)
                     return;
 
-                var worker_index = @truncate(u16, idle_queue >> 16);
-                var aba_tag = @truncate(u15, idle_queue >> 1);
+                var worker_index = @truncate(u16, idle_queue);
+                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
                 var is_notified = idle_queue & IDLE_NOTIFIED != 0;
                 
                 // if the idle queue is empty, we should leave a notification that we tried to resume().
                 // if not, we could resume(), a thread could suspend(), and then miss our resume request.
                 if (worker_index == 0) {
-                    // if the idle queue is already notified, nothing more we can do
-                    if (is_notified)
-                        return;
-                    is_notified = true;
+                    // if the idle queue is already notified, nothing more we can do if we're not the waking thread.
+                    // if we are the waking thread, then we need to unset the is_notified to signify that we're done waking (see below).
+                    if (is_notified) {
+                        if (resume_config.is_waking) {
+                            is_notified = false;
+                        } else {
+                            return;
+                        }
+                    } else {
+                        if (resume_config.is_waking)
+                            unreachable; // waking thread calling resumeThread() while is_notified is not set.
+                        is_notified = true;
+                    }
                     resume_type = ResumeType{ .notified = {} };
 
                 // handle the case where theres workers on the idle queue to wake up.
@@ -440,7 +450,7 @@ pub const Task = extern struct {
                         // the worker has a running thread, use the thread's next_worker index for the idle_queue link
                         .running => |thread| {
                             resume_type = ResumeType{ .resumed = thread };
-                            worker_index = @atomicLoad(u16, &thread.worker_state, .Unordered);
+                            worker_index = @atomicLoad(u16, &thread.worker_next, .Unordered);
                         },
                         // the worker should not be shutdown while another worker is running (e.g. calling resume())
                         .shutdown => {
@@ -449,13 +459,13 @@ pub const Task = extern struct {
                     }
                 }
 
-                var new_idle_queue: u32 = 0;
-                new_idle_queue |= @boolToInt(is_notified);
-                new_idle_queue |= @as(u32, aba_tag) << 1;
-                new_idle_queue |= @as(u32, worker_index) << 16;
+                var new_idle_queue: usize = 0;
+                new_idle_queue |= @as(usize, worker_index);
+                new_idle_queue |= @boolToInt(is_notified) << 16;
+                new_idle_queue |= @as(usize, aba_tag) << 17;
 
                 _ = @cmpxchgWeak(
-                    u32,
+                    usize,
                     &self.idle_queue,
                     idle_queue,
                     new_idle_queue,
@@ -476,7 +486,7 @@ pub const Task = extern struct {
                     break :blk worker_index;
                 },
                 .resumed => |thread| {
-                    @atomicStore(u16, &thread.worker_state, Thread.IS_WAKING, .Unordered);
+                    thread.sched_state = @ptrToInt(self) | @enumToInt(Thread.State.waking);
                     thread.notify();
                     return;
                 },
@@ -523,10 +533,10 @@ pub const Task = extern struct {
 
             // We failed to spawn an OS thread for this Worker, backtrack our updates
             // Add the worker back to the idle queue stack
-            var idle_queue = @atomicLoad(u32, &self.idle_queue, .Monotonic);
+            var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
             while (true) {
-                var next_worker_index = @truncate(u16, idle_queue >> 16);
-                var aba_tag = @truncate(u15, idle_queue >> 1);
+                var next_worker_index = @truncate(u16, idle_queue);
+                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
                 var is_notified = idle_queue & IDLE_NOTIFIED != 0;
                 
                 // Link the worker to point to the top worker index of the idle queue.
@@ -538,15 +548,15 @@ pub const Task = extern struct {
                 is_notified = false;
                 aba_tag +%= 1;
 
-                var new_idle_queue: u32 = 0;
-                new_idle_queue |= @boolToInt(is_notified);
-                new_idle_queue |= @as(u32, aba_tag) << 1;
-                new_idle_queue |= @as(u32, worker_index) << 16;
+                var new_idle_queue: usize = 0;
+                new_idle_queue |= @as(usize, worker_index);
+                new_idle_queue |= @boolToInt(is_notified) << 16;
+                new_idle_queue |= @as(AbaTag, aba_tag) << 17;
 
                 // Once we push the worker back to the idle queue, we return as a failed resume() operation.
                 // Release memory ordering on success to ensure that the worker store above is visible on othe resuming threads.
                 _ = @cmpxchgWeak(
-                    u32,
+                    usize,
                     &self.idle_queue,
                     idle_queue,
                     new_idle_queue,
@@ -556,14 +566,77 @@ pub const Task = extern struct {
             }
         }
 
+        fn suspendThread(self: *Scheduler, thread: *Thread) bool {
+            var new_thread_state: Thread.State = undefined;
+            const thread_state = @intToEnum(Thread.State, @truncate(u2, thread.sched_state));
+
+            while (true) : (spinLoopHint()) {
+                const idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+
+                var worker_index = @truncate(u16, idle_queue);
+                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
+                var is_notified = idle_queue & IDLE_NOTIFIED != 0;
+
+                // mark the thread as shutdown if the Scheduler itself was shutdown
+                if (idle_queue == IDLE_SHUTDOWN) {
+                    new_thread_state = Thread.State.shutdown;
+                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
+                    break;
+
+                // unset the notified bit if we're the waking thread and if we're notified 
+                } else if (thread_state == .waking and is_notified) {
+                    new_thread_state = Thread.State.running;
+                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
+                    is_notified = false;
+
+                } else {
+                    new_thread_state = Thread.State.suspended;
+                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
+                    @atomicStore(u16, &thread.worker_next, worker_index, .Unordered);
+                    worker_index = thread.worker_index + 1;
+                    aba_tag +%= 1;
+                }
+
+                var new_idle_queue: usize = 0;
+                new_idle_queue |= @as(usize, worker_index);
+                new_idle_queue |= @boolToInt(is_notified) << 16;
+                new_idle_queue |= @as(AbaTag, aba_tag) << 17;
+
+                _ = @cmpxchgWeak(
+                    usize,
+                    &self.idle_queue,
+                    idle_queue,
+                    new_idle_queue,
+                    .Release,
+                    .Monotonic,
+                ) orelse break;
+            }
+
+            switch (new_thread_state) {
+                .shutdown => return false,
+                .running, .waking => return true,
+                .suspended => {
+                    thread.wait();
+                    switch (@intToEnum(Thread.State, @truncate(u2, thread.sched_state))) {
+                        .shutdown => return false,
+                        .waking => return true,
+                        .suspended => unreachable, // Thread still suspended after .wait()
+                        .running => unreachable, // Thread is running after .wait() (should be waking)
+                    }
+                },
+            }
+        }
+
         pub fn shutdown(self: *Scheduler) void {
-            const idle_queue = @atomicRmw(u32, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
+            const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
             if (idle_queue == IDLE_SHUTDOWN)
                 return;
 
-            var worker_index = @truncate(u6, idle_queue >> 16);
+            const workers = self.workers;
+            var worker_index = @truncate(u6, idle_queue);
+
             while (worker_index != 0) {
-                
+                const worker = 
             }
         }
     };
@@ -574,15 +647,19 @@ pub const Task = extern struct {
         runq_next: ?*Task,
         runq_overflow: ?*Task,
         run_queue: [256]*Task,
-        scheduler: ?*Scheduler,
+        sched_state: usize,
         handle: ?*std.Thread,
+        event: std.AutoResetEvent,
         worker_index: u16,
-        worker_state: u16,
+        worker_next: u16,
         xorshift: u32,
 
-        const IS_RUNNING = 0;
-        const IS_WAKING = 1;
-        const IS_SHUTDOWN = 2;
+        const State = enum(u2) {
+            running,
+            waking,
+            suspended,
+            shutdown,
+        };
 
         const SpawnInfo = struct {
             scheduler: *Scheduler,
@@ -600,10 +677,11 @@ pub const Task = extern struct {
                 .runq_tail = 0,
                 .runq_overflow = null,
                 .run_queue = buffer,
-                .scheduler = scheduler,
+                .sched_state = @ptrToInt(scheduler) | @enumToInt(State.waking),
                 .handle = null,
+                .event = std.AutoResetEvent{},
                 .worker_index = worker_index,
-                .worker_state = IS_WAKING,
+                .worker_next = undefined,
                 .xorshift = seed: {
                     var ptr = @ptrToInt(scheduler) + worker_index;
                     ptr = (13 * ptr) ^ (ptr >> 15);
@@ -665,15 +743,18 @@ pub const Task = extern struct {
                 }
 
                 if (!scheduler.suspendThread(&self))
-                    return;
-
-                switch (@atomicLoad(u16, &self.worker_state, .Unordered)) {
-                    IS_RUNNING => {}, // we consumed a notification left behind from a Scheduler.resumeThread()
-                    IS_WAKING => {}, // we were woken up by someone calling Scheduler.resumeThread() 
-                    IS_SHUTDOWN => break, // we were woken up from a Scheduler.shutdown() request
-                    else => unreachable, // Thread woke up with an invalid worker_state
-                }
+                    break;
             }
+        }
+
+        /// Block execution of the calling thread until signalled on another thread via `notify()`.
+        fn wait(self: *Thread) void {
+            self.event.wait();
+        }
+
+        /// Wake-up the provided thread if its execution is blocked on a call to `wait()`.
+        fn notify(self: *Thread) void {
+            self.event.set();
         }
 
         threadlocal var tls_current: ?*Thread = null;
@@ -686,7 +767,8 @@ pub const Task = extern struct {
 
         /// Return the scheduler that this thread belongs to.
         pub fn getScheduler() *Scheduler {
-            return self.scheduler;
+            @setRuntimeSafety(false);
+            return @intToPtr(*Scheduler, self.sched_state ~@as(usize, 0b11));
         }
 
         /// Schedule a batch of tasks for execution available to the Scheduler that this Thread is apart of.
@@ -792,7 +874,7 @@ pub const Task = extern struct {
         /// Using the provided Thread, finds and dequeues a runnable task in the scheduler.
         fn pop(self: *Thread) ?*Task {
             var did_inject = false;
-            const is_waking = self.worker_state == IS_WAKING;
+            const is_waking = @enumToInt(State, @truncate(u2, self.sched_state)) == .waking;
             
             // look for a thread to run
             const task = self.poll(&did_inject) orelse return;
@@ -802,7 +884,8 @@ pub const Task = extern struct {
             // if we injected tasks into our run queue, then it means others may have failed to steal when we were injecting.
             if (is_waking or did_inject) {
                 self.getScheduler().resumeThread(.{ .is_waking = is_waking });
-                @atomicStore(u16, &self.worker_state, IS_RUNNING, .Unordered);
+                self.sched_state &= ~@as(usize, 0b11);
+                self.sched_state |= @enumToInt(State.running);
             }
             
             return task;

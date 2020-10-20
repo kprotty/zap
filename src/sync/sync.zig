@@ -1,23 +1,44 @@
-// Copyright (c) 2020 kprotty
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2015-2020 Zig Contributors
+// This file is part of [zig](https://ziglang.org/), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
 
-pub const Barrier = struct {
-    pub fn init() @This() {}
+const std = @import("std");
+const zap = @import("../zap.zig");
 
-    pub fn deinit(self: *@This()) void {}
+pub fn yieldCpu(iterations: usize) void {
+    std.SpinLock.loopHint(iterations);
+}
 
-    pub fn wait(self: *@This()) void {}
-
-    pub fn notify(self: *@This()) void {}
+pub const core = struct {
+    pub const Lock = @import("./lock.zig").Lock;
 };
+
+pub const task = struct {
+    pub const AutoResetEvent = zap.Task.AutoResetEvent;
+
+    pub const Lock = core.Lock(AutoResetEvent);
+};
+
+pub const os = struct {
+    pub const AutoResetEvent = struct {
+        inner: std.AutoResetEvent = std.AutoResetEvent{},
+
+        pub fn set(self: *AutoResetEvent) void {
+            self.inner.set();
+        }
+
+        pub fn wait(self: *AutoResetEvent) void {
+            self.inner.wait();
+        }
+        
+        pub fn yield() void {
+            std.os.sched_yield() catch unreachable;
+        }
+    };
+
+    pub const Lock = core.Lock(AutoResetEvent);
+};
+
+

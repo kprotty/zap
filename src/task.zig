@@ -1,1158 +1,862 @@
-// Copyright (c) 2020 kprotty
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// 	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2015-2020 Zig Contributors
+// This file is part of [zig](https://ziglang.org/), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
 
 const std = @import("std");
+const assert = std.debug.assert;
+
+const zap = @import("./zap.zig");
+const Lock = zap.sync.os.Lock;
+const spinLoopHint = zap.sync.yieldCpu;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
     continuation: usize,
-    
-    const IS_FRAME = 1;
 
-    /// Initialize a Task which will resume an async frame when scheduled.
+    pub const CallbackFn = fn(*Task) callconv(.C) void;
+
     pub fn init(frame: anyframe) Task {
-        return Task{ .continuation = @ptrToInt(frame) | IS_FRAME };
+        return Task{ .continuation = @ptrToInt(frame) };
     }
 
-    /// The callback function type which represents the task continuation.
-    /// Takes in the thread for cases where tls_current isnt required (i.e. in C).
-    /// tls_current may not be necessary in the future for zig async as well if it ever gets resume arguments?
-    pub const Callbackfn = fn(*Task, *Thread) callconv(.C) void;
-
-    /// Initialize a Task which will invoke the callback when scheduled
     pub fn initCallback(callback: CallbackFn) Task {
-        return Task{ .continuation = @ptrToInt(callback) };
+        return Task{ .continuation = @ptrToInt(callback) | 1 };
     }
 
-    fn execute(self: *Task, thread: *Thread) void {
-        // Since this is a hot-path functions, we should get rid of any checks when decoding the continuation.
-        // These have proven to have enough overhead for the execution of very small tasks.
-
-        if (self.continuation & IS_FRAME != 0) {
-            const frame = blk: {
+    pub fn execute(self: *Task, worker: *Worker) void {
+        if (self.continuation & 1 != 0) {
+            return (blk: {
                 @setRuntimeSafety(false);
-                break :blk @intToPtr(anyframe, self.continuation & ~@as(usize, IS_FRAME));
-            };
-            resume frame;
-            return;
+                break :blk @intToPtr(CallbackFn, self.continuation & ~@as(usize, 1));
+            })(self);
+        } else {
+            resume (blk: {
+                @setRuntimeSafety(false);
+                break :blk @intToPtr(anyframe, self.continuation);
+            });
         }
-
-        const callback_fn = blk: {
-            @setRuntimeSafety(false);
-            break :blk @intToPtr(CallbackFn, self.continuation);
-        };
-        (callback_fn)(self, thread);
     }
-
-    pub const ScheduleHint = struct {
-        fifo: bool = false,
-    };
-
-    pub fn schedule(self: *Task, hint: ScheduleHint) void {
-        self.toBatch().schedule(hint);
-    }
-
-    pub fn fork() void {
-        var task = Task.init(@frame());
-        suspend task.schedule(.{});
-    }
-
-    pub fn yield() void {
-        var task = Task.init(@frame());
-        suspend task.schedule(.{ .fifo = true });
-    }
-
-    pub fn shutdown() void {
-        const thread = Thread.getCurrent();
-        const scheduler = thread.getScheduler();
-        scheduler.shutdown();
-    }
-
-    /// Convert a single Task to a Batch containing only that one Task
-    pub fn toBatch(self: *Task) Batch {
-        self.next = null;
-        return Batch{
-            .head = self,
-            .tail = self,
-        };
-    }
-
-    /// An ordered set of Tasks objects which are scheduled as a unit together.
-    pub const Batch = extern struct {
-        head: ?*Task = null,
-        tail: *Task = undefined,
-        
-        /// Returns true if the Batch contains no Tasks
-        pub fn isEmpty(self: Batch) bool {
-            return self.head == null;
-        }
-
-        /// Push the task to the Batch, defaulting to FIFO ordering.
-        /// This takes ownership of the Task until its consumed/popped.
-        pub fn push(self: *Batch, task: *Task) void {
-            self.pushManyBack(task.toBatch());
-        }
-
-        /// Push a batch of tasks to the front of this batch, consuming the pushed batch.
-        pub fn pushManyFront(self: *Batch, batch: Batch) void {
-            if (self.isEmpty()) {
-                self.* = batch;
-            } else if (!batch.isEmpty()) {
-                batch.tail.next = self.head;
-                self.head = batch.head;
-            }
-        }
-
-        /// Push a batch of tasks to the back of this batch, consuming the pushed batch.
-        pub fn pushManyBack(self: *Batch, batch: Batch) void {
-            if (self.isEmpty()) {
-                self.* = batch;
-            } else if (!batch.isEmpty()) {
-                self.tail.next = batch.head;
-                self.tail = batch.tail;
-            }
-        }
-
-        /// Pop a task from the queue, taking ownership of the dequeued task.
-        /// This dequeues in a FIFO manner.
-        pub fn pop(self: *Batch) ?*Task {
-            return self.popFront();
-        }
-
-        /// Pop a task from the front queue, taking ownership when dequeued. 
-        pub fn popFront(self: *Batch) ?*Task {
-            const task = self.head orelse return null;
-            self.head = task.next;
-            return task;
-        }
-
-        /// Schedule this batch of operations onto the current running Thread/Scheduler.
-        /// This must be called from a function running inside the the Scheduler.
-        /// this also consumes the Batch so it should no longer be used after this operation.
-        pub fn schedule(self: Batch, hint: ScheduleHint) void {
-            if (self.isEmpty())
-                return;
-
-            const thread = Thread.getCurrent();
-            thread.schedule(self, hint);
-        }
-    };
 
     pub const RunConfig = struct {
         threads: usize = 0,
-        allocator: ?*std.mem.Allocator = null,
     };
 
-    /// Get the return type of a function.
-    /// Sad that this isnt in `std.meta`
     fn ReturnTypeOf(comptime asyncFn: anytype) type {
         return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
     }
 
-    /// Run an async function by starting up a task scheduler.
-    /// Once the asyncFn completes, then shutdown the scheduler.
-    pub fn runAsync(
-        run_config: RunConfig,
+    pub fn run(
+        config: RunConfig,
         comptime asyncFn: anytype,
         args: anytype,
     ) !ReturnTypeOf(asyncFn) {
-        return runAsyncWithShutdown(true, run_config, asyncFn, args);
+        return runWithShutdown(config, asyncFn, args, true);
     }
 
-    /// Run an async function by starting up a task scheduler.
-    /// Unlike `runAsync`, the scheduler keeps running until its shutdown manually via `Task.shutdown()`.
-    pub fn runAsyncUntilShutdown(
-        run_config: RunConfig,
+    pub fn runForever(
+        config: RunConfig,
         comptime asyncFn: anytype,
         args: anytype,
     ) !ReturnTypeOf(asyncFn) {
-        return runAsyncWithShutdown(false, run_config, asyncFn, args);
+        return runWithShutdown(config, asyncFn, args, false);
     }
 
-    /// Start the task scheduler using the provided asyncFn as the entry point.
-    /// After the asyncFn completes, then shutdown the scheduler if desired by `shutdown_after`.
-    fn runAsyncWithShutdown(
-        comptime shutdown_after: bool,
-        run_config: RunConfig,
+    fn runWithShutdown(
+        config: RunConfig,
         comptime asyncFn: anytype,
-        args: anytype, 
+        args: anytype,
+        comptime shutdown_after_async_fn: bool,
     ) !ReturnTypeOf(asyncFn) {
-        // wrap the task so that it immediately suspends in order to make a Task for it.
-        // suspend at completion when storing the result as it doesnt need to run the compiler-inserted async exit code.
+        const Args = @TypeOf(args);
+        const ReturnType = ReturnTypeOf(asyncFn);
+
         const Wrapper = struct {
-            fn entry(fn_args: anytype, task: *Task, ret: *?ReturnTypeOf(asyncFn)) void {
+            fn entry(fn_args: Args, task: *Task, result: *?ReturnType) void {
                 suspend task.* = Task.init(@frame());
-                const result = @call(.{}, asyncFn, fn_args);
+                const result_value = @call(.{}, asyncFn, fn_args);
                 suspend {
-                    ret.* = result;
-                    if (shutdown_after) {
+                    result.* = result_value;
+                    if (shutdown_after_async_fn)
                         Task.shutdown();
-                    }
                 }
             }
         };
 
         var task: Task = undefined;
-        var result: ?ReturnTypeOf(asyncFn) = null;
+        var result: ?ReturnType = null;
         var frame = async Wrapper.entry(args, &task, &result);
-        
-        // create a Task for the async function and use that to run.
-        try task.runUntilShutdown(run_config);
 
-        // if theres no result, then the async function never set it so it didn't complete
-        return result orelse error.AsyncFnDeadLocked;
-    }
-
-    pub fn runUntilShutdown(self: *Task, run_config: RunConfig) !void {
-        const num_workers = blk: {
-            if (std.builtin.single_threaded)
-                break :blk 1;
-            if (run_config.threads > 0)
-                break :blk run_config.threads;
-            break :blk (std.Thread.cpuCount() catch 1);
+        const num_threads = blk: {
+            if (std.builtin.single_threaded) {
+                break :blk @as(usize, 1);
+            } else if (config.threads > 0) {
+                break :blk config.threads;
+            } else {
+                break :blk (std.Thread.cpuCount() catch 1);
+            }
         };
 
-        // small worker count optimization
-        const stack_workers = 2048 / @sizeOf(Worker);
-        if (num_workers <= stack_workers) {
-            var workers: [stack_workers]Worker = undefined;
-            return self.runUntilShutdownWithWorkers(workers[0..]);
+        var scheduler: Scheduler = undefined;
+        scheduler.init(num_threads);
+        scheduler.run_queue.push(Batch.from(&task));
+        scheduler.worker_pool.resumeWorker(.{ .use_caller_thread = true });
+
+        return result orelse error.DeadLocked;
+    }
+
+    pub const Batch = struct {
+        head: ?*Task = null,
+        tail: *Task = undefined,
+
+        pub fn isEmpty(self: Batch) bool {
+            return self.head == null;
         }
 
-        const allocator = blk: {
-            if (run_config.allocator) |allocator|
-                break :blk allocator;
-            if (std.builtin.link_libc)
-                break :blk std.heap.c_allocator;
-            break :blk std.heap.page_allocator;
-        };
+        pub fn from(task: *Task) Batch {
+            task.next = null;
+            return Batch{
+                .head = task,
+                .tail = task,
+            };
+        }
 
-        // the only instance of the allocator usage
-        const workers = allocator.alloc(Worker, num_workers);
-        defer allocator.free(workers);
-        return self.runUntilShutdownWithWorkers(workers);
-    }
+        pub fn push(self: *Batch, task: *Task) void {
+            return self.pushMany(Batch.from(task));
+        }
 
-    pub fn runUntilShutdownWithWorkers(self: *Task, workers: []Worker) !void {
-        return Scheduler.run(self, workers);
-    }
-
-    /// Hint to the CPU that it can yield its hardware thread if need be.
-    fn spinLoopHint() void {
-        std.SpinLock.loopHint(1);
-    }
-
-    pub const Worker = struct {
-        ptr: usize,
-
-        const Ptr = union(enum) {
-            idle: u16,
-            spawning: ?*std.Thread,
-            running: *Thread,
-            shutdown: ?*std.Thread,
-
-            fn fromUsize(value: usize) Ptr {
-                if (std.meta.alignment(*std.Thread) < 4)
-                    @compileError("Platform does not support pointer tagging to this granularity");
-
-                return switch (value & 0b11) {
-                    0 => Ptr{ .idle = @truncate(u16, value >> 2) },
-                    1 => Ptr{ .spawning = @intToPtr(?*std.Thread, value & ~@as(usize, 0b11)) },
-                    2 => Ptr{ .running = @intToPtr(*Thread, value & ~@as(usize, 0b11)) },
-                    3 => Ptr{ .shutdown = @intToPtr(?*std.Thread, value & ~@as(usize, 0b11)) },
-                    else => unreachable,
-                };
+        pub fn pushMany(self: *Batch, other: Batch) void {
+            if (other.isEmpty())
+                return;    
+            if (self.isEmpty()) {
+                self.* = other;
+            } else {
+                self.tail.next = other.head;
+                self.tail = other.tail;
             }
+        }
 
-            fn toUsize(self: Ptr) usize {
-                return switch (self) {
-                    .idle => |index| (@as(usize, index) << 2) | 0,
-                    .spawning => |handle| (@ptrToInt(handle) << 2) | 1,
-                    .running => |thread| (@ptrToInt(thread) << 2) | 2,
-                    .shutdown => |handle| (@ptrToInt(handle) << 2) | 3,
-                };
-            }
-        };
+        pub fn pop(self: *Batch) ?*Task {
+            const task = self.head orelse return null;
+            self.head = task.next;
+            return task;
+        }
+
+        pub fn schedule(self: Batch) void {
+            const worker = Worker.current orelse {
+                std.debug.panic("Cannot schedule tasks from outside the thread pool", .{});
+            };
+            worker.schedule(self);
+        }
     };
 
-    pub const Scheduler = struct {
-        workers: []Worker,
-        run_queue: ?*Task,
-        idle_queue: usize,
-        
-        fn run(task: *Task, workers: []Worker) void {
-            // limit the workers so that they fit in Scheduler.idle_queue as indices
-            const max_workers = std.math.maxInt(u16) - 1;
-            const num_workers = @intCast(u16, std.math.min(max_workers, workers.len));
-            if (num_workers == 0)
-                return;
+    pub fn schedule(self: *Task) void {
+        const batch = Batch.from(self);
+        batch.schedule();
+    }
 
-            // in order to run the workers, we need a Scheduler. allocate it on the stack
-            var self = Scheduler {
-                .run_queue = null,
-                .idle_queue = 0,
-                .workers = workers[0..num_workers],
-            };
+    pub fn scheduleNext(self: *Task) void {
+        const worker = Worker.current orelse {
+            std.debug.panic("Cannot yield into a task from outside the thread pool", .{});
+        };
 
-            // safety checks on cleanup
-            defer if (std.debug.runtime_safety) {
-                const idle_queue = @atomicLoad(u32, &self.idle_queue, .Monotonic);
-                if (idle_queue != IDLE_SHUTDOWN)
-                    unreachable; // Scheduler exit when idle queue isn't shutdown
-
-                const run_queue = @atomicLoad(?*Task, &self.run_queue, .Monotonic);
-                if (run_queue != null)
-                    unreachable; // Scheduler exit when run queue isn't empty
-            }
-
-            // link the worker indices together to form a stack where idle_queue references the top index
-            self.idle_queue = num_workers;
-            for (self.workers) |*worker, index| {
-                worker.* = Worker{ .ptr = Worker.Ptr{ .idle = index } };
-            }
-
-            // schedule the task and run a worker thread (using the caller/main thread)
-            self.push(task.toBatch());
-            self.resumeThread(.{ .use_caller = true });
-
-            // for all the std.Thread's that we spawned, wait for them to complete
-            for (self.workers) |*worker| {
-                const worker_ptr_value = @atomicLoad(usize, &worker.ptr, .Acquire);
-                switch (Worker.Ptr.fromUsize(worker_ptr_value)) {
-                    .handle => |thread_handle| {
-                        if (thread_handle) |handle| {
-                            handle.wait();
-                        }
-                    },
-                    else => unreachable,
-                }
-            }
+        if (worker.run_next) |old_next| {
+            worker.schedule(Batch.from(old_next));
         }
 
-        /// Schedule a batch of Tasks to the scheduler from outside a scheduler Thread.
+        worker.run_next = self;
+    }
+
+    pub fn runConcurrently() void {
+        suspend {
+            var task = Task.init(@frame());
+            task.schedule();
+        }
+    }
+
+    pub fn yield() void {
+        const worker = Worker.current orelse {
+            std.debug.panic("Cannot yield from outside the thread pool", .{});
+        };
+
+        worker.run_next = worker.pollTask() orelse return;
+        suspend {
+            var task = Task.init(@frame());
+            worker.push(Batch.from(&task));
+        }
+    }
+
+    pub fn shutdown() void {
+        const worker = Worker.current orelse {
+            std.debug.panic("Cannot shutdown scheduler outside the thread pool", .{});
+        };
+        worker.scheduler.shutdown();
+    }
+
+    pub const Scheduler = struct {
+        run_queue: RunQueue,
+        worker_pool: WorkerPool,
+
+        fn init(self: *Scheduler, max_threads: usize) void {
+            self.run_queue = RunQueue{};
+            self.worker_pool = WorkerPool{ .max = max_threads };
+        }
+
         pub fn schedule(self: *Scheduler, batch: Batch) void {
             if (batch.isEmpty())
                 return;
 
-            self.push(batch);
-            self.resumeThread(.{});
-        }
-        
-        /// Push a batch of tasks onto the Scheduler's run queue
-        fn push(self: *Scheduler, batch: Batch) void {
-            if (batch.isEmpty())
-                return;
-
-            // Simple lock-free stack push
-            // Release memory ordering on success to make the task writes visible to other threads when published
-            var run_queue = @atomicLoad(?*Task, &self.run_queue, .Monotonic);
-            while (true) {
-
-                batch.tail.next = run_queue;
-                const new_run_queue = batch.head;
-
-                run_queue = @cmpxchgWeak(
-                    ?*Task,
-                    &self.run_queue,
-                    run_queue,
-                    new_run_queue,
-                    .Release,
-                    .Monotonic,
-                ) orelse return;
-            }
-        }
-
-        const IDLE_NOTIFIED = 1 << 16;
-        const IDLE_SHUTDOWN = std.math.maxInt(usize);
-        const AbaTag = std.meta.IntType(false, std.meta.bitCount(usize) - 17);
-
-        const ResumeConfig = struct {
-            use_caller: bool = false,
-            is_waking: bool = false,
-        };
-
-        const ResumeType = union(enum) {
-            spawned: u16,
-            resumed: *Thread,
-            notified: void,
-        };
-
-        fn resumeThread(self: *Scheduler, resume_config: ResumeConfig) void {
-            const workers = self.workers;
-            var resume_type: ResumeType = undefined;
-
-            while (true) : (spinLoopHint()) {
-                const idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
-
-                // bail if the scheduler is already shutdown
-                if (idle_queue == IDLE_SHUTDOWN)
-                    return;
-
-                var worker_index = @truncate(u16, idle_queue);
-                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
-                var is_notified = idle_queue & IDLE_NOTIFIED != 0;
-                
-                // if the idle queue is empty, we should leave a notification that we tried to resume().
-                // if not, we could resume(), a thread could suspend(), and then miss our resume request.
-                if (worker_index == 0) {
-                    // if the idle queue is already notified, nothing more we can do if we're not the waking thread.
-                    // if we are the waking thread, then we need to unset the is_notified to signify that we're done waking (see below).
-                    if (is_notified) {
-                        if (resume_config.is_waking) {
-                            is_notified = false;
-                        } else {
-                            return;
-                        }
-                    } else {
-                        if (resume_config.is_waking)
-                            unreachable; // waking thread calling resumeThread() while is_notified is not set.
-                        is_notified = true;
-                    }
-                    resume_type = ResumeType{ .notified = {} };
-
-                // handle the case where theres workers on the idle queue to wake up.
-                } else {
-                    // if the idle queue is notified, it means theres a Thread in the process of waking.
-                    // we shouldn't wake up more threads while a Thread is waking as that would just increase contention.
-                    //
-                    // if we're the waking thread (resume_config.is_waking) and we call resume() it means we found a task.
-                    // a waking thread stops waking either if it found a task after being resumed or it found nothing and suspended.
-                    // If we're the waking thread and we're resuming (we found a task) then we should keep the notified and wake another thread.
-                    if (is_notified and !resume_config.is_waking) {
-                        return;
-                    } else {
-                        is_notified = true;
-                    }
-
-                    const worker = &workers[worker_index - 1];
-                    var worker_ptr = @atomicLoad(usize, &worker.ptr, .Acquire);
-                    switch (Worker.Ptr.fromUsize(worker_ptr)) {
-                        // the worker isnt associated with a thread yet so we should spawn a new one
-                        .idle => |next_index| {
-                            resume_type = ResumeType{ .spawned = worker_index - 1 };
-                            worker_index = next_index;
-                        },
-                        // the worker is being resumed on another thread so our idle_queue is outdated
-                        .spawning => {
-                            continue;
-                        },
-                        // the worker has a running thread, use the thread's next_worker index for the idle_queue link
-                        .running => |thread| {
-                            resume_type = ResumeType{ .resumed = thread };
-                            worker_index = @atomicLoad(u16, &thread.worker_next, .Unordered);
-                        },
-                        // the worker should not be shutdown while another worker is running (e.g. calling resume())
-                        .shutdown => {
-                            unreachable; // worker shutdown when trying to resume it
-                        },
-                    }
-                }
-
-                var new_idle_queue: usize = 0;
-                new_idle_queue |= @as(usize, worker_index);
-                new_idle_queue |= @boolToInt(is_notified) << 16;
-                new_idle_queue |= @as(usize, aba_tag) << 17;
-
-                _ = @cmpxchgWeak(
-                    usize,
-                    &self.idle_queue,
-                    idle_queue,
-                    new_idle_queue,
-                    .Acquire,
-                    .Acquire,
-                ) orelse break;
-            }
-
-            // If we need to wake up a thread, do so
-            // Else we need to spawn a new thread using the worker
-            const worker_index = switch (resume_type) {
-                .notified => {
-                    return;
-                },
-                .spawned => |worker_index| {
-                    const worker_ptr_value = (Worker.Ptr{ .spawning = null }).toUsize();
-                    @atomicStore(usize, &workers[worker_index].ptr, worker_ptr_value, .Monotonic);
-                    break :blk worker_index;
-                },
-                .resumed => |thread| {
-                    thread.sched_state = @ptrToInt(self) | @enumToInt(Thread.State.waking);
-                    thread.notify();
-                    return;
-                },
-            };
-
-            const spawn_info = Thread.SpawnInfo{
-                .scheduler = self,
-                .worker_index = worker_index,
-            };
-
-            // If provided, use the callers stack/OS-thread to run the worker Thread instead of spawning a new one
-            if (resume_config.use_caller) {
-                Thread.run(spawn_info);
-                return;
-            } else if (std.builtin.single_threaded) {
-                unreachable;
-            }
-
-            // Spawn a Thread using the worker info.
-            // Atomically update the worker ptr with the thread handle if it hasn't changed.
-            // If it did change, then it changed to the *Thread itself, so set the thread handle directly onto it.
-            if (std.Thread.spawn(
-                spawn_info,
-                Thread.run,
-            )) |thread_handle| {
-                const worker_ptr = @cmpxchgStrong(
-                    usize,
-                    &workers[worker_index].ptr,
-                    (Worker.Ptr{ .spawning = null }).toUsize(),
-                    (Worker.Ptr{ .spawning = thread_handle }).toUsize(),
-                    .Acquire,
-                    .Acquire,
-                ) orelse return;
-                switch (Worker.Ptr.fromUsize(worker_ptr)) {
-                    .idle => unreachable, // worker still idle when spawning a thread for it
-                    .shutdown => unreachable, // worker shutdown when trying to spawn with it
-                    .spawning => return, // we spawned the thread, our task is complete,
-                    .running => |thread| {
-                        thread.handle = thread_handle;
-                        return;
-                    },
-                }
-            } else |err| {}
-
-            // We failed to spawn an OS thread for this Worker, backtrack our updates
-            // Add the worker back to the idle queue stack
-            var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
-            while (true) {
-                var next_worker_index = @truncate(u16, idle_queue);
-                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
-                var is_notified = idle_queue & IDLE_NOTIFIED != 0;
-                
-                // Link the worker to point to the top worker index of the idle queue.
-                // Unset the notified bit since we were suppose to have this thread be the waking thread.
-                // Then increment the aba tag since its needs to be bumped on every push to the idle queue to be useful.
-                const worker_ptr = (Worker.Ptr{ .idle = next_worker_index }).toUsize();
-                @atomicStore(usize, &workers[worker_index].ptr, worker_ptr, .Unordered);
-                next_worker_index = worker_index + 1;
-                is_notified = false;
-                aba_tag +%= 1;
-
-                var new_idle_queue: usize = 0;
-                new_idle_queue |= @as(usize, worker_index);
-                new_idle_queue |= @boolToInt(is_notified) << 16;
-                new_idle_queue |= @as(AbaTag, aba_tag) << 17;
-
-                // Once we push the worker back to the idle queue, we return as a failed resume() operation.
-                // Release memory ordering on success to ensure that the worker store above is visible on othe resuming threads.
-                _ = @cmpxchgWeak(
-                    usize,
-                    &self.idle_queue,
-                    idle_queue,
-                    new_idle_queue,
-                    .Release,
-                    .Monotonic,
-                ) orelse return;
-            }
-        }
-
-        fn suspendThread(self: *Scheduler, thread: *Thread) bool {
-            var new_thread_state: Thread.State = undefined;
-            const thread_state = @intToEnum(Thread.State, @truncate(u2, thread.sched_state));
-
-            while (true) : (spinLoopHint()) {
-                const idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
-
-                var worker_index = @truncate(u16, idle_queue);
-                var aba_tag = @truncate(AbaTag, idle_queue >> 17);
-                var is_notified = idle_queue & IDLE_NOTIFIED != 0;
-
-                // mark the thread as shutdown if the Scheduler itself was shutdown
-                if (idle_queue == IDLE_SHUTDOWN) {
-                    new_thread_state = Thread.State.shutdown;
-                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
-                    break;
-
-                // unset the notified bit if we're the waking thread and if we're notified 
-                } else if (thread_state == .waking and is_notified) {
-                    new_thread_state = Thread.State.running;
-                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
-                    is_notified = false;
-
-                } else {
-                    new_thread_state = Thread.State.suspended;
-                    thread.sched_state = @ptrToInt(self) | @enumToInt(new_thread_state);
-                    @atomicStore(u16, &thread.worker_next, worker_index, .Unordered);
-                    worker_index = thread.worker_index + 1;
-                    aba_tag +%= 1;
-                }
-
-                var new_idle_queue: usize = 0;
-                new_idle_queue |= @as(usize, worker_index);
-                new_idle_queue |= @boolToInt(is_notified) << 16;
-                new_idle_queue |= @as(AbaTag, aba_tag) << 17;
-
-                _ = @cmpxchgWeak(
-                    usize,
-                    &self.idle_queue,
-                    idle_queue,
-                    new_idle_queue,
-                    .Release,
-                    .Monotonic,
-                ) orelse break;
-            }
-
-            switch (new_thread_state) {
-                .shutdown => return false,
-                .running, .waking => return true,
-                .suspended => {
-                    thread.wait();
-                    switch (@intToEnum(Thread.State, @truncate(u2, thread.sched_state))) {
-                        .shutdown => return false,
-                        .waking => return true,
-                        .suspended => unreachable, // Thread still suspended after .wait()
-                        .running => unreachable, // Thread is running after .wait() (should be waking)
-                    }
-                },
-            }
+            self.run_queue.push(batch);
+            self.worker_pool.resumeWorker(.{});
         }
 
         pub fn shutdown(self: *Scheduler) void {
-            const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
-            if (idle_queue == IDLE_SHUTDOWN)
-                return;
-
-            const workers = self.workers;
-            var worker_index = @truncate(u6, idle_queue);
-
-            while (worker_index != 0) {
-                const worker = 
-            }
+            const worker = Worker.current orelse {
+                std.debug.panic("cannot shutdown a Scheduler from outside the thread pool", .{});
+            };
+            self.worker_pool.shutdown(worker);
         }
+
+        const RunQueue = struct {
+            lock: Lock = Lock{},
+            tasks: Batch = Batch{},
+
+            fn push(self: *RunQueue, batch: Batch) void {
+                if (batch.isEmpty())
+                    return;
+
+                self.lock.acquire();
+                defer self.lock.release();
+
+                self.tasks.pushMany(batch);
+            }
+
+            fn popInto(noalias self: *RunQueue, noalias run_queue: *Worker.RunQueue) ?*Task {
+                self.lock.acquire();
+
+                const first_task = self.tasks.pop() orelse {
+                    self.lock.release();
+                    return null;
+                };
+
+                var migrated = Batch{};
+                var steal = run_queue.buffer.len;
+                while (steal != 0) : (steal -= 1) {
+                    const task = self.tasks.pop() orelse break;
+                    migrated.push(task);
+                }
+
+                self.lock.release();
+                
+                const overflowed = run_queue.push(migrated);
+                assert(overflowed == null);
+                return first_task;
+            } 
+        };
+
+        const WorkerPool = struct {
+            lock: Lock = Lock{},
+            max: usize,
+            running: usize = 0,
+            active_head: ?*Worker = null,
+            idle_queue: IdleQueue = IdleQueue{},
+            shutdown_event: std.AutoResetEvent = std.AutoResetEvent{},
+            is_shutdown: bool = false,
+            is_waking: bool = false,
+            is_notified: bool = false,
+
+            const IdleQueue = struct {
+                head: ?*Worker = null,
+                
+                fn isEmpty(self: IdleQueue) bool {
+                    return self.head == null;
+                }
+
+                fn push(self: *IdleQueue, worker: *Worker) void {
+                    worker.next = self.head;
+                    self.head = worker;
+                }
+
+                fn pop(self: *IdleQueue) ?*Worker {
+                    const worker = self.head orelse return null;
+                    self.head = worker.next;
+                    return worker;
+                }
+            };
+
+            const ResumeContext = struct {
+                is_waking: bool = false,
+                use_caller_thread: bool = false,
+            };
+
+            fn resumeWorker(self: *WorkerPool, context: ResumeContext) void {
+                self.lock.acquire();
+                var retries: usize = 3;
+                
+                while (true) {
+                    if (self.is_shutdown) {
+                        self.lock.release();
+                        return;
+                    }
+
+                    if (!context.is_waking and self.is_waking) {
+                        self.is_notified = true;
+                        self.lock.release();
+                        return;
+                    }
+
+                    if (self.running == self.max and self.idle_queue.isEmpty()) {
+                        if (context.is_waking) {
+                            self.is_waking = false;
+                        } else {
+                            self.is_notified = true;
+                        }
+                        self.lock.release();
+                        return;
+                    }
+
+                    if (self.idle_queue.pop()) |worker| {
+                        assert(!std.builtin.single_threaded);
+                        self.is_waking = true;
+                        self.lock.release();
+
+                        assert(worker.state == .suspended);
+                        worker.state = .waking;
+                        worker.event.set();
+                        return;
+                    }
+
+                    @atomicStore(usize, &self.running, self.running + 1, .Monotonic);
+                    self.is_waking = true;
+                    self.lock.release();
+
+                    var spawn = Worker.Spawn{
+                        .lock = Lock{},
+                        .scheduler = @fieldParentPtr(Scheduler, "worker_pool", self),
+                        .state = .{ .empty = {} },
+                    };
+
+                    if (context.use_caller_thread) {
+                        Worker.run(&spawn);
+                        return;
+                    }
+
+                    if (std.builtin.single_threaded)
+                        unreachable; // single threaded mode trying to spawn a thread
+                        
+                    var spawner = Worker.Spawn.Spawner{};
+                    spawn.state = .{ .spawning = {} };
+
+                    if (std.Thread.spawn(&spawn, Worker.run)) |thread| {
+                        spawn.lock.acquire();
+                        return switch (spawn.state) {
+                            .spawning => {
+                                spawn.state = .{ .spawned = &spawner };
+                                spawner.thread = thread;
+                                spawn.lock.release();
+                                spawner.event.wait();
+                            },
+                            .waiting => |worker| {
+                                worker.thread = thread;
+                                worker.event.set();
+                            },
+                            else => unreachable // invalid spawn state
+                        };
+                    } else |err| {}
+
+                    self.lock.acquire();
+                    @atomicStore(usize, &self.running, self.running - 1, .Monotonic);
+                    self.is_waking = false;
+
+                    if (self.is_notified) {
+                        self.is_notified = false;
+                        if (retries != 0) {
+                            retries -= 1;
+                            continue;
+                        }
+                    }
+
+                    self.lock.release();
+                    return;
+                }
+            }
+
+            fn suspendWorker(self: *WorkerPool, worker: *Worker) void {
+                self.lock.acquire();
+
+                if (self.is_shutdown) {
+                    worker.state = .shutdown;
+                    self.lock.release();
+                    return;
+                }
+
+                if (worker.state == .waking and self.is_notified) {
+                    self.is_notified = false;
+                    self.lock.release();
+                    return;
+                }
+
+                if (worker.state == .waking) {
+                    assert(self.is_waking);
+                    self.is_waking = false;
+                }
+
+                worker.state = .suspended;
+                self.idle_queue.push(worker);
+                self.lock.release();
+
+                worker.event.wait();
+            }
+
+            fn shutdown(self: *WorkerPool, worker: *Worker) void {
+                self.lock.acquire();
+
+                if (self.is_shutdown) {
+                    self.lock.release();
+                    return;
+                }
+
+                self.is_shutdown = true;
+                var idle_queue = self.idle_queue;
+                self.idle_queue = IdleQueue{};
+                self.lock.release();
+
+                while (idle_queue.pop()) |idle_worker| {
+                    idle_worker.state = .shutdown;
+                    idle_worker.event.set();
+                }
+            }
+
+            fn onWorkerBegin(self: *WorkerPool, worker: *Worker) void {
+                var active_head = @atomicLoad(?*Worker, &self.active_head, .Monotonic);
+                while (true) {
+                    worker.active_next = active_head;
+                    active_head = @cmpxchgWeak(
+                        ?*Worker,
+                        &self.active_head,
+                        active_head,
+                        worker,
+                        .Release,
+                        .Monotonic,
+                    ) orelse break;
+                }
+            }
+
+            fn onWorkerEnd(self: *WorkerPool, worker: *Worker) void {
+                self.lock.acquire();
+
+                self.idle_queue.push(worker);
+                @atomicStore(usize, &self.running, self.running - 1, .Monotonic);
+                const last_worker = self.running == 0;
+                self.lock.release();
+
+                if (last_worker) {
+                    self.shutdown_event.set();
+                }
+
+                if (worker.thread != null) {
+                    worker.event.wait();
+                    return;
+                }
+
+                self.shutdown_event.wait();
+
+                self.lock.acquire();
+                var idle_workers = self.idle_queue;
+                self.idle_queue = IdleQueue{};
+                self.lock.release();
+
+                while (idle_workers.pop()) |idle_worker| {
+                    if (idle_worker.thread) |thread| {
+                        idle_worker.event.set();
+                        thread.wait();
+                    }
+                }
+            }
+        };
     };
 
-    pub const Thread = struct {
-        runq_head: u8,
-        runq_tail: u8,
-        runq_next: ?*Task,
-        runq_overflow: ?*Task,
-        run_queue: [256]*Task,
-        sched_state: usize,
-        handle: ?*std.Thread,
+    pub const Worker = struct {
+        state: State,
+        next: ?*Worker,
+        target: ?*Worker,
+        active_next: ?*Worker,
+        thread: ?*std.Thread,
+        scheduler: *Scheduler,
         event: std.AutoResetEvent,
-        worker_index: u16,
-        worker_next: u16,
-        xorshift: u32,
+        run_next: ?*Task,
+        run_queue: RunQueue,
 
-        const State = enum(u2) {
-            running,
+        const State = enum {
             waking,
+            running,
             suspended,
             shutdown,
         };
 
-        const SpawnInfo = struct {
+        const Spawn = struct {
+            lock: Lock,
             scheduler: *Scheduler,
-            worker_index: u16,
-        };
+            state: SpawnState,
 
-        // the entry point for a worker thread in the Scheduler 
-        fn run(spawn_info: SpawnInfo) void {
-            const scheduler = spawn_info.scheduler;
-            const worker_index = spawn_info.worker_index;
-            
-            // allocate the Thread object on the OS thread's stack.
-            var self = Thread {
-                .runq_head = 0,
-                .runq_tail = 0,
-                .runq_overflow = null,
-                .run_queue = buffer,
-                .sched_state = @ptrToInt(scheduler) | @enumToInt(State.waking),
-                .handle = null,
-                .event = std.AutoResetEvent{},
-                .worker_index = worker_index,
-                .worker_next = undefined,
-                .xorshift = seed: {
-                    var ptr = @ptrToInt(scheduler) + worker_index;
-                    ptr = (13 * ptr) ^ (ptr >> 15);
-                    break :seed @truncate(u32, ptr);
-                },
+            const Spawner = struct {
+                thread: *std.Thread = undefined,
+                event: std.AutoResetEvent = std.AutoResetEvent{},
             };
 
-            // Ensure that the tls_current points to our thread.
-            // Restore the old value to support nested threads running if that ever needs to happen.
-            const old_tls_current = tls_current;
-            tls_current = &self;
-            defer tls_current = old_tls_current;
+            const SpawnState = union(enum) {
+                empty: void,
+                spawning: void,
+                spawned: *Spawner,
+                waiting: *Worker, 
+            };
+        };
 
-            {
-                // The worker.ptr should be a Ptr{ .spawning = ?*std.Thread }
-                // We swap it with Ptr{ .running = *Thread } to indicate to other workers that our thread is ready & running.
-                // If the spawning ?*std.Thread is not null, then the spawner set it first so we store it in our .handle field.
-                // If its null, then we updated the worker ptr first so the spawner will see our Thread ptr and store the .handle field itself.
-                //
-                // An Acquire-Release (AcqRel) barrier is used for the swap operation:
-                // - Acquire barrier to ensure valid pointer writes to the *std.Thread if there is any
-                // - Release barrier to ensure other threads see our Thread writes above when seeing that we're running (using an Acquire load).
-                const worker = &scheduler.workers[worker_index];
-                const worker_ptr_value = (Worker.Ptr{ .running = &self }).toUsize();
-                const new_worker_ptr_value = @atomicRmw(usize, worker.ptr, .Xchg, worker_ptr_value, .AcqRel);
+        threadlocal var current: ?*Worker = null;
 
-                switch (Worker.Ptr.fromUsize(new_worker_ptr_value)) {
-                    .idle => unreachable, // the worker should be spawning 
-                    .running => unreachable, // the worker shouldn't be associated with another thread but ours
-                    .shutdown => unreachable, // our thread is just started, the worker shouldn't be finishing
-                    .spawning => |thread_handle_ptr| {
-                        if (@intToPtr(?*std.Thread, thread_handle_ptr)) |thread_handle| {
-                            self.handle = thread_handle;
-                        }
-                    }
-                }
+        fn run(spawn: *Spawn) void {
+            var self = Worker{
+                .state = .waking,
+                .next = null,
+                .target = null,
+                .active_next = null,
+                .thread = null,
+                .scheduler = spawn.scheduler,
+                .event = std.AutoResetEvent{},
+                .run_next = null,
+                .run_queue = RunQueue{},
+            };
+
+            const old_current = Worker.current;
+            Worker.current = &self;
+            defer Worker.current = old_current;
+
+            spawn.lock.acquire();
+            switch (spawn.state) {
+                .empty => {},
+                .waiting => unreachable, // more than one thread on a Worker.Spawn
+                .spawning => {
+                    std.debug.assert(!std.builtin.single_threaded);
+                    spawn.state = .{ .waiting = &self };
+                    spawn.lock.release();
+                    self.event.wait();
+                },
+                .spawned => |spawner| {
+                    std.debug.assert(!std.builtin.single_threaded);
+                    self.thread = spawner.thread;
+                    spawner.event.set();
+                },
             }
 
-            // Safety checks on cleanup 
-            defer if (std.debug.runtime_safety) {
-                const runq_tail = self.runq_tail;
-                const runq_head = @atomicLoad(u8, &self.runq_head, .Monotonic);
-                if (runq_tail != runq_head)
-                   unreachable; // Thread exit with run_queue is not empty
-
-                const runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
-                if (runq_overflow != null)
-                    unreachable; // Thread exit with non empty runq overflow
-
-                const runq_next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
-                if (runq_next != null)
-                    unreachable; // Thread exit with non empty runq next
-            }
+            self.scheduler.worker_pool.onWorkerBegin(&self);
+            defer self.scheduler.worker_pool.onWorkerEnd(&self);
 
             while (true) {
-                if (self.pop()) |task| {
-                    task.execute();
+                if (self.pollTask()) |task| {
+                    task.execute(&self);
                     continue;
                 }
 
-                if (!scheduler.suspendThread(&self))
-                    break;
-            }
-        }
+                self.scheduler.worker_pool.suspendWorker(&self);
 
-        /// Block execution of the calling thread until signalled on another thread via `notify()`.
-        fn wait(self: *Thread) void {
-            self.event.wait();
-        }
-
-        /// Wake-up the provided thread if its execution is blocked on a call to `wait()`.
-        fn notify(self: *Thread) void {
-            self.event.set();
-        }
-
-        threadlocal var tls_current: ?*Thread = null;
-
-        /// Get a reference to current thread.
-        /// This goes through the thread local above as zig async doesnt have resume arguments / poll contexes.
-        pub fn getCurrent() *Thread {
-            return tls_current orelse unreachable; // Caller not running inside a Scheduelr thread
-        }
-
-        /// Return the scheduler that this thread belongs to.
-        pub fn getScheduler() *Scheduler {
-            @setRuntimeSafety(false);
-            return @intToPtr(*Scheduler, self.sched_state ~@as(usize, 0b11));
-        }
-
-        /// Schedule a batch of tasks for execution available to the Scheduler that this Thread is apart of.
-        pub fn schedule(self: *Thread, batch: Batch, hint: ScheduleHint) void {
-            if (batch.isEmpty())
-                return;
-
-            self.push(batch, !hint.fifo);
-            self.getScheduler().resumeThread(.{});
-        }
-
-        /// Push a batch of tasks to the local run queues of the caller Thread.
-        /// When tasks are made available to other threads there is a Release memory barrier.
-        /// That it to ensure the Task writes (e.g. the continuation) is correctly read when its stolen.
-        fn push(self: *Thread, batch: Batch, push_next: bool) void {
-            var tasks = batch;
-            var tail = self.runq_tail;
-
-            while (!tasks.isEmpty()) {
-                // Try to push to the "next" slot of the run queue which is polled first as a LIFO mechanism 
-                if (push_next) {
-                    if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
-                        const next = tasks.pop().?;
-                        @atomicStore(?*Task, &self.runq_next, next, .Release);
-                        continue;
-                    }
-                }
-
-                // Push to the local run_queue buffer if its not empty.
-                var head = @atomicLoad(u8, &self.runq_head, .Monotonic);
-                const size = tail -% head;
-                var remaining = self.run_queue.len - size;
-                if (remaining != 0) {
-
-                    while (remaining != 0) : (remaining -= 1) {
-                        const task = tasks.pop() orelse break;
-                        @atomicStore(*Task, &self.run_queue[tail % self.run_queue.len], task, .Unordered);
-                        overflowed.push(task);;
-                        tail +%= 1;
-                        break :blk overflowed;
-                    }
-
-                    @atomicStore(u8, &self.runq_tail, tail, .Release);
-                    continue;
-                }
-
-                // The run_queue buffer is full, try to move half of it to the overflow queue.
-                // This will make future pushes go through the fast path above.
-                // The fast path to the buffer only requires an atomic store while this path requires cmpxchg.
-                // Atomic loads/stores to aligned values on most modern platforms (e.g. arm, x86) has no synchronization.
-                //
-                // Acquire memory barrier on success to ensure that the task reads & updates in the migration
-                //   dont happen before the migrating steal has been confirmed/committed.
-                const migrate = self.run_queue.len / 2;
-                const new_head = head +% migrate;
-                if (@cmpxchgWeak(
-                    u8,
-                    &self.runq_head,
-                    head,
-                    new_head,
-                    .Acquire,
-                    .Monotonic,
-                )) |_| {
-                    spinLoopHint();
-                    continue;
-                }
-
-                // Prepend the migrated tasks to the existing task batch
-                tasks.pushMany(blk: {
-                    var overflowed = Batch{};
-                    while (head != new_head) : (head +%= 1) {
-                        const task = @atomicLoad(*Task, &self.run_queue[head % self.run_queue.len], .Unordered);
-                        overflowed.push(task);
-                    }
-                    break :blk overflowed;
-                });
-
-                // then push the entire remaining batch to the overflow queue
-                var runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
-                while (true) {
-                    tasks.tail.next = runq_overflow;
-                    const new_runq_overflow = tasks.head;
-
-                    // if the overflow stack is empty, we can just store to it instead of cmpxchg.
-                    // This is because we are the only producer thread.
-                    if (runq_overflow == null) {
-                        @atomicStore(?*Task, &self.runq_overflow, new_runq_overflow, .Release);
-                        return;
-                    }
-
-                    runq_overflow = @cmpxchgWeak(
-                        ?*Task,
-                        &self.runq_overflow,
-                        runq_overflow,
-                        new_runq_overflow,
-                        .Release,
-                        .Monotonic,
-                    ) orelse return;
+                switch (self.state) {
+                    .shutdown => break,
+                    .waking, .running => {},
+                    .suspended => unreachable, // worker running when suspended
                 }
             }
         }
 
-        /// Using the provided Thread, finds and dequeues a runnable task in the scheduler.
-        fn pop(self: *Thread) ?*Task {
-            var did_inject = false;
-            const is_waking = @enumToInt(State, @truncate(u2, self.sched_state)) == .waking;
-            
-            // look for a thread to run
-            const task = self.poll(&did_inject) orelse return;
+        fn pollTask(self: *Worker) ?*Task {
+            const task = self.findTask() orelse return null;
 
-            // we should do a resume call if poll() added more tasks or if we're the waking thread.
-            // if we're the waking thread, we need to either stop waking or wake another thread as the waking thread.
-            // if we injected tasks into our run queue, then it means others may have failed to steal when we were injecting.
-            if (is_waking or did_inject) {
-                self.getScheduler().resumeThread(.{ .is_waking = is_waking });
-                self.sched_state &= ~@as(usize, 0b11);
-                self.sched_state |= @enumToInt(State.running);
+            if (self.state == .waking) {
+                self.scheduler.worker_pool.resumeWorker(.{ .is_waking = true });
+                self.state = .running;
             }
-            
+
             return task;
         }
 
-        /// Poll for and dequeue a runnable Task from the Scheduler.
-        /// Checks multiple layers of task run queues similar to a caching system. 
-        fn poll(self: *Thread, did_inject: *bool) ?*Task {
-            // TODO: check timers and maybe check IO if any
-
-            // check our local queue first for tasks since this is fastest
-            if (self.pollSelf(did_inject)) |task| {
+        fn findTask(self: *Worker) ?*Task {
+            if (self.run_next) |next_task| {
+                const task = next_task;
+                self.run_next = null;
                 return task;
             }
 
-            // our local queue is empty, check the scheduler for any new work
-            const scheduler = self.getScheduler();
-            if (self.pollScheduler(scheduler, did_inject)) |task| {
+            if (self.run_queue.pop()) |task| {
                 return task;
             }
-            
-            // Iterate over the workers array from the scheduler starting at a random point.
-            // This is just a tiny way to limit contention when stealing from other threads.
-            const workers = scheduler.workers;
-            var index = blk: {
-                var x = self.xorshift;
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                self.xorshift = x;
-                break :blk (x % workers.len);
-            };
 
-            var i: usize = workers.len;
-            while (i != 0) : (i -= 1) {
-                const worker = &workers[index];
-                index = if (index == workers.len - 1) 0 else index + 1;
-                
-                // Try to steal from the Thread associated with this worker if it has any.
-                // 
-                // Acquire barrier in order to ensure we see valid memory from the threads.
-                // note: There is a matching Release barrier on Thread creation which stores .running.
-                const worker_ptr_value = @atomicLoad(usize, &worker.ptr, .Acquire);
-                switch (Worker.Ptr.fromUsize(worker_ptr_value)) {
-                    .idle, .spawning => {}, // skip idle/spawning workers as we cant steal anything from them
-                    .shutdown => unreachable, // no worker should be shutdown while any worker thread is running
-                    .running => |thread| {
-                        if (thread == self)
-                            continue; // we can't steal from ourselves.
-                        if (self.pollOtherThread(thread, did_inject)) |task| {
-                            return task;
-                        } 
-                    },
+            const global_queue = &self.scheduler.run_queue;
+            const worker_pool = &self.scheduler.worker_pool;
+
+            var attempts: usize = 2;
+            while (attempts > 0) : (attempts -= 1) {
+
+                var active = @atomicLoad(usize, &worker_pool.running, .Monotonic);
+                while (active != 0) : (active -= 1) {
+
+                    const target = self.target orelse blk: {
+                        const target = @atomicLoad(?*Worker, &worker_pool.active_head, .Acquire);
+                        self.target = target;
+                        break :blk target orelse unreachable; // no active_head when trying to steal
+                    };
+
+                    self.target = @atomicLoad(?*Worker, &target.active_next, .Acquire);
+                    if (target == self)
+                        continue;
+
+                    if (self.run_queue.steal(&target.run_queue)) |task| {
+                        return task;
+                    }
                 }
             }
 
-            // If we couldn't find any Tasks in ours and other Thread's run queues, then poll the Scheduler's run queue again.
-            // This is the last ditch effort before giving up on search.
-            if (self.pollScheduler(scheduler, did_inject)) |task| {
+            if (global_queue.popInto(&self.run_queue)) |task| {
                 return task;
             }
 
-            // no tasks were actually found runnable on the system
             return null;
         }
 
-        /// Poll for tasks that live in the local run queues of the Thread.
-        fn pollSelf(self: *Thread, did_inject: *bool) ?*Task {
-            // always check the "next" slot first for LIFO scheduling
-            if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) != null) {
-                if (@atomicRmw(?*Task, &self.runq_next, .Xchg, null, .Acquire)) |task| {
+        fn schedule(self: *Worker, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            self.push(batch);
+            self.scheduler.worker_pool.resumeWorker(.{});
+        }
+
+        fn push(self: *Worker, batch: Batch) void {
+            if (self.run_queue.push(batch)) |overflowed| {
+                self.scheduler.run_queue.push(overflowed);
+            }
+        }
+
+        const RunQueue = struct {
+            head: usize = 0,
+            tail: usize = 0,
+            next: ?*Task = null,
+            buffer: [256]*Task = undefined,
+
+            fn push(self: *RunQueue, tasks: Batch) ?Batch {
+                var batch = tasks;
+                var tail = self.tail;
+                var head = @atomicLoad(usize, &self.head, .Monotonic);
+        
+                while (true) {
+                    if (batch.isEmpty())
+                        return null;
+
+                    if (@atomicLoad(?*Task, &self.next, .Monotonic) == null) {
+                        const task = batch.pop() orelse unreachable; // !batch.isEmpty() but failed pop
+                        @atomicStore(?*Task, &self.next, task, .Release);
+                        continue;
+                    }
+
+                    var size = tail -% head;
+                    if (size < self.buffer.len) {
+                        while (size < self.buffer.len) : (size += 1) {
+                            const task = batch.pop() orelse break;
+                            @atomicStore(*Task, &self.buffer[tail % self.buffer.len], task, .Unordered);
+                            tail +%= 1;
+                        }
+                        @atomicStore(usize, &self.tail, tail, .Release);
+                        head = @atomicLoad(usize, &self.head, .Monotonic);
+                        continue;
+                    }
+
+                    const new_head = head +% (self.buffer.len / 2);
+                    if (@cmpxchgWeak(
+                        usize,
+                        &self.head,
+                        head,
+                        new_head,
+                        .Monotonic,
+                        .Monotonic,
+                    )) |updated_head| {
+                        head = updated_head;
+                        continue;
+                    }
+
+                    var overflowed = Batch{};
+                    while (head != new_head) : (head +%= 1)
+                        overflowed.push(self.buffer[head % self.buffer.len]);
+                    overflowed.pushMany(batch);
+                    return overflowed;
+                }
+            }
+
+            fn pop(self: *RunQueue) ?*Task {
+                var next_task = @atomicLoad(?*Task, &self.next, .Monotonic);
+                while (next_task) |task| {
+                    next_task = @cmpxchgWeak(
+                        ?*Task,
+                        &self.next,
+                        next_task,
+                        null,
+                        .Monotonic,
+                        .Monotonic,
+                    ) orelse return task;
+                }
+
+                var tail = self.tail;
+                var head = @atomicLoad(usize, &self.head, .Monotonic);
+
+                while (true) {
+                    if (tail == head)
+                        return null;
+
+                    if (@cmpxchgWeak(
+                        usize,
+                        &self.head,
+                        head,
+                        head +% 1,
+                        .Monotonic,
+                        .Monotonic,
+                    )) |updated_head| {
+                        head = updated_head;
+                        continue;
+                    }
+
+                    const task = self.buffer[head % self.buffer.len];
                     return task;
                 }
             }
 
-            // check the local run_queue buffer for tasks
-            const tail = self.runq_tail;
-            var head = @atomicLoad(u8, &self.runq_head, .Monotonic);
-            while (tail != head) {
-                head = @cmpxchgWeak(
-                    u8,
-                    &self.runq_head,
-                    head,
-                    head +% 1,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse return @atomicLoad(*Task, &self.run_queue[head % self.run_queue.len], .Unordered);
-            }
+            fn steal(noalias self: *RunQueue, noalias target: *RunQueue) ?*Task {
+                var tail = self.tail;
+                var head = @atomicLoad(usize, &self.head, .Monotonic);
+                std.debug.assert(tail == head);
 
-            // both the "next" slot and the local run_queue buffer are empty.
-            // try to poll from and inject the runq_overflow stack into the run_queue buffer.
-            var runq_overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
-            while (runq_overflow) |top_task| {
-                runq_overflow = @cmpxchgWeak(
-                    ?*Task,
-                    &self.runq_overflow,
-                    runq_overflow,
-                    null,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse {
-                    self.inject(top_task.next, did_inject);
-                    return top_task;
-                };
-            }
+                var target_head = @atomicLoad(usize, &target.head, .Monotonic);
+                while (true) {
+                    const target_tail = @atomicLoad(usize, &target.tail, .Acquire);
 
-            // all the Thread local run queues are empty
-            return null;
-        }
-
-        /// Poll for tasks on the given Thread's Scheduler.
-        /// This touches resources generally shared by all threads.
-        fn pollScheduler(
-            noalias self: *Thread,
-            noalias scheduler: *Scheduler,
-            noalias did_inject: *bool,
-        ) ?*Task {
-            var run_queue = @atomicLoad(?*Task, &scheduler.run_queue, .Monotonic);
-            while (run_queue) |top_task| {
-                
-                // steal the entire stack from the Scheduler's run_queue in one go.
-                // This amortizes the cost of the cmpxchg as other threads will bail on the load above.
-                // Acquire barrier in order for us to see any Task writes in the stack when we steal it.
-                run_queue = @cmpxchgWeak(
-                    ?*Task,
-                    &scheduler.run_queue,
-                    run_queue,
-                    null,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse {
-                    self.inject(top_task.next, did_inject);
-                    return top_task;
-                };
-            }
-
-            // the Scheduler's run_queue stack was empty
-            return null;
-        }
-
-        /// Poll for tasks from another Thread and move them into our Thread.
-        /// This acts as the main work-stealing algorithm.
-        fn pollOtherThread(
-            noalias self: *Thread,
-            noalias target: *Thread,
-            noalias did_inject: *bool,
-        ) ?*Task {
-            const tail = self.runq_tail;
-            if (std.debug.runtime_safety) {
-                const head = @atomicLoad(u8, &self.runq_head, .Monotonic);
-                const size = tail -% head;
-                if (size != 0) {
-                    unreachable; // Thread stealing from another when local run queue isn't empty
-                }
-            }
-
-            while (true) : (spinLoopHint()) {
-                const target_head = @atomicLoad(u8, &target.runq_head, .Acquire);
-                const target_tail = @atomicLoad(u8, &target.runq_tail, .Acquire);
-
-                // check the size of the target's run queue, and retry if we loaded invalid head/tail combo
-                const target_size = target_tail -% target_head;
-                if (target_size > target.run_queue.len)
-                    continue;
-
-                // try to steal half of the tasks from the target's run queue
-                var steal_size = target_size - (target_size / 2);
-                if (steal_size == 0) {
-
-                    // the target's run queue is empty, try to steal from its overflow stack
-                    if (@atomicLoad(?*Task, &target.runq_overflow, .Monotonic) != null) {
-                        if (@atomicRmw(?*Task, &target.runq_overflow, .Xchg, null, .Acquire)) |top_task| {
-                            self.inject(top_task.next, did_inject);
-                            return top_task;
-                        }
+                    const target_size = target_tail -% target_head;
+                    if (target_size > target.buffer.len) {
+                        spinLoopHint(1);
+                        target_head = @atomicLoad(usize, &target.head, .Monotonic);
+                        continue;
                     }
 
-                    // the target's run queue and overflow stack are empty, try to steal from its LIFO "next" slot.
-                    // This is really a last resort as the "next" slot is generally meant to be run on the owning Thread.
-                    if (@atomicLoad(?*Task, &target.runq_next, .Monotonic) != null) {
-                        spinLoopHint();
-                        if (@atomicRmw(?*Task, &target.runq_next, .Xchg, null, .Acquire)) |task| {
-                            return task;
-                        }
+                    var num_steal = target_size - (target_size / 2);
+                    if (num_steal == 0) {
+                        const next_task = @atomicLoad(?*Task, &target.next, .Monotonic) orelse return null;
+                        _ = @cmpxchgWeak(
+                            ?*Task,
+                            &target.next,
+                            next_task,
+                            null,
+                            .Acquire,
+                            .Monotonic,
+                        ) orelse return next_task;
+                        
+                        spinLoopHint(1);
+                        target_head = @atomicLoad(usize, &target.head, .Monotonic);
+                        continue;
+                    }
+                    
+                    const first_task = @atomicLoad(*Task, &target.buffer[target_head % target.buffer.len], .Unordered);
+                    var new_target_head = target_head +% 1;
+                    var new_tail = tail;
+                    num_steal -= 1;
+
+                    while (num_steal > 0) : (num_steal -= 1) {
+                        const task = @atomicLoad(*Task, &target.buffer[new_target_head % target.buffer.len], .Unordered);
+                        new_target_head +%= 1;
+                        @atomicStore(*Task, &self.buffer[new_tail % self.buffer.len], task, .Unordered);
+                        new_tail +%= 1;
                     }
 
-                    // the Thread is really empty
-                    break;
-                }
+                    if (@cmpxchgWeak(
+                        usize,
+                        &target.head,
+                        target_head,
+                        new_target_head,
+                        .Monotonic,
+                        .Monotonic,
+                    )) |updated_target_head| {
+                        target_head = updated_target_head;
+                        continue;
+                    }
 
-                // we will be returning the first task stolen
-                const first_task = @atomicLoad(*Task, &target.run_queue[target_head % target.runq_queue.len], .Unordered);
-                var new_target_head = target_head +% 1;
-                steal_size -= 1;
-
-                // prepare to racy read & steal (copy from theirs to ours) from the target's run queue buffer.
-                // we cannot write to these tasks as we dont actually have ownership of the tasks were reading yet until the cmpxchg.
-                var new_tail = tail;
-                while (steal_size != 0) : (steal_size -= 1) {
-                    const task = @atomicLoad(*Task, &target.run_queue[new_target_head % target.runq_queue.len], .Unordered);
-                    new_target_head +%= 1;
-                    @atomicStore(*Task, &self.run_queue[new_tail % self.runq_queue.len], task, .Unordered);
-                    new_tail +%= 1;
+                    if (tail != new_tail)
+                        @atomicStore(usize, &self.tail, new_tail, .Release);
+                    return first_task;
                 }
-
-                // Try to commit that we stole the tasks from the target's run queue buffer.
-                // Acquire barrier to ensure that when we succeed, we see valid Task writes and have ownership of the stolen Tasks.
-                // There are matching Release barriers on the target_tail for when the tasks are put into the queue. 
-                if (@cmpxchgWeak(
-                    u8,
-                    &target.runq_head,
-                    target_head,
-                    new_target_head,
-                    .Acquire,
-                    .Monotonic,
-                )) |_| {
-                    continue;
-                }
-                
-                // If we copied tasks into our run queue buffer, then make them available to other threads.
-                if (new_tail != tail) {
-                    @atomicStore(u8, &self.runq_tail, new_tail, .Release);
-                }
-
-                did_inject.* = true;
-                return first_task;
             }
+        };
+    };
 
-            // There were no task found on the Thread
-            return null;
+    pub const AutoResetEvent = struct {
+        state: usize = EMPTY,
+
+        const EMPTY = 0;
+        const NOTIFIED = 1;
+
+        pub fn wait(self: *AutoResetEvent) void {
+            var task = Task.init(@frame());
+            var state = @atomicLoad(usize, &self.state, .Acquire);
+
+            suspend {
+                while (true) {
+                    switch (state) {
+                        EMPTY => state = @cmpxchgWeak(
+                            usize,
+                            &self.state,
+                            EMPTY,
+                            @ptrToInt(&task),
+                            .Release,
+                            .Acquire,
+                        ) orelse break,
+                        NOTIFIED => {
+                            @atomicStore(usize, &self.state, EMPTY, .Monotonic);
+                            return task.scheduleNext();
+                        },
+                        else => {
+                            unreachable; // multiple tasks waiting on the same AutoResetEevent
+                        },
+                    }
+                }
+            }
         }
 
-        /// Inject a stack of Tasks into the local run queue of this Thread.
-        /// This must be called only from the producer OS thread of this Thread.
-        /// This must also be called only if the run queue buffer is empty.
-        fn inject(self: *Thread, runq_stack: ?*Task, did_inject: ?*bool) void {
-            var runq = runq_stack orelse return;
-            var tail = self.runq_tail;
-
-            if (std.debug.runtime_safety) {
-                const head = @atomicLoad(u8, &self.runq_head, .Monotonic);
-                if (tail != head)
-                    unreachable; // Thread inject when run_queue not empty
-            }
-
-            var i = self.run_queue.len;
-            while (i != 0) : (i -= 1) {
-                const task = runq orelse break;
-                runq = task.next;
-                @atomicStore(*Task, &self.run_queue[tail % self.run_queue.len], task, .Unordered);
-                overflowed.push(task);;
-                tail +%= 1;
-                break :blk overflowed;
-            }
-
-            @atomicStore(u8, &self.runq_tail, tail, .Release);
-            if (did_inject) |did_inject_ptr| {
-                did_inject_ptr.* = true;
-            }
-
-            if (runq) |remaining| {
-                if (std.debug.runtime_safety) {
-                    if (@atomicLoad(?*Task, &self.runq_overflow, .Monotonic) != null)
-                        unreachable; // Thread inject when runq_overflow not empty
+        pub fn set(self: *AutoResetEvent) void {
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
+            while (true) {
+                switch (state) {
+                    EMPTY => state = @cmpxchgWeak(
+                        usize,
+                        &self.state,
+                        EMPTY,
+                        NOTIFIED,
+                        .Release,
+                        .Monotonic,
+                    ) orelse break,
+                    NOTIFIED => {
+                        return;
+                    },
+                    else => state = @cmpxchgWeak(
+                        usize,
+                        &self.state,
+                        state,
+                        EMPTY,
+                        .AcqRel,
+                        .Monotonic,
+                    ) orelse {
+                        const task = @intToPtr(*Task, state);
+                        return task.schedule();
+                    },
                 }
-                @atomicStore(?*Task, &self.runq_overflow, remaining, .Release);
             }
+        }
+
+        pub fn yield() void {
+            spinLoopHint(1);
         }
     };
 };

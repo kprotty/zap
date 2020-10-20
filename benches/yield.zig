@@ -29,10 +29,7 @@ fn asyncMain() callconv(.Async) !void {
 }
 
 fn worker(batch: *zap.Task.Batch, remaining_ptr: *usize, main_task: *zap.Task) void {
-    suspend {
-        var task = zap.Task.init(@frame());
-        batch.push(&task);
-    }
+    zap.Task.runConcurrently();
 
     var i: usize = num_yields;
     while (i > 0) : (i -= 1) {

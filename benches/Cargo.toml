@@ -10,3 +10,7 @@ tokio = { version = "0.3", features = ["rt", "rt-multi-thread", "sync", "macros"
 [[bin]]
 name = "yield"
 path = "./yield.rs"
+
+[[bin]]
+name = "spawn"
+path = "./spawn.rs"

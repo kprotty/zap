@@ -151,6 +151,13 @@ pub const Task = extern struct {
         worker.run_next = self;
     }
 
+    pub fn runConcurrently() void {
+        suspend {
+            var task = Task.init(@frame());
+            task.schedule();
+        }
+    }
+
     pub fn yield() void {
         const worker = Worker.current orelse {
             std.debug.panic("Cannot yield from outside the thread pool", .{});

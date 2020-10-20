@@ -23,6 +23,7 @@ pub fn build(b: *std.build.Builder) void {
 
     inline for ([_][]const u8 {
         "yield",
+        "spawn",
     }) |example| {
         const zig_exe = b.addExecutable(example, example ++ ".zig");
         if (libc)

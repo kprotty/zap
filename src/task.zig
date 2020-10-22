@@ -9,7 +9,7 @@ const assert = std.debug.assert;
 
 const zap = @import("./zap.zig");
 const Lock = zap.sync.os.Lock;
-const spinLoopHint = zap.sync.yieldCpu;
+const spinLoopHint = zap.sync.core.spinLoopHint;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
@@ -738,7 +738,7 @@ pub const Task = extern struct {
 
                     const target_size = target_tail -% target_head;
                     if (target_size > target.buffer.len) {
-                        spinLoopHint(1);
+                        spinLoopHint();
                         target_head = @atomicLoad(usize, &target.head, .Monotonic);
                         continue;
                     }
@@ -755,7 +755,7 @@ pub const Task = extern struct {
                             .Monotonic,
                         ) orelse return next_task;
                         
-                        spinLoopHint(1);
+                        spinLoopHint();
                         target_head = @atomicLoad(usize, &target.head, .Monotonic);
                         continue;
                     }
@@ -856,7 +856,7 @@ pub const Task = extern struct {
         }
 
         pub fn yield() void {
-            spinLoopHint(1);
+            spinLoopHint();
         }
     };
 };

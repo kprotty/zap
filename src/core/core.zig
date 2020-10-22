@@ -4,8 +4,4 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 
-pub const core = @import("./core/core.zig");
-
-pub const sync = @import("./sync.zig");
-
-pub const Task = @import("./task.zig").Task;
+pub const sync = @import("./sync/sync.zig");

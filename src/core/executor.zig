@@ -13,7 +13,7 @@
 // limitations under the License.
 
 pub const Platform = struct {
-    actionFn: fn(*Platform, ?*Worker, Action) bool,
+    actionFn: fn(*Platform, ?*Worker, Action) void,
 
     pub const Action = union(enum) {
         spawned: *Scheduler,
@@ -22,25 +22,34 @@ pub const Platform = struct {
         poll_last: *Task.Batch,
     };
 
-    pub fn performAction(self: *Platform, worker_scope: ?*Worker, action: Action) bool {
+    pub fn performAction(self: *Platform, worker_scope: ?*Worker, action: Action) void {
         return (self.actionFn)(self, worker_scope, action);
     }
 };
 
 pub const Scheduler = extern struct {
     platform: *Platform align(std.math.max(@alignOf(usize), 8)),
+    active_queue: ?*Worker,
     active_workers: usize,
     max_workers: usize,
     run_queue: ?*Task,
     idle_queue: IdleQueue,
 
+    const IdleState = enum(u2) {
+        pending,
+        waking,
+        notified,
+        shutdown,
+    };
+
     pub fn init(self: *Scheduler, platform: *Platform, max_workers: usize) void {
         self.* = .{
             .platform = platform,
+            .active_queue = null,
             .active_workers = 0,
             .max_workers = max_workers,
             .run_queue = null,
-            .idle_queue = IdleQueue.init(0),
+            .idle_queue = IdleQueue.init(@enumToInt(IdleState.pending)),
         };
     }
 
@@ -68,14 +77,95 @@ pub const Scheduler = extern struct {
     }
 
     pub fn notify(self: *Scheduler) void {
+        self.resumeWorker(.{});
+    }
+
+    const ResumeContext = struct {
+        is_waking: bool = false,
+        worker: ?*Worker = null,   
+    };
+
+    fn resumeWorker(self: *Scheduler, context: ResumeContext) void {
+        var is_waking = false;
+        var is_resuming = false;
         var idle_queue = self.idle_queue.load(.Acquire);
 
         while (true) {
+            const idle_state = @intToEnum(IdleState, @truncate(u2, idle_queue.value);
+            if (idle_state == .shutdown) {
+                return;
+            }
 
+            if (context.is_waking and idle_state != .waking) {
+                unreachable; // resumeWorker(is_waking) when idle_queue is not marked as such
+            }
+
+            if (!context.is_waking and idle_state == .waking) {
+                idle_queue = self.idle_queue.cmpxchgWeak(
+                    idle_queue,
+                    (idle_queue.value & ~@as(usize, 0b11)) | @enumtToInt(IdleState.notified),
+                    .Acquire,
+                    .Acquire,
+                ) orelse return;
+                continue;
+            }
+
+            if (!context.is_waking and idle_state == .notified) {
+                return;
+            }
+
+            if (@intToPtr(?*Worker, idle_queue.value & ~@as(usize, 0b11))) |idle_worker| {
+                const next_worker = @atomicLoad(usize, &idle_worker.state, .Unordered) & ~@as(usize, 0b11);
+                if (self.idle_queue.cmpxchgWeak(
+                    idle_queue,
+                    next_worker | @enumToInt(IdleState.waking),
+                    .Acquire,
+                    .Acquire,
+                )) |updated_idle_queue| {
+                    idle_queue = updated_idle_queue;
+                    continue;
+                }
+
+                const new_state = @ptrToInt(self) | @enumToInt(Worker.State.waking);
+                @atomicStore(usize, &idle_worker.state, new_state, .Unordered);
+                self.platform.performAction(context.worker, .{ .resumed = idle_worker });
+                return;
+            }
+
+            const active_workers = @atomicLoad(usize, &self.active_workers, .Monotonic);
+            if (active_workers < self.max_workers) {
+                if (!context.is_waking) {
+                    if (self.idle_queue.cmpxchgWeak(
+                        idle_queue,
+                        @enumToInt(IdleState.waking),
+                        .Acquire,
+                        .Acquire,
+                    )) |updated_idle_queue| {
+                        idle_queue = updated_idle_queue;
+                        continue;
+                    } 
+                }
+
+                _ = @atomicRmw(usize, &self.active_workers, .Add, 1, .Monotonic);
+                self.platform.performAction(context.worker, .{ .spawned = self });
+                return;
+            }
+
+            if (context.is_waking) {
+                idle_queue = self.idle_queue.cmpxchgWeak(
+                    idle_queue,
+                    @enumToInt(IdleState.pending),
+                    .Acquire,
+                    .Acquire,
+                ) orelse return;
+                continue;
+            }
+
+            return;
         }
     }
 
-    fn wait(self: *Scheduler, worker: *Worker) void {
+    fn suspendWorker(self: *Scheduler, worker: *Worker) void {
 
     }
 
@@ -148,11 +238,12 @@ pub const Scheduler = extern struct {
 };
 
 pub const Worker = extern struct {
-    id: Id align(std.math.max(@alignOf(usize), 8)),
-    next: usize,
-    sched_state: usize,
-    runq_head: usize,
-    runq_tail: usize,
+    id: ?Id align(std.math.max(@alignOf(Id), 8)),
+    state: usize,
+    target: ?*Worker,
+    active_next: ?*Worker,
+    runq_head: u8,
+    runq_tail: u8,
     runq_next: ?*Task,
     runq_overflow: ?*Task,
     runq_buffer: [256]*Task,
@@ -164,7 +255,37 @@ pub const Worker = extern struct {
         shutdown,
     };
 
-    pub const Id = *const std.meta.Int(.unsigned, 8 * std.meta.bitCount(u8));
+    pub const Id = *align(8) c_void;
+
+    pub fn init(self: *Worker, scheduler: *Scheduler, id: ?Id) void {
+        self.* = Worker{
+            .id = id,
+            .state = @ptrToInt(scheduler) | @enumToInt(State.waking),
+            .active_next = undefined,
+            .runq_head = 0,
+            .runq_tail = 0,
+            .runq_next = null,
+            .runq_buffer = undefined,
+        };
+
+        var active_queue = @atomicLoad(?*Task, &scheduler.active_queue, .Monotonic);
+        while (true) {
+            self.active_next = active_queue;
+            active_queue = @cmpxchgWeak(
+                ?*Task,
+                &scheduler.active_queue,
+                active_queue,
+                self,
+                .Release,
+                .Monotonic,
+            ) orelse break;
+        }
+    }
+
+    pub fn deinit(self: *Worker) void {
+        const scheduler = self.getScheduler();
+        _ = @atomicRmw(usize, &scheduler.active_workers, .Sub, 1, .Monotonic);
+    }
 
     pub fn getId(self: *Worker) Id {
         return self.id;
@@ -198,11 +319,16 @@ pub const Worker = extern struct {
             return .{ .executed = task };
         }
 
-        
+        if (scheduler.suspendWorker(self)) {
+            return .suspended;
+        }
+
+        // TODO: scheduler.shutdownWorker(self); - join if main/master_worker
+        return .shutdown;
     }
 
     pub fn push(self: *Worker, tasks: Task.Batch) void {
-
+        
     }
 
     fn pollTask(self: *Worker, scheduler: *Scheduler, did_inject: *bool) ?*Task {
@@ -215,7 +341,7 @@ pub const Worker = extern struct {
             return task;
         }
 
-
+        // TODO: work-stealing by iterating active_head -> active_next
 
         if (self.pollTaskFromScheduler(scheduler, did_inject)) |task| {
             return task;
@@ -293,6 +419,8 @@ pub const Task = extern struct {
             self.head = task.next;
             return task;
         }
+
+        // TODO: add more functionality
     };
 };
 

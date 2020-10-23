@@ -12,4 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const Task = @import("./task.zig").Task;
+
+pub const core = struct {
+    pub const executor = @import("./core/executor.zig");
+};

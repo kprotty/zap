@@ -16,7 +16,7 @@ pub const Platform = struct {
     actionFn: fn(*Platform, ?*Worker, Action) bool,
 
     pub const Action = union(enum) {
-        spawned: *Worker.Slot,
+        spawned: *Scheduler,
         resumed: *Worker,
         poll_first: *Task.Batch,
         poll_last: *Task.Batch,
@@ -29,25 +29,18 @@ pub const Platform = struct {
 
 pub const Scheduler = extern struct {
     platform: *Platform align(std.math.max(@alignOf(usize), 8)),
-    slots_ptr: [*]Worker.Slot,
-    slots_len: usize,
+    active_workers: usize,
+    max_workers: usize,
     run_queue: ?*Task,
-    idle_queue: usize, // [aba_tag:..., [is_shutdown:1, is_waking:1, is_notified:1, is_empty:1, worker_index:12(4096)]:16]
+    idle_queue: IdleQueue,
 
-    pub fn init(self: *Scheduler, platform: *Platform, worker_slots: []Worker.Slot) void {
-        const num_slots = std.math.min(Worker.Slot.max, worker_slots.len);
-
-        for (worker_slots[0..num_slots]) |*slot, index| {
-            const next_index = if (index == 0) null else index;
-            slot.ptr = (Worker.Slot.Ptr{ .idle = next_index }).toUsize();
-        }
-
+    pub fn init(self: *Scheduler, platform: *Platform, max_workers: usize) void {
         self.* = .{
             .platform = platform,
-            .slots_ptr = worker_slots.ptr,
-            .slots_len = num_slots,
+            .active_workers = 0,
+            .max_workers = max_workers,
             .run_queue = null,
-            .idle_queue = num_slots - 1,
+            .idle_queue = IdleQueue.init(0),
         };
     }
 
@@ -55,30 +48,111 @@ pub const Scheduler = extern struct {
 
     }
 
-    pub fn getSlots(self: *Scheduler) []Worker.Slot {
-
-    }
-
-    pub fn push(self: *Scheduler, tasks: Task.Batch) void {
-
+    pub fn push(self: *Scheduler, batch: Task.Batch) void {
+        if (batch.isEmpty()) {
+            return;
+        }
+        
+        var run_queue = @atomicLoad(?*Task, &self.run_queue, .Monotonic);
+        while (true) {
+            batch.tail.next = run_queue;
+            run_queue = @cmpxchgWeak(
+                ?*Task,
+                &self.run_queue,
+                run_queue,
+                batch.head,
+                .Release,
+                .Monotonic,
+            ) orelse break;
+        }
     }
 
     pub fn notify(self: *Scheduler) void {
+        var idle_queue = self.idle_queue.load(.Acquire);
+
+        while (true) {
+
+        }
+    }
+
+    fn wait(self: *Scheduler, worker: *Worker) void {
 
     }
 
     pub fn shutdown(self: *Scheduler) void {
 
     }
+
+    const IdleQueue = switch (std.builtin.arch) {
+        .i386, .x86_64 => extern struct {
+            value: usize align(@alignOf(DoubleWord)),
+            aba_tag: usize = 0,
+
+            const DoubleWord = std.meta.Int(.unsigned, std.meta.bitCount(usize) * 2);
+
+            fn load(self: *const IdleQueue, comptime ordering: std.builtin.AtomicOrder) IdleQueue {
+                return IdleQueue{
+                    .value = @atomicLoad(usize, &self.value, ordering),
+                    .aba_tag = @atomicLoad(usize, &self.value, .Unordered),
+                };
+            }
+
+            fn cmpxchgWeak(
+                self: *IdleQueue,
+                compare: IdleQueue,
+                exchange: usize,
+                comptime success: std.builtin.AtomicOrder,
+                comptime failure: std.builtin.AtomicOrder,
+            ) ?IdleQueue {
+                const value = @cmpxchgWeak(
+                    DoubleWord,
+                    @ptrCast(*DoubleWord, self),
+                    @bitCast(DoubleWord, compare),
+                    @bitCast(DoubleWord, IdleQueue{
+                        .value = exchange,
+                        .aba_tag = compare.aba_tag +% 1,
+                    }),
+                    success,
+                    failure,
+                ) orelse return null;
+                return @bitCast(IdleQueue, value);
+            }
+        },
+        else => extern struct {
+            value: usize,
+
+            fn load(self: *const IdleQueue, comptime ordering: std.builtin.AtomicOrder) IdleQueue {
+                const value = @atomicLoad(usize, &self.value, ordering);
+                return IdleQueue{ .value = value };
+            }
+
+            fn cmpxchgWeak(
+                self: *IdleQueue,
+                compare: IdleQueue,
+                exchange: usize,
+                comptime success: std.builtin.AtomicOrder,
+                comptime failure: std.builtin.AtomicOrder,
+            ) ?IdleQueue {
+                const value = @cmpxchgWeak(
+                    usize,
+                    &self.value,
+                    compare.value,
+                    exchange,
+                    success,
+                    failure,
+                ) orelse return null;
+                return IdleQueue{ .value = value };
+            }
+        },
+    };
 };
 
 pub const Worker = extern struct {
-    sched_state: usize align(std.math.max(@alignOf(usize), 8)),
-    id: Id,
-    prng: u32,
-    slot: u16,
-    runq_head: u8,
-    runq_tail: u8,
+    id: Id align(std.math.max(@alignOf(usize), 8)),
+    next: usize,
+    sched_state: usize,
+    runq_head: usize,
+    runq_tail: usize,
     runq_next: ?*Task,
     runq_overflow: ?*Task,
     runq_buffer: [256]*Task,
@@ -97,7 +171,7 @@ pub const Worker = extern struct {
     }
 
     pub fn getScheduler(self: *Worker) *Scheduler {
-
+        const scheduler = 
     }
 
     pub const Poll = union(enum) {
@@ -141,43 +215,7 @@ pub const Worker = extern struct {
             return task;
         }
 
-        const slots = scheduler.getSlots();
-        const self_index = self.slot_index;
-        
-        var steal_attempts: u8 = 1;
-        while (steal_attempts > 0) : (steal_attempts -= 1) {
-            
-            var slot_index = blk: {
-                var x = self.prng;
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                self.prng = x;
-                break :blk (x % slots.len);
-            };
 
-            var slot_iter = slots.len;
-            while (slot_iter > 0) : (slot_iter -= 1) {
-                const target_index = slot_index;
-                slot_index = if (index == slots.len - 1) 0 else (slot_index + 1);
-
-                if (target_index == self_index) {
-                    continue;
-                }
-
-                const slot_value = @atomicLoad(usize, &slots[slot_index].ptr, .Acquire);
-                switch (Slot.Ptr.fromUsize(slot_value)) {
-                    .idle => {},
-                    .spawning => {},
-                    .shutdown => return null,
-                    .running => |worker| {
-                        if (self.pollTaskFromWorker(worker, did_inject)) |task| {
-                            return task;
-                        }
-                    },
-                }
-            }
-        }
 
         if (self.pollTaskFromScheduler(scheduler, did_inject)) |task| {
             return task;
@@ -189,37 +227,6 @@ pub const Worker = extern struct {
 
         return null;
     }
-
-    pub const Slot = extern struct {
-        ptr: usize,
-
-        pub const max = 1 << 12;
-
-        const Ptr = union(enum) {
-            idle: ?usize,
-            running: *Worker,
-            spawning: *Scheduler,
-            shutdown: ?Id,
-
-            fn fromUsize(value: usize) Ptr {
-                return switch (value & 0b11) {
-                    0 => Ptr{ .idle = if (value & (1 << 2) != 0) null else (value >> 3) },
-                    1 => Ptr{ .running = @intToPtr(*Worker, value >> 2) },
-                    2 => Ptr{ .spawning = @intToPtr(*Scheduler, value >> 2) },
-                    3 => Ptr{ .shutdown = @intToPtr(?Id, value >> 2) },
-                };
-            }
-            
-            fn toUsize(self: Ptr) usize {
-                return switch (self) {
-                    .idle => |next_index| (if (next_index) |i| (i << (bits + 1)) else (1 << bits)) | 0,
-                    .running => |worker| @ptrToInt(worker) | 1,
-                    .spawning => |scheduler| @ptrToInt(scheduler) | 2,
-                    .shutdown => |id| @ptrToInt(id) | 3,
-                };
-            }
-        };
-    };
 };
 
 pub const Task = extern struct {

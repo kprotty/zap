@@ -1,6 +1,24 @@
 const std = @import("std");
 
-const Mutex = std.Mutex;
+const Mutex = struct {
+    const Lock = @import("./lock.zig").Lock;
+
+    lock: Lock = Lock{},
+
+    fn acquire(self: *Mutex) Held {
+        self.lock.acquire();
+        return Held{ .mutex = self };
+    }
+
+    const Held = struct {
+        mutex: *Mutex,
+
+        fn release(self: Held) void {
+            self.mutex.lock.release();
+        }
+    };
+};
+
 const AutoResetEvent = std.AutoResetEvent;
 const Thread = std.Thread;
 
@@ -16,50 +34,21 @@ pub const Task = struct {
         Batch.from(self).schedule();
     }
 
+    pub fn scheduleNext(self: *Task) void {
+        const worker = Worker.current orelse unreachable; // schedule() called when not in scheduler
+        const old_next = worker.runq_next;
+        worker.runq_next = self;
+
+        if (old_next) |old_task|
+            worker.schedule(Batch.from(old_task));
+    }
+
     pub const runConcurrently = yield;
     pub fn yield() void {
         suspend {
             var task = Task.init(@frame());
             task.schedule();
         }
-    }
-
-    fn ReturnTypeOf(comptime asyncFn: anytype) type {
-        return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
-    }
-
-    pub const Config = struct {
-        threads: usize = 0,
-    };
-
-    pub fn run(config: Config, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
-        const Decorator = struct {
-            fn entry(fn_args: anytype, task: *Task, result: *?ReturnTypeOf(asyncFn)) void {
-                suspend task.* = Task.init(@frame());
-                const value = @call(.{}, asyncFn, fn_args);
-                suspend {
-                    result.* = value;
-                    const worker = Worker.current.?;
-                    worker.scheduler.shutdown(worker); 
-                }
-            }
-        };
-
-        var task: Task = undefined;
-        var result: ?ReturnTypeOf(asyncFn) = undefined;
-        var frame = async Decorator.entry(args, &task, &result);
-
-        const num_threads: usize = 
-            if (std.builtin.single_threaded) 1
-            else if (config.threads > 0) config.threads
-            else Thread.cpuCount() catch 1;
-
-        var scheduler = Scheduler{};
-        scheduler.max_workers = num_threads;
-        scheduler.run_queue.push(&task);
-        scheduler.resumeWorker(.{ .is_main_thread = true });
-
-        return result orelse error.Deadlocked;
     }
 
     pub const Batch = struct {
@@ -102,6 +91,44 @@ pub const Task = struct {
             worker.schedule(self);
         }
     };
+
+    fn ReturnTypeOf(comptime asyncFn: anytype) type {
+        return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
+    }
+
+    pub const Config = struct {
+        threads: usize = 0,
+    };
+
+    pub fn run(config: Config, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
+        const Decorator = struct {
+            fn entry(fn_args: anytype, task: *Task, result: *?ReturnTypeOf(asyncFn)) void {
+                suspend task.* = Task.init(@frame());
+                const value = @call(.{}, asyncFn, fn_args);
+                suspend {
+                    result.* = value;
+                    const worker = Worker.current.?;
+                    worker.scheduler.shutdown(worker); 
+                }
+            }
+        };
+
+        var task: Task = undefined;
+        var result: ?ReturnTypeOf(asyncFn) = undefined;
+        var frame = async Decorator.entry(args, &task, &result);
+
+        const num_threads: usize = 
+            if (std.builtin.single_threaded) 1
+            else if (config.threads > 0) config.threads
+            else Thread.cpuCount() catch 1;
+
+        var scheduler = Scheduler{};
+        scheduler.max_workers = num_threads;
+        scheduler.run_queue.push(&task);
+        scheduler.resumeWorker(.{ .is_main_thread = true });
+
+        return result orelse error.Deadlocked;
+    }
 
     const Scheduler = struct {
         lock: Mutex = Mutex{},
@@ -290,9 +317,10 @@ pub const Task = struct {
         next: ?*Worker = null,
         active_next: ?*Worker = null,
         active_target: ?*Worker = null,
+        runq_next: ?*Task = null,
         runq_head: usize = 0,
         runq_tail: usize = 0,
-        runq_next: ?*Task = null,
+        runq_lifo: ?*Task = null,
         runq_buffer: [256]*Task = undefined,
 
         const State = enum {
@@ -387,9 +415,9 @@ pub const Task = struct {
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
             while (!batch.isEmpty()) {
 
-                if (@atomicLoad(?*Task, &self.runq_next, .Monotonic) == null) {
+                if (@atomicLoad(?*Task, &self.runq_lifo, .Monotonic) == null) {
                     const task = batch.pop().?;
-                    @atomicStore(?*Task, &self.runq_next, task, .Release);
+                    @atomicStore(?*Task, &self.runq_lifo, task, .Release);
                     head = @atomicLoad(usize, &self.runq_head, .Monotonic);
                     continue;
                 }
@@ -440,11 +468,17 @@ pub const Task = struct {
         fn poll(self: *Worker, held: *?Mutex.Held) ?*Task {
             // TODO: if single-threaded, poll io-driver here
             
-            var next = @atomicLoad(?*Task, &self.runq_next, .Monotonic);
+            if (self.runq_next) |next| {
+                const task = next;
+                self.runq_next = null;
+                return task;
+            }
+
+            var next = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
             while (next) |task| {
                 next = @cmpxchgWeak(
                     ?*Task,
-                    &self.runq_next,
+                    &self.runq_lifo,
                     task,
                     null,
                     .Monotonic,
@@ -491,10 +525,10 @@ pub const Task = struct {
 
                     var steal = target_size - (target_size / 2);
                     if (steal == 0) {
-                        const task = @atomicLoad(?*Task, &target.runq_next, .Monotonic) orelse break;
+                        const task = @atomicLoad(?*Task, &target.runq_lifo, .Monotonic) orelse break;
                         _ = @cmpxchgWeak(
                             ?*Task,
-                            &target.runq_next,
+                            &target.runq_lifo,
                             task,
                             null,
                             .Acquire,

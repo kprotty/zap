@@ -1,27 +1,29 @@
 const std = @import("std");
 const zap = @import("zap");
+
+const Task = zap.runtime.Task;
 const allocator = std.heap.page_allocator;
 
-const num_tasks = 100_000;
 const num_spawners = 10;
+const num_tasks = 100_000;
 
 pub fn main() !void {
-    try (try zap.Task.run(.{}, asyncMain, .{}));
+    try (try Task.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() callconv(.Async) !void {
     const frames = try allocator.alloc(@Frame(spawner), num_spawners);
     defer allocator.free(frames);
 
-    var task = zap.Task.init(@frame());
+    var task = Task.initAsync(@frame());
     var counter: usize = num_tasks * num_spawners;
     
     suspend {
-        var batch = zap.Task.Batch{};
+        var batch = Task.Batch{};
         for (frames) |*frame| {
             frame.* = async spawner(&batch, &counter, &task);
         }
-        batch.schedule();
+        batch.scheduleNext();
     }
 
     const count = @atomicLoad(usize, &counter, .Monotonic);
@@ -29,9 +31,9 @@ fn asyncMain() callconv(.Async) !void {
         std.debug.panic("bad counter", .{});
 }
 
-fn spawner(batch: *zap.Task.Batch, counter: *usize, main_task: *zap.Task) !void {
+fn spawner(batch: *Task.Batch, counter: *usize, main_task: *Task) !void {
     suspend {
-        var task = zap.Task.init(@frame());
+        var task = Task.initAsync(@frame());
         batch.push(&task);
     }
 
@@ -39,7 +41,7 @@ fn spawner(batch: *zap.Task.Batch, counter: *usize, main_task: *zap.Task) !void 
     defer allocator.free(frames);
 
     suspend {
-        var runnber_batch = zap.Task.Batch{};
+        var runnber_batch = Task.Batch{};
         for (frames) |*frame| {
             frame.* = async runner(&runnber_batch, counter, main_task);
         }
@@ -47,9 +49,9 @@ fn spawner(batch: *zap.Task.Batch, counter: *usize, main_task: *zap.Task) !void 
     }
 }
 
-fn runner(batch: *zap.Task.Batch, counter: *usize, main_task: *zap.Task) void {
+fn runner(batch: *Task.Batch, counter: *usize, main_task: *Task) void {
     suspend {
-        var task = zap.Task.init(@frame());
+        var task = Task.initAsync(@frame());
         batch.push(&task);
     }
 

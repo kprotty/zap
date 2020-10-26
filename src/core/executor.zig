@@ -139,9 +139,11 @@ pub const Scheduler = extern struct {
                 self.idle_queue = worker.next;
                 self.state = .waking;
 
-                std.debug.assert(!std.builtin.single_threaded);
-                std.debug.assert(worker.state == .suspended);
-                worker.state = .waking;
+                if (worker.state == .suspended) {
+                    worker.state = .waking;
+                } else {
+                    unreachable; // worker with invalid state when being resumed
+                }
 
                 self.release();
                 worker.notify();
@@ -222,8 +224,11 @@ pub const Scheduler = extern struct {
                 const shutdown_worker = idle_worker;
                 idle_queue = shutdown_worker.next;
                 
-                std.debug.assert(shutdown_worker.state == .stopping);
-                shutdown_worker.state = .shutdown;
+                if (shutdown_worker.state == .stopping) {
+                    shutdown_worker.state = .shutdown;
+                } else {
+                    unreachable; // worker had invalid state when trying to join/shutdown
+                }
 
                 self.platform.call(.{
                     .joined = .{

@@ -216,6 +216,7 @@ pub const Task = extern struct {
                 .spawned => |spawned| {
                     const scheduler = @fieldParentPtr(Scheduler, "scheduler", spawned.scheduler);
                     if (std.builtin.single_threaded or !scheduler.has_worker) {
+                        spawned.spawned = true;
                         Worker.run(null, @ptrToInt(scheduler));
                     } else {
                         spawned.spawned = Thread.spawn(@ptrToInt(scheduler), Worker.run);

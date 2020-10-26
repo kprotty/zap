@@ -10,7 +10,8 @@ pub const Lock = extern struct {
     const WAITING = ~@as(usize, (1 << 9) - 1);
 
     const Waiter = struct {
-        prev: ?*Waiter align(~WAITING + 1) = undefined,
+        aligned: void align(~WAITING + 1) = undefined,
+        prev: ?*Waiter = undefined,
         next: ?*Waiter = undefined,
         tail: ?*Waiter = undefined,
         waker: sync.Waker,

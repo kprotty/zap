@@ -8,7 +8,8 @@ pub const AutoResetEvent = extern struct {
     const SET = 1;
 
     const Waiter = struct {
-        waker: sync.Waker align(2),
+        aligned: void align(2) = undefined,
+        waker: sync.Waker,
     };
 
     pub fn wait(self: *AutoResetEvent, comptime Futex: type) void {

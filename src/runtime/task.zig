@@ -162,12 +162,14 @@ pub const Task = extern struct {
     };
 
     pub const Worker = struct {
+        tick: usize,
         event: AutoResetEvent,
         worker: core.executor.Worker,
         thread: ?Thread.Handle,
 
         fn run(thread: ?Thread.Handle, scheduler_ptr: usize) void {
             var self: Worker = undefined;
+            self.tick = 1;
             self.event = AutoResetEvent{};
             self.thread = thread;
 
@@ -245,7 +247,23 @@ pub const Task = extern struct {
                     const scheduler = @fieldParentPtr(Scheduler, "scheduler", core_scheduler);
                     scheduler.lock.release();
                 },
+                .polled => |polled| {
+                    const worker = @fieldParentPtr(Worker, "worker", polled.worker);
+                    const should_poll =
+                        (polled.intention == .last_resort) or
+                        (polled.intention == .eager and (worker.tick % 61 == 0));
+                    if (!should_poll)
+                        return;
+
+                    const scheduler = worker.getScheduler();
+                    const batch = @fieldParentPtr(Batch, "batch", polled.batch);
+
+                    // TODO: grab rights to poll for io & timers
+                },
                 .executed => |executed| {
+                    const worker = @fieldParentPtr(Worker, "worker", executed.worker);
+                    worker.tick +%= 1;
+
                     const task = blk: {
                         @setRuntimeSafety(false);
                         break :blk @fieldParentPtr(Task, "task", executed.task);

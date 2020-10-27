@@ -1,5 +1,5 @@
-const NUM_TASKS: usize = 100_000;
 const NUM_SPAWNERS: usize = 10;
+const NUM_TASKS: usize = 100_000;
 
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 

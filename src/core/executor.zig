@@ -51,6 +51,7 @@ pub const Platform = struct {
         suspended: *Worker,
         acquired: *Scheduler,
         released: *Scheduler,
+        polled: Polled,
         executed: Executed,
 
         pub const Spawned = struct {
@@ -66,6 +67,17 @@ pub const Platform = struct {
         pub const Executed = struct {
             worker: *Worker,
             task: *Task,
+        };
+
+        pub const Polled = struct {
+            worker: *Worker,
+            batch: *Task.Batch,
+            intention: Intention,
+
+            pub const Intention = enum {
+                eager,
+                last_resort,
+            };
         };
     };
 
@@ -327,7 +339,7 @@ pub const Worker = extern struct {
 
             var has_lock = false;
             if (should_poll) {
-                if (self.poll(&has_lock)) |task| {
+                if (self.poll(&has_lock, scheduler)) |task| {
                     if (self.state == .waking) {
                         scheduler.resumeWorker(.{
                             .is_waking = true,
@@ -378,21 +390,32 @@ pub const Worker = extern struct {
     };
 
     pub fn schedule(self: *Worker, tasks: Task.Batch, hints: ScheduleHints) void {
+        if (self.push(tasks, hints)) |overflowed| {
+            const scheduler = self.getScheduler();
+            scheduler.acquire();
+            scheduler.run_queue.pushMany(overflowed);
+            scheduler.resumeWorker(.{ .is_acquired = true });
+        }   
+    }
+
+    fn push(self: *Worker, tasks: Task.Batch, hints: ScheduleHints) ?Task.Batch {
         var batch = tasks;
         if (batch.isEmpty())
-            return;
+            return null;
 
         if (hints.use_next) {
             if (self.runq_next) |old_next|
                 batch.push(old_next);
             self.runq_next = batch.pop();
             if (batch.isEmpty())
-                return;
+                return null;
         }
 
         var tail = self.runq_tail.get();
         var head = self.runq_head.load(.relaxed);
-        while (!batch.isEmpty()) {
+        while (true) {
+            if (batch.isEmpty())
+                return null;
 
             if (hints.use_lifo and self.runq_lifo.load(.relaxed) == null) {
                 const task = batch.pop().?;
@@ -432,18 +455,33 @@ pub const Worker = extern struct {
             }
 
             overflowed.pushMany(batch);
-            batch = overflowed;
-            break;
+            return overflowed;
         }
-
-        const scheduler = self.getScheduler();
-        scheduler.acquire();
-        scheduler.run_queue.pushMany(batch);
-        scheduler.resumeWorker(.{ .is_acquired = true });
     }
 
-    fn poll(self: *Worker, has_lock: *bool) ?*Task {
-        // TODO: if single-threaded, poll io-driver here
+    fn poll(self: *Worker, has_lock: *bool, scheduler: *Scheduler) ?*Task {
+        var polled = Task.Batch{};
+        scheduler.platform.call(.{
+            .polled = .{
+                .worker = self,
+                .batch = &polled,
+                .intention = .eager,
+            },
+        });
+
+        if (polled.pop()) |first_task| {
+            if (self.push(polled, .{ .use_lifo = true })) |overflowed| {
+                scheduler.acquire();
+                scheduler.run_queue.pushMany(overflowed);
+                scheduler.resumeWorker(.{
+                    .is_waking = self.state == .waking,
+                    .is_acquired = true,
+                });
+                scheduler.release();
+                self.state = .running;
+            }
+            return first_task;
+        }
         
         if (self.runq_next) |next| {
             const task = next;
@@ -472,7 +510,6 @@ pub const Worker = extern struct {
             ) orelse return self.runq_buffer[head % self.runq_buffer.len].get();
         }
 
-        const scheduler = self.getScheduler();
         var active_workers = scheduler.active_workers.load(.relaxed);
         while (active_workers > 0) : (active_workers -= 1) {
 
@@ -534,20 +571,52 @@ pub const Worker = extern struct {
             }
         }
 
-        has_lock.* = true;
         scheduler.acquire();
-        const first_task = scheduler.run_queue.pop() orelse return null;
+        if (scheduler.run_queue.pop()) |first_task| {
+            var new_tail = tail;
+            var remaining = self.runq_buffer.len;
+            while (remaining > 0) : (remaining -= 1) {
+                const task = scheduler.run_queue.pop() orelse break;
+                self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
+                new_tail +%= 1;
+            }
 
-        var new_tail = tail;
-        var remaining = self.runq_buffer.len;
-        while (remaining > 0) : (remaining -= 1) {
-            const task = scheduler.run_queue.pop() orelse break;
-            self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
-            new_tail +%= 1;
+            if (new_tail != tail)
+                self.runq_tail.store(new_tail, .release);
+
+            has_lock.* = true;
+            return first_task;
         }
 
-        if (new_tail != tail)
-            self.runq_tail.store(new_tail, .release);
-        return first_task;
+        scheduler.release();
+        scheduler.platform.call(.{
+            .polled = .{
+                .worker = self,
+                .batch = &polled,
+                .intention = .last_resort,
+            },
+        });
+
+        if (polled.pop()) |first_task| {
+            var new_tail = tail;
+            var remaining = self.runq_buffer.len;
+            while (remaining > 0) : (remaining -= 1) {
+                const task = polled.pop() orelse break;
+                self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
+                new_tail +%= 1;
+            }
+
+            if (new_tail != tail)
+                self.runq_tail.store(new_tail, .release);
+            if (!polled.isEmpty()) {
+                scheduler.acquire();
+                scheduler.run_queue.pushMany(polled);
+                has_lock.* = true;
+            }
+
+            return first_task;
+        }
+
+        return null;
     }
 };

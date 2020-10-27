@@ -1,6 +1,8 @@
 const std = @import("std");
 const zap = @import("../zap.zig");
+
 const core = zap.core;
+const single_threaded = std.builtin.single_threaded;
 
 pub const Task = extern struct {
     task: core.executor.Task = core.executor.Task{},
@@ -136,7 +138,6 @@ pub const Task = extern struct {
 
     pub const Scheduler = struct {
         lock: Lock,
-        has_worker: bool,
         platform: Platform,
         scheduler: core.executor.Scheduler,
 
@@ -144,12 +145,10 @@ pub const Task = extern struct {
             var self: Scheduler = undefined;
 
             self.lock = Lock{};
-            self.has_worker = false;
             self.platform = Platform{};
             self.scheduler.init(&self.platform.platform, num_threads);
 
             self.scheduler.schedule(initial_batch.batch);
-            std.debug.assert(self.has_worker);
         }
 
         pub fn schedule(self: *Scheduler, batch: Batch) void {
@@ -173,9 +172,8 @@ pub const Task = extern struct {
             self.event = AutoResetEvent{};
             self.thread = thread;
 
-            const scheduler = @intToPtr(*Scheduler, scheduler_ptr);
-            const is_main_thread = !scheduler.has_worker;
-            scheduler.has_worker = true;
+            const scheduler = @intToPtr(*Scheduler, scheduler_ptr & ~@as(usize, 1));
+            const is_main_thread = scheduler_ptr & 1 != 0;
 
             const old_current = Worker.tryGetCurrent();
             Worker.setCurrent(&self);
@@ -217,12 +215,15 @@ pub const Task = extern struct {
             switch (action) {
                 .spawned => |spawned| {
                     const scheduler = @fieldParentPtr(Scheduler, "scheduler", spawned.scheduler);
-                    if (std.builtin.single_threaded or !scheduler.has_worker) {
-                        spawned.spawned = true;
-                        Worker.run(null, @ptrToInt(scheduler));
-                    } else {
-                        spawned.spawned = Thread.spawn(@ptrToInt(scheduler), Worker.run);
-                    }
+
+                    spawned.spawned.* = blk: {
+                        if (single_threaded or spawned.was_first) {
+                            Worker.run(null, @ptrToInt(scheduler) | 1);
+                            break :blk true;
+                        } else {
+                            break :blk Thread.spawn(@ptrToInt(scheduler), Worker.run);
+                        }
+                    };
                 },
                 .joined => |joined| {
                     const worker = @fieldParentPtr(Worker, "worker", joined.worker);
@@ -231,12 +232,12 @@ pub const Task = extern struct {
                     if (thread) |thread_handle|
                         Thread.join(thread_handle);
                 },
-                .resumed => |core_worker| {
-                    const worker = @fieldParentPtr(Worker, "worker", core_worker);
+                .resumed => |resumed| {
+                    const worker = @fieldParentPtr(Worker, "worker", resumed.worker);
                     worker.event.set();
                 },
-                .suspended => |core_worker| {
-                    const worker = @fieldParentPtr(Worker, "worker", core_worker);
+                .suspended => |suspended| {
+                    const worker = @fieldParentPtr(Worker, "worker", suspended.worker);
                     worker.event.wait();
                 },
                 .acquired => |core_scheduler| {

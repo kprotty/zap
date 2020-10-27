@@ -1,6 +1,9 @@
 const std = @import("std");
 const core = @import("../zap.zig").core;
 
+const Atomic = core.sync.atomic.Atomic;
+const spinLoopHint = core.sync.atomic.spinLoopHint;
+
 pub const Task = extern struct {
     next: ?*Task = undefined,
 
@@ -45,10 +48,10 @@ pub const Platform = struct {
     callFn: fn(*Platform, Action) void,
 
     pub const Action = union(enum) {
-        spawned: *Spawned,
+        spawned: Spawned,
         joined: Joined,
-        resumed: *Worker,
-        suspended: *Worker,
+        resumed: Resumed,
+        suspended: Suspended,
         acquired: *Scheduler,
         released: *Scheduler,
         polled: Polled,
@@ -56,12 +59,35 @@ pub const Platform = struct {
 
         pub const Spawned = struct {
             scheduler: *Scheduler,
-            spawned: bool = false,
+            spawned: *bool,
+            was_first: bool,
         };
 
         pub const Joined = struct {
             scheduler: *Scheduler,
             worker: *Worker,
+        };
+
+        pub const Suspended = struct {
+            worker: *Worker,
+            intention: Intention,
+
+            pub const Intention = enum {
+                last,
+                waiting,
+                shutdown,
+            };
+        };
+
+        pub const Resumed = struct {
+            worker: *Worker,
+            intention: Intention,
+
+            pub const Intention = enum {
+                first,
+                waking,
+                shutdown,
+            };
         };
 
         pub const Executed = struct {
@@ -90,8 +116,9 @@ pub const Scheduler = extern struct {
     platform: *Platform,
     run_queue: Task.Batch = Task.Batch{},
     idle_queue: ?*Worker = null,
-    active_queue: core.sync.atomic.Atomic(?*Worker) = core.sync.atomic.Atomic(?*Worker).init(null),
-    active_workers: core.sync.atomic.Atomic(usize) = core.sync.atomic.Atomic(usize).init(0),
+    running_workers: Atomic(usize) = Atomic(usize).init(0),
+    active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+    active_workers: Atomic(usize) = Atomic(usize).init(0),
     max_workers: usize,
     state: State = .ready,
     main_worker: *Worker = undefined,
@@ -157,8 +184,12 @@ pub const Scheduler = extern struct {
                     unreachable; // worker with invalid state when being resumed
                 }
 
+                const running_workers = self.running_workers.get();
+                self.running_workers.store(running_workers + 1, .relaxed);
+                const was_first = running_workers == 0;
+
                 self.release();
-                worker.notify();
+                worker.notify(if (was_first) .first else .waking);
                 return;
             }
 
@@ -169,17 +200,29 @@ pub const Scheduler = extern struct {
                 return;
             }
 
+            const running_workers = self.running_workers.get();
+            self.running_workers.store(running_workers + 1, .relaxed);
+            const was_first = running_workers == 0;
+
             self.active_workers.store(active_workers + 1, .relaxed);
             self.state = .waking;
             self.release();
 
-            var spawned = Platform.Action.Spawned{ .scheduler = self };
-            self.platform.call(.{ .spawned = &spawned });
-            if (spawned.spawned)
+            var did_spawn = false;
+            self.platform.call(.{
+                .spawned = .{
+                    .scheduler = self,
+                    .spawned = &did_spawn,
+                    .was_first = was_first,
+                },
+            });
+
+            if (did_spawn)
                 return;
 
             self.acquire();
             self.active_workers.store(self.active_workers.get() - 1, .relaxed);
+            self.running_workers.store(self.running_workers.get() - 1, .relaxed);
             is_waking = true;
 
             spawn_attempts -= 1;
@@ -213,10 +256,10 @@ pub const Scheduler = extern struct {
             self.release();
 
             if (active_workers == 1) {
-                self.main_worker.notify();
+                self.main_worker.notify(.shutdown);
             }
 
-            worker.wait();
+            worker.wait(.shutdown);
             if (!worker.isMainWorker())
                 return;
 
@@ -263,12 +306,16 @@ pub const Scheduler = extern struct {
             }
         }
 
+        const running_workers = self.running_workers.get();
+        self.running_workers.store(running_workers - 1, .relaxed);
+        const was_last = running_workers == 1;
+
         worker.state = .suspended;
         worker.next = self.idle_queue;
         self.idle_queue = worker;
         self.release();
         
-        worker.wait();
+        worker.wait(if (was_last) .last else .waiting);
     }
 
     pub fn shutdown(self: *Scheduler) void {
@@ -280,6 +327,8 @@ pub const Scheduler = extern struct {
         }
 
         self.state = .shutdown;
+        self.running_workers.store(0, .relaxed);
+        
         var idle_workers = self.idle_queue;
         self.idle_queue = null;
         self.release();
@@ -288,7 +337,7 @@ pub const Scheduler = extern struct {
             const shutdown_worker = idle_worker;
             idle_workers = shutdown_worker.next;
             shutdown_worker.state = .stopping;
-            shutdown_worker.notify();
+            shutdown_worker.notify(.shutdown);
         }
     }
 };
@@ -300,10 +349,10 @@ pub const Worker = extern struct {
     active_next: ?*Worker = null,
     active_target: ?*Worker = null,
     runq_next: ?*Task = null,
-    runq_head: core.sync.atomic.Atomic(usize) = core.sync.atomic.Atomic(usize).init(0),
-    runq_tail: core.sync.atomic.Atomic(usize) = core.sync.atomic.Atomic(usize).init(0),
-    runq_lifo: core.sync.atomic.Atomic(?*Task) = core.sync.atomic.Atomic(?*Task).init(null),
-    runq_buffer: [256]core.sync.atomic.Atomic(*Task) = undefined,
+    runq_head: Atomic(usize) = Atomic(usize).init(0),
+    runq_tail: Atomic(usize) = Atomic(usize).init(0),
+    runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
+    runq_buffer: [256]Atomic(*Task) = undefined,
 
     const State = extern enum {
         running,
@@ -376,12 +425,22 @@ pub const Worker = extern struct {
         return self.scheduler & 1 != 0;
     }
 
-    fn wait(self: *Worker) void {
-        self.getScheduler().platform.call(.{ .suspended = self });
+    fn wait(self: *Worker, intention: Platform.Action.Suspended.Intention) void {
+        self.getScheduler().platform.call(.{
+            .suspended = .{
+                .worker = self,
+                .intention = intention,
+            },
+        });
     }
 
-    fn notify(self: *Worker) void {
-        self.getScheduler().platform.call(.{ .resumed = self });
+    fn notify(self: *Worker, intention: Platform.Action.Resumed.Intention) void {
+        self.getScheduler().platform.call(.{
+            .resumed = .{
+                .worker = self,
+                .intention = intention,
+            },
+        });
     }
 
     pub const ScheduleHints = struct {
@@ -529,7 +588,7 @@ pub const Worker = extern struct {
                 
                 const target_size = target_tail -% target_head;
                 if (target_size > target.runq_buffer.len) {
-                    core.sync.atomic.spinLoopHint();
+                    spinLoopHint();
                     target_head = target.runq_head.load(.relaxed);
                     continue;
                 }

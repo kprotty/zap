@@ -1,5 +1,5 @@
 const std = @import("std");
-const zap = @import("./zap.zig");
+const zap = @import("../zap.zig");
 const core = zap.core;
 
 pub const Task = extern struct {

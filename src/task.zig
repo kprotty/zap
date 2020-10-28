@@ -77,13 +77,16 @@ pub const Task = struct {
     pub fn yield() void {
         suspend {
             var task = Task.init(@frame());
-            const worker = Worker.getCurrent() orelse @panic("Task.yield() when not inside scheduler");
-            worker.schedule(Batch.from(&task), .{ .use_lifo = false });
+            Batch.from(&task).schedule(.{ .use_lifo = false });
         }
     }
 
     pub fn schedule(self: *Task) void {
-        Batch.from(self).schedule();
+        Batch.from(self).schedule(.{});
+    }
+
+    pub fn scheduleNext(self: *Task) void {
+        Batch.from(self).schedule(.{ .use_next = true });
     }
 
     pub const Batch = struct {
@@ -121,12 +124,12 @@ pub const Task = struct {
             return task;
         }
 
-        pub fn schedule(self: Batch) void {
+        pub fn schedule(self: Batch, hints: Worker.ScheduleHints) void {
             if (self.isEmpty())
                 return;
 
             const worker = Worker.getCurrent() orelse @panic("Batch.schedule when not inside scheduler");
-            worker.schedule(self, .{});
+            worker.schedule(self, hints);
         }
     };
 
@@ -141,6 +144,7 @@ pub const Task = struct {
         runq_head: usize = 0,
         runq_tail: usize = 0,
         runq_lifo: ?*Task = null,
+        runq_next: ?*Task = null,
         runq_buffer: [256]*Task = undefined,
 
         const State = enum {
@@ -167,12 +171,21 @@ pub const Task = struct {
 
         pub const ScheduleHints = struct {
             use_lifo: bool = true,
+            use_next: bool = false,
         };
 
         pub fn schedule(self: *Worker, tasks: Batch, hints: ScheduleHints) void {
             var batch = tasks;
             if (batch.isEmpty())
                 return;
+
+            if (hints.use_next) {
+                if (self.runq_next) |old_next|
+                    batch.push(old_next);
+                self.runq_next = batch.pop();
+                if (batch.isEmpty())
+                    return;
+            }
 
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
@@ -235,6 +248,12 @@ pub const Task = struct {
 
         fn poll(self: *Worker, scheduler: *Scheduler, held: *?Mutex.Held) ?*Task {
             // TODO: if single-threaded, poll for io/timers (non-blocking)
+
+            if (self.runq_next) |next| {
+                const task = next;
+                self.runq_next = null;
+                return task;
+            }
 
             var lifo = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
             while (lifo) |task| {

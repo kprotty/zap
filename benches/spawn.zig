@@ -1,64 +1,44 @@
 const std = @import("std");
 const zap = @import("zap");
 
-const Task = zap.runtime.Task;
+const Task = zap.Task;
 const allocator = std.heap.page_allocator;
 
 const num_spawners = 10;
 const num_tasks = 100_000;
 
 pub fn main() !void {
-    try (try Task.runAsync(.{}, asyncMain, .{}));
+    try (try Task.run(.{}, asyncMain, .{}));
 }
 
-fn asyncMain() callconv(.Async) !void {
+fn asyncMain() !void {
     const frames = try allocator.alloc(@Frame(spawner), num_spawners);
     defer allocator.free(frames);
 
-    var task = Task.initAsync(@frame());
     var counter: usize = num_tasks * num_spawners;
-    
-    suspend {
-        var batch = Task.Batch{};
-        for (frames) |*frame| {
-            frame.* = async spawner(&batch, &counter, &task);
-        }
-        batch.scheduleNext();
-    }
+    for (frames) |*frame|
+        frame.* = async spawner(&counter);
+    for (frames) |*frame|
+        try (await frame);
 
     const count = @atomicLoad(usize, &counter, .Monotonic);
     if (count != 0)
         std.debug.panic("bad counter", .{});
 }
 
-fn spawner(batch: *Task.Batch, counter: *usize, main_task: *Task) !void {
-    suspend {
-        var task = Task.initAsync(@frame());
-        batch.push(&task);
-    }
+fn spawner(counter: *usize) !void {
+    Task.yield();
 
     const frames = try allocator.alloc(@Frame(runner), num_tasks);
     defer allocator.free(frames);
 
-    suspend {
-        var runnber_batch = Task.Batch{};
-        for (frames) |*frame| {
-            frame.* = async runner(&runnber_batch, counter, main_task);
-        }
-        runnber_batch.schedule();
-    }
+    for (frames) |*frame|
+        frame.* = async runner(counter);
+    for (frames) |*frame|
+        await frame;
 }
 
-fn runner(batch: *Task.Batch, counter: *usize, main_task: *Task) void {
-    suspend {
-        var task = Task.initAsync(@frame());
-        batch.push(&task);
-    }
-
-    suspend {
-        const count = @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
-        if (count == 1) {
-            main_task.scheduleNext();
-        }
-    }
+fn runner(counter: *usize) void {
+    Task.yield();
+    _ =  @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
 }

@@ -9,7 +9,6 @@ pub fn build(b: *std.build.Builder) void {
 
     inline for ([_][]const u8 {
         "spawn",
-        "lock",
         "yield",
     }) |example| {
         const zig_exe = b.addExecutable(example, example ++ ".zig");

@@ -1,27 +1,9 @@
 const std = @import("std");
 const zap = @import("./zap.zig");
 
+const Mutex = std.Mutex;
 const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
-
-const Mutex = if (std.builtin.os.tag != .windows) std.Mutex else struct {
-    locked: bool = false,
-
-    fn acquire(self: *Mutex) Held {
-        while (@atomicRmw(bool, &self.locked, .Xchg, true, .Acquire)) {
-            _ = std.os.windows.kernel32.Sleep(1);
-        }
-        return Held{ .mutex = self };
-    }
-
-    const Held = struct {
-        mutex: *Mutex,
-
-        fn release(self: Held) void {
-            @atomicStore(bool, &self.mutex.locked, false, .Release);
-        }  
-    };
-};
 
 pub const Task = struct {
     next: ?*Task = undefined,

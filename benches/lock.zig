@@ -5,8 +5,8 @@ const Task = zap.runtime.Task;
 const Lock = zap.runtime.sync.Lock;
 const allocator = std.heap.page_allocator;
 
-const num_iters = 100_000;
-const num_tasks = 100_000;
+const num_iters = 100;
+const num_tasks = 500;
 
 pub fn main() !void {
     try (try Task.runAsync(.{}, asyncMain, .{}));

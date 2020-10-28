@@ -28,6 +28,9 @@ pub const OsFutex = struct {
     }
 
     pub fn yield(self: *OsFutex, iteration: ?usize) bool {
+        if (std.builtin.single_threaded)
+            return false;
+            
         var iter = iteration orelse {
             Event.yield();
             return false;
@@ -88,15 +91,14 @@ pub const OsFutex = struct {
 };
 
 pub const AsyncFutex = struct {
-    state: sync.atomic.Atomic(usize) = undefined,
+    task: *Task = undefined,
 
     pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: *core.sync.Condition) bool {
-        var task = Task.initAsync(@frame());
-
         // TODO: integrate timers with deadline
         
         suspend {
-            self.state.store(@ptrToInt(&task), .release);
+            var task = Task.initAsync(@frame());
+            self.task = &task;
 
             if (condition.isMet()) {
                 task.scheduleNext();
@@ -107,19 +109,25 @@ pub const AsyncFutex = struct {
     }
 
     pub fn wake(self: *AsyncFutex) void {
-        const task = blk: {
-            @setRuntimeSafety(false);
-            const state = self.state.load(.acquire);
-            break :blk @intToPtr(*Task, state);
-        };
-
-        task.schedule();
+        self.task.schedule();
     }
 
     pub fn yield(self: *AsyncFutex, iteration: ?usize) bool {
-        // async doesn't benefit from yielding
-        sync.atomic.spinLoopHint();
-        return false;
+        if (std.builtin.single_threaded)
+            return false;
+
+        const max_spin = 8;
+        const max_iter = @ctz(usize, max_spin);
+        
+        var iter = iteration orelse max_iter;
+        if (iter > max_iter)
+            return false;
+
+        iter = @as(usize, 1) << @intCast(std.math.Log2Int(usize), iter);
+        while (iter != 0) : (iter -= 1)
+            sync.atomic.spinLoopHint();
+
+        return true;
     }
 
     pub const Timestamp = u64;

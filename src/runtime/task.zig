@@ -131,10 +131,29 @@ pub const Task = extern struct {
             });
         }
     };
+
+    const Lock = zap.runtime.sync.Lock;
+    // const Lock = OsLock;
+    const OsLock = extern struct {
+        s: usize = 0,
+
+        fn acquire(self: *@This()) void {
+            AcquireSRWLockExclusive(&self.s);
+        }
+
+        fn release(self: *@THis()) void {
+            ReleaseSRWLockExclusive(&self.s);
+        }
+
+        extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+        extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    };
+
+    // const AutoResetEvent = zap.runtime.sync.AutoResetEvent;
+    const AutoResetEvent = std.AutoResetEvent;
     
     const Thread = zap.runtime.Thread;
-    const Lock = zap.runtime.sync.Lock;
-    const AutoResetEvent = zap.runtime.sync.AutoResetEvent;
+    
 
     pub const Scheduler = struct {
         lock: Lock,

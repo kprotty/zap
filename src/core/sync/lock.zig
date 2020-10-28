@@ -26,9 +26,10 @@ pub const Lock = extern struct {
     }
 
     pub fn acquire(self: *Lock, comptime Futex: type) void {
-        if (!self.tryAcquire()) {
-            self.acquireSlow(Futex);
-        }
+        // if (!self.tryAcquire()) {
+        //     self.acquireSlow(Futex);
+        // }
+        self.acquireSlow(Futex);
     }
 
     fn acquireSlow(this: *Lock, comptime Futex: type) void {
@@ -93,7 +94,10 @@ pub const Lock = extern struct {
                         (state & ~WAITING) | @ptrToInt(&self.waiter),
                         .release,
                         .relaxed,
-                    ) orelse return false;
+                    ) orelse {
+                        std.debug.warn("waker wait = {*}\n", .{&self.waiter.waker});
+                        return false;
+                    };
                 }                
             }
         };
@@ -162,7 +166,7 @@ pub const Lock = extern struct {
                 while (true) {
                     state = self.state.tryCompareAndSwap(
                         state,
-                        (state & LOCKED) | WAKING,
+                        state & (LOCKED | WAKING),
                         .relaxed,
                         .relaxed,
                     ) orelse break;
@@ -173,6 +177,7 @@ pub const Lock = extern struct {
                 }
             }
 
+            std.debug.warn("waker wake = {*}\n", .{&tail.waker});
             tail.waker.wake();
             return;
         }

@@ -91,35 +91,32 @@ pub const OsFutex = struct {
 };
 
 pub const AsyncFutex = struct {
-    task: core.sync.atomic.Atomic(usize) = undefined,
+    task: *Task = undefined,
 
     pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: *core.sync.Condition) bool {
         // TODO: integrate timers with deadline
 
-        self.task.set(0);
-        
-        if (condition.isMet())
-            return true;
+        var waiting = false;
+        var task = Task.initAsync(@frame());
 
-        suspend {
-            var task = Task.initAsync(@frame());
-            const t = self.task.swap(@ptrToInt(&task), .acq_rel);
+        suspend {    
+            self.task = &task;
 
-            std.debug.warn("{*} sleeping = {}\n", .{&task, t});
-            if (t == 1)
+            waiting = !condition.isMet();
+            std.debug.warn("sleeping = {*} (wait = {})\n", .{&task, waiting});
+
+            if (!waiting)
                 task.scheduleNext();
         }
 
+        // std.debug.warn("waking = {*} (wait = {})\n", .{&task, waiting});
         return true;
     }
 
     pub fn wake(self: *AsyncFutex) void {
-        const task = self.task.swap(1, .acq_rel);
-        if (task > 1) {
-            const t =@intToPtr(*Task, task);
-            std.debug.warn("{*} waking\n", .{t});
-            t.schedule();
-        }
+        const task = self.task;
+        std.debug.warn("waking = {*}\n", .{task});
+        task.schedule();
     }
 
     pub fn yield(self: *AsyncFutex, iteration: ?usize) bool {

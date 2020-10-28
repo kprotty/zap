@@ -1,9 +1,28 @@
 const std = @import("std");
 const zap = @import("./zap.zig");
 
-const Mutex = std.Mutex;
 const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
+
+const Mutex = if (std.builtin.os.tag != .windows) std.Mutex else struct {
+    srwlock: usize = 0,
+
+    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+
+    fn acquire(self: *Mutex) Held {
+        AcquireSRWLockExclusive(&self.srwlock);
+        return Held{ .mutex = self };
+    }
+
+    const Held = struct {
+        mutex: *Mutex,
+
+        fn release(self: Held) void {
+            ReleaseSRWLockExclusive(&self.mutex.srwlock);
+        }  
+    };
+};
 
 pub const Task = struct {
     next: ?*Task = undefined,

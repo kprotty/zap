@@ -146,6 +146,7 @@ pub const Task = struct {
         active_next: ?*Worker = null,
         target_worker: ?*Worker = null,
         event: AutoResetEvent = AutoResetEvent{},
+        runq_tick: usize = 0,
         runq_head: usize = 0,
         runq_tail: usize = 0,
         runq_lifo: ?*Task = null,
@@ -288,6 +289,26 @@ pub const Task = struct {
                 const task = next;
                 self.runq_next = null;
                 return task;
+            }
+
+            if (self.runq_tick % 61 == 0) {
+                var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+                while (overflow) |first_task| {
+                    overflow = @cmpxchgWeak(
+                        ?*Task,
+                        &self.runq_overflow,
+                        first_task,
+                        null,
+                        .Monotonic,
+                        .Monotonic,
+                    ) orelse {
+                        if (first_task.next) |next| {
+                            injected.* = true;
+                            @atomicStore(?*Task, &self.runq_overflow, next, .Release);
+                        }
+                        return first_task;
+                    };
+                }
             }
 
             var lifo = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
@@ -508,6 +529,7 @@ pub const Task = struct {
                 ) orelse break;
             }
 
+            self.runq_tick = @ptrToInt(&self);
             while (true) {
                 const should_poll = switch (self.state) {
                     .running, .waking => true,
@@ -522,6 +544,7 @@ pub const Task = struct {
                         if (injected or self.state == .waking)
                             scheduler.resumeWorker(self.state == .waking);
                         self.state = .running;
+                        self.runq_tick +%= 1;
                         resume task.frame;
                         continue;
                     }

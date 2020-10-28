@@ -5,6 +5,10 @@ const Mutex = std.Mutex;
 const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
 
+fn spinLoopHint() void {
+    std.SpinLock.loopHint(1);
+}
+
 pub const Task = struct {
     next: ?*Task = undefined,
     frame: anyframe,
@@ -62,6 +66,13 @@ pub const Task = struct {
         }
     }
 
+    pub fn runConcurrently() void {
+        suspend {
+            var task = Task.init(@frame());
+            Batch.from(&task).schedule(.{ .use_lifo = true });
+        }
+    }
+
     pub fn schedule(self: *Task) void {
         Batch.from(self).schedule(.{});
     }
@@ -96,6 +107,19 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 self.tail.next = other.head;
                 self.tail = other.tail;
+            }
+        }
+
+        pub fn pushFront(self: *Batch, task: *Task) void {
+            self.pushFrontMany(Batch.from(task));
+        }
+
+        pub fn pushFrontMany(self: *Batch, other: Batch) void {
+            if (self.isEmpty()) {
+                self.* = other;
+            } else if (!other.isEmpty()) {
+                other.tail.next = self.head;
+                self.head = other.head;
             }
         }
 
@@ -169,16 +193,15 @@ pub const Task = struct {
                     return;
             }
 
+            if (hints.use_lifo) {
+                if (@atomicRmw(?*Task, &self.runq_lifo, .Xchg, batch.pop(), .Release)) |old_lifo|
+                    batch.pushFront(old_lifo);
+            }
+
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
 
             while (!batch.isEmpty()) {
-                if (hints.use_lifo and @atomicLoad(?*Task, &self.runq_lifo, .Monotonic) == null) {
-                    @atomicStore(?*Task, &self.runq_lifo, batch.pop(), .Release);
-                    head = @atomicLoad(usize, &self.runq_head, .Monotonic);
-                    continue;
-                }
-
                 var remaining = self.runq_buffer.len - (tail -% head);
                 if (remaining > 0) {
                     while (remaining > 0) : (remaining -= 1) {
@@ -210,8 +233,7 @@ pub const Task = struct {
                     const task = self.runq_buffer[head % self.runq_buffer.len];
                     overflowed.push(task);
                 }
-                overflowed.pushMany(batch);
-                batch = overflowed;
+                batch.pushFrontMany(overflowed);
                 
                 var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
                 while (true) {
@@ -311,6 +333,7 @@ pub const Task = struct {
 
                         const target_size = target_tail -% target_head;
                         if (target_size > target.runq_buffer.len) {
+                            spinLoopHint();
                             target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
                             continue;
                         }
@@ -342,6 +365,7 @@ pub const Task = struct {
                                 break;
                             }
 
+                            spinLoopHint();
                             target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
                             continue;
                         }

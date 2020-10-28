@@ -39,6 +39,7 @@ fn spawner(counter: *usize) !void {
 }
 
 fn runner(counter: *usize) void {
-    Task.yield();
+    Task.runConcurrently();
+    
     _ =  @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
 }

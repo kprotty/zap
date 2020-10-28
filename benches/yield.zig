@@ -27,7 +27,7 @@ fn asyncMain() !void {
 }
 
 fn yielder(counter: *usize) void {
-    Task.yield();
+    Task.runConcurrently();
 
     var i: usize = num_yields;
     while (i != 0) : (i -= 1) {

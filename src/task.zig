@@ -5,13 +5,12 @@ const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
 
 const Mutex = if (std.builtin.os.tag != .windows) std.Mutex else struct {
-    srwlock: usize = 0,
-
-    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
-    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    locked: bool = false,
 
     fn acquire(self: *Mutex) Held {
-        AcquireSRWLockExclusive(&self.srwlock);
+        while (@atomicRmw(bool, &self.locked, .Xchg, true, .Acquire)) {
+            _ = std.os.windows.kernel32.Sleep(1);
+        }
         return Held{ .mutex = self };
     }
 
@@ -19,7 +18,7 @@ const Mutex = if (std.builtin.os.tag != .windows) std.Mutex else struct {
         mutex: *Mutex,
 
         fn release(self: Held) void {
-            ReleaseSRWLockExclusive(&self.mutex.srwlock);
+            @atomicStore(bool, &self.mutex.locked, false, .Release);
         }  
     };
 };
@@ -280,7 +279,7 @@ pub const Task = struct {
                 ) orelse return self.runq_buffer[head % self.runq_buffer.len];
             }
 
-            var steal_attempts: usize = 4;
+            var steal_attempts: usize = 1;
             while (steal_attempts > 0) : (steal_attempts -= 1) {
                 
                 var active_workers = @atomicLoad(usize, &scheduler.active_workers, .Monotonic);

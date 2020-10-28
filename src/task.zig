@@ -77,7 +77,8 @@ pub const Task = struct {
     pub fn yield() void {
         suspend {
             var task = Task.init(@frame());
-            task.schedule();
+            const worker = Worker.getCurrent() orelse @panic("Task.yield() when not inside scheduler");
+            worker.schedule(Batch.from(&task), .{ .use_lifo = false });
         }
     }
 
@@ -125,7 +126,7 @@ pub const Task = struct {
                 return;
 
             const worker = Worker.getCurrent() orelse @panic("Batch.schedule when not inside scheduler");
-            worker.schedule(self);
+            worker.schedule(self, .{});
         }
     };
 
@@ -139,6 +140,7 @@ pub const Task = struct {
         event: AutoResetEvent = AutoResetEvent{},
         runq_head: usize = 0,
         runq_tail: usize = 0,
+        runq_lifo: ?*Task = null,
         runq_buffer: [256]*Task = undefined,
 
         const State = enum {
@@ -163,7 +165,11 @@ pub const Task = struct {
             return self.scheduler;
         }
 
-        pub fn schedule(self: *Worker, tasks: Batch) void {
+        pub const ScheduleHints = struct {
+            use_lifo: bool = true,
+        };
+
+        pub fn schedule(self: *Worker, tasks: Batch, hints: ScheduleHints) void {
             var batch = tasks;
             if (batch.isEmpty())
                 return;
@@ -172,6 +178,15 @@ pub const Task = struct {
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
 
             while (true) {
+                if (hints.use_lifo and @atomicLoad(?*Task, &self.runq_lifo, .Monotonic) == null) {
+                    @atomicStore(?*Task, &self.runq_lifo, batch.pop(), .Release);
+                    if (batch.isEmpty())
+                        break;
+
+                    head = @atomicLoad(usize, &self.runq_head, .Monotonic);
+                    continue;
+                }
+
                 var remaining = self.runq_buffer.len - (tail -% head);
                 if (remaining > 0) {
                     while (remaining > 0) : (remaining -= 1) {
@@ -221,6 +236,18 @@ pub const Task = struct {
         fn poll(self: *Worker, scheduler: *Scheduler, held: *?Mutex.Held) ?*Task {
             // TODO: if single-threaded, poll for io/timers (non-blocking)
 
+            var lifo = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
+            while (lifo) |task| {
+                lifo = @cmpxchgWeak(
+                    ?*Task,
+                    &self.runq_lifo,
+                    lifo,
+                    null,
+                    .Monotonic,
+                    .Monotonic,
+                ) orelse return task;
+            }
+
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
             while (tail != head) {
@@ -257,12 +284,27 @@ pub const Task = struct {
                         const target_size = target_tail -% target_head;
                         if (target_size > target.runq_buffer.len) {
                             target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
-                            continue;    
+                            continue;
                         }
 
                         var steal = target_size - (target_size / 2);
-                        if (steal == 0)
-                            break;
+                        if (steal == 0) {
+                            if (@atomicLoad(?*Task, &target.runq_lifo, .Monotonic)) |task| {
+                                _ = @cmpxchgWeak(
+                                    ?*Task,
+                                    &target.runq_lifo,
+                                    task,
+                                    null,
+                                    .Acquire,
+                                    .Monotonic,
+                                ) orelse return task;
+                            } else {
+                                break;
+                            }
+
+                            target_head = @atomicLoad(usize, &target.runq_head, .Monotonic);
+                            continue;
+                        }
 
                         const first_task = @atomicLoad(*Task, &target.runq_buffer[target_head % target.runq_buffer.len], .Unordered);
                         var new_target_head = target_head +% 1;

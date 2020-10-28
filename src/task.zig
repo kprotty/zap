@@ -176,7 +176,7 @@ pub const Task = struct {
         }
 
         pub const ScheduleHints = struct {
-            use_lifo: bool = true,
+            use_lifo: bool = false,
             use_next: bool = false,
         };
 

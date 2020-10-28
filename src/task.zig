@@ -240,12 +240,15 @@ pub const Task = struct {
             }
 
             const scheduler = self.getScheduler();
-            const held = scheduler.lock.acquire();
-            scheduler.run_queue.pushMany(batch);
-            scheduler.resumeWorker(.{ .held = held });
+            if (!batch.isEmpty()) {
+                const held = scheduler.runq_lock.acquire();
+                scheduler.run_queue.pushMany(batch);
+                held.release();
+            }
+            scheduler.resumeWorker(false);
         }
 
-        fn poll(self: *Worker, scheduler: *Scheduler, held: *?Mutex.Held) ?*Task {
+        fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
             // TODO: if single-threaded, poll for io/timers (non-blocking)
 
             if (self.runq_next) |next| {
@@ -355,20 +358,23 @@ pub const Task = struct {
                 }
             }
 
-            held.* = scheduler.lock.acquire();
-            if (scheduler.run_queue.pop()) |first_task| {
-                var new_tail = tail;
-                var remaining: usize = self.runq_buffer.len;
+            {
+                const held = scheduler.runq_lock.acquire();
+                defer held.release();
+                if (scheduler.run_queue.pop()) |first_task| {
+                    var new_tail = tail;
+                    var remaining: usize = self.runq_buffer.len;
 
-                while (remaining > 0) : (remaining -= 1) {
-                    const task = scheduler.run_queue.pop() orelse break;
-                    @atomicStore(*Task, &self.runq_buffer[new_tail % self.runq_buffer.len], task, .Unordered);
-                    new_tail +%= 1;
+                    while (remaining > 0) : (remaining -= 1) {
+                        const task = scheduler.run_queue.pop() orelse break;
+                        @atomicStore(*Task, &self.runq_buffer[new_tail % self.runq_buffer.len], task, .Unordered);
+                        new_tail +%= 1;
+                    }
+
+                    if (new_tail != tail)
+                        @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+                    return first_task;
                 }
-
-                if (new_tail != tail)
-                    @atomicStore(usize, &self.runq_tail, new_tail, .Release);
-                return first_task;
             }
 
             // TODO: if single-threaded, poll for io/timers (blocking)
@@ -433,34 +439,25 @@ pub const Task = struct {
                     .shutdown => break,
                 };
 
-                var held: ?Mutex.Held = null;
                 if (should_poll) {
-                    if (self.poll(scheduler, &held)) |task| {
-                        if (self.state == .waking) {
-                            scheduler.resumeWorker(.{
-                                .is_waking = true,
-                                .held = held,
-                            });
-                        } else if (held) |h| {
-                            h.release();
-                        }
+                    if (self.poll(scheduler)) |task| {
+                        if (self.state == .waking)
+                            scheduler.resumeWorker(true);
                         self.state = .running;
                         resume task.frame;
                         continue;
                     }
                 }
 
-                scheduler.suspendWorker(.{
-                    .worker = &self,
-                    .held = held,
-                });
+                scheduler.suspendWorker(&self);
             }
         }
     };
 
     pub const Scheduler = struct {
         state: State = .running,
-        lock: Mutex = Mutex{},
+        runq_lock: Mutex = Mutex{},
+        idle_lock: Mutex = Mutex{},
         run_queue: Batch = Batch{},
         idle_queue: ?*Worker = null,
         active_queue: ?*Worker = null,
@@ -488,11 +485,11 @@ pub const Task = struct {
         }
 
         pub fn run(self: *Scheduler) void {
-            self.resumeWorker(.{});
+            self.resumeWorker(false);
         }
 
         pub fn shutdown(self: *Scheduler) void {
-            const held = self.lock.acquire();
+            const held = self.idle_lock.acquire();
 
             if (self.state == .shutdown) {
                 held.release();
@@ -513,15 +510,10 @@ pub const Task = struct {
             }
         }
 
-        const ResumeContext = struct {
-            is_waking: bool = false,
-            held: ?Mutex.Held = null,
-        };
-
-        fn resumeWorker(self: *Scheduler, context: ResumeContext) void {
+        fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
             var spawn_retries: usize = 3;
-            var is_waking = context.is_waking;
-            var held = context.held orelse self.lock.acquire();
+            var is_waking = is_caller_waking;
+            var held = self.idle_lock.acquire();
 
             while (true) {
                 if (self.state == .shutdown) {
@@ -560,7 +552,7 @@ pub const Task = struct {
                         return;
                     }
 
-                    held = self.lock.acquire();
+                    held = self.idle_lock.acquire();
                     active_workers = self.active_workers;
                     @atomicStore(usize, &self.active_workers, active_workers - 1, .Monotonic);
                     if (self.state != .waking)
@@ -577,22 +569,17 @@ pub const Task = struct {
             }
         }
 
-        const SuspendContext = struct {
-            worker: *Worker,
-            held: ?Mutex.Held,
-        };
-
-        fn suspendWorker(self: *Scheduler, context: SuspendContext) void {
-            var held = context.held orelse self.lock.acquire();
+        fn suspendWorker(self: *Scheduler, worker: *Worker) void {
+            var held = self.idle_lock.acquire();
 
             if (self.state == .shutdown) {
-                context.worker.state = .stopping;
-                context.worker.idle_next = self.idle_queue;
-                self.idle_queue = context.worker;
+                worker.state = .stopping;
+                worker.idle_next = self.idle_queue;
+                self.idle_queue = worker;
 
-                const is_main_worker = context.worker.thread == null;
+                const is_main_worker = worker.thread == null;
                 if (is_main_worker) {
-                    self.main_worker = context.worker;
+                    self.main_worker = worker;
                 }
                 
                 const active_workers = self.active_workers;
@@ -604,34 +591,34 @@ pub const Task = struct {
                     main_worker.event.set();
                 }
 
-                context.worker.event.wait();
+                worker.event.wait();
 
                 if (is_main_worker) {
                     if (@atomicLoad(usize, &self.active_workers, .Monotonic) != 0)
                         @panic("remaining active workers when trying to shutdown all workers");
 
                     while (self.idle_queue) |idle_worker| {
-                        const worker = idle_worker;
-                        self.idle_queue = worker.idle_next;
+                        const shutdown_worker = idle_worker;
+                        self.idle_queue = shutdown_worker.idle_next;
 
-                        if (worker.state != .stopping)
+                        if (shutdown_worker.state != .stopping)
                             @panic("worker with invalid state when trying to shutdown");
-                        worker.state = .shutdown;
+                        shutdown_worker.state = .shutdown;
 
-                        const thread = worker.thread;
-                        worker.event.set();
+                        const thread = shutdown_worker.thread;
+                        shutdown_worker.event.set();
 
                         if (thread) |thread_handle|
                             thread_handle.wait();
                     }
                 }
 
-                if (context.worker.state != .shutdown)
+                if (worker.state != .shutdown)
                     @panic("worker with invalid state when shutting down");
                 return;
             }
 
-            if (context.worker.state == .waking) {
+            if (worker.state == .waking) {
                 if (self.state == .notified) {
                     self.state = .waking;
                     held.release();
@@ -641,13 +628,13 @@ pub const Task = struct {
                 }
             }
 
-            context.worker.state = .suspended;
-            context.worker.idle_next = self.idle_queue;
-            self.idle_queue = context.worker;
+            worker.state = .suspended;
+            worker.idle_next = self.idle_queue;
+            self.idle_queue = worker;
             held.release();
 
-            context.worker.event.wait();
-            switch (context.worker.state) {
+            worker.event.wait();
+            switch (worker.state) {
                 .waking, .stopping => {},
                 .suspended => @panic("worker resumed while still suspended"),
                 .shutdown => @panic("worker resumed when already shutdown"),

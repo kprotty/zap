@@ -194,8 +194,27 @@ pub const Task = struct {
             }
 
             if (hints.use_lifo) {
-                if (@atomicRmw(?*Task, &self.runq_lifo, .Xchg, batch.pop(), .Release)) |old_lifo|
-                    batch.pushFront(old_lifo);
+                const new_lifo = batch.pop();
+                var runq_lifo = @atomicLoad(?*Task, &self.runq_lifo, .Monotonic);
+
+                while (true) {
+                    const old_lifo = runq_lifo orelse {
+                        @atomicStore(?*Task, &self.runq_lifo, new_lifo, .Release);
+                        break;
+                    };
+
+                    runq_lifo = @cmpxchgWeak(
+                        ?*Task,
+                        &self.runq_lifo,
+                        old_lifo,
+                        new_lifo,
+                        .Release,
+                        .Monotonic,
+                    ) orelse {
+                        batch.pushFront(old_lifo);
+                        break;
+                    };
+                }
             }
 
             var tail = self.runq_tail;

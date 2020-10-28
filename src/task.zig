@@ -144,6 +144,7 @@ pub const Task = struct {
         runq_tail: usize = 0,
         runq_lifo: ?*Task = null,
         runq_next: ?*Task = null,
+        runq_overflow: ?*Task = null,
         runq_buffer: [256]*Task = undefined,
 
         const State = enum {
@@ -189,12 +190,9 @@ pub const Task = struct {
             var tail = self.runq_tail;
             var head = @atomicLoad(usize, &self.runq_head, .Monotonic);
 
-            while (true) {
+            while (!batch.isEmpty()) {
                 if (hints.use_lifo and @atomicLoad(?*Task, &self.runq_lifo, .Monotonic) == null) {
                     @atomicStore(?*Task, &self.runq_lifo, batch.pop(), .Release);
-                    if (batch.isEmpty())
-                        break;
-
                     head = @atomicLoad(usize, &self.runq_head, .Monotonic);
                     continue;
                 }
@@ -208,9 +206,6 @@ pub const Task = struct {
                     }
 
                     @atomicStore(usize, &self.runq_tail, tail, .Release);
-                    if (batch.isEmpty())
-                        break;
-
                     head = @atomicLoad(usize, &self.runq_head, .Monotonic);
                     continue;
                 }
@@ -233,22 +228,37 @@ pub const Task = struct {
                     const task = self.runq_buffer[head % self.runq_buffer.len];
                     overflowed.push(task);
                 }
-
                 overflowed.pushMany(batch);
                 batch = overflowed;
+                
+                var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+                while (true) {
+                    batch.tail.next = overflow;
+
+                    if (overflow == null) {
+                        @atomicStore(?*Task, &self.runq_overflow, batch.head, .Release);
+                        break;
+                    }
+
+                    overflow = @cmpxchgWeak(
+                        ?*Task,
+                        &self.runq_overflow,
+                        overflow,
+                        batch.head,
+                        .Release,
+                        .Monotonic,
+                    ) orelse break;
+                }
+
+                batch = Batch{};
                 break;
             }
 
             const scheduler = self.getScheduler();
-            if (!batch.isEmpty()) {
-                const held = scheduler.runq_lock.acquire();
-                scheduler.run_queue.pushMany(batch);
-                held.release();
-            }
             scheduler.resumeWorker(false);
         }
 
-        fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
+        fn poll(self: *Worker, scheduler: *Scheduler, injected: *bool) ?*Task {
             // TODO: if single-threaded, poll for io/timers (non-blocking)
 
             if (self.runq_next) |next| {
@@ -282,6 +292,21 @@ pub const Task = struct {
                 ) orelse return self.runq_buffer[head % self.runq_buffer.len];
             }
 
+            var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
+            while (overflow) |first_task| {
+                overflow = @cmpxchgWeak(
+                    ?*Task,
+                    &self.runq_overflow,
+                    first_task,
+                    null,
+                    .Monotonic,
+                    .Monotonic,
+                ) orelse {
+                    self.inject(first_task.next, tail, injected);
+                    return first_task;
+                };
+            }
+
             var steal_attempts: usize = 1;
             while (steal_attempts > 0) : (steal_attempts -= 1) {
                 
@@ -310,7 +335,19 @@ pub const Task = struct {
 
                         var steal = target_size - (target_size / 2);
                         if (steal == 0) {
-                            if (@atomicLoad(?*Task, &target.runq_lifo, .Monotonic)) |task| {
+                            if (@atomicLoad(?*Task, &target.runq_overflow, .Monotonic)) |first_task| {
+                                _ = @cmpxchgWeak(
+                                    ?*Task,
+                                    &target.runq_overflow,
+                                    first_task,
+                                    null,
+                                    .Acquire,
+                                    .Monotonic,
+                                ) orelse {
+                                    self.inject(first_task.next, tail, injected);
+                                    return first_task;
+                                };
+                            } else if (@atomicLoad(?*Task, &target.runq_lifo, .Monotonic)) |task| {
                                 _ = @cmpxchgWeak(
                                     ?*Task,
                                     &target.runq_lifo,
@@ -357,28 +394,43 @@ pub const Task = struct {
                     }
                 }
             }
-
-            {
-                const held = scheduler.runq_lock.acquire();
-                defer held.release();
-                if (scheduler.run_queue.pop()) |first_task| {
-                    var new_tail = tail;
-                    var remaining: usize = self.runq_buffer.len;
-
-                    while (remaining > 0) : (remaining -= 1) {
-                        const task = scheduler.run_queue.pop() orelse break;
-                        @atomicStore(*Task, &self.runq_buffer[new_tail % self.runq_buffer.len], task, .Unordered);
-                        new_tail +%= 1;
-                    }
-
-                    if (new_tail != tail)
-                        @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+            
+            var run_queue = @atomicLoad(?*Task, &scheduler.run_queue, .Monotonic);
+            while (run_queue) |first_task| {
+                run_queue = @cmpxchgWeak(
+                    ?*Task,
+                    &scheduler.run_queue,
+                    first_task,
+                    null,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse {
+                    self.inject(first_task.next, tail, injected);
                     return first_task;
-                }
+                };
             }
 
             // TODO: if single-threaded, poll for io/timers (blocking)
             return null;
+        }
+
+        fn inject(self: *Worker, run_queue: ?*Task, tail: usize, injected: *bool) void {
+            var new_tail = tail;
+            var runq: ?*Task = run_queue orelse return;
+            
+            var remaining: usize = self.runq_buffer.len;
+            while (remaining > 0) : (remaining -= 1) {
+                const task = runq orelse break;
+                runq = task.next;
+                @atomicStore(*Task, &self.runq_buffer[new_tail % self.runq_buffer.len], task, .Unordered);
+                new_tail +%= 1;
+            }
+
+            injected.* = true;
+            @atomicStore(usize, &self.runq_tail, new_tail, .Release);
+
+            if (runq != null)
+                @atomicStore(?*Task, &self.runq_overflow, runq, .Release);
         }
 
         const SpawnInfo = struct {
@@ -440,9 +492,10 @@ pub const Task = struct {
                 };
 
                 if (should_poll) {
-                    if (self.poll(scheduler)) |task| {
-                        if (self.state == .waking)
-                            scheduler.resumeWorker(true);
+                    var injected = false;
+                    if (self.poll(scheduler, &injected)) |task| {
+                        if (injected or self.state == .waking)
+                            scheduler.resumeWorker(self.state == .waking);
                         self.state = .running;
                         resume task.frame;
                         continue;
@@ -456,9 +509,8 @@ pub const Task = struct {
 
     pub const Scheduler = struct {
         state: State = .running,
-        runq_lock: Mutex = Mutex{},
         idle_lock: Mutex = Mutex{},
-        run_queue: Batch = Batch{},
+        run_queue: ?*Task = null,
         idle_queue: ?*Worker = null,
         active_queue: ?*Worker = null,
         active_workers: usize = 0,
@@ -481,7 +533,11 @@ pub const Task = struct {
         }
 
         pub fn push(self: *Scheduler, batch: Batch) void {
-            self.run_queue.pushMany(batch);
+            if (batch.isEmpty())
+                return;
+            
+            batch.tail.next = self.run_queue;
+            self.run_queue = batch.head;
         }
 
         pub fn run(self: *Scheduler) void {

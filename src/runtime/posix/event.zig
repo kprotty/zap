@@ -2,7 +2,7 @@ const std = @import("std");
 const zap = @import("../../zap.zig");
 
 const core = zap.core;
-const Futex = zap.runtime.sync.Futex;
+const OsFutex = zap.runtime.sync.OsFutex;
 const Atomic = core.sync.atomic.Atomic;
 const LinuxEvent = @import("../linux/event.zig").Event;
 
@@ -226,7 +226,7 @@ const BinarySemaphore = extern struct {
                 };
             }
 
-            const now = Futex.nanotime();
+            const now = OsFutex.nanotime();
             if (now > deadline_ns) {
                 self.updated = false;
                 return false;

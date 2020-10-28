@@ -2,7 +2,7 @@ const std = @import("std");
 const windows = std.os.windows;
 
 const zap = @import("../../zap.zig");
-const Futex = zap.runtime.sync.Futex;
+const OsFutex = zap.runtime.sync.OsFutex;
 const Atomic = zap.core.sync.atomic.Atomic;
 
 pub const Event = extern struct {
@@ -27,7 +27,7 @@ pub const Event = extern struct {
         var timeout_ptr: ?*windows.LARGE_INTEGER = null;
 
         if (deadline) |deadline_ns| {
-            const now = Futex.nanotime();
+            const now = OsFutex.nanotime();
             timed_out = now > deadline_ns;
             if (!timed_out) {
                 timeout_ptr = &timeout;

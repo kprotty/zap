@@ -517,7 +517,7 @@ pub const Task = struct {
         max_workers: usize,
         main_worker: ?*Worker = null,
 
-        const State = enum {
+        const State = enum(usize) {
             running,
             waking,
             notified,
@@ -545,6 +545,10 @@ pub const Task = struct {
         }
 
         pub fn shutdown(self: *Scheduler) void {
+            const state = @atomicLoad(State, &self.state, .Monotonic);
+            if (state == .shutdown)
+                return;
+
             const held = self.idle_lock.acquire();
 
             if (self.state == .shutdown) {
@@ -554,7 +558,7 @@ pub const Task = struct {
 
             var idle_queue = self.idle_queue;
             self.idle_queue = null;
-            self.state = .shutdown;
+            @atomicStore(State, &self.state, .shutdown, .Monotonic);
             held.release();
 
             while (idle_queue) |idle_worker| {
@@ -567,6 +571,12 @@ pub const Task = struct {
         }
 
         fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
+            const state = @atomicLoad(State, &self.state, .Monotonic);
+            if (state == .shutdown)
+                return;
+            if (!is_caller_waking and state == .notified)
+                return;
+
             var spawn_retries: usize = 3;
             var is_waking = is_caller_waking;
             var held = self.idle_lock.acquire();
@@ -579,7 +589,7 @@ pub const Task = struct {
 
                 if (!is_waking and self.state != .running) {
                     if (self.state == .waking)
-                        self.state = .notified;
+                        @atomicStore(State, &self.state, .notified, .Monotonic);
                     held.release();
                     return;
                 }
@@ -587,7 +597,7 @@ pub const Task = struct {
                 if (self.idle_queue) |idle_worker| {
                     const worker = idle_worker;
                     self.idle_queue = worker.idle_next;
-                    self.state = .waking;
+                    @atomicStore(State, &self.state, .waking, .Monotonic);
                     held.release();
 
                     if (worker.state != .suspended)
@@ -600,7 +610,7 @@ pub const Task = struct {
                 var active_workers = self.active_workers;
                 if (active_workers < self.max_workers) {
                     @atomicStore(usize, &self.active_workers, active_workers + 1, .Monotonic);
-                    self.state = .waking;
+                    @atomicStore(State, &self.state, .waking, .Monotonic);
                     is_waking = true;
                     held.release();
 
@@ -619,7 +629,7 @@ pub const Task = struct {
                         continue;
                 }
 
-                self.state = if (is_waking) .running else .notified;
+                @atomicStore(State, &self.state, if (is_waking) State.running else .notified, .Monotonic);
                 held.release();
                 return;
             }
@@ -676,11 +686,11 @@ pub const Task = struct {
 
             if (worker.state == .waking) {
                 if (self.state == .notified) {
-                    self.state = .waking;
+                    @atomicStore(State, &self.state, .waking, .Monotonic);
                     held.release();
                     return;
                 } else {
-                    self.state = .running;
+                    @atomicStore(State, &self.state, .running, .Monotonic);
                 }
             }
 

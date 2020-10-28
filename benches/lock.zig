@@ -9,7 +9,7 @@ const num_iters = 100;
 const num_tasks = 500;
 
 pub fn main() !void {
-    try (try Task.runAsync(.{}, asyncMain, .{}));
+    try (try Task.runAsync(.{ .threads = 2 }, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -19,26 +19,24 @@ fn asyncMain() !void {
     var lock = Lock{};
     var counter: u64 = 0;
 
-    var batch = Task.Batch{};
-    for (frames) |*frame|
-        frame.* = async runner(&batch, &lock, &counter);
+    for (frames) |*frame, id|
+        frame.* = async runner(&lock, &counter, id);
 
-    batch.schedule();
-    for (frames) |*frame|
+    for (frames) |*frame, id| {
+        std.debug.warn("waiting on {}\n", .{id});
         await frame;
+        std.debug.warn("{} completed\n", .{id});
+    }
 
-    lock.acquireAsync();
-    defer lock.release();
+    // lock.acquireAsync();
+    // defer lock.release();
 
     if (counter != num_tasks * num_iters)
         unreachable; // invalid counter result
 }
 
-fn runner(batch: *Task.Batch, lock: *Lock, counter: *u64) void {
-    suspend {
-        var task = Task.initAsync(@frame());
-        batch.push(&task);
-    }
+fn runner(lock: *Lock, counter: *u64, id: usize) void {
+    Task.runConcurrentlyAsync();
 
     var i: usize = num_iters;
     while (i != 0) : (i -= 1) {
@@ -48,4 +46,6 @@ fn runner(batch: *Task.Batch, lock: *Lock, counter: *u64) void {
 
         counter.* += 1;
     }
+
+    // std.debug.warn("{} finished on thread {}\n", .{id, std.Thread.getCurrentId()});
 }

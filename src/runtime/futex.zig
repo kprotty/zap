@@ -30,7 +30,7 @@ pub const OsFutex = struct {
     pub fn yield(self: *OsFutex, iteration: ?usize) bool {
         if (std.builtin.single_threaded)
             return false;
-            
+
         var iter = iteration orelse {
             Event.yield();
             return false;
@@ -91,25 +91,35 @@ pub const OsFutex = struct {
 };
 
 pub const AsyncFutex = struct {
-    task: *Task = undefined,
+    task: core.sync.atomic.Atomic(usize) = undefined,
 
     pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: *core.sync.Condition) bool {
         // TODO: integrate timers with deadline
+
+        self.task.set(0);
         
+        if (condition.isMet())
+            return true;
+
         suspend {
             var task = Task.initAsync(@frame());
-            self.task = &task;
+            const t = self.task.swap(@ptrToInt(&task), .acq_rel);
 
-            if (condition.isMet()) {
+            std.debug.warn("{*} sleeping = {}\n", .{&task, t});
+            if (t == 1)
                 task.scheduleNext();
-            }
         }
 
         return true;
     }
 
     pub fn wake(self: *AsyncFutex) void {
-        self.task.schedule();
+        const task = self.task.swap(1, .acq_rel);
+        if (task > 1) {
+            const t =@intToPtr(*Task, task);
+            std.debug.warn("{*} waking\n", .{t});
+            t.schedule();
+        }
     }
 
     pub fn yield(self: *AsyncFutex, iteration: ?usize) bool {

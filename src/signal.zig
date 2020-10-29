@@ -2,7 +2,27 @@ const std = @import("std");
 const zap = @import("./zap.zig");
 const system = std.os.system;
 
-pub const Signal = struct {
+pub const Signal = if (std.builtin.os.tag == .windows) _Signal else struct {
+    event: std.AutoResetEvent = std.AutoResetEvent{},
+
+    pub fn init(self: *Signal) void {
+        self.* = Signal{};
+    }
+
+    pub fn deinit(self: *Signal) void {
+        self.* = undefined;
+    }
+
+    pub fn wait(self: *Signal) void {
+        self.event.wait();
+    }
+
+    pub fn notify(self: *Signal) void {
+        self.event.set();
+    }
+};
+
+pub const _Signal = struct {
     event: OsEvent,
 
     pub fn init(self: *Signal) void {

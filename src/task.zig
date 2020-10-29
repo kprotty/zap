@@ -1,7 +1,8 @@
 const std = @import("std");
 const zap = @import("./zap.zig");
 
-const Mutex = std.Mutex;
+const Lock = zap.sync.os.Lock;
+
 const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
 
@@ -557,7 +558,7 @@ pub const Task = struct {
 
     pub const Scheduler = struct {
         state: State = .running,
-        idle_lock: Mutex = Mutex{},
+        idle_lock: Lock = Lock{},
         run_queue: ?*Task = null,
         idle_queue: ?*Worker = null,
         active_queue: ?*Worker = null,
@@ -597,17 +598,17 @@ pub const Task = struct {
             if (state == .shutdown)
                 return;
 
-            const held = self.idle_lock.acquire();
+            self.idle_lock.acquire();
 
             if (self.state == .shutdown) {
-                held.release();
+                self.idle_lock.release();
                 return;
             }
 
             var idle_queue = self.idle_queue;
             self.idle_queue = null;
             @atomicStore(State, &self.state, .shutdown, .Monotonic);
-            held.release();
+            self.idle_lock.release();
 
             while (idle_queue) |idle_worker| {
                 const worker = idle_worker;
@@ -627,18 +628,18 @@ pub const Task = struct {
 
             var spawn_retries: usize = 3;
             var is_waking = is_caller_waking;
-            var held = self.idle_lock.acquire();
+            self.idle_lock.acquire();
 
             while (true) {
                 if (self.state == .shutdown) {
-                    held.release();
+                    self.idle_lock.release();
                     return;
                 }
 
                 if (!is_waking and self.state != .running) {
                     if (self.state == .waking)
                         @atomicStore(State, &self.state, .notified, .Monotonic);
-                    held.release();
+                    self.idle_lock.release();
                     return;
                 }
 
@@ -646,7 +647,7 @@ pub const Task = struct {
                     const worker = idle_worker;
                     self.idle_queue = worker.idle_next;
                     @atomicStore(State, &self.state, .waking, .Monotonic);
-                    held.release();
+                    self.idle_lock.release();
 
                     if (worker.state != .suspended)
                         @panic("worker with invalid state when waking");
@@ -660,13 +661,13 @@ pub const Task = struct {
                     @atomicStore(usize, &self.active_workers, active_workers + 1, .Monotonic);
                     @atomicStore(State, &self.state, .waking, .Monotonic);
                     is_waking = true;
-                    held.release();
+                    self.idle_lock.release();
 
                     if (Worker.spawn(self, active_workers == 0)) {
                         return;
                     }
 
-                    held = self.idle_lock.acquire();
+                    self.idle_lock.acquire();
                     active_workers = self.active_workers;
                     @atomicStore(usize, &self.active_workers, active_workers - 1, .Monotonic);
                     if (self.state != .waking)
@@ -678,13 +679,13 @@ pub const Task = struct {
                 }
 
                 @atomicStore(State, &self.state, if (is_waking) State.running else .notified, .Monotonic);
-                held.release();
+                self.idle_lock.release();
                 return;
             }
         }
 
         fn suspendWorker(self: *Scheduler, worker: *Worker) void {
-            var held = self.idle_lock.acquire();
+            self.idle_lock.acquire();
 
             if (self.state == .shutdown) {
                 worker.state = .stopping;
@@ -698,7 +699,7 @@ pub const Task = struct {
                 
                 const active_workers = self.active_workers;
                 @atomicStore(usize, &self.active_workers, active_workers - 1, .Monotonic);
-                held.release();
+                self.idle_lock.release();
 
                 if (active_workers - 1 == 0) {
                     const main_worker = self.main_worker orelse @panic("scheduler shutting down without main worker");
@@ -735,7 +736,7 @@ pub const Task = struct {
             if (worker.state == .waking) {
                 if (self.state == .notified) {
                     @atomicStore(State, &self.state, .waking, .Monotonic);
-                    held.release();
+                    self.idle_lock.release();
                     return;
                 } else {
                     @atomicStore(State, &self.state, .running, .Monotonic);
@@ -745,7 +746,7 @@ pub const Task = struct {
             worker.state = .suspended;
             worker.idle_next = self.idle_queue;
             self.idle_queue = worker;
-            held.release();
+            self.idle_lock.release();
 
             worker.event.wait();
             switch (worker.state) {

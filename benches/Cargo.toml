@@ -14,3 +14,7 @@ path = "./spawn.rs"
 [[bin]]
 name = "yield"
 path = "./yield.rs"
+
+[[bin]]
+name = "pong"
+path = "./pong.rs"

@@ -19,15 +19,50 @@ pub fn Lock(comptime Signal: type) type {
             signal: Signal,
         };
 
+        const spinLoopHint = zap.sync.core.spinLoopHint;
+        const isx86 = switch (std.builtin.arch) {
+            .i386, .x86_64 => true,
+            else => false,
+        };
+
+        pub fn tryAcquire(self: *Self) bool {
+            if (isx86) {
+                return asm volatile(
+                    "lock btsw $0, %[ptr]"
+                    : [ret] "={@ccc}" (-> u8),
+                    : [ptr] "*m" (&self.state)
+                    : "cc", "memory"
+                ) == 0;
+            }
+
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
+            while (true) {
+                if (state & LOCKED != 0)
+                    return false;
+                state = @cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    state,
+                    state | LOCKED,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return true;
+            }
+        }
+
         pub fn acquire(self: *Self) void {
-            if (@cmpxchgWeak(
-                usize,
-                &self.state,
-                UNLOCKED,
-                LOCKED,
-                .Acquire,
-                .Monotonic,
-            )) |_| {
+            const acquired = 
+                if (isx86) self.tryAcquire()
+                else @cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    UNLOCKED,
+                    LOCKED,
+                    .Acquire,
+                    .Monotonic,
+                ) == null;
+
+            if (!acquired) {
                 self.acquireSlow();
             }
         }
@@ -45,14 +80,23 @@ pub fn Lock(comptime Signal: type) type {
             while (true) {
 
                 if (state & LOCKED == 0) {
-                    state = @cmpxchgWeak(
-                        usize,
-                        &self.state,
-                        state,
-                        state | LOCKED,
-                        .Acquire,
-                        .Monotonic,
-                    ) orelse return;
+                    state = blk: {
+                        if (isx86) {
+                            if (self.tryAcquire())
+                                return;
+                            spinLoopHint();
+                            break :blk @atomicLoad(usize, &self.state, .Monotonic);
+                        } else {
+                            break :blk @cmpxchgWeak(
+                                usize,
+                                &self.state,
+                                state,
+                                state | LOCKED,
+                                .Acquire,
+                                .Monotonic,
+                            ) orelse return;
+                        }
+                    };
                     continue;
                 }
 
@@ -61,7 +105,7 @@ pub fn Lock(comptime Signal: type) type {
                     spin +%= 1;
                     var iters = @as(usize, 1) << spin;
                     while (iters > 0) : (iters -= 1)
-                        zap.sync.core.spinLoopHint();
+                        spinLoopHint();
                     state = @atomicLoad(usize, &self.state, .Monotonic);
                     continue;
                 }

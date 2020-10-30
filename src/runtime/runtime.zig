@@ -8,7 +8,8 @@ pub const Task = @import("./task.zig").Task;
 pub const sync = struct {
     pub const atomic = core.sync.atomic;
 
-    pub const OsFutex = @import("./futex.zig").OsFutex;
+    pub const OsFutex = @import("./futex.zig").Futex;
+    // pub const AsyncFutex = Task.Futex;
 
     pub const Lock = extern struct {
         lock: core.sync.Lock = core.sync.Lock{},

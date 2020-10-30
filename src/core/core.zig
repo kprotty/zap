@@ -14,6 +14,7 @@ pub const is_darwin = switch (os_type) {
     else => false,
 };
 
+pub const is_android = is_linux and std.builtin.abi == .android;
 pub const is_bsd = is_darwin or switch (os_type) {
     .openbsd,
     .freebsd,

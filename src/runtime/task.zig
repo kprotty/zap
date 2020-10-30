@@ -1,14 +1,12 @@
 const std = @import("std");
-const zap = @import("./zap.zig");
+const zap = @import("../zap.zig");
 
-const Lock = zap.sync.os.Lock;
+const runtime = zap.runtime;
+const spinLoopHint = runtime.sync.atomic.spinLoopHint;
 
+const Lock = runtime.sync.Lock;
 const Thread = std.Thread;
 const AutoResetEvent = std.AutoResetEvent;
-
-fn spinLoopHint() void {
-    std.SpinLock.loopHint(1);
-}
 
 pub const Task = struct {
     next: ?*Task = undefined,

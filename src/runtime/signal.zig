@@ -101,20 +101,7 @@ const OsEvent =
     else
         @compileError("OS event blocking primitive not supported");
 
-const is_posix = switch (std.builtin.os.tag) {
-    .linux,
-    .minix,
-    .macos,
-    .ios,
-    .tvos,
-    .watchos,
-    .openbsd,
-    .freebsd,
-    .kfreebsd,
-    .netbsd,
-    .dragonfly => true,
-    else => false,
-};
+
 
 fn ReturnTypeOf(comptime function: anytype) type {
     return @typeInfo(@TypeOf(function)).Fn.return_type.?;
@@ -298,4 +285,44 @@ fn AtomicEvent(comptime Futex: type) type {
 
 const PthreadEvent = struct {
 
+    fn init(self: *OsEvent) void {
+
+    }
+
+    fn deinit(self: *OsEvent) void {
+
+    }
+
+    fn waitUntil(self: *OsEvent, deadline: ?u64) error{TimedOut}!void {
+
+    }
+
+    fn notify(self: *OsEvent) void {
+
+    }
+
+    const is_actually_monotonic = switch (std.builtin.os.tag) {
+        .linux => switch (std.builtin.arch) {
+            .aarch64, .s390x => false,
+            else => true,
+        },
+        .openbsd => switch (std.builtin.arch) {
+            .x86_64 => false,
+            else => true,
+        },
+        else => true,
+    };
+
+    const nanotime = switch (std.builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => nanotimeDarwin,
+        else => nanotimePosix,
+    }
+
+    fn nanotimeDarwin() u64 {
+
+    }
+
+    fn nanotimePosix() u64 {
+
+    }
 };

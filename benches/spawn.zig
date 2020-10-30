@@ -1,7 +1,7 @@
 const std = @import("std");
 const zap = @import("zap");
 
-const Task = zap.Task;
+const Task = zap.runtime.Task;
 const allocator = std.heap.page_allocator;
 
 const num_spawners = 10;

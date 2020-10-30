@@ -23,15 +23,11 @@ pub const is_bsd = is_darwin or switch (os_type) {
     else => false,
 };
 
-pub const is_posix = link_libc and (
-    is_bsd or
-    is_linux or
-    switch (os_type) {
-        .minix,
-        .hermit => true,
-        else => false,
-    }
-);
+pub const is_posix = is_bsd or is_linux or switch (os_type) {
+    .minix,
+    .hermit => true,
+    else => false,
+};
 
 pub const is_x86 = switch (arch_type) {
     .i386, .x86_64 => true,

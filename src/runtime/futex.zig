@@ -123,62 +123,15 @@ const OsEvent =
         @compileError("OS thread blocking/unblocking not supported");
 
 
-const LinuxEvent = AtomicEvent(struct {
-    fn wait(ptr: *const i32, expected: i32, deadline: ?u64) i32 {
-        var ts: system.timespec = undefined;
-        var ts_ptr: ?*system.timespec = null;
+const WindowsEvent = extern struct {
+    thread_id: Atomic(system.DWORD) = undefined,
 
-        const atomic_ptr = @ptrCast(*const Atomic(i32), ptr);
-        const futex_op = system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAIT;
+    fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
+        self.thread_id.set(GetCurrentThreadId());
 
-        while (true) {
-            const value = atomic_ptr.load(.acquire);
-            if (value != expected)
-                return value;
+        if (condition.isMet())
+            return true;
 
-            if (deadline) |deadline_ns| {
-                const now = Clock.nanotime();
-                if (now > deadline_ns)
-                    return value;
-
-                const duration = deadline_ns - now;
-                ts_ptr = &ts;
-                ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), @divFloor(duration, std.time.ns_per_s));
-                ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), @mod(duration, std.time.ns_per_s));
-            }
-
-            const rc = system.futex_wait(ptr, futex_op, expected, ts_ptr);
-            switch (system.getErrno(rc)) {
-                0 => continue,
-                system.EINTR => continue,
-                system.EAGAIN => return atomic_ptr.load(.acquire),
-                system.ETIMEDOUT => return value,
-                else => @panic("futex(WAIT) unhandled errno code"),
-            }
-        }
-    }
-
-    fn wake(ptr: *const i32) void {
-        const futex_op = system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAKE;
-        const rc = system.futex_wake(ptr, futex_op, @as(i32, 1));
-        switch (rc) {
-            0, 1, system.EFAULT => {},
-            else => @panic("futex(WAKE) unhandled errno"),
-        }
-    }
-
-    fn cancel(ptr: *const i32) void {}
-
-    const nanotime = PosixEvent.nanotime;
-    const is_actually_monotonic = switch (core.os_type) {
-        .linux => core.arch_type != .aarch64 and .arch_type != .s390x,
-        .openbsd => core.arch_type != .x86_64,
-        else => true,
-    };
-});
-
-const WindowsEvent = AtomicEvent(struct {
-    fn wait(ptr: *const i32, expected: i32, deadline: ?u64) i32 {
         var timed_out = false;
         var timeout: system.LARGE_INTEGER = undefined;
         var timeout_ptr: ?*system.LARGE_INTEGER = null;
@@ -186,40 +139,40 @@ const WindowsEvent = AtomicEvent(struct {
         if (deadline) |deadline_ns| {
             const now = Clock.nanotime();
             timed_out = now > deadline_ns;
-
             if (!timed_out) {
                 timeout_ptr = &timeout;
-                timeout = @intCast(@TypeOf(timeout), deadline_ns - now);
+                timeout = @intCast(system.LARGE_INTEGER, deadline_ns - now);
                 timeout = -(@divFloor(timeout, 100));
             }
         }
 
         if (!timed_out) {
-            const key = @ptrCast(*align(4) const c_void, ptr);
-            switch (NtWaitForKeyedEvent(null, key, system.FALSE, timeout_ptr)) {
-                .SUCCESS => {},
+            switch (NtWaitForAlertByThreadId(null, timeout_ptr)) {
                 .TIMEOUT => {},
-                else => @panic("NtWaitForKeyedEvent unknown status"),
+                .ALERTED => return true,
+                else => @panic("NtWaitForAlertByThreadId() unhandled status code"),
             }
         }
 
-        const atomic_ptr = @ptrCast(*const Atomic(i32), ptr); 
-        return atomic_ptr.load(.acquire);
-    }
-
-    fn wake(ptr: *const i32) void {
-        const key = @ptrCast(*align(4) const c_void, ptr);
-        switch (NtReleaseKeyedEvent(null, key, system.FALSE, null)) {
-            .SUCCESS => {},
-            else => @panic("NtReleaseKeyedEvent unknown status"),
+        if (self.thread_id.swap(0, .acquire) == 0) {
+            switch (NtWaitForAlertByThreadId(null, null)) {
+                .ALERTED => {},
+                else => @panic("NtWaitForAlertByThreadId() unhandled status code"),
+            }
         }
+
+        return false;
     }
 
-    fn cancel(ptr: *const i32) void {
-        const key = @ptrCast(*align(4) const c_void, ptr);
-        switch (NtWaitForKeyedEvent(null, key, system.FALSE, null)) {
+    fn set(self: *OsEvent) void {
+        const thread_id = self.thread_id.swap(0, .release);
+        if (thread_id == 0)
+            return;
+
+        switch (NtAlertThreadByThreadId(@intToPtr(?system.HANDLE, thread_id))) {
             .SUCCESS => {},
-            else => @panic("NtWaitForKeyedEvent in cancel with unknown status"),
+            .INVALID_CID => @panic("NtAlertThreadByThreadId() invalid thread id"),
+            else => @panic("NtAlertThreadByThreadId() unhandled status code"),
         }
     }
 
@@ -231,63 +184,93 @@ const WindowsEvent = AtomicEvent(struct {
         return @divFloor(counter *% std.time.ns_per_s, frequency);
     }
 
-    extern "NtDll" fn NtWaitForKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
-        timeout: ?*const system.LARGE_INTEGER,
+    extern "kernel32" fn GetCurrentThreadId() callconv(.Stdcall) system.DWORD;
+
+    extern "NtDll" fn NtAlertThreadByThreadId(
+        thread_id: ?system.HANDLE,
     ) callconv(.Stdcall) system.NTSTATUS;
 
-    extern "NtDll" fn NtReleaseKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
+    extern "NtDll" fn NtWaitForAlertByThreadId(
+        address: ?system.PVOID,
         timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;
-});
+    ) callconv(.Stdcall) system.NTSTATUS;    
+};
 
-fn AtomicEvent(comptime FutexImpl: type) type {
-    return extern struct {
-        state: Atomic(State) = undefined,
+const LinuxEvent = extern struct {
+    state: Atomic(State) = undefined,
 
-        const Self = @This();
-        const State = extern enum(i32) {
-            running,
-            waiting,
-        };
+    const State = extern enum(i32) {
+        waiting,
+        notified,
+    };
 
-        fn wait(self: *Self, deadline: ?u64, condition: *Condition) bool {
-            self.state.set(.waiting);
+    fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
+        self.state.set(.waiting);
 
-            if (condition.isMet())
-                return true;
+        if (condition.isMet())
+            return true;
 
-            var state = @intToEnum(State, FutexImpl.wait(
+        var ts: system.timespec = undefined;
+        var ts_ptr: ?*system.timespec = null;
+
+        while (true) {
+            switch (self.state.load(.acquire)) {
+                .waiting => {},
+                .notified => return true,
+            }
+
+            if (deadline) |deadline_ns| {
+                const now = Clock.nanotime();
+                if (now > deadline_ns)
+                    return false;
+
+                const duration = deadline_ns - now;
+                ts_ptr = &ts;
+                ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), @divFloor(duration, std.time.ns_per_s));
+                ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), @mod(duration, std.time.ns_per_s));
+            }
+
+            const rc = system.futex_wait(
                 @ptrCast(*const i32, &self.state),
+                system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAIT,
                 @as(i32, @enumToInt(State.waiting)),
-                deadline,
-            ));
+                ts_ptr,
+            );
 
-            if (state == .running)
-                return true;
-
-            state = self.state.swap(.running, .acquire);
-            if (state == .running)
-                FutexImpl.cancel(@ptrCast(*const i32, &self.state));
-
-            return false;
-        }
-
-        fn set(self: *Self) void {
-            if (self.state.swap(.running, .release) == .waiting) {
-                FutexImpl.wake(@ptrCast(*const i32, &self.state));
+            switch (system.getErrno(rc)) {
+                0 => continue,
+                system.EINTR => continue,
+                system.EAGAIN => return true,
+                system.ETIMEDOUT => return false,
+                else => @panic("futex(WAIT) unhandled errno code"),
             }
         }
+    }
 
-        const nanotime = FutexImpl.nanotime;
-        const is_actually_monotonic = FutexImpl.is_actually_monotonic;
+    fn set(self: *OsEvent) void {
+        self.state.store(.notified, .release);
+
+        const rc = system.futex_wake(
+            @ptrCast(*const i32, &self.state),
+            system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAKE,
+            @as(i32, 1),
+        );
+
+        switch (system.getErrno(rc)) {
+            0 => {},
+            system.EFAULT => {},
+            else => @panic("futex(WAKE) unhandled errno"),
+        }
+    }
+
+    const nanotime = PosixEvent.nanotime;
+
+    const is_actually_monotonic = switch (core.os_type) {
+        .linux => core.arch_type != .aarch64 and .arch_type != .s390x,
+        .openbsd => core.arch_type != .x86_64,
+        else => true,
     };
-}
+};
 
 const PosixEvent = extern struct {
     event: Atomic(?*PthreadEvent) = Atomic(?*PthreadEvent).init(null),

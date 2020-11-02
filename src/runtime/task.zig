@@ -6,7 +6,33 @@ const spinLoopHint = runtime.sync.atomic.spinLoopHint;
 
 // const Lock = runtime.sync.Lock;
 const Thread = std.Thread;
-const AutoResetEvent = std.AutoResetEvent;
+// const AutoResetEvent = std.AutoResetEvent;
+
+const AutoResetEvent = struct {
+    futex: Futex = Futex{},
+    updated: bool = false,
+    condition: Condition = Condition{ .isMetFn = poll },
+
+    const Futex = runtime.sync.OsFutex;
+    const Condition = zap.core.sync.Condition;
+
+    fn poll(condition: *Condition) bool {
+        const self = @fieldParentPtr(AutoResetEvent, "condition", condition);
+        return @atomicRmw(bool, &self.updated, .Xchg, true, .Acquire);
+    }
+
+    fn wait(self: *AutoResetEvent) void {
+        const waited = self.futex.wait(null, &self.condition);
+        if (!waited)
+            @panic("AutoResetEvent timed without without a deadline");
+        self.updated = false;
+    }
+
+    fn set(self: *AutoResetEvent) void {
+        if (@atomicRmw(bool, &self.updated, .Xchg, true, .Release))
+            self.futex.wake();
+    }
+};
 
 pub const Task = struct {
     next: ?*Task = undefined,

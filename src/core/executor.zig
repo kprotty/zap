@@ -1,7 +1,9 @@
 const std = @import("std");
 const core = @import("./core.zig");
 
+const fence = core.sync.atomic.fence;
 const Atomic = core.sync.atomic.Atomic;
+const Ordering = core.sync.atomic.Ordering;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
 
 pub const Task = extern struct {
@@ -58,29 +60,111 @@ pub const Task = extern struct {
 };
 
 pub const Worker = extern struct {
-    state: State = .waking,
-    scheduler: *Scheduler,
-    idle_next: ?*Worker = null,
+    aligned: void align(@as(usize, @as(@TagType(Scheduler.State), 0)) + 1) = undefined,
+    state: Atomic(State) = Atomic(State).init(.waking),
+    sched_state: usize,
+    idle_next: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+    idle_position: Atomic(usize) = Atomic(usize).init(0),
     active_next: ?*Worker = null,
     target_worker: ?*Worker = null,
-    runq_tick: Atomic(usize) = Atomic(usize).init(0),
+    runq_tick: usize = 0,
+    runq_next: ?*Task = null,
     runq_head: Atomic(usize) = Atomic(usize).init(0),
     runq_tail: Atomic(usize) = Atomic(usize).init(0),
     runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
-    runq_next: Atomic(?*Task) = Atomic(?*Task).init(null),
     runq_overflow: Atomic(?*Task) = Atomic(?*Task).init(null),
     runq_buffer: [256]Atomic(*Task) = undefined,
 
-    const State = enum {
-        waking,
+    const State = extern enum(usize) {
+        waking = 0,
         running,
         suspended,
         stopping,
+        joining,
         shutdown,
     };
 
-    pub fn getScheduler(self: *Worker) *Scheduler {
-        return self.scheduler;
+    pub fn init(self: *Worker, scheduler: *Scheduler, is_main_worker: bool) void {
+        self.* = Worker{
+            .runq_tick = @ptrToInt(self),
+            .sched_state = @ptrToInt(scheduler) | @boolToInt(is_main_worker),
+        };
+
+        if (is_main_worker) {
+            scheduler.main_worker = self;
+        }
+
+        var active_queue = scheduler.active_queue.load(.relaxed);
+        while (true) {
+            self.active_next = active_queue;
+            active_queue = scheduler.active_queue.tryCompareAndSwap(
+                active_queue,
+                self,
+                .release,
+                .relaxed,
+            ) orelse break;
+        }
+    }
+
+    pub const Poll = union(enum) {
+        executed: *Task,
+        suspended: SuspendIntent,
+        shutdown: void,
+
+        pub const SuspendIntent = enum {
+            first,
+            last,
+            normal,
+            retry,
+        };
+    };
+
+    pub fn poll(self: *Worker) Poll {
+        const scheduler = self.getScheduler();
+        while (true) {
+            const state = self.state.load(.unordered);
+            const is_waking = state == .waking;
+
+            switch (state) {
+                .running, .waking => {
+                    var injected = false;
+                    if (self.pop(scheduler, &injected)) |task| {
+                        if (injected or is_waking) {
+                            scheduler.resumeWorker(is_waking);
+                            if (is_waking) {
+                                self.state.store(.running, .unordered);
+                            }
+                        }
+                        self.runq_tick +%= 1;
+                        return .{ .exececuted = task };
+                    }
+                },
+                .suspended => {
+                    @panic("worker polled while still suspended");
+                },
+                .stopping => {},
+                .joining => {
+                    scheduler.join();
+                    return .shutdown;
+                },
+                .shutdown => {
+                    return .shutdown;
+                },
+            }
+
+            const suspend_intent = scheduler.suspendWorker(self, state);
+            return .{ .suspended = suspend_intent };
+        }
+    }
+
+    pub fn getScheduler(self: *const Worker) *Scheduler {
+        @setRuntimeSafety(false);
+        const sched_ptr = self.sched_state & ~@as(usize, 1);
+        return @intToPtr(?*Scheduler, sched_ptr);
+    }
+
+    pub fn isMainWorker(self: *const Worker) bool {
+        return self.sched_state & 1 != 0;
     }
 
     pub const ScheduleHints = struct {
@@ -188,18 +272,20 @@ pub const Worker = extern struct {
         }
     }
 
-    fn poll(self: *Worker, scheduler: *Scheduler, injected: *bool) ?*Task {
+    fn pop(self: *Worker, scheduler: *Scheduler, injected: *bool) ?*Task {
         var polled = Task.Batch{};
         scheduler.platform.call(.{
-            .worker = self,
-            .polled = &polled,
-            .intention = .eager,
+            .polled = .{
+                .worker = self,
+                .batch = &polled,
+                .intent = .first,
+            },
         });
 
         if (polled.pop()) |first_task| {
             if (!polled.isEmpty()) {
-                self.pushOverflow(polled);
                 injected.* = true;
+                self.pushOverflow(polled);
             }
             return first_task;
         }
@@ -220,8 +306,8 @@ pub const Worker = extern struct {
                     .relaxed,
                 ) orelse {
                     if (first_task.next) |next| {
-                        self.runq_overflow.store(next, .release);
                         injected.* = true;
+                        self.runq_overflow.store(next, .release);
                     }
                     return first_task;
                 };
@@ -262,7 +348,7 @@ pub const Worker = extern struct {
             };
         }
 
-        var steal_attempts: usize = 1;
+        var steal_attempts: usize = 1 + (self.runq_tick % 4);
         while (steal_attempts > 0) : (steal_attempts -= 1) {
             
             var active_workers = scheduler.active_workers.load(.relaxed);
@@ -360,15 +446,17 @@ pub const Worker = extern struct {
         }
 
         scheduler.platform.call(.{
-            .worker = self,
-            .polled = &polled,
-            .intention = .last_resort,
+            .polled = .{
+                .worker = self,
+                .batch = &polled,
+                .intent = .last,
+            },
         });
 
         if (polled.pop()) |first_task| {
             if (!polled.isEmpty()) {
-                self.pushOverflow(polled);
                 injected.* = true;
+                self.pushOverflow(polled);
             }
             return first_task;
         }
@@ -394,262 +482,411 @@ pub const Worker = extern struct {
         if (runq != null)
             self.runq_overflow.store(runq, .release);
     }
-
-    fn run(self: *Worker, scheduler: *Scheduler) void {
-        self.* = Worker{ .scheduler = scheduler };
-
-        var active_queue = scheduler.active_queue.load(.relaxed);
-        while (true) {
-            self.active_next = active_queue;
-            active_queue = scheduler.active_queue.tryCompareAndSwap(
-                active_queue,
-                &self,
-                .release,
-                .relaxed,
-            ) orelse break;
-        }
-
-        self.runq_tick = @ptrToInt(&self);
-        while (true) {
-            const should_poll = switch (self.state) {
-                .running, .waking => true,
-                .suspended => @panic("worker trying to poll when suspended"),
-                .stopping => false,
-                .shutdown => break,
-            };
-
-            if (should_poll) {
-                var injected = false;
-                if (self.poll(scheduler, &injected)) |task| {
-                    if (injected or self.state == .waking)
-                        scheduler.resumeWorker(self.state == .waking);
-                    self.state = .running;
-                    self.runq_tick +%= 1;
-                    resume task.frame;
-                    continue;
-                }
-            }
-
-            scheduler.suspendWorker(&self);
-        }
-    }
 };
 
 pub const Scheduler = extern struct {
-    state: State = .running,
-    idle_queue: ?*Worker = null,
+    idle_queue: IdleQueue = IdleQueue{ .value = @enumToInt(State.ready) },
     run_queue: Atomic(?*Task) = Atomic(?*Task).init(null),
     active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
     active_workers: Atomic(usize) = Atomic(usize).init(0),
     max_workers: usize,
     main_worker: ?*Worker = null,
+    platform: *Platform,
 
-    const State = enum(usize) {
-        running,
+    const State = enum(u3) {
+        ready,
         waking,
-        notified,
+        waking_notified,
+        suspend_notified,
         shutdown,
     };
 
-    pub fn init(self: *Scheduler, num_threads: usize) void {
-        self.* = Scheduler{ .max_workers = num_threads };
+    pub fn init(self: *Scheduler, platform: *Platform, num_threads: usize) void {
+        self.* = Scheduler{
+            .max_workers = num_threads,
+            .platform = platform,
+        };
     }
 
     pub fn deinit(self: *Scheduler) void {
         self.* = undefined;
     }
 
-    pub fn push(self: *Scheduler, batch: Batch) void {
+    pub fn run(self: *Scheduler, batch: Batch) void {
         if (batch.isEmpty())
             return;
         
         batch.tail.next = self.run_queue;
         self.run_queue = batch.head;
-    }
 
-    pub fn run(self: *Scheduler) void {
         self.resumeWorker(false);
     }
 
-    fn acquire(self: *Scheduler) void {
-        self.platform.
-    }
-
-    fn release(self: *Scheduler) void {
-
-    }
-
-    pub fn shutdown(self: *Scheduler) void {
-        const state = self.state.load(.relaxed);
-        if (state == .shutdown)
-            return;
-
-        self.acquire();
-        self.idle_lock.acquire();
-
-        if (self.state == .shutdown) {
-            self.idle_lock.release();
-            return;
-        }
-
-        var idle_queue = self.idle_queue;
-        self.idle_queue = null;
-        @atomicStore(State, &self.state, .shutdown, .relaxed);
-        self.idle_lock.release();
-
-        while (idle_queue) |idle_worker| {
-            const worker = idle_worker;
-            idle_queue = worker.idle_next;
-            
-            worker.state = .stopping;
-            worker.event.set();
-        }
-    }
-
     fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
-        const state = @atomicLoad(State, &self.state, .relaxed);
-        if (state == .shutdown)
-            return;
-        if (!is_caller_waking and state == .notified)
-            return;
-
-        var spawn_retries: usize = 3;
+        var waking_attempts: u8 = 5;
         var is_waking = is_caller_waking;
-        self.idle_lock.acquire();
+        var idle_queue = self.idle_queue.load(.relaxed);
 
         while (true) {
-            if (self.state == .shutdown) {
-                self.idle_lock.release();
+            const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+
+            if (idle_state == .shutdown)
                 return;
-            }
 
-            if (!is_waking and self.state != .running) {
-                if (self.state == .waking)
-                    @atomicStore(State, &self.state, .notified, .relaxed);
-                self.idle_lock.release();
-                return;
-            }
+            if (
+                (!is_waking and idle_state == .ready) or
+                (is_waking and idle_state == .waking_notified and waking_attempts > 0)
+            ) {
+                const active_workers = self.active_workers.load(.relaxed);
 
-            if (self.idle_queue) |idle_worker| {
-                const worker = idle_worker;
-                self.idle_queue = worker.idle_next;
-                @atomicStore(State, &self.state, .waking, .relaxed);
-                self.idle_lock.release();
+                if (@intToPtr(?*Worker, idle_ptr)) |worker| {
+                    fence(.acquire);
+                    const next_worker = worker.idle_next.load(.unordered);
+                    if (self.idle_queue.tryCompareAndSwap(
+                        idle_queue,
+                        @ptrToInt(next_worker) | @enumToInt(State.waking),
+                        .relaxed,
+                        .relaxed,
+                    )) |updated| {
+                        idle_queue = updated;
+                        continue;
+                    }
 
-                if (worker.state != .suspended)
-                    @panic("worker with invalid state when waking");
-                worker.state = .waking;
-                worker.event.set();
-                return;
-            }
-            
-            var active_workers = self.active_workers;
-            if (active_workers < self.max_workers) {
-                @atomicStore(usize, &self.active_workers, active_workers + 1, .relaxed);
-                @atomicStore(State, &self.state, .waking, .relaxed);
-                is_waking = true;
-                self.idle_lock.release();
+                    const worker_state = worker.state.load(.unordered);
+                    if (worker_state != .suspended)
+                        @panic("resuming worker with invalid state");
+                    worker.state.store(.waking, .unordered);
 
-                if (Worker.spawn(self, active_workers == 0)) {
+                    const idle_position = worker.idle_position.load(.unordered);
+                    self.platform.call(.{
+                        .resumed = .{
+                            .scheduler = self,
+                            .worker = worker,
+                            .intent = 
+                                if (idle_position == 0) .first
+                                else if (active_workers > 0 and idle_position == active_workers - 1) .last
+                                else .normal,
+                        },
+                    });
+
                     return;
                 }
 
-                self.idle_lock.acquire();
-                active_workers = self.active_workers;
-                @atomicStore(usize, &self.active_workers, active_workers - 1, .relaxed);
-                if (self.state != .waking)
-                    @panic("invalid scheduler state when trying to resume from failed spawn");
+                if (active_workers < self.max_workers) {
+                    if (self.idle_queue.tryCompareAndSwap(
+                        idle_queue,
+                        @enumToInt(State.waking),
+                        .relaxed,
+                        .relaxed,
+                    )) |updated| {
+                        idle_queue = updated;
+                        continue;
+                    }
 
-                spawn_retries -= 1;
-                if (spawn_retries != 0)
+                    self.active_workers.store(active_workers + 1, .relaxed);
+                    var did_spawn = false;
+                    self.platform.call(.{
+                        .spawned = .{
+                            .scheduler = self,
+                            .succeeded = &did_spawn,
+                            .intent = 
+                                if (active_workers == 0) .first
+                                else if (active_workers == self.max_workers - 1) .last
+                                else .normal,
+                        },
+                    });
+                    if (did_spawn) {
+                        return;
+                    }
+
+                    self.active_workers.store(active_workers, .relaxed);
+                    waking_attempts -= 1;
+                    is_waking = true;
+
+                    spinLoopHint();
+                    idle_queue = self.idle_queue.load(.relaxed);
                     continue;
-            }
-
-            @atomicStore(State, &self.state, if (is_waking) State.running else .notified, .relaxed);
-            self.idle_lock.release();
-            return;
-        }
-    }
-
-    fn suspendWorker(self: *Scheduler, worker: *Worker) void {
-        self.idle_lock.acquire();
-
-        if (self.state == .shutdown) {
-            worker.state = .stopping;
-            worker.idle_next = self.idle_queue;
-            self.idle_queue = worker;
-
-            const is_main_worker = worker.thread == null;
-            if (is_main_worker) {
-                self.main_worker = worker;
-            }
-            
-            const active_workers = self.active_workers;
-            @atomicStore(usize, &self.active_workers, active_workers - 1, .relaxed);
-            self.idle_lock.release();
-
-            if (active_workers - 1 == 0) {
-                const main_worker = self.main_worker orelse @panic("scheduler shutting down without main worker");
-                main_worker.event.set();
-            }
-
-            worker.event.wait();
-
-            if (is_main_worker) {
-                if (@atomicLoad(usize, &self.active_workers, .relaxed) != 0)
-                    @panic("remaining active workers when trying to shutdown all workers");
-
-                while (self.idle_queue) |idle_worker| {
-                    const shutdown_worker = idle_worker;
-                    self.idle_queue = shutdown_worker.idle_next;
-
-                    if (shutdown_worker.state != .stopping)
-                        @panic("worker with invalid state when trying to shutdown");
-                    shutdown_worker.state = .shutdown;
-
-                    const thread = shutdown_worker.thread;
-                    shutdown_worker.event.set();
-
-                    if (thread) |thread_handle|
-                        thread_handle.wait();
                 }
             }
 
-            if (worker.state != .shutdown)
-                @panic("worker with invalid state when shutting down");
-            return;
-        }
-
-        if (worker.state == .waking) {
-            if (self.state == .notified) {
-                @atomicStore(State, &self.state, .waking, .relaxed);
-                self.idle_lock.release();
+            const new_state = blk: {
+                if (is_waking)
+                    break :blk State.ready;
+                if (idle_state == .waking)
+                    break :blk State.waking_notified;
+                if (idle_state == .ready)
+                    break :blk State.suspend_notified;
                 return;
-            } else {
-                @atomicStore(State, &self.state, .running, .relaxed);
-            }
-        }
+            };
 
-        worker.state = .suspended;
-        worker.idle_next = self.idle_queue;
-        self.idle_queue = worker;
-        self.idle_lock.release();
-
-        worker.event.wait();
-        switch (worker.state) {
-            .waking, .stopping => {},
-            .suspended => @panic("worker resumed while still suspended"),
-            .shutdown => @panic("worker resumed when already shutdown"),
-            .running => @panic("worker resumed running instead of waking"),
+            idle_queue = self.idle_queue.tryCompareAndSwap(
+                idle_queue,
+                idle_ptr | @enumToInt(new_state),
+                .relaxed,
+                .relaxed,
+            ) orelse return;
         }
     }
+
+    fn suspendWorker(self: *Scheduler, worker: *Worker, worker_state: Worker.State) Worker.Poll.SuspendIntent {
+        const is_main_worker = worker.isMainWorker();
+        var idle_queue = self.idle_queue.load(.relaxed);
+
+        while (true) {
+            const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+
+            if (
+                (idle_state == .suspend_notified) or
+                (old_worker_state == .waking and idle_state == .waking_notified)
+            ) {
+                const new_state: State = switch (idle_state) {
+                    .waking_notified => .waking,
+                    .suspend_notified => .ready,
+                    else => unreachable,
+                };
+
+                if (self.idle_queue.tryCompareAndSwap(
+                    idle_queue,
+                    idle_ptr | @enumToInt(new_state),
+                    .relaxed,
+                    .relaxed,
+                )) |updated| {
+                    idle_queue = updated;
+                    continue;
+                }
+
+                worker.state.store(worker_state, .unordered);
+                self.platform.call(.{
+                    .resumed = .{
+                        .scheduler = self,
+                        .worker = worker,
+                        .intent = .poll,
+                    },
+                });
+                return .retry;
+            }
+            
+            const idle_worker = @intToPtr(?*Worker, idle_ptr);
+            worker.idle_next.store(idle_worker, .unordered);
+            worker.state.store((idle_state == .shutdown) .stopping else .suspended, .unordered);
+
+            const idle_position = if (idle_worker) |w| w.idle_position.load(.unordered) + 1 else 0;
+            worker.idle_position.store(idle_position, .unordered);
+
+            if (self.idle_queue.tryCompareAndSwap(
+                idle_queue,
+                @ptrToInt(worker) | @enumToInt(idle_state),
+                .release,
+                .relaxed,
+            )) |updated| {
+                idle_queue = updated;
+                continue;
+            }
+
+            var active_workers: usize = undefined;
+            if (idle_state == .shutdown) {
+                active_workers = self.active_workers.fetchSub(1, .release);
+                if (active_workers == 1) {
+                    const main_worker = self.main_worker orelse @panic("no main worker when shutting down");
+                    main_worker.state.store(.joining, .unordered);
+                    self.platform.call(.{
+                        .resumed = .{
+                            .scheduler = self,
+                            .worker = main_worker,
+                            .intent = .poll,
+                        },
+                    });
+                }
+            } else {
+                active_workers = self.active_workers.load(.relaxed);
+            }
+
+            if (idle_position == 0)
+                return .first;
+            if (active_workers > 0 and idle_position == active_workers - 1)
+                return .last;
+            return .normal;
+        }
+    }
+
+    fn join(self: *Scheduler) void {
+        const idle_queue = self.idle_queue.load(.Acquire);
+        const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
+
+        var idle_worker = @intToPtr(?*Worker, idle_ptr);
+        while (idle_worker) |new_idle_worker| {
+            const worker = new_idle_worker;
+            idle_worker = worker.idle_next.load(.unordered);
+
+            const worker_state = worker.state.load(.unordered);
+            if (worker_state != .stopping)
+                @panic("worker shutting down with an invalid state");
+            worker.state.store(.shutdown, .unordered);
+
+            self.platform.call(.{
+                .resumed = .{
+                    .scheduler = self,
+                    .worker = worker,
+                    .intent = .join,
+                },
+            });
+        }
+    }
+
+    pub fn shutdown(self: *Scheduler) void {
+        var idle_queue = self.idle_queue.load(.relaxed);
+
+        while (true) {
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+            if (idle_state == .shutdown)
+                return;
+
+            if (self.idle_queue.tryCompareAndSwap(
+                idle_queue,
+                @enumToInt(State.shutdown),
+                .acquire,
+                .relaxed,
+            )) |updated| {
+                idle_queue = updated;
+                continue;
+            }
+
+            var idle_worker = @intToPtr(?*Worker, idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0)));
+            while (idle_worker) |new_idle_worker| {
+                const worker = new_idle_worker;
+                idle_worker = worker.idle_next.load(.unordered);
+
+                const worker_state = worker.state.load(.unordered);
+                if (worker_state != .suspended)
+                    @panic("stopping worker with invalid state");
+                worker.state.store(.stopping, .unordered);
+
+                self.platform.call(.{
+                    .resumed = .{
+                        .scheduler = self,
+                        .worker = worker,
+                        .intent = .poll,
+                    },
+                });
+            }
+
+            return;
+        }
+    }
+
+    const IdleQueue = switch (core.arch_type) {
+        .i386, .x86_64 => extern struct {
+            value: Atomic(usize) align(@alignOf(DoubleWord)),
+            aba_tag: Atomic(usize) = Atomic(usize).init(0),
+
+            const DoubleWord = std.meta.Int(.unsigned, std.meta.bitCount(usize) * 2);
+
+            fn load(
+                self: *const IdleQueue,
+                comptime ordering: Ordering,
+            ) IdleQueue {
+                return IdleQueue{
+                    .value = self.value.load(ordering),
+                    .aba_tag = self.aba_tag.load(.relaxed),
+                };
+            }
+
+            fn tryCompareAndSwap(
+                self: *IdleQueue,
+                compare: IdleQueue,
+                exchange: usize,
+                comptime success: Ordering,
+                comptime failure: Ordering,
+            ) ?IdleQueue {
+                const dword_ptr = @ptrCast(*Atomic(DoubleWord), self);
+                const dword_value = dword_ptr.tryCompareAndSwap(
+                    @bitCast(DoubleWord, compare),
+                    @bitCast(DoubleWord, IdleQueue{
+                        .value = Atomic(usize).init(exchange),
+                        .aba_tag = Atomic(usize).init(compare.aba_tag.get() +% 1),
+                    }),
+                    success,
+                    failure,
+                ) orelse return null;
+                return @bitCast(IdleQueue, dword_value);
+            }
+        },
+        else => extern struct {
+            value: Atomic(usize),
+
+            fn load(
+                self: *const IdleQueue,
+                comptime ordering: Ordering,
+            ) IdleQueue {
+                return IdleQueue{
+                    .value = self.value.load(ordering),
+                };
+            }
+
+            fn tryCompareAndSwap(
+                self: *IdleQueue,
+                compare: IdleQueue,
+                exchange: usize,
+                comptime success: Ordering,
+                comptime failure: Ordering,
+            ) ?IdleQueue {
+                const value = self.tryCompareAndSwap(
+                    compare.value,
+                    exchange,
+                    success,
+                    failure,
+                ) orelse return null;
+                return IdleQueue{ .value = value };
+            }
+        },
+    };
 };
 
 pub const Platform = extern struct {
     callFn: fn(*Platform, Action) void,
 
     pub const Action = union(enum) {
-        
+        polled: Polled,
+        spawned: Spawned,
+        resumed: Resumed,
+
+        pub const Polled = struct {
+            worker: *Worker,
+            batch: *Task.Batch,
+            intent: Intent,
+
+            pub const Intent = enum {
+                first,
+                last,
+            };
+        };
+
+        pub const Spawned = struct {
+            scheduler: *Scheduler,
+            succeeded: *bool,
+            intent: Intent,
+
+            pub const Intent = enum {
+                first,
+                last,
+                normal,
+            };
+        };
+
+        pub const Resumed = struct {
+            scheduler: *Scheduler,
+            worker: *Worker,
+            intent: Intent,
+
+            pub const Intent = enum {
+                first,
+                last,
+                normal,
+                join,
+            };
+        };
     };
 
     pub fn call(self: *Platform, action: Action) void {

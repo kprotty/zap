@@ -124,10 +124,15 @@ const OsEvent =
 
 
 const WindowsEvent = extern struct {
-    thread_id: Atomic(system.DWORD) = undefined,
+    state: Atomic(State) = undefined,
+
+    const State = extern enum(system.DWORD) {
+        waiting,
+        notified,
+    };
 
     fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
-        self.thread_id.set(GetCurrentThreadId());
+        self.state.set(.waiting);
 
         if (condition.isMet())
             return true;
@@ -146,18 +151,19 @@ const WindowsEvent = extern struct {
             }
         }
 
+        const key = @ptrCast(?*align(4) const c_void, &self.state);
         if (!timed_out) {
-            switch (NtWaitForAlertByThreadId(null, timeout_ptr)) {
+            switch (NtWaitForKeyedEvent(null, key, system.FALSE, timeout_ptr)) {
                 .TIMEOUT => {},
-                .ALERTED => return true,
-                else => @panic("NtWaitForAlertByThreadId() unhandled status code"),
+                .SUCCESS => return true,
+                else => @panic("NtWaitForKeyedEvent() unhandled status code"),
             }
         }
 
-        if (self.thread_id.swap(0, .acquire) == 0) {
-            switch (NtWaitForAlertByThreadId(null, null)) {
-                .ALERTED => {},
-                else => @panic("NtWaitForAlertByThreadId() unhandled status code"),
+        if (self.state.swap(.notified, .acquire) == .notified) {
+            switch (NtWaitForKeyedEvent(null, key, system.FALSE, null)) {
+                .SUCCESS => {},
+                else => @panic("NtWaitForKeyedEvent() unhandled status code"),
             }
         }
 
@@ -165,14 +171,14 @@ const WindowsEvent = extern struct {
     }
 
     fn set(self: *OsEvent) void {
-        const thread_id = self.thread_id.swap(0, .release);
-        if (thread_id == 0)
+        const state = self.state.swap(.notified, .release);
+        if (state == .notified)
             return;
 
-        switch (NtAlertThreadByThreadId(@intToPtr(?system.HANDLE, thread_id))) {
+        const key = @ptrCast(?*align(4) const c_void, &self.state);
+        switch (NtReleaseKeyedEvent(null, key, system.FALSE, null)) {
             .SUCCESS => {},
-            .INVALID_CID => @panic("NtAlertThreadByThreadId() invalid thread id"),
-            else => @panic("NtAlertThreadByThreadId() unhandled status code"),
+            else => @panic("NtReleaseKeyedEvent() unhandled status code"),
         }
     }
 
@@ -184,16 +190,19 @@ const WindowsEvent = extern struct {
         return @divFloor(counter *% std.time.ns_per_s, frequency);
     }
 
-    extern "kernel32" fn GetCurrentThreadId() callconv(.Stdcall) system.DWORD;
-
-    extern "NtDll" fn NtAlertThreadByThreadId(
-        thread_id: ?system.HANDLE,
+    extern "NtDll" fn NtWaitForKeyedEvent(
+        handle: ?system.HANDLE,
+        key: ?*align(4) const c_void,
+        alertable: system.BOOLEAN,
+        timeout: ?*const system.LARGE_INTEGER,
     ) callconv(.Stdcall) system.NTSTATUS;
 
-    extern "NtDll" fn NtWaitForAlertByThreadId(
-        address: ?system.PVOID,
+    extern "NtDll" fn NtReleaseKeyedEvent(
+        handle: ?system.HANDLE,
+        key: ?*align(4) const c_void,
+        alertable: system.BOOLEAN,
         timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;    
+    ) callconv(.Stdcall) system.NTSTATUS;
 };
 
 const LinuxEvent = extern struct {

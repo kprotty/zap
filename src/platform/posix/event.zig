@@ -1,290 +1,18 @@
 const std = @import("std");
-const zap = @import("../zap.zig");
+const zap = @import("../../zap.zig");
+const LinuxEvent = @import("../linux/event.zig").Event;
 
-const core = zap.core;
 const system = std.os.system;
-const Condition = core.sync.Condition;
-const Atomic = core.sync.atomic.Atomic;
+const sync = zap.core.sync;
+const platform = zap.platform;
 
-pub const Futex = extern struct {
-    event: OsEvent = undefined,
+const Condition = sync.Condition;
+const Atomic = sync.atomic.Atomic;
 
-    pub fn wait(self: *Futex, deadline_ptr: ?*Timestamp, condition: *Condition) bool {
-        const deadline = if (deadline_ptr) |ptr| ptr.* else null;
-        return self.event.wait(deadline, condition);
-    }
-
-    pub fn wake(self: *Futex) void {
-        self.event.set();
-    }
-
-    pub const Timestamp = u64;
-
-    pub const nanotime = Clock.nanotime;
-
-    pub fn timestamp(self: *Futex, current: *Timestamp) void {
-        current.* = nanotime();
-    }
-
-    pub fn timeSince(self: *Futex, t1: *Timestamp, t2: *Timestamp) u64 {
-        return t1.* - t2.*;
-    }
-};
-
-const Clock = struct {
-    var last_now: u64 = 0;
-    var last_lock = core.sync.Lock{};
-
-    fn nanotime() u64 {
-        const now = OsEvent.nanotime();
-        if (OsEvent.is_actually_monotonic)
-            return now;
-
-        if (std.meta.bitCount(usize) < 64) {
-            last_lock.acquire(Futex);
-            defer last_lock.release();
-
-            const last = last_now;
-            if (last > now)
-                return last;
-
-            last_now = now;
-            return now;
-        }
-
-        var last = @atomicLoad(u64, &last_now, .Monotonic);
-        while (true) {
-            if (last > now)
-                return last;
-            last = @cmpxchgWeak(
-                u64,
-                &last_now,
-                last,
-                now,
-                .Monotonic,
-                .Monotonic,
-            ) orelse return now;
-        }
-    }
-
-    fn ReturnTypeOf(comptime function: anytype) type {
-        return @typeInfo(@TypeOf(function)).Fn.return_type.?;
-    }
-
-    fn getCachedFrequency(comptime getFrequencyFn: anytype) ReturnTypeOf(getFrequencyFn) {
-        const Frequency = ReturnTypeOf(getFrequencyFn);
-        const FrequencyState = enum(usize) {
-            uninit,
-            storing,
-            init,
-        };
-
-        const Cached = struct {
-            var frequency: Frequency = undefined;
-            var frequenc_state = Atomic(FrequencyState).init(.uninit);
-            
-            fn get() Frequency {
-                if (frequenc_state.load(.acquire) == .init)
-                    return frequency;
-                return getSlow();
-            }
-
-            fn getSlow() Frequency {
-                @setCold(true);
-
-                const local_frequency = getFrequencyFn();
-
-                if (frequenc_state.compareAndSwap(
-                    .uninit,
-                    .storing,
-                    .relaxed,
-                    .relaxed,
-                ) == null) {
-                    frequency = local_frequency;
-                    frequenc_state.store(.init, .release);
-                }
-
-                return local_frequency;
-            }
-        };
-
-        return Cached.get();
-    }
-};
-
-const OsEvent =
-    if (core.is_windows)
-        WindowsEvent
-    else if (core.link_libc and core.is_posix)
-        PosixEvent
-    else if (core.is_linux)
-        LinuxEvent
-    else
-        @compileError("OS thread blocking/unblocking not supported");
-
-
-const WindowsEvent = extern struct {
-    state: Atomic(State) = undefined,
-
-    const State = extern enum(system.DWORD) {
-        waiting,
-        notified,
-    };
-
-    fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
-        self.state.set(.waiting);
-
-        if (condition.isMet())
-            return true;
-
-        var timed_out = false;
-        var timeout: system.LARGE_INTEGER = undefined;
-        var timeout_ptr: ?*system.LARGE_INTEGER = null;
-
-        if (deadline) |deadline_ns| {
-            const now = Clock.nanotime();
-            timed_out = now > deadline_ns;
-            if (!timed_out) {
-                timeout_ptr = &timeout;
-                timeout = @intCast(system.LARGE_INTEGER, deadline_ns - now);
-                timeout = -(@divFloor(timeout, 100));
-            }
-        }
-
-        const key = @ptrCast(?*align(4) const c_void, &self.state);
-        if (!timed_out) {
-            switch (NtWaitForKeyedEvent(null, key, system.FALSE, timeout_ptr)) {
-                .TIMEOUT => {},
-                .SUCCESS => return true,
-                else => @panic("NtWaitForKeyedEvent() unhandled status code"),
-            }
-        }
-
-        if (self.state.swap(.notified, .acquire) == .notified) {
-            switch (NtWaitForKeyedEvent(null, key, system.FALSE, null)) {
-                .SUCCESS => {},
-                else => @panic("NtWaitForKeyedEvent() unhandled status code"),
-            }
-        }
-
-        return false;
-    }
-
-    fn set(self: *OsEvent) void {
-        const state = self.state.swap(.notified, .release);
-        if (state == .notified)
-            return;
-
-        const key = @ptrCast(?*align(4) const c_void, &self.state);
-        switch (NtReleaseKeyedEvent(null, key, system.FALSE, null)) {
-            .SUCCESS => {},
-            else => @panic("NtReleaseKeyedEvent() unhandled status code"),
-        }
-    }
-
-    const is_actually_monotonic = false;
-
-    fn nanotime() u64 {
-        const frequency = Clock.getCachedFrequency(system.QueryPerformanceFrequency);
-        const counter = system.QueryPerformanceCounter();
-        return @divFloor(counter *% std.time.ns_per_s, frequency);
-    }
-
-    extern "NtDll" fn NtWaitForKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
-        timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;
-
-    extern "NtDll" fn NtReleaseKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
-        timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;
-};
-
-const LinuxEvent = extern struct {
-    state: Atomic(State) = undefined,
-
-    const State = extern enum(i32) {
-        waiting,
-        notified,
-    };
-
-    fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
-        self.state.set(.waiting);
-
-        if (condition.isMet())
-            return true;
-
-        var ts: system.timespec = undefined;
-        var ts_ptr: ?*system.timespec = null;
-
-        while (true) {
-            switch (self.state.load(.acquire)) {
-                .waiting => {},
-                .notified => return true,
-            }
-
-            if (deadline) |deadline_ns| {
-                const now = Clock.nanotime();
-                if (now > deadline_ns)
-                    return false;
-
-                const duration = deadline_ns - now;
-                ts_ptr = &ts;
-                ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), @divFloor(duration, std.time.ns_per_s));
-                ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), @mod(duration, std.time.ns_per_s));
-            }
-
-            const rc = system.futex_wait(
-                @ptrCast(*const i32, &self.state),
-                system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAIT,
-                @as(i32, @enumToInt(State.waiting)),
-                ts_ptr,
-            );
-
-            switch (system.getErrno(rc)) {
-                0 => continue,
-                system.EINTR => continue,
-                system.EAGAIN => return true,
-                system.ETIMEDOUT => return false,
-                else => @panic("futex(WAIT) unhandled errno code"),
-            }
-        }
-    }
-
-    fn set(self: *OsEvent) void {
-        self.state.store(.notified, .release);
-
-        const rc = system.futex_wake(
-            @ptrCast(*const i32, &self.state),
-            system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAKE,
-            @as(i32, 1),
-        );
-
-        switch (system.getErrno(rc)) {
-            0 => {},
-            system.EFAULT => {},
-            else => @panic("futex(WAKE) unhandled errno"),
-        }
-    }
-
-    const nanotime = PosixEvent.nanotime;
-
-    const is_actually_monotonic = switch (core.os_type) {
-        .linux => core.arch_type != .aarch64 and .arch_type != .s390x,
-        .openbsd => core.arch_type != .x86_64,
-        else => true,
-    };
-};
-
-const PosixEvent = extern struct {
+pub const Event = extern struct {
     event: Atomic(?*PthreadEvent) = Atomic(?*PthreadEvent).init(null),
 
-    fn wait(self: *OsEvent, deadline: ?u64, condition: *Condition) bool {
+    pub fn wait(self: *Event, deadline: ?u64, condition: *Condition, comptime nanotimeFn: anytype) bool {
         var has_stack_event = false;
         var stack_event: PthreadEvent = undefined;
         defer if (has_stack_event)
@@ -301,7 +29,7 @@ const PosixEvent = extern struct {
         if (condition.isMet())
             return true;
 
-        event.wait(deadline);
+        event.wait(deadline, nanotimeFn);
         if (self.event.load(.acquire) == null)
             return true;
 
@@ -310,18 +38,18 @@ const PosixEvent = extern struct {
         return false;
     }
 
-    fn set(self: *OsEvent) void {
+    pub fn notify(self: *Event) void {
         if (self.event.swap(null, .acq_rel)) |event|
             event.notify();
     }
 
-    const is_actually_monotonic = 
-        if (core.is_linux) LinuxEvent.is_actually_monotonic
+    pub const is_actually_monotonic = 
+        if (platform.is_linux) LinuxEvent.is_actually_monotonic
         else true;
 
-    fn nanotime() u64 {
-        if (core.is_darwin) {
-            const frequency = Clock.getCachedFrequency(struct {
+    pub fn nanotime(comptime getCachedFn: type) u64 {
+        if (platform.is_darwin) {
+            const frequency = getCachedFn(struct {
                 fn get() system.mach_timebase_info_data {
                     var info: @TypeOf(@This().get()) = undefined;
                     system.mach_timebase_info(&info);
@@ -352,7 +80,7 @@ const PosixEvent = extern struct {
         fn init(self: *PthreadEvent) !void {
             var cond_attr: pthread_condattr_t = undefined;
             var cond_attr_ptr: ?*pthread_condattr_t = null;
-            const use_clock_monotonic = !core.is_darwin and !core.is_android;
+            const use_clock_monotonic = !platform.is_darwin and !platform.is_android;
 
             if (use_clock_monotonic and pthread_condattr_init(&cond_attr) != 0)
                 return error.PthreadCondAttrInit;
@@ -397,7 +125,7 @@ const PosixEvent = extern struct {
             self.is_notified = false;
         }
 
-        fn wait(self: *PthreadEvent, deadline: ?u64) void {
+        fn wait(self: *PthreadEvent, deadline: ?u64, comptime nanotimeFn: anytype) void {
             self.lock();
             defer self.unlock();
 
@@ -408,20 +136,20 @@ const PosixEvent = extern struct {
                     continue;
                 };
 
-                const now = Clock.nanotime();
+                const now = nanotimeFn();
                 if (now > deadline_ns) {
                     self.is_waiting = false;
                     return;
                 }
 
                 var ts: system.timespec = undefined;
-                if (core.is_darwin) {
+                if (platform.is_darwin) {
                     var tv: system.timeval = undefined;
                     if (system.gettimeofday(&tv, null) != 0)
                         @panic("gettimeofday() failed");
                     ts.tv_sec = @intCast(@TypeOf(ts.tv_sec), tv.tv_sec);
                     ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), tv.tv_usec) * std.time.ns_per_us;
-                } else if (core.is_android) {
+                } else if (platform.is_android) {
                     clock_gettime("CLOCK_REALTIME", &ts);
                 } else {
                     clock_gettime("CLOCK_MONOTONIC", &ts);

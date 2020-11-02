@@ -316,7 +316,7 @@ pub const Task = struct {
                 return task;
             }
 
-            if (self.runq_tick % 31 == 0) {
+            if (self.runq_tick % 61 == 0) {
                 var overflow = @atomicLoad(?*Task, &self.runq_overflow, .Monotonic);
                 while (overflow) |first_task| {
                     overflow = @cmpxchgWeak(

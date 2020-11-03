@@ -355,7 +355,7 @@ pub const Worker = struct {
             while (active_workers > 0) : (active_workers -= 1) {
 
                 const target = self.target_worker orelse blk: {
-                    const target = scheduler.active_queue.load(.acquire);
+                    const target = scheduler.active_queue.load(.consume);
                     self.target_worker = target;
                     break :blk (target orelse @panic("no active workers when trying to steal"));
                 };
@@ -381,7 +381,7 @@ pub const Worker = struct {
                             _ = target.runq_overflow.tryCompareAndSwap(
                                 first_task,
                                 null,
-                                .acquire,
+                                .consume,
                                 .relaxed,
                             ) orelse {
                                 self.inject(first_task.next, tail, injected);
@@ -391,7 +391,7 @@ pub const Worker = struct {
                             _ = target.runq_lifo.tryCompareAndSwap(
                                 task,
                                 null,
-                                .acquire,
+                                .consume,
                                 .relaxed,
                             ) orelse return task;
                         } else {
@@ -437,7 +437,7 @@ pub const Worker = struct {
             run_queue = scheduler.run_queue.tryCompareAndSwap(
                 first_task,
                 null,
-                .acquire,
+                .consume,
                 .relaxed,
             ) orelse {
                 self.inject(first_task.next, tail, injected);
@@ -711,7 +711,7 @@ pub const Scheduler = struct {
     }
 
     fn join(self: *Scheduler) void {
-        const idle_queue = self.idle_queue.load(.acquire);
+        const idle_queue = self.idle_queue.load(.consume);
         const idle_ptr = idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0));
 
         var idle_worker = @intToPtr(?*Worker, idle_ptr);

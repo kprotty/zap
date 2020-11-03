@@ -12,6 +12,7 @@ pub fn spinLoopHint() void {
 pub const Ordering = enum {
     unordered,
     relaxed,
+    consume,
     acquire,
     release,
     acq_rel,
@@ -20,6 +21,10 @@ pub const Ordering = enum {
     fn toBuiltin(comptime self: Ordering) std.builtin.AtomicOrder {
         return switch (self) {
             .unordered => .Unordered,
+            .consume => switch (core.arch_type) {
+                .i386, .x86_64, .arm, .aarch64, .powerpc, .powerpc64, .powerpc64le => .Monotonic,
+                else => .Acquire,
+            },
             .relaxed => .Monotonic,
             .acquire => .Acquire,
             .release => .Release,

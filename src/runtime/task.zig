@@ -316,7 +316,7 @@ pub const Task = extern struct {
     pub const AsyncFutex = struct {
         task: Atomic(*Task) = undefined,
 
-        pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: *Condition) bool {
+        pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: anytype) bool {
             var task = Task.initAsync(@frame());
 
             suspend {
@@ -335,13 +335,5 @@ pub const Task = extern struct {
         }
 
         pub const Timestamp = OsFutex.Timestamp;
-
-        pub fn timestamp(current: *Timestamp) void {
-            return OsFutex.timestamp(current);
-        }
-
-        pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
-            return OsFutex.timeSince(t1, t2);
-        }
     };
 };

@@ -36,13 +36,13 @@ pub const SpinFutex = extern struct {
         self.notified.store(true, .release);
     }
 
-    pub const Timestamp = void;
+    pub const Timestamp = extern struct {
+        pub fn current(self: *Timestamp) void {}
 
-    pub fn timestamp(current: *Timestamp) void {
-        current.* = undefined;
-    }
+        pub fn since(self: *const Timestamp, other: *const Timestamp) u64 {
+            return 0;
+        }
 
-    pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
-        return 0;
-    }
+        pub fn setAfter(self: *Timestamp, duration: u64) void {}
+    };
 };

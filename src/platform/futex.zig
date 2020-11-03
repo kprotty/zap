@@ -18,17 +18,21 @@ pub const Futex = extern struct {
         self.event.notify();
     }
 
-    pub const Timestamp = u64;
+    pub const Timestamp = extern struct {
+        nanos: u64 = 0,
 
-    pub const nanotime = Clock.nanotime;
+        pub fn current(self: *Timestamp) void {
+            self.nanos = Clock.nanotime();
+        }
 
-    pub fn timestamp(current: *Timestamp) void {
-        current.* = nanotime();
-    }
+        pub fn since(self: Timestamp, other: Timestamp) u64 {
+            return self.nanos - other.nanos;
+        }
 
-    pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
-        return t1.* - t2.*;
-    }
+        pub fn setAfter(self: *Timestamp, duration: u64) void {
+            self.nanos += duration;
+        }
+    };
 };
 
 const Event =

@@ -158,7 +158,7 @@ pub const Lock = extern struct {
             state = self.state.tryCompareAndSwap(
                 state,
                 state | WAKING,
-                .acquire,
+                .consume,
                 .relaxed,
             ) orelse {
                 state |= WAKING;
@@ -186,7 +186,7 @@ pub const Lock = extern struct {
                     state,
                     state & ~@as(usize, WAKING),
                     .release,
-                    .acquire,
+                    .consume,
                 ) orelse return;
                 continue;
             }
@@ -197,8 +197,8 @@ pub const Lock = extern struct {
             } else if (self.state.tryCompareAndSwap(
                 state,
                 UNLOCKED,
-                .acquire,
-                .acquire,
+                .consume,
+                .consume,
             )) |updated| {
                 state = updated;
                 continue;

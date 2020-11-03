@@ -8,7 +8,7 @@ const num_tasks = 100_000;
 const num_yields = 100;
 
 pub fn main() !void {
-    try (try Task.run(.{}, asyncMain, .{}));
+    try (try Task.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -27,11 +27,11 @@ fn asyncMain() !void {
 }
 
 fn yielder(counter: *usize) void {
-    Task.runConcurrently();
+    Task.runConcurrentlyAsync();
 
     var i: usize = num_yields;
     while (i != 0) : (i -= 1) {
-        Task.yield();
+        Task.yieldAsync();
     }
 
     _ = @atomicRmw(usize, counter, .Sub, 1, .Monotonic);

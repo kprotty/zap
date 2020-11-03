@@ -7,7 +7,7 @@ const allocator = std.heap.page_allocator;
 const num_tasks = 100_000;
 
 pub fn main() !void {
-    try (try Task.run(.{}, asyncMain, .{}));
+    try (try Task.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -26,7 +26,7 @@ fn asyncMain() !void {
 }
 
 fn pingPong(counter: *usize) void {
-    Task.runConcurrently();
+    Task.runConcurrentlyAsync();
 
     const Channel = Oneshot(void);
     const item = {};
@@ -36,7 +36,7 @@ fn pingPong(counter: *usize) void {
         c2: Channel = Channel{},
 
         fn run(self: *@This()) void {
-            Task.runConcurrently();
+            Task.runConcurrentlyAsync();
             self.c1.send(item);
             std.debug.assert(self.c2.recv() == item);
         }
@@ -63,7 +63,7 @@ fn Oneshot(comptime T: type) type {
 
         fn send(self: *Self, item: T) void {
             var waiter = Waiter{
-                .task = Task.init(@frame()),
+                .task = Task.initAsync(@frame()),
                 .item = item,
             };
 
@@ -78,7 +78,7 @@ fn Oneshot(comptime T: type) type {
         }
 
         fn recv(self: *Self) T {
-            var waiter = Waiter{ .task = Task.init(@frame()) };
+            var waiter = Waiter{ .task = Task.initAsync(@frame()) };
 
             suspend {
                 if (@atomicRmw(?*Waiter, &self.waiter, .Xchg, &waiter, .AcqRel)) |sender| {

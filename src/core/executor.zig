@@ -59,11 +59,10 @@ pub const Task = extern struct {
     };
 };
 
-pub const Worker = extern struct {
-    aligned: void align(@as(usize, @as(@TagType(Scheduler.State), 0)) + 1) = undefined,
+pub const Worker = struct {
+    sched_state: usize align(@as(usize, @as(@TagType(Scheduler.State), 0)) + 1),
     state: Atomic(State) = Atomic(State).init(.waking),
-    sched_state: usize,
-    idle_next: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+    idle_next: ?*Worker = null,
     idle_position: Atomic(usize) = Atomic(usize).init(0),
     active_next: ?*Worker = null,
     target_worker: ?*Worker = null,
@@ -75,7 +74,7 @@ pub const Worker = extern struct {
     runq_overflow: Atomic(?*Task) = Atomic(?*Task).init(null),
     runq_buffer: [256]Atomic(*Task) = undefined,
 
-    const State = extern enum(usize) {
+    const State = enum(usize) {
         waking = 0,
         running,
         suspended,
@@ -135,8 +134,9 @@ pub const Worker = extern struct {
                                 self.state.store(.running, .unordered);
                             }
                         }
+                        
                         self.runq_tick +%= 1;
-                        return .{ .exececuted = task };
+                        return .{ .executed = task };
                     }
                 },
                 .suspended => {
@@ -160,7 +160,7 @@ pub const Worker = extern struct {
     pub fn getScheduler(self: *const Worker) *Scheduler {
         @setRuntimeSafety(false);
         const sched_ptr = self.sched_state & ~@as(usize, 1);
-        return @intToPtr(?*Scheduler, sched_ptr);
+        return @intToPtr(*Scheduler, sched_ptr);
     }
 
     pub fn isMainWorker(self: *const Worker) bool {
@@ -207,7 +207,7 @@ pub const Worker = extern struct {
             }
         }
 
-        var tail = self.runq_tail;
+        var tail = self.runq_tail.get();
         var head = self.runq_head.load(.relaxed);
 
         while (!batch.isEmpty()) {
@@ -409,7 +409,7 @@ pub const Worker = extern struct {
                     steal -= 1;
 
                     while (steal > 0) : (steal -= 1) {
-                        const task = target.runq_buffer[new_target_head % target.runq_buffer.len], .unordered);
+                        const task = target.runq_buffer[new_target_head % target.runq_buffer.len].load(.unordered);
                         new_target_head +%= 1;
                         self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
                         new_tail +%= 1;
@@ -484,8 +484,8 @@ pub const Worker = extern struct {
     }
 };
 
-pub const Scheduler = extern struct {
-    idle_queue: IdleQueue = IdleQueue{ .value = @enumToInt(State.ready) },
+pub const Scheduler = struct {
+    idle_queue: IdleQueue = IdleQueue{ .value = Atomic(usize).init(@enumToInt(State.ready)) },
     run_queue: Atomic(?*Task) = Atomic(?*Task).init(null),
     active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
     active_workers: Atomic(usize) = Atomic(usize).init(0),
@@ -512,12 +512,12 @@ pub const Scheduler = extern struct {
         self.* = undefined;
     }
 
-    pub fn run(self: *Scheduler, batch: Batch) void {
+    pub fn run(self: *Scheduler, batch: Task.Batch) void {
         if (batch.isEmpty())
             return;
         
-        batch.tail.next = self.run_queue;
-        self.run_queue = batch.head;
+        batch.tail.next = self.run_queue.get();
+        self.run_queue.set(batch.head);
 
         self.resumeWorker(false);
     }
@@ -528,8 +528,8 @@ pub const Scheduler = extern struct {
         var idle_queue = self.idle_queue.load(.relaxed);
 
         while (true) {
-            const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
-            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+            const idle_ptr = idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0));
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value.get()));
 
             if (idle_state == .shutdown)
                 return;
@@ -542,7 +542,7 @@ pub const Scheduler = extern struct {
 
                 if (@intToPtr(?*Worker, idle_ptr)) |worker| {
                     fence(.acquire);
-                    const next_worker = worker.idle_next.load(.unordered);
+                    const next_worker = worker.idle_next;
                     if (self.idle_queue.tryCompareAndSwap(
                         idle_queue,
                         @ptrToInt(next_worker) | @enumToInt(State.waking),
@@ -563,10 +563,13 @@ pub const Scheduler = extern struct {
                         .resumed = .{
                             .scheduler = self,
                             .worker = worker,
-                            .intent = 
-                                if (idle_position == 0) .first
-                                else if (active_workers > 0 and idle_position == active_workers - 1) .last
-                                else .normal,
+                            .intent = blk: {
+                                if (idle_position == 0) 
+                                    break :blk .first;
+                                if (active_workers > 0 and idle_position == active_workers - 1)
+                                    break :blk .last;
+                                break :blk .normal;
+                            },
                         },
                     });
 
@@ -590,10 +593,13 @@ pub const Scheduler = extern struct {
                         .spawned = .{
                             .scheduler = self,
                             .succeeded = &did_spawn,
-                            .intent = 
-                                if (active_workers == 0) .first
-                                else if (active_workers == self.max_workers - 1) .last
-                                else .normal,
+                            .intent = blk: {
+                                if (active_workers == 0) 
+                                    break :blk .first;
+                                if (active_workers == self.max_workers - 1)
+                                    break :blk .last;
+                                break :blk .normal;
+                            },
                         },
                     });
                     if (did_spawn) {
@@ -634,12 +640,12 @@ pub const Scheduler = extern struct {
         var idle_queue = self.idle_queue.load(.relaxed);
 
         while (true) {
-            const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
-            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+            const idle_ptr = idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0));
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value.get()));
 
             if (
                 (idle_state == .suspend_notified) or
-                (old_worker_state == .waking and idle_state == .waking_notified)
+                (worker_state == .waking and idle_state == .waking_notified)
             ) {
                 const new_state: State = switch (idle_state) {
                     .waking_notified => .waking,
@@ -658,19 +664,12 @@ pub const Scheduler = extern struct {
                 }
 
                 worker.state.store(worker_state, .unordered);
-                self.platform.call(.{
-                    .resumed = .{
-                        .scheduler = self,
-                        .worker = worker,
-                        .intent = .poll,
-                    },
-                });
                 return .retry;
             }
             
             const idle_worker = @intToPtr(?*Worker, idle_ptr);
-            worker.idle_next.store(idle_worker, .unordered);
-            worker.state.store((idle_state == .shutdown) .stopping else .suspended, .unordered);
+            worker.idle_next = idle_worker;
+            worker.state.store(if (idle_state == .shutdown) .stopping else .suspended, .unordered);
 
             const idle_position = if (idle_worker) |w| w.idle_position.load(.unordered) + 1 else 0;
             worker.idle_position.store(idle_position, .unordered);
@@ -695,7 +694,7 @@ pub const Scheduler = extern struct {
                         .resumed = .{
                             .scheduler = self,
                             .worker = main_worker,
-                            .intent = .poll,
+                            .intent = .normal,
                         },
                     });
                 }
@@ -712,26 +711,28 @@ pub const Scheduler = extern struct {
     }
 
     fn join(self: *Scheduler) void {
-        const idle_queue = self.idle_queue.load(.Acquire);
-        const idle_ptr = idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0));
+        const idle_queue = self.idle_queue.load(.acquire);
+        const idle_ptr = idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0));
 
         var idle_worker = @intToPtr(?*Worker, idle_ptr);
         while (idle_worker) |new_idle_worker| {
             const worker = new_idle_worker;
-            idle_worker = worker.idle_next.load(.unordered);
+            idle_worker = worker.idle_next;
 
             const worker_state = worker.state.load(.unordered);
-            if (worker_state != .stopping)
+            if (worker_state != .stopping and worker_state != .joining)
                 @panic("worker shutting down with an invalid state");
             worker.state.store(.shutdown, .unordered);
 
-            self.platform.call(.{
-                .resumed = .{
-                    .scheduler = self,
-                    .worker = worker,
-                    .intent = .join,
-                },
-            });
+            if (worker_state == .stopping) {
+                self.platform.call(.{
+                    .resumed = .{
+                        .scheduler = self,
+                        .worker = worker,
+                        .intent = .join,
+                    },
+                });
+            }
         }
     }
 
@@ -739,7 +740,7 @@ pub const Scheduler = extern struct {
         var idle_queue = self.idle_queue.load(.relaxed);
 
         while (true) {
-            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value));
+            const idle_state = @intToEnum(State, @truncate(@TagType(State), idle_queue.value.get()));
             if (idle_state == .shutdown)
                 return;
 
@@ -753,10 +754,10 @@ pub const Scheduler = extern struct {
                 continue;
             }
 
-            var idle_worker = @intToPtr(?*Worker, idle_queue.value & ~@as(usize, ~@as(@TagType(State), 0)));
+            var idle_worker = @intToPtr(?*Worker, idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0)));
             while (idle_worker) |new_idle_worker| {
                 const worker = new_idle_worker;
-                idle_worker = worker.idle_next.load(.unordered);
+                idle_worker = worker.idle_next;
 
                 const worker_state = worker.state.load(.unordered);
                 if (worker_state != .suspended)
@@ -767,7 +768,7 @@ pub const Scheduler = extern struct {
                     .resumed = .{
                         .scheduler = self,
                         .worker = worker,
-                        .intent = .poll,
+                        .intent = .normal,
                     },
                 });
             }
@@ -783,13 +784,17 @@ pub const Scheduler = extern struct {
 
             const DoubleWord = std.meta.Int(.unsigned, std.meta.bitCount(usize) * 2);
 
+            fn get(self: IdleQueue) usize {
+                return self.value.get();
+            }
+
             fn load(
                 self: *const IdleQueue,
                 comptime ordering: Ordering,
             ) IdleQueue {
                 return IdleQueue{
-                    .value = self.value.load(ordering),
-                    .aba_tag = self.aba_tag.load(.relaxed),
+                    .value = Atomic(usize).init(self.value.load(ordering)),
+                    .aba_tag = Atomic(usize).init(self.aba_tag.load(.relaxed)),
                 };
             }
 
@@ -816,12 +821,16 @@ pub const Scheduler = extern struct {
         else => extern struct {
             value: Atomic(usize),
 
+            fn get(self: IdleQueue) usize {
+                return self.value.get();
+            }
+
             fn load(
                 self: *const IdleQueue,
                 comptime ordering: Ordering,
             ) IdleQueue {
                 return IdleQueue{
-                    .value = self.value.load(ordering),
+                    .value = Atomic(usize).init(self.value.load(ordering)),
                 };
             }
 
@@ -844,7 +853,7 @@ pub const Scheduler = extern struct {
     };
 };
 
-pub const Platform = extern struct {
+pub const Platform = struct {
     callFn: fn(*Platform, Action) void,
 
     pub const Action = union(enum) {

@@ -8,7 +8,7 @@ const num_spawners = 10;
 const num_tasks = 100_000;
 
 pub fn main() !void {
-    try (try Task.run(.{}, asyncMain, .{}));
+    try (try Task.runAsync(.{}, asyncMain, .{}));
 }
 
 fn asyncMain() !void {
@@ -27,7 +27,7 @@ fn asyncMain() !void {
 }
 
 fn spawner(counter: *usize) !void {
-    Task.yield();
+    Task.runConcurrentlyAsync();
 
     const frames = try allocator.alloc(@Frame(runner), num_tasks);
     defer allocator.free(frames);
@@ -39,7 +39,7 @@ fn spawner(counter: *usize) !void {
 }
 
 fn runner(counter: *usize) void {
-    Task.runConcurrently();
+    Task.runConcurrentlyAsync();
     
     _ =  @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
 }

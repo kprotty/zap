@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const sync = @import("./sync/sync.zig");
+pub const executor = @import("./executor.zig");
 
 pub const arch_type = std.builtin.arch;
 pub const sigle_threaded = std.builtin.single_threaded;

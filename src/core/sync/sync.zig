@@ -38,11 +38,11 @@ pub const SpinFutex = extern struct {
 
     pub const Timestamp = void;
 
-    pub fn timestamp(self: *SpinFutex, current: *Timestamp) void {
+    pub fn timestamp(current: *Timestamp) void {
         current.* = undefined;
     }
 
-    pub fn timeSince(self: *SpinFutex, t1: *Timestamp, t2: *Timestamp) u64 {
+    pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
         return 0;
     }
 };

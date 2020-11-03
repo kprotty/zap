@@ -22,11 +22,11 @@ pub const Futex = extern struct {
 
     pub const nanotime = Clock.nanotime;
 
-    pub fn timestamp(self: *Futex, current: *Timestamp) void {
+    pub fn timestamp(current: *Timestamp) void {
         current.* = nanotime();
     }
 
-    pub fn timeSince(self: *Futex, t1: *Timestamp, t2: *Timestamp) u64 {
+    pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
         return t1.* - t2.*;
     }
 };

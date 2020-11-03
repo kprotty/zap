@@ -336,12 +336,12 @@ pub const Task = extern struct {
 
         pub const Timestamp = OsFutex.Timestamp;
 
-        pub fn timestamp(self: *AsyncFutex, current: *Timestamp) void {
-            return OsFutex.timestamp(undefined, current);
+        pub fn timestamp(current: *Timestamp) void {
+            return OsFutex.timestamp(current);
         }
 
-        pub fn timeSince(self: *AsyncFutex, t1: *Timestamp, t2: *Timestamp) u64 {
-            return OsFutex.timeSince(undefined, t1, t2);
+        pub fn timeSince(t1: *Timestamp, t2: *Timestamp) u64 {
+            return OsFutex.timeSince(t1, t2);
         }
     };
 };

@@ -96,14 +96,6 @@ pub const Lock = extern struct {
 
                 while (true) {
                     if (state & LOCKED == 0) {
-                        if (is_x86) {
-                            if (lock.tryAcquire())
-                                break;
-                            atomic.spinLoopHint();
-                            state = lock.state.load(.relaxed);
-                            continue;
-                        }
-                        
                         state = lock.state.tryCompareAndSwap(
                             state,
                             state | LOCKED,

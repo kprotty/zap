@@ -3,32 +3,32 @@ const zap = @import("../zap.zig");
 
 const executor = zap.core.executor;
 const Atomic = zap.core.sync.atomic.Atomic;
+const OsFutex = zap.runtime.sync.OsFutex;
+const Condition = zap.core.sync.Condition;
 
 const Thread = std.Thread;
-const AutoResetEvent = struct {
-    futex: Futex = Futex{},
+const ResetEvent = struct {
+    futex: OsFutex = OsFutex{},
     updated: Atomic(bool) = Atomic(bool).init(false),
     condition: Condition = Condition{ .isMetFn = poll },
 
-    const Futex = zap.platform.Futex;
-    const Condition = zap.core.sync.Condition;
-
     fn poll(condition: *Condition) bool {
-        const self = @fieldParentPtr(AutoResetEvent, "condition", condition);
+        const self = @fieldParentPtr(ResetEvent, "condition", condition);
         return self.updated.swap(true, .acquire);
     }
 
-    fn wait(self: *AutoResetEvent) void {
-        const waited = self.futex.wait(null, &self.condition);
-        if (!waited)
-            @panic("AutoResetEvent timed without without a deadline");
+    fn reset(self: *ResetEvent) void {
         self.updated.set(false);
     }
 
-    fn set(self: *AutoResetEvent) void {
-        if (self.updated.swap(true, .release)) {
+    fn wait(self: *ResetEvent) void {
+        if (!self.futex.wait(null, &self.condition))
+            @panic("ResetEvent timed out without a deadline");
+    }
+
+    fn set(self: *ResetEvent) void {
+        if (self.updated.swap(true, .release))
             self.futex.wake();
-        }
     }
 };
 
@@ -187,7 +187,7 @@ pub const Task = extern struct {
     pub const Worker = struct {
         worker: executor.Worker,
         thread: ?*Thread,
-        event: AutoResetEvent,
+        event: ResetEvent,
 
         fn run(spawn_info: *SpawnInfo) void {
             const scheduler = spawn_info.scheduler;
@@ -199,7 +199,7 @@ pub const Task = extern struct {
             var self: Worker = undefined;
             self.worker.init(&scheduler.scheduler, thread == null);
             self.thread = thread;
-            self.event = AutoResetEvent{};
+            self.event = ResetEvent{};
 
             const old_current = Worker.getCurrent();
             Worker.setCurrent(&self);
@@ -215,6 +215,7 @@ pub const Task = extern struct {
                         if (intent == .retry)
                             continue;
                         self.event.wait();
+                        self.event.reset();
                     },
                     .shutdown => break,
                 }
@@ -245,8 +246,8 @@ pub const Task = extern struct {
         const SpawnInfo = struct {
             scheduler: *Scheduler,
             thread: ?*Thread = null,
-            thread_event: AutoResetEvent = AutoResetEvent{},
-            spawn_event: AutoResetEvent = AutoResetEvent{},
+            thread_event: ResetEvent = ResetEvent{},
+            spawn_event: ResetEvent = ResetEvent{},
         };
 
         fn spawn(scheduler: *Scheduler, use_caller_thread: bool) bool {
@@ -309,6 +310,38 @@ pub const Task = extern struct {
                     }
                 },
             }
+        }
+    };
+
+    pub const AsyncFutex = struct {
+        task: Atomic(*Task) = undefined,
+
+        pub fn wait(self: *AsyncFutex, deadline: ?*Timestamp, condition: *Condition) bool {
+            var task = Task.initAsync(@frame());
+
+            suspend {
+                self.task.store(&task, .unordered);
+                if (condition.isMet())
+                    task.scheduleNext();    
+            }
+
+            // TODO: integrate timers
+            return true;
+        }
+
+        pub fn wake(self: *AsyncFutex) void {
+            const task = self.task.load(.unordered);
+            task.schedule();
+        }
+
+        pub const Timestamp = OsFutex.Timestamp;
+
+        pub fn timestamp(self: *AsyncFutex, current: *Timestamp) void {
+            return OsFutex.timestamp(undefined, current);
+        }
+
+        pub fn timeSince(self: *AsyncFutex, t1: *Timestamp, t2: *Timestamp) u64 {
+            return OsFutex.timeSince(undefined, t1, t2);
         }
     };
 };

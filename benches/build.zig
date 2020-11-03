@@ -11,6 +11,7 @@ pub fn build(b: *std.build.Builder) void {
         "spawn",
         "yield",
         "pong",
+        "lock",
     }) |example| {
         const zig_exe = b.addExecutable(example, example ++ ".zig");
         if (libc)

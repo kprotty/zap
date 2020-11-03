@@ -5,8 +5,7 @@ const core = zap.core;
 pub const atomic = core.sync.atomic;
 
 pub const OsFutex = zap.platform.Futex;
-
-// pub const AsyncFutex = Task.Futex;
+pub const AsyncFutex = zap.runtime.Task.AsyncFutex;
 
 pub const Lock = extern struct {
     lock: core.sync.Lock = core.sync.Lock{},

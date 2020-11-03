@@ -6,6 +6,8 @@ authors = ["kprotty"]
 
 [dependencies]
 tokio = { version = "0.3", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+futures-intrusive = { version = "0.3" }
+async-mutex = { version = "1.4" }
 
 [[bin]]
 name = "spawn"
@@ -18,3 +20,7 @@ path = "./yield.rs"
 [[bin]]
 name = "pong"
 path = "./pong.rs"
+
+[[bin]]
+name = "lock"
+path = "./lock.rs"

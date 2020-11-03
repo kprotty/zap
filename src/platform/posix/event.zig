@@ -34,7 +34,7 @@ pub const Event = extern struct {
             return true;
 
         if (self.event.swap(null, .acquire) == null)
-            event.wait(null);
+            event.wait(null, nanotimeFn);
         return false;
     }
 
@@ -47,7 +47,7 @@ pub const Event = extern struct {
         if (platform.is_linux) LinuxEvent.is_actually_monotonic
         else true;
 
-    pub fn nanotime(comptime getCachedFn: type) u64 {
+    pub fn nanotime(comptime getCachedFn: anytype) u64 {
         if (platform.is_darwin) {
             const frequency = getCachedFn(struct {
                 fn get() system.mach_timebase_info_data {

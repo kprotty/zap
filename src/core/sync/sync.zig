@@ -39,8 +39,8 @@ pub const SpinFutex = extern struct {
     pub const Timestamp = extern struct {
         pub fn current(self: *Timestamp) void {}
 
-        pub fn since(self: *const Timestamp, other: *const Timestamp) u64 {
-            return 0;
+        pub fn since(self: *const Timestamp, other: *const Timestamp) ?u64 {
+            return null;
         }
 
         pub fn setAfter(self: *Timestamp, duration: u64) void {}

@@ -31,10 +31,18 @@ pub const ParkResult = union(enum) {
 };
 
 pub const Unparker = struct {
-    filterFn: fn(*Unparker, usize, usize) UnparkResult,
+    filterFn: fn(*Unparker, usize, usize, fairCheck: *FairCheck) UnparkResult,
 
-    pub fn filter(self: *Unparker, token: usize, remaining: usize) UnparkResult {
-        return (self.filterfn)(self, token, remaining);
+    pub fn filter(self: *Unparker, token: *usize, remaining: usize, fairCheck: *FairCheck) UnparkResult {
+        return (self.filterfn)(self, token, remaining, fairCheck);
+    }
+};
+
+pub const FairCheck = struct {
+    beFairFn: fn(*FairCheck) bool,
+
+    pub fn shouldBeFair(self: *FairCheck) bool {
+        return (self.beFairFn)(self);
     }
 };
 
@@ -98,9 +106,20 @@ pub fn BucketParkingLot(
                         return true;
                     };
 
-                    bucket.push(&future.waiter);
-                    bucket.lock.release();
+                    const waiter = &future.waiter;
+                    waiter.next = null;
+                    waiter.tail = waiter;
+                    if (bucket.head) |head| {
+                        const tail = bucket.tail.?;
+                        tail.next = waiter;
+                        waiter.prev = tail;
+                        bucket.tail = waiter;
+                    } else {
+                        waiter.prev = null;
+                        bucket.head = waiter;
+                    }
 
+                    bucket.lock.release();
                     parker.call(.parking);
                     return false;
                 }
@@ -117,7 +136,7 @@ pub fn BucketParkingLot(
             const bucket: *ParkBucket = BucketProvider.fromAddress(address);
             bucket.lock.acquire(Futex);
 
-            if (!bucket.tryRemove(&future.waiter)) {
+            if (future.waiter.tail == null) {
                 bucket.lock.release();
                 return .{ .unparked = future.waiter.token };
             }
@@ -138,8 +157,53 @@ pub fn BucketParkingLot(
             const bucket: *ParkBucket = BucketProvider.fromAddress(address);
             bucket.lock.acquire(Futex);
 
+            var remaining: ?usize = null;
             var unparked: ?*ParkBucket.Waiter = null;
-            
+            var current: ?*ParkBucket.Waiter = bucket.head;
+
+            while (current) |waiter| {
+                current = waiter.next;
+                if (waiter.address != address)
+                    continue;
+
+                const remains = remaining orelse blk: {
+                    var scan = current;
+                    var remains: usize = 0;
+                    while (scan) |sw| {
+                        if (sw.address == address)
+                            remains += 1;
+                        scan = sw.next;
+                    }
+                    remaining = remains;
+                    break :blk remains;
+                };
+
+                const FairnessCheck = struct {
+                    fair_check: FairCheck = FairCheck{ .beFairFn = beFair },
+                    bucket: *ParkBucket,
+
+                    fn beFairFn(fair_check: *FairCheck) bool {
+                        const fairness_check = @fieldParentPtr(@This(), "fair_check", fair_check);
+                        const bucket = fairness_check.bucket;
+
+                        var now = BucketTimestamp{};
+                        now.current();
+                        if (!now.since(&bucket.times_out))
+                            return false;
+
+                        // TODO
+                    }
+                };
+
+                var fairness_check = FairnessCheck{ .bucket = bucket };
+                switch (unparker.filter(&waiter.token, remains, &fairness_check.fair_check)) {
+                    .stop => break,
+                    .skip => continue,
+                    .unpark => {
+
+                    },
+                }
+            }
         }
     };
 }

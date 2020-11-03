@@ -25,7 +25,9 @@ pub const Futex = extern struct {
             self.nanos = Clock.nanotime();
         }
 
-        pub fn since(self: Timestamp, other: Timestamp) u64 {
+        pub fn since(self: Timestamp, other: Timestamp) ?u64 {
+            if (self.nanos < other.nanos)
+                return null;
             return self.nanos - other.nanos;
         }
 

@@ -15,8 +15,7 @@ pub const Lock = extern struct {
     const WAITING = ~@as(usize, LOCKED | WAKING);
 
     const Waiter = struct {
-        aligned: void align(~WAITING + 1) = undefined,
-        prev: ?*Waiter = undefined,
+        prev: ?*Waiter align(~WAITING + 1) = undefined,
         next: ?*Waiter = undefined,
         tail: ?*Waiter = undefined,
         waker: Waker = undefined,
@@ -142,8 +141,7 @@ pub const Lock = extern struct {
 
     pub fn release(self: *Lock) void {
         const state = self.state.fetchSub(LOCKED, .release);
-
-        if (state & WAITING != 0) {
+        if ((state & WAITING != 0) and (state & WAKING == 0)) {
             self.releaseSlow();
         }
     }

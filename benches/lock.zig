@@ -125,8 +125,23 @@ const ParkingLock = struct {
         tail: *Waiter,
         task: Task,
     };
+
+    fn tryAcquireX86(self: *@This()) bool {
+        return asm volatile(
+            "lock btsw $0, %[ptr]"
+            : [ret] "={@ccc}" (-> u8),
+            : [ptr] "*m" (&self.state)
+            : "cc", "memory"
+        ) == 0;
+    }
     
     fn acquireAsync(self: *@This()) void {
+        if (zap.core.is_x86) {
+            if (!self.tryAcquireX86())
+                self.acquireSlow();
+            return;
+        }
+
         if (self.state.tryCompareAndSwap(
             UNLOCKED,
             LOCKED,
@@ -181,7 +196,7 @@ const ParkingLock = struct {
             }
 
             blk: {
-                self.lock.acquireAsync();
+                self.lock.acquire();
 
                 state = self.state.load(.relaxed);
                 if (state != (LOCKED | PARKED)) {

@@ -348,7 +348,7 @@ pub const Worker = struct {
             };
         }
 
-        var steal_attempts: usize = 1 + (self.runq_tick % 4);
+        var steal_attempts: usize = 1;
         while (steal_attempts > 0) : (steal_attempts -= 1) {
             
             var active_workers = scheduler.active_workers.load(.relaxed);

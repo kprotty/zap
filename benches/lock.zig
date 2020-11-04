@@ -196,7 +196,7 @@ const ParkingLock = struct {
             }
 
             blk: {
-                self.lock.acquire();
+                self.lock.acquireAsync();
 
                 state = self.state.load(.relaxed);
                 if (state != (LOCKED | PARKED)) {

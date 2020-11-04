@@ -1,0 +1,146 @@
+https://softwareengineering.stackexchange.com/questions/340284/mutex-vs-semaphore-how-to-implement-them-not-in-terms-of-the-other
+
+resume(waking):
+    attempts = 5
+    is_waking = waking
+    iq = load(idle_queue)
+
+    loop:
+        is = iq & 0b1111
+        if is == .shutdown:
+            return
+
+        sc = (iq >> (14+4))
+        ac = (iq >> 4) & ((1<<14)-1)
+        
+        if (
+            ((is_waking and attempts > 0) or (!is_waking and is == .ready)) and
+            ((sc > 0) or (ac > 0))
+        ):
+            if sc > 0:
+                t = .resumed
+                sc -= 1
+            else:
+                t = .spawned
+                ac += 1
+
+            if (cas(
+                idle_queue,
+                iq,
+                (sc << (14+4)) | (ac << 4) | etoi(.waking)
+            )) |updated|:
+                iq = updated
+                continue
+
+            if (t == .resumed):
+                return notify()
+            if (spawn())
+                return;
+
+            attempts -= 1
+            is_waking = true
+            spin_loop_hint()
+            iq = fetch_sub(idle_queue, 1 << 4)
+            continue
+
+        new_is = blk:
+            if (is_waking):
+                if sc == 0 and ac == 0:
+                    blk: .snotify
+                blk: .ready
+            elif is == .waking:
+                blk: .wnotify
+            elif is == .ready:
+                blk: .snotify
+            return
+        
+        iq = cas(
+            idle_queue,
+            iq,
+            (sc << (14+4)) | (ac << 4) | etoi(new_is)
+        ) orelse return
+
+suspend(worker):
+    is_waking = worker.waking
+    iq = load(idle_queue)
+
+    loop:
+        is = iq & 0b1111
+        if is == .shutdown:
+            break
+
+        if is == .snotify or (is_waking and is == .wnotify):
+            iq = cas(
+                idle_queue,
+                iq,
+                if (is == .snotify) .ready else .waking
+            ) orelse {
+                worker.waking = is_waking
+                return
+            }
+            continue
+
+        sc = (iq >> (14+4))
+        ac = (iq >> 4) & ((1<<14)-1)
+        sc -= 1
+
+        if (cas(
+            idle_queue,
+            iq,
+            (sc << (14+4)) | (ac << 4) | etoi(is)
+        )) |updated|:
+            iq = updated
+            continue
+
+        wait(idle_queue)
+        return
+
+    sq = load(shutdown_queue)
+    loop:
+        worker.next = sq
+        sq = cas(
+            shutdown_queue
+            sq,
+            worker
+        ) orelse break
+
+    ac = fetch_sub(idle_queue, 1 << 4)
+    if ac == 1:
+        notify(main_worker)
+
+    wait(worker)
+    if not worker.is_main:
+        return
+
+    sq = load(shutdown_queue)
+    while sq |iwrk|:
+        sq = iwrk.next
+        iwrk.shutdown = true
+        if iwrk.thread |t|:
+            notify(iwrk)
+            t.wait()
+
+shutdown:
+    iq = load(idle_queue)
+
+    loop:
+        is = iq & 0b1111
+        if is == .shutdown:
+            return
+
+        sc = (iq >> (14+4))
+        ac = (iq >> 4) & ((1<<14)-1)
+
+        if (cas(
+            idle_queue,
+            iq,
+            (ac << 4) | etoi(.shutdown)
+        )) |updated|:
+            iq = updated
+            continue
+
+        while sc != 0:
+            sc -= 1
+            notify(idle_queue)
+
+        return

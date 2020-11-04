@@ -6,7 +6,7 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 #[tokio::main]
 async fn main() {
     let event = tokio::sync::Notify::new();
-    let counter = async_mutex::Mutex::new(0u64);
+    let counter = tokio::sync::Mutex::new(0u64);
     let ev_counter = AtomicUsize::new(NUM_TASKS);
     let context = Arc::new((event, ev_counter, counter));
 

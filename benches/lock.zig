@@ -236,7 +236,9 @@ const ParkingLock = struct {
 
         var is_fair = false;
         if (waiter) |w| {
-            const now = zap.runtime.sync.OsFutex.nanotime();
+            var ts = zap.runtime.sync.OsFutex.Timestamp{};
+            ts.current();
+            const now = ts.nanos;
             if (self.timed_out == 0) {
                 is_fair = true;
                 self.timed_out = now;

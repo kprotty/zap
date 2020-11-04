@@ -10,8 +10,8 @@ pub const Futex = extern struct {
     event: Event = undefined,
 
     pub fn wait(self: *Futex, deadline_ptr: ?*Timestamp, condition: *Condition) bool {
-        const deadline = if (deadline_ptr) |ptr| ptr.* else null;
-        return self.event.wait(deadline, condition, nanotime);
+        const deadline = if (deadline_ptr) |ptr| ptr.nanos else null;
+        return self.event.wait(deadline, condition, Clock.nanotime);
     }
 
     pub fn wake(self: *Futex) void {

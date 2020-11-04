@@ -139,8 +139,37 @@ shutdown:
             iq = updated
             continue
 
-        while sc != 0:
-            sc -= 1
-            notify(idle_queue)
-
+        notify_all(idle_queue)
         return
+
+Futex:
+    wait(counter, timeout):
+        loop:
+            c = load(counter)
+            while c > 0:
+                c = cas(counter, c, c - 1) orelse return
+            futex_wait(counter, 0, timeout):
+                timed_out: return
+            if timeout:
+                reduce-time
+
+    notify(counter):
+        _notify(counter, 1)
+
+    notify_all(counter):
+        _notify(counter, max_workers)
+
+    _notify(counter, n):
+        fetch_add(counter, n)
+        futex_wake(counter, n)
+
+KeyedEvent:
+    wait(counter, timeout):
+        fetch_add(counter, 1)
+        s = NtWait(null, counter, true, timeout)
+        fetch_sub(counter, 1)
+
+    notify(counter):
+        c = load(counter)
+
+    notify_all(counter):

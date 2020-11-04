@@ -282,7 +282,8 @@ const ParkingLock = struct {
         }
 
         self.lock.release();
-        if (waiter) |w|
-            w.task.schedule();
+        if (waiter) |w| {
+            Task.Batch.from(&w.task).schedule(.{ .use_lifo = true });
+        }
     }
 };

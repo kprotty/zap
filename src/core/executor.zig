@@ -57,6 +57,92 @@ pub const Task = extern struct {
             return task;
         }
     };
+
+    const FifoQueue = struct {
+        head: Atomic(*Task),
+        tail: Atomic(usize),
+        stub: Task,
+
+        const IS_LOCKED: usize = 1;
+
+        fn init(self: *FifoQueue) void {
+            self.head.set(&self.stub);
+            self.tail.set(@ptrToInt(&self.stub));
+            self.stub.next = null;
+        } 
+
+        fn tryAcquire(self: *FifoQueue) bool {
+            if (self.head.load(.relaxed) == &self.stub)
+                return false;
+
+            if (core.is_x86) {
+                return asm volatile(
+                    "lock btsw $0, %[ptr]"
+                    : [ret] "={@ccc}" (-> u8),
+                    : [ptr] "*m" (&self.tail)
+                    : "cc", "memory"
+                ) == 0;
+            }
+
+            var tail = self.tail.load(.relaxed);
+            while (true) {
+                if (tail & IS_LOCKED != 0)
+                    return false;
+                tail = self.tail.tryCompareAndSwap(
+                    tail,
+                    tail | IS_LOCKED,
+                    .acquire,
+                    .relaxed,
+                ) orelse return true;
+            }
+        }
+
+        fn release(self: *FifoQueue) void {
+            const unlocked_tail = self.tail.get() & ~IS_LOCKED;
+            self.tail.store(unlocked_tail, .release);
+        }
+
+        fn push(self: *FifoQueue, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            batch.tail.next = null;
+            const prev = self.head.swap(batch.tail, .acq_rel);
+            @ptrCast(*Atomic(?*Task), &prev.next).store(batch.head, .release);
+        }
+
+        fn pop(self: *FifoQueue) ?*Task {
+            var new_tail = @intToPtr(*Task, self.tail.get() & ~IS_LOCKED);
+            defer self.tail.set(@ptrToInt(new_tail) | IS_LOCKED);
+            
+            var tail = new_tail;
+            var next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+
+            if (tail == &self.stub) {
+                tail = next orelse return null;
+                new_tail = tail;
+                next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+            }
+
+            if (next) |next_tail| {
+                new_tail = next_tail;
+                return tail;
+            }
+
+            const head = self.head.load(.relaxed);
+            if (head != tail)
+                return null;
+
+            self.push(Batch.from(&self.stub));
+
+            if (@ptrCast(*Atomic(?*Task), &tail.next).load(.acquire)) |next_tail| {
+                new_tail = next_tail;
+                return tail;
+            }
+
+            return null;
+        }
+    };
 };
 
 pub const Worker = struct {
@@ -71,7 +157,7 @@ pub const Worker = struct {
     runq_head: Atomic(usize) = Atomic(usize).init(0),
     runq_tail: Atomic(usize) = Atomic(usize).init(0),
     runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
-    runq_overflow: Atomic(?*Task) = Atomic(?*Task).init(null),
+    runq_fifo: Task.FifoQueue = undefined,
     runq_buffer: [256]Atomic(*Task) = undefined,
 
     const State = enum(usize) {
@@ -88,6 +174,7 @@ pub const Worker = struct {
             .runq_tick = @ptrToInt(self),
             .sched_state = @ptrToInt(scheduler) | @boolToInt(is_main_worker),
         };
+        self.runq_fifo.init();
 
         if (is_main_worker) {
             scheduler.main_worker = self;
@@ -186,24 +273,8 @@ pub const Worker = struct {
         }
 
         if (hints.use_lifo) {
-            const new_lifo = batch.pop();
-            var runq_lifo = self.runq_lifo.load(.relaxed);
-
-            while (true) {
-                const old_lifo = runq_lifo orelse {
-                    self.runq_lifo.store(new_lifo, .release);
-                    break;
-                };
-
-                runq_lifo = self.runq_lifo.tryCompareAndSwap(
-                    old_lifo,
-                    new_lifo,
-                    .release,
-                    .relaxed,
-                ) orelse {
-                    batch.pushFront(old_lifo);
-                    break;
-                };
+            if (self.runq_lifo.swap(batch.pop(), .release)) |old_lifo| {
+                batch.pushFront(old_lifo);
             }
         }
 
@@ -242,7 +313,7 @@ pub const Worker = struct {
             }
 
             batch.pushFrontMany(overflowed);
-            self.pushOverflow(batch);
+            self.runq_fifo.push(batch);
             break;
         }
 
@@ -250,26 +321,28 @@ pub const Worker = struct {
         scheduler.resumeWorker(false);
     }
 
-    fn pushOverflow(self: *Worker, batch: Task.Batch) void {
-        if (batch.isEmpty())
-            return;
+    fn popFifo(self: *Worker, target: *Task.FifoQueue, tail: usize, injected: *bool) ?*Task {
+        if (!target.tryAcquire()) 
+            return null;
+        
+        var new_tail = tail;
+        var remaining = self.runq_buffer.len;
+        const first_task = target.pop();
 
-        var overflow = self.runq_overflow.load(.relaxed);
-        while (true) {
-            batch.tail.next = overflow;
-
-            if (overflow == null) {
-                self.runq_overflow.store(batch.head, .release);
-                break;
-            }
-
-            overflow = self.runq_overflow.tryCompareAndSwap(
-                overflow,
-                batch.head,
-                .release,
-                .relaxed,
-            ) orelse break;
+        while (remaining > 0) : (remaining -= 1) {
+            const task = target.pop() orelse break;
+            self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
+            new_tail +%= 1;
         }
+
+        target.release();
+
+        if (new_tail != tail) {
+            injected.* = true;
+            self.runq_tail.store(new_tail, .release);
+        }
+
+        return first_task;
     }
 
     fn pop(self: *Worker, scheduler: *Scheduler, injected: *bool) ?*Task {
@@ -285,7 +358,7 @@ pub const Worker = struct {
         if (polled.pop()) |first_task| {
             if (!polled.isEmpty()) {
                 injected.* = true;
-                self.pushOverflow(polled);
+                self.runq_fifo.push(polled);
             }
             return first_task;
         }
@@ -297,20 +370,11 @@ pub const Worker = struct {
         }
 
         if (self.runq_tick % 61 == 0) {
-            var overflow = self.runq_overflow.load(.relaxed);
-            while (overflow) |first_task| {
-                overflow = self.runq_overflow.tryCompareAndSwap(
-                    first_task,
-                    null,
-                    .relaxed,
-                    .relaxed,
-                ) orelse {
-                    if (first_task.next) |next| {
-                        injected.* = true;
-                        self.runq_overflow.store(next, .release);
-                    }
-                    return first_task;
-                };
+            if (self.runq_fifo.tryAcquire()) {
+                const first_task = self.runq_fifo.pop();
+                self.runq_fifo.release();
+                if (first_task) |task|
+                    return task;
             }
         }
 
@@ -335,17 +399,8 @@ pub const Worker = struct {
             ) orelse return self.runq_buffer[head % self.runq_buffer.len].get();
         }
 
-        var overflow = self.runq_overflow.load(.relaxed);
-        while (overflow) |first_task| {
-            overflow = self.runq_overflow.tryCompareAndSwap(
-                first_task,
-                null,
-                .relaxed,
-                .relaxed,
-            ) orelse {
-                self.inject(first_task.next, tail, injected);
-                return first_task;
-            };
+        if (self.popFifo(&self.runq_fifo, tail, injected)) |task| {
+            return task;
         }
 
         var steal_attempts: usize = 1;
@@ -377,16 +432,8 @@ pub const Worker = struct {
 
                     var steal = target_size - (target_size / 2);
                     if (steal == 0) {
-                        if (target.runq_overflow.load(.relaxed)) |first_task| {
-                            _ = target.runq_overflow.tryCompareAndSwap(
-                                first_task,
-                                null,
-                                .consume,
-                                .relaxed,
-                            ) orelse {
-                                self.inject(first_task.next, tail, injected);
-                                return first_task;
-                            };
+                        if (self.popFifo(&target.runq_fifo, tail, injected)) |task| {
+                            return task;
                         } else if (target.runq_lifo.load(.relaxed)) |task| {
                             _ = target.runq_lifo.tryCompareAndSwap(
                                 task,
@@ -431,18 +478,9 @@ pub const Worker = struct {
                 }
             }
         }
-        
-        var run_queue = scheduler.run_queue.load(.relaxed);
-        while (run_queue) |first_task| {
-            run_queue = scheduler.run_queue.tryCompareAndSwap(
-                first_task,
-                null,
-                .consume,
-                .relaxed,
-            ) orelse {
-                self.inject(first_task.next, tail, injected);
-                return first_task;
-            };
+
+        if (self.popFifo(&scheduler.run_queue, tail, injected)) |task| {
+            return task;
         }
 
         scheduler.platform.call(.{
@@ -456,37 +494,18 @@ pub const Worker = struct {
         if (polled.pop()) |first_task| {
             if (!polled.isEmpty()) {
                 injected.* = true;
-                self.pushOverflow(polled);
+                self.runq_fifo.push(polled);
             }
             return first_task;
         }
 
         return null;
     }
-
-    fn inject(self: *Worker, run_queue: ?*Task, tail: usize, injected: *bool) void {
-        var new_tail = tail;
-        var runq: ?*Task = run_queue orelse return;
-        
-        var remaining: usize = self.runq_buffer.len;
-        while (remaining > 0) : (remaining -= 1) {
-            const task = runq orelse break;
-            runq = task.next;
-            self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
-            new_tail +%= 1;
-        }
-
-        injected.* = true;
-        self.runq_tail.store(new_tail, .release);
-
-        if (runq != null)
-            self.runq_overflow.store(runq, .release);
-    }
 };
 
 pub const Scheduler = struct {
     idle_queue: IdleQueue = IdleQueue{ .value = Atomic(usize).init(@enumToInt(State.ready)) },
-    run_queue: Atomic(?*Task) = Atomic(?*Task).init(null),
+    run_queue: Task.FifoQueue = undefined,
     active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
     active_workers: Atomic(usize) = Atomic(usize).init(0),
     max_workers: usize,
@@ -506,6 +525,7 @@ pub const Scheduler = struct {
             .max_workers = num_threads,
             .platform = platform,
         };
+        self.run_queue.init();
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -516,16 +536,14 @@ pub const Scheduler = struct {
         if (batch.isEmpty())
             return;
         
-        batch.tail.next = self.run_queue.get();
-        self.run_queue.set(batch.head);
-
+        self.run_queue.push(batch);
         self.resumeWorker(false);
     }
 
     fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
         var waking_attempts: u8 = 5;
         var is_waking = is_caller_waking;
-        var idle_queue = self.idle_queue.load(.relaxed);
+        var idle_queue = self.idle_queue.load(.consume);
 
         while (true) {
             const idle_ptr = idle_queue.value.get() & ~@as(usize, ~@as(@TagType(State), 0));
@@ -541,13 +559,12 @@ pub const Scheduler = struct {
                 const active_workers = self.active_workers.load(.relaxed);
 
                 if (@intToPtr(?*Worker, idle_ptr)) |worker| {
-                    fence(.acquire);
                     const next_worker = worker.idle_next;
                     if (self.idle_queue.tryCompareAndSwap(
                         idle_queue,
                         @ptrToInt(next_worker) | @enumToInt(State.waking),
-                        .relaxed,
-                        .relaxed,
+                        .consume,
+                        .consume,
                     )) |updated| {
                         idle_queue = updated;
                         continue;
@@ -580,8 +597,8 @@ pub const Scheduler = struct {
                     if (self.idle_queue.tryCompareAndSwap(
                         idle_queue,
                         @enumToInt(State.waking),
-                        .relaxed,
-                        .relaxed,
+                        .consume,
+                        .consume,
                     )) |updated| {
                         idle_queue = updated;
                         continue;
@@ -611,7 +628,7 @@ pub const Scheduler = struct {
                     is_waking = true;
 
                     spinLoopHint();
-                    idle_queue = self.idle_queue.load(.relaxed);
+                    idle_queue = self.idle_queue.load(.consume);
                     continue;
                 }
             }
@@ -629,8 +646,8 @@ pub const Scheduler = struct {
             idle_queue = self.idle_queue.tryCompareAndSwap(
                 idle_queue,
                 idle_ptr | @enumToInt(new_state),
-                .relaxed,
-                .relaxed,
+                .consume,
+                .consume,
             ) orelse return;
         }
     }

@@ -106,10 +106,10 @@ pub const Task = struct {
                 return;
                 
             const worker = Worker.current.?;
-            if (worker.run_queue.push(self)) |overflowed|
-                worker.overflow_queue.push(overflowed);
-
             const scheduler = worker.scheduler;
+
+            if (worker.run_queue.push(self)) |overflowed|
+                scheduler.run_queue.push(overflowed);
             scheduler.resumeWorker(false);
         }
     };
@@ -279,7 +279,6 @@ pub const Task = struct {
         fn tryStealUnbounded(
             noalias self: *BoundedQueue,
             noalias target: *UnboundedQueue,
-            noalias injected: *bool,
         ) ?*Task {
             if (!target.tryAcquire())
                 return null;
@@ -299,18 +298,14 @@ pub const Task = struct {
 
             target.release();
 
-            if (new_tail != tail) {
-                injected.* = true;
+            if (new_tail != tail)
                 self.tail.store(new_tail, .release);
-            }
-
             return first_task;
         }
 
         fn tryStealBounded(
             noalias self: *BoundedQueue,
             noalias target: *BoundedQueue,
-            noalias injected: *bool,
         ) ?*Task {
             var tail = self.tail.get();
             var target_head = target.head.load(.relaxed);
@@ -350,11 +345,8 @@ pub const Task = struct {
                     continue;
                 }
 
-                if (new_tail != tail) {
-                    injected.* = true;
+                if (new_tail != tail)
                     self.tail.store(new_tail, .release);
-                }
-
                 return first_task;
             }
         }
@@ -367,8 +359,8 @@ pub const Task = struct {
         state: State = .waking,
         target: ?*Worker = null,
         next: ?*Worker = undefined,
+        runq_tick: usize = undefined,
         run_queue: BoundedQueue = BoundedQueue{},
-        overflow_queue: UnboundedQueue = undefined,
 
         const State = enum {
             waking,
@@ -409,10 +401,12 @@ pub const Task = struct {
             const thread = spawner.thread;
             spawner.spawn_event.set();
 
-            var self = Worker{.scheduler = scheduler };
-            self.overflow_queue.init();
-            self.thread = thread;
+            var self = Worker{
+                .scheduler = scheduler,
+                .thread = thread,
+            };
 
+            self.runq_tick = @ptrToInt(&self);
             if (self.thread == null)
                 scheduler.main_worker = &self;
 
@@ -440,12 +434,11 @@ pub const Task = struct {
                 };
 
                 if (should_poll) {
-                    var injected = false;
-                    if (self.poll(scheduler, &injected)) |task| {
-                        if (injected or self.state == .waking)
+                    if (self.poll(scheduler)) |task| {
+                        if (self.state == .waking)
                             scheduler.resumeWorker(self.state == .waking);
-                        
                         self.state = .running;
+                        self.runq_tick +%= 1;
                         resume task.frame;
                         continue;
                     }
@@ -455,15 +448,25 @@ pub const Task = struct {
             }
         }
 
-        fn poll(self: *Worker, scheduler: *Scheduler, injected: *bool) ?*Task {
+        fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
+            if (self.runq_tick % 61 == 0) {
+                if (self.run_queue.tryStealUnbounded(&scheduler.run_queue)) |task|
+                    return task;
+            }
+            
             if (self.run_queue.pop()) |task|
                 return task;
 
-            if (self.run_queue.tryStealUnbounded(&self.overflow_queue, injected)) |task|
+            if (self.run_queue.tryStealUnbounded(&scheduler.run_queue)) |task|
                 return task;
 
-            var active_workers = scheduler.idle_queue.load(.relaxed) >> 18;
-            while (active_workers > 0) : (active_workers -= 1) {
+            var spawned_workers = blk: {
+                const idle_queue = scheduler.idle_queue.load(.relaxed);
+                const iq = Scheduler.IdleQueue.unpack(idle_queue);
+                break :blk iq.spawned;
+            };
+
+            while (spawned_workers > 0) : (spawned_workers -= 1) {
                 const target = self.target orelse blk: {
                     const target = scheduler.worker_queue.load(.consume);
                     self.target = target;
@@ -474,13 +477,11 @@ pub const Task = struct {
                 if (target == self)
                     continue;
 
-                if (self.run_queue.tryStealBounded(&target.run_queue, injected)) |task|
-                    return task;
-                if (self.run_queue.tryStealUnbounded(&target.overflow_queue, injected)) |task|
+                if (self.run_queue.tryStealBounded(&target.run_queue)) |task|
                     return task;
             }
 
-            if (self.run_queue.tryStealUnbounded(&scheduler.run_queue, injected)) |task|
+            if (self.run_queue.tryStealUnbounded(&scheduler.run_queue)) |task|
                 return task;
 
             return null;

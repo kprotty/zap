@@ -639,6 +639,8 @@ pub const Task = struct {
                     new_iq.state = if (worker_state == .waking) .waking else .pending;
                 } else {
                     new_iq.suspended += 1;
+                    if (worker_state == .waking)
+                        new_iq.state = .pending;
                 }
 
                 worker.state = .suspended;

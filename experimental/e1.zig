@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("real_zap").core;
 
+const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
 
@@ -354,7 +355,8 @@ pub const Task = struct {
 
     const Worker = struct {
         thread: ?*Thread = undefined,
-        shutdown_event: std.AutoResetEvent = std.AutoResetEvent{},
+        event: std.AutoResetEvent = std.AutoResetEvent{},
+        idle_next: Atomic(usize) = Atomic(usize).init(0),
         scheduler: *Scheduler,
         state: State = .waking,
         target: ?*Worker = null,
@@ -494,7 +496,7 @@ pub const Task = struct {
         run_queue: UnboundedQueue = undefined,
         idle_queue: Atomic(u32) = Atomic(u32).init(0),
         worker_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-        idle_semaphore: Semaphore = Semaphore{},
+        idle_stack: Atomic(usize) = Atomic(usize).init(0),
 
         fn init(self: *Scheduler, max_workers: u16) void {
             self.* = Scheduler{};
@@ -580,7 +582,7 @@ pub const Task = struct {
                     }
 
                     if (resumed) {
-                        return self.idle_semaphore.post(1);
+                        return self.notify();
                     } else if (Worker.spawn(self, iq.spawned == 0)) {
                         return;
                     }
@@ -658,7 +660,7 @@ pub const Task = struct {
                     return;
                 }
 
-                self.idle_semaphore.wait(1);
+                self.wait(worker);
                 idle_queue = self.idle_queue.load(.relaxed);
                 worker.state = switch (IdleQueue.unpack(idle_queue).state) {
                     .waking, .waking_notified => .waking,
@@ -675,10 +677,10 @@ pub const Task = struct {
             idle_queue = self.idle_queue.fetchSub(spawn_iq.pack(), .release);
             if (IdleQueue.unpack(idle_queue).spawned == 1) {
                 const main_worker = self.main_worker orelse unreachable;
-                main_worker.shutdown_event.set();
+                main_worker.event.set();
             }
 
-            worker.shutdown_event.wait();
+            worker.event.wait();
             if (worker.thread != null)
                 return;
 
@@ -696,7 +698,7 @@ pub const Task = struct {
                 shutdown_worker.state = .shutdown;
 
                 const shutdown_thread = shutdown_worker.thread;
-                shutdown_worker.shutdown_event.set();
+                shutdown_worker.event.set();
 
                 if (shutdown_thread) |thread|
                     thread.wait();
@@ -720,101 +722,77 @@ pub const Task = struct {
                     new_iq.pack(),
                     .relaxed,
                     .relaxed,
-                ) orelse return self.idle_semaphore.post(self.max_workers);
+                ) orelse return self.notifyAll();
+            }
+        }
+
+        const IDLE_EMPTY: usize = 0;
+        const IDLE_NOTIFIED: usize = 1;
+        const IDLE_SHUTDOWN: usize = 2;
+
+        fn wait(self: *Scheduler, worker: *Worker) void {
+            var idle_stack = self.idle_stack.load(.relaxed);
+            while (true) {
+                if (idle_stack == IDLE_SHUTDOWN)
+                    return;
+
+                if (idle_stack == IDLE_NOTIFIED) {
+                    idle_stack = self.idle_stack.tryCompareAndSwap(
+                        idle_stack,
+                        IDLE_EMPTY,
+                        .acquire,
+                        .relaxed,
+                    ) orelse return;
+                    continue;
+                }
+
+                worker.idle_next.store(idle_stack, .unordered);
+                idle_stack = self.idle_stack.tryCompareAndSwap(
+                    idle_stack,
+                    @ptrToInt(worker),
+                    .release,
+                    .relaxed,
+                ) orelse return worker.event.wait();
+            }
+        }
+        
+        fn notify(self: *Scheduler) void {
+            var idle_stack = self.idle_stack.load(.consume);
+            while (true) {
+                if (idle_stack == IDLE_SHUTDOWN)
+                    return;
+
+                if (idle_stack == IDLE_EMPTY) {
+                    idle_stack = self.idle_stack.tryCompareAndSwap(
+                        idle_stack,
+                        IDLE_NOTIFIED,
+                        .release,
+                        .consume,
+                    ) orelse return;
+                    continue;
+                }
+
+                const worker = @intToPtr(*Worker, idle_stack);
+                idle_stack = self.idle_stack.tryCompareAndSwap(
+                    idle_stack,
+                    worker.idle_next.load(.unordered),
+                    .release,
+                    .consume,
+                ) orelse return worker.event.set();
+            }
+        }
+
+        fn notifyAll(self: *Scheduler) void {
+            var idle_stack = self.idle_stack.swap(IDLE_SHUTDOWN, .consume);
+            if (idle_stack == IDLE_SHUTDOWN)
+                unreachable;
+            if (idle_stack == IDLE_NOTIFIED)
+                return;
+
+            while (@intToPtr(?*Worker, idle_stack)) |idle_worker| {
+                idle_stack = idle_worker.idle_next.load(.unordered);
+                idle_worker.event.set();
             }
         }
     };
-};
-
-const Thread = std.Thread;
-
-const Semaphore = struct {
-    mutex: std.Mutex = std.Mutex{},
-    count: usize = 0,
-    waiters: ?*Waiter = null,
-
-    const Waiter = struct {
-        next: ?*Waiter,
-        tail: *Waiter,
-        amount: usize,
-        event: std.ResetEvent,
-    };
-
-    fn wait(self: *Semaphore, amount: usize) void {
-        var waiter: Waiter = undefined;
-        var has_event = false;
-        defer if (has_event)
-            waiter.event.deinit();
-
-        const event = blk: {
-            var held = self.mutex.acquire();
-            defer held.release();
-
-            while (true) {
-                if (self.count >= amount) {
-                    self.count -= amount;
-                    break;
-                }
-
-                if (has_event) {
-                    waiter.next = self.waiters;
-                    waiter.tail = if (self.waiters) |w| w.tail else &waiter;
-                    self.waiters = &waiter;
-                } else if (self.waiters) |head| {
-                    waiter.next = null;
-                    head.tail.next = &waiter;
-                    head.tail = &waiter;
-                } else {
-                    waiter.next = null;
-                    waiter.tail = &waiter;
-                    self.waiters = &waiter;
-                }
-
-                if (has_event) {
-                    waiter.event.reset();
-                } else {
-                    waiter.event = std.ResetEvent.init();
-                    waiter.amount = amount;
-                    has_event = true;
-                }
-
-                held.release();
-                waiter.event.wait();
-                held = self.mutex.acquire();
-            }
-
-            const next_waiter = self.waiters orelse break :blk null;
-            if (self.count < next_waiter.amount)
-                break :blk null;
-            
-            self.waiters = next_waiter.next;
-            if (self.waiters) |next|
-                next.tail = next_waiter.tail;
-            break :blk &next_waiter.event;
-        };
-
-        if (event) |reset_event|
-            reset_event.set();
-    }
-
-    fn post(self: *Semaphore, amount: usize) void {
-        if (amount == 0)
-            return;
-
-        const event = blk: {
-            const held = self.mutex.acquire();
-            defer held.release();
-
-            self.count += amount;
-            
-            const waiter = self.waiters orelse break :blk null;
-            self.waiters = waiter.next;
-            if (self.waiters) |head|
-                head.tail = waiter.tail;
-            break :blk &waiter.event;
-        };
-
-        if (event) |reset_event|
-            reset_event.set();
-    }
 };

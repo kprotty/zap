@@ -1,7 +1,6 @@
 const std = @import("std");
-const core = @import("../src/zap.zig").core;
+const core = @import("real_zap").core;
 
-const Thread = std.Thread; 
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
 
@@ -18,7 +17,7 @@ pub const Task = struct {
     }
 
     pub const Config = struct {
-        threads: ?usize = null,
+        threads: ?u16 = null,
     };
 
     pub fn runAsync(config: Config, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
@@ -28,7 +27,7 @@ pub const Task = struct {
                 const res = @call(.{}, asyncFn, fn_args);
                 suspend {
                     result.* = res;
-                    Worker.getCurrent().?.getScheduler().shutdown();
+                    Worker.current.?.scheduler.shutdown();
                 }
             }
         };
@@ -39,11 +38,17 @@ pub const Task = struct {
 
         const num_threads = 
             if (std.builtin.single_threaded) 
-                @as(usize, 1)
+                @as(u16, 1)
             else if (config.threads) |threads|
                 std.math.max(1, threads)
             else
-                Thread.cpuCount() catch 1;
+                @intCast(u16, Thread.cpuCount() catch 1);
+
+        var scheduler: Scheduler = undefined;
+        scheduler.init(num_threads);
+        defer scheduler.deinit();
+
+        scheduler.run(Batch.from(&task));
 
         return result orelse error.Deadlocked;
     }
@@ -95,7 +100,27 @@ pub const Task = struct {
             self.head = task.next;
             return task;
         }
+
+        pub fn schedule(self: Batch) void {
+            if (self.isEmpty())
+                return;
+                
+            const worker = Worker.current.?;
+            if (worker.run_queue.push(self)) |overflowed|
+                worker.overflow_queue.push(overflowed);
+
+            const scheduler = worker.scheduler;
+            scheduler.resumeWorker(false);
+        }
     };
+
+    pub const runConcurrentlyAsync = yieldAsync;
+    pub fn yieldAsync() void {
+        suspend {
+            var task = Task.initAsync(@frame());
+            Batch.from(&task).schedule();
+        }
+    }
 
     const UnboundedQueue = struct {
         head: Atomic(*Task),
@@ -292,7 +317,7 @@ pub const Task = struct {
 
             while (true) {
                 const target_tail = target.tail.load(.acquire);
-                const target_size = taregt_tail -% target_head;
+                const target_size = target_tail -% target_head;
 
                 var steal = target_size - (target_size / 2);
                 if (steal > target.buffer.len / 2) {
@@ -336,6 +361,8 @@ pub const Task = struct {
     };
 
     const Worker = struct {
+        thread: ?*Thread = undefined,
+        shutdown_event: std.AutoResetEvent = std.AutoResetEvent{},
         scheduler: *Scheduler,
         state: State = .waking,
         target: ?*Worker = null,
@@ -382,8 +409,12 @@ pub const Task = struct {
             const thread = spawner.thread;
             spawner.spawn_event.set();
 
-            var self = Worker{ .scheduler = scheduler };
+            var self = Worker{.scheduler = scheduler };
             self.overflow_queue.init();
+            self.thread = thread;
+
+            if (self.thread == null)
+                scheduler.main_worker = &self;
 
             var worker_queue = scheduler.worker_queue.load(.relaxed);
             while (true) {
@@ -415,7 +446,7 @@ pub const Task = struct {
                             scheduler.resumeWorker(self.state == .waking);
                         
                         self.state = .running;
-                        resume task;
+                        resume task.frame;
                         continue;
                     }
                 }
@@ -449,7 +480,7 @@ pub const Task = struct {
                     return task;
             }
 
-            if (self.run_queue.tryStealBounded(&scheduler.run_queue, injected)) |task|
+            if (self.run_queue.tryStealUnbounded(&scheduler.run_queue, injected)) |task|
                 return task;
 
             return null;
@@ -458,26 +489,465 @@ pub const Task = struct {
 
     const Scheduler = struct {
         max_workers: u16 = undefined,
+        main_worker: ?*Worker = null,
         run_queue: UnboundedQueue = undefined,
         idle_queue: Atomic(u32) = Atomic(u32).init(0),
         worker_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-        semaphore:
-        runtime: *struct {
-            blocking_thread: ?*Thread,
-            blocking: Scheduler,
-            non_blocking: Scheduler,
+        idle_semaphore: Semaphore = undefined,
+
+        fn init(self: *Scheduler, max_workers: u16) void {
+            self.* = Scheduler{};
+            self.run_queue.init();
+            self.idle_semaphore.init();
+            self.max_workers = max_workers;
         }
 
-        fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
+        fn deinit(self: *Scheduler) void {
+            self.idle_semaphore.deinit();
+            self.* = undefined;
+        }
 
+        fn run(self: *Scheduler, batch: Batch) void {
+            self.run_queue.push(batch);
+            self.resumeWorker(false);
+        }
+
+        const IdleQueue = struct {
+            state: State = .pending,
+            spawned: u16 = 0,
+            suspended: u16 = 0,
+
+            const State = enum(u4) {
+                pending = 0,
+                waking,
+                waking_notified,
+                suspend_notified,
+                shutdown,
+            };
+            
+            fn unpack(value: u32) IdleQueue {
+                var self: IdleQueue = undefined;
+                self.state = @intToEnum(State, @truncate(u4, value));
+                self.spawned = @truncate(u14, value >> 4);
+                self.suspended = @truncate(u14, value >> (4 + 14));
+                return self;
+            }
+
+            fn pack(self: IdleQueue) u32 {
+                var value: u32 = 0;
+                value |= @as(u32, @enumToInt(self.state));
+                value |= @as(u32, @intCast(u14, self.spawned)) << 4;
+                value |= @as(u32, @intCast(u14, self.suspended)) << (4 + 14);
+                return value;
+            }
+        };
+
+        fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
+            var wake_attempts: u8 = 5;
+            var is_waking = is_caller_waking;
+            const max_workers = self.max_workers;
+            var idle_queue = self.idle_queue.load(.relaxed);
+
+            while (true) {
+                const iq = IdleQueue.unpack(idle_queue);
+                if (iq.state == .shutdown)
+                    return;
+
+                if ((iq.suspended > 0 or iq.spawned < max_workers) and (
+                    (is_waking and wake_attempts > 0) or
+                    (!is_waking and iq.state == .pending)
+                )) {
+                    var new_iq = iq;
+                    new_iq.state = .waking;
+                    const resumed = switch (iq.suspended) {
+                        0 => blk: {
+                            new_iq.spawned += 1;
+                            break :blk false;
+                        },
+                        else => blk: {
+                            new_iq.suspended -= 1;
+                            break :blk true;
+                        },
+                    };
+
+                    if (self.idle_queue.tryCompareAndSwap(
+                        idle_queue,
+                        new_iq.pack(),
+                        .relaxed,
+                        .relaxed,
+                    )) |updated| {
+                        idle_queue = updated;
+                        continue;
+                    }
+
+                    if (resumed) {
+                        return self.idle_semaphore.post(1);
+                    } else if (Worker.spawn(self, iq.spawned == 0)) {
+                        return;
+                    }
+
+                    wake_attempts -= 1;
+                    is_waking = true;
+                    spinLoopHint();
+
+                    var spawn_iq = IdleQueue.unpack(0);
+                    spawn_iq.spawned = 1;
+                    idle_queue = self.idle_queue.fetchSub(spawn_iq.pack(), .relaxed);
+                    continue;
+                }
+
+                var new_iq = iq;
+                new_iq.state = blk: {
+                    const State = IdleQueue.State;
+                    if (is_waking) {
+                        if (iq.suspended == 0)
+                            break :blk State.suspend_notified;
+                        break :blk State.pending;
+                    }
+                    if (iq.state == .waking)
+                        break :blk State.waking_notified;
+                    if (iq.state == .pending)
+                        break :blk State.suspend_notified;
+                    return;
+                };
+
+                idle_queue = self.idle_queue.tryCompareAndSwap(
+                    idle_queue,
+                    new_iq.pack(),
+                    .relaxed,
+                    .relaxed,
+                ) orelse return;
+            }
         }
 
         fn suspendWorker(self: *Scheduler, worker: *Worker) void {
+            const worker_state = worker.state;
+            var idle_queue = self.idle_queue.load(.relaxed);
 
+            while (true) {
+                const iq = IdleQueue.unpack(idle_queue);
+                if (iq.state == .shutdown)
+                    break;
+
+                const notified = (
+                    (iq.state == .suspend_notified) or
+                    (worker_state == .waking and iq.state == .waking_notified)
+                );
+
+                var new_iq = iq;
+                if (notified) {
+                    new_iq.state = if (worker_state == .waking) .waking else .pending;
+                } else {
+                    new_iq.suspended += 1;
+                }
+
+                worker.state = .suspended;
+                if (self.idle_queue.tryCompareAndSwap(
+                    idle_queue,
+                    new_iq.pack(),
+                    .relaxed,
+                    .relaxed,
+                )) |updated| {
+                    idle_queue = updated;
+                    continue;
+                }
+
+                if (notified) {
+                    worker.state = worker_state;
+                    return;
+                }
+
+                self.idle_semaphore.wait();
+                idle_queue = self.idle_queue.load(.relaxed);
+                worker.state = switch (IdleQueue.unpack(idle_queue).state) {
+                    .waking, .waking_notified => .waking,
+                    .shutdown => .stopping,
+                    else => unreachable,
+                };
+
+                return;
+            }
+
+            var spawn_iq = IdleQueue.unpack(0);
+            spawn_iq.spawned += 1;
+            worker.state = .stopping;
+            idle_queue = self.idle_queue.fetchSub(spawn_iq.pack(), .release);
+            if (IdleQueue.unpack(idle_queue).spawned == 1) {
+                const main_worker = self.main_worker orelse unreachable;
+                main_worker.shutdown_event.set();
+            }
+
+            worker.shutdown_event.wait();
+            if (worker.thread != null)
+                return;
+
+            idle_queue = self.idle_queue.load(.acquire);
+            if (IdleQueue.unpack(idle_queue).spawned != 0)
+                unreachable;
+
+            var workers = self.worker_queue.load(.consume);
+            while (workers) |idle_worker| {
+                const shutdown_worker = idle_worker;
+                workers = shutdown_worker.next;
+
+                if (shutdown_worker.state != .stopping)
+                    unreachable;
+                shutdown_worker.state = .shutdown;
+
+                const shutdown_thread = shutdown_worker.thread;
+                shutdown_worker.shutdown_event.set();
+
+                if (shutdown_thread) |thread|
+                    thread.wait();
+            }
         }
 
         fn shutdown(self: *Scheduler) void {
+            var idle_queue = self.idle_queue.load(.relaxed);
 
+            while (true) {
+                const iq = IdleQueue.unpack(idle_queue);
+                if (iq.state == .shutdown)
+                    return;
+
+                var new_iq = iq;
+                new_iq.state = .shutdown;
+                new_iq.suspended = 0;
+
+                idle_queue = self.idle_queue.tryCompareAndSwap(
+                    idle_queue,
+                    new_iq.pack(),
+                    .relaxed,
+                    .relaxed,
+                ) orelse return self.idle_semaphore.post(iq.suspended);
+            }
         }
     };
+};
+
+const system = std.os.system;
+const is_linux = std.builtin.os.tag == .linux;
+const is_windows = std.builtin.os.tag == .windows;
+const is_darwin = std.Target.current.isDarwin();
+const is_freebsd = is_darwin or std.builtin.os.tag == .freebsd or .tag == .kfreebsd;
+const is_bsd = is_freebsd or std.builtin.os.tag == .openbsd or .tag == .netbsd or .tag == .dragonfly;
+const is_posix = is_linux or is_bsd or std.builtin.os.tag == .minix or .tag == .solaris or .tag == .fuchsia;
+
+const Thread = std.Thread;
+
+const Semaphore = 
+    if (is_windows) 
+        WindowsSemaphore
+    else if (std.builtin.link_libc and is_posix)
+        PosixSemaphore
+    else if (is_linux)
+        LinuxSemaphore
+    else
+        SpinSemaphore;
+
+const SpinSemaphore = struct {
+    counter: Atomic(u32),
+
+    fn init(self: *@This()) void {
+        self.counter.set(0);
+    }
+
+    fn deinit(self: *@This()) void {
+        self.* = undefined;
+    }
+
+    fn wait(self: *@This()) void {
+        return self.waitUsing(struct {
+            fn yield(_: anytype) void {
+                spinLoopHint();
+            }
+        });
+    }
+
+    fn waitUsing(self: *@This(), comptime yielder: anytype) void {
+        var counter = self.counter.load(.relaxed);
+        while (true) {
+            if (counter > 0) {
+                counter = self.counter.tryCompareAndSwap(
+                    counter,
+                    counter - 1,
+                    .acquire,
+                    .relaxed,
+                ) orelse return;
+            } else {
+                yielder.yield(self);
+                counter = self.counter.load(.relaxed);
+            }
+        }
+    }
+
+    fn post(self: *@This(), amount: u16) void {
+        _ = self.counter.fetchAdd(amount, .release);
+    }
+};
+
+const WindowsSemaphore = struct {
+    key: u32,
+
+    fn init(self: *@This()) void {}
+    fn deinit(self: *@This()) void {}
+
+    fn wait(self: *@This()) void {
+        const key = @ptrCast(*align(4) const c_void, &self.key);
+        const status = NtWaitForKeyedEvent(null, key, system.FALSE, null);
+        std.debug.assert(status == .SUCCESS);
+    }
+
+    fn post(self: *@This(), amount: u16) void {
+        var waiting = amount;
+        const key = @ptrCast(*align(4) const c_void, &self.key);
+
+        while (waiting > 0) : (waiting -= 1) {
+            const status = NtReleaseKeyedEvent(null, key, system.FALSE, null);
+            std.debug.assert(status == .SUCCESS);
+        }
+    }
+
+    extern "NtDll" fn NtWaitForKeyedEvent(
+        handle: ?system.HANDLE,
+        key: ?*align(4) const c_void,
+        alertable: system.BOOLEAN,
+        timeout: ?*const system.LARGE_INTEGER,
+    ) callconv(.Stdcall) system.NTSTATUS;
+
+    extern "NtDll" fn NtReleaseKeyedEvent(
+        handle: ?system.HANDLE,
+        key: ?*align(4) const c_void,
+        alertable: system.BOOLEAN,
+        timeout: ?*const system.LARGE_INTEGER,
+    ) callconv(.Stdcall) system.NTSTATUS;
+};
+
+const LinuxSemaphore = struct {
+    spin: SpinSemaphore,
+
+    fn init(self: *@This()) void {
+        self.spin.init();
+    }
+
+    fn deinit(self: *@This()) void {
+        self.spin.deinit();
+    }
+
+    fn wait(self: *@This()) void {
+        return self.spin.waitUsing(struct {
+            fn yield(spin: *SpinSemaphore) void {
+                const rc = system.futex_wait(
+                    @ptrCast(*const i32, spin),
+                    system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAIT,
+                    @as(i32, 0),
+                    null,
+                );
+
+                switch (system.getErrno(rc)) {
+                    0, system.EINTR, system.EAGAIN => {},
+                    else => unreachable,
+                }
+            }
+        });
+    }
+
+    fn post(self: *@This(), amount: u16) void {
+        self.spin.post(amount);
+
+        const ptr = @ptrCast(*const i32, &self.counter);
+        const op = system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAKE;
+        const rc = system.futex_wake(ptr, op, amount);
+        std.debug.assert(rc >= 0 and rc <= amount);
+    }
+};
+
+const PosixSemaphore = struct {
+    spin: SpinSemaphore,
+    use_spin: bool,
+    cond: pthread_cond_t,
+    mutex: pthread_mutex_t,
+
+    fn init(self: *@This()) void {
+        self.use_spin = true;
+
+        if (pthread_cond_init(&self.cond, null) == 0) {
+            if (pthread_mutex_init(&self.mutex, null) == 0) {
+                self.use_spin = false;
+            } else {
+                std.debug.assert(pthread_cond_destroy(&self.cond) == 0);
+            }
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.use_spin)
+            return;
+
+        std.debug.assert(pthread_cond_destroy(&self.cond) == 0);
+        std.debug.assert(pthread_mutex_destroy(&self.mutex) == 0);
+    }
+
+    fn wait(self: *@This()) void {
+        if (self.use_spin) {
+            return self.spin.waitUsing(struct {
+                fn yield(_: anytype) void {
+                    _ = sched_yield();
+                }
+            });
+        }
+
+        std.debug.assert(pthread_mutex_lock(&self.mutex) == 0);
+        defer std.debug.assert(pthread_mutex_unlock(&self.mutex) == 0);
+
+        while (true) {
+            const counter = self.spin.counter.get();
+            if (counter > 0) {
+                return self.spin.counter.set(counter - 1);
+            } else {
+                std.debug.assert(pthread_cond_wait(&self.cond, &self.mutex) == 0);
+            }   
+        }
+    }
+
+    fn post(self: *@This(), amount: u16) void {
+        if (self.use_spin)
+            return self.spin.post(amount);
+
+        {
+            std.debug.assert(pthread_mutex_lock(&self.mutex) == 0);
+            defer std.debug.assert(pthread_mutex_unlock(&self.mutex) == 0);
+
+            const counter = self.spin.counter.get();
+            self.spin.counter.set(counter + amount);
+        }
+
+        if (amount == 1) {
+            std.debug.assert(pthread_cond_signal(&self.cond) == 0);
+        } else {
+            std.debug.assert(pthread_cond_broadcast(&self.cond) == 0);
+        }
+    }
+
+    const pthread_cond_t = pthread_t;
+    const pthread_condattr_t = pthread_t;
+
+    const pthread_mutex_t = pthread_t;
+    const pthread_mutexattr_t = pthread_t;
+
+    extern "c" fn sched_yield() callconv(.C) c_int;
+    const pthread_t = extern struct {
+        _opaque: [128]u8 align(16),
+    };
+
+    extern "c" fn pthread_mutex_init(m: *pthread_mutex_t, a: ?*pthread_mutexattr_t) callconv(.C) c_int;
+    extern "c" fn pthread_mutex_lock(m: *pthread_mutex_t) callconv(.C) c_int;
+    extern "c" fn pthread_mutex_unlock(m: *pthread_mutex_t) callconv(.C) c_int;
+    extern "c" fn pthread_mutex_destroy(m: *pthread_mutex_t) callconv(.C) c_int;
+
+    extern "c" fn pthread_cond_init(c: *pthread_cond_t, a: ?*pthread_condattr_t) callconv(.C) c_int;
+    extern "c" fn pthread_cond_wait(noalias c: *pthread_cond_t, noalias m: *pthread_mutex_t) callconv(.C) c_int;
+    extern "c" fn pthread_cond_signal(c: *pthread_cond_t) callconv(.C) c_int;
+    extern "c" fn pthread_cond_broadcast(c: *pthread_cond_t) callconv(.C) c_int;
+    extern "c" fn pthread_cond_destroy(c: *pthread_cond_t) callconv(.C) c_int;
 };

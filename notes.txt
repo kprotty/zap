@@ -143,33 +143,62 @@ shutdown:
         return
 
 Futex:
-    wait(counter, timeout):
+    wait():
         loop:
             c = load(counter)
             while c > 0:
                 c = cas(counter, c, c - 1) orelse return
-            futex_wait(counter, 0, timeout):
-                timed_out: return
-            if timeout:
-                reduce-time
+            futex_wait(counter, 0):
 
-    notify(counter):
-        _notify(counter, 1)
-
-    notify_all(counter):
-        _notify(counter, max_workers)
-
-    _notify(counter, n):
+    notify(all):
+        n = if (all) max_workers else 1
         fetch_add(counter, n)
         futex_wake(counter, n)
 
+Pthread:
+    wait():
+        mutex_lock(mutex)
+        loop:
+            if counter > 0:
+                counter -= 1
+                break
+            waiters += 1    
+            cond_wait(cond, mutex)
+            waiters -= 1
+        mutex_unlock(mutex)
+
+    notify(all):
+        mutex_lock(mutex)
+        counter += if (all) max_workers else 1
+        w = waiters
+        if w > 0:
+            waiters -= if (all) w else 1
+        mutex_unlock(mutex)
+        if w > 0:
+            if all: cond_broadcast(cond)
+            else: cond_signal(cond)
+
 KeyedEvent:
-    wait(counter, timeout):
-        fetch_add(counter, 1)
-        s = NtWait(null, counter, true, timeout)
-        fetch_sub(counter, 1)
-
-    notify(counter):
+    wait():
         c = load(counter)
+        loop:
+            if c & NOTIFY > 0:
+                c = cas(counter, c, c - NOTIFY) orelse return
+                continue
+            c = cas(counter, c, c + WAIT) orelse break
+        NtWait(null, counter, false, null)
 
-    notify_all(counter):
+    notify(all):
+        if all:
+            c = swap(counter, NOTIFY * max_workers)
+            while c & WAIT > 0:
+                c -= WAIT
+                NtRelease(null, counter, false, null)
+            return
+        c = load(counter)
+        loop:
+            nc = if (c & WAIT > 0) c - WAIT else c
+            c = cas(counter, c, nc + NOTIFY) orelse break
+        if c & WAIT:
+            NtRelease(null, counter, false, null)
+                

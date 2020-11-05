@@ -494,17 +494,15 @@ pub const Task = struct {
         run_queue: UnboundedQueue = undefined,
         idle_queue: Atomic(u32) = Atomic(u32).init(0),
         worker_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-        idle_semaphore: Semaphore = undefined,
+        idle_semaphore: Semaphore = Semaphore{},
 
         fn init(self: *Scheduler, max_workers: u16) void {
             self.* = Scheduler{};
             self.run_queue.init();
-            self.idle_semaphore.init();
             self.max_workers = max_workers;
         }
 
         fn deinit(self: *Scheduler) void {
-            self.idle_semaphore.deinit();
             self.* = undefined;
         }
 
@@ -660,7 +658,7 @@ pub const Task = struct {
                     return;
                 }
 
-                self.idle_semaphore.wait();
+                self.idle_semaphore.wait(1);
                 idle_queue = self.idle_queue.load(.relaxed);
                 worker.state = switch (IdleQueue.unpack(idle_queue).state) {
                     .waking, .waking_notified => .waking,
@@ -672,7 +670,7 @@ pub const Task = struct {
             }
 
             var spawn_iq = IdleQueue.unpack(0);
-            spawn_iq.spawned += 1;
+            spawn_iq.spawned = 1;
             worker.state = .stopping;
             idle_queue = self.idle_queue.fetchSub(spawn_iq.pack(), .release);
             if (IdleQueue.unpack(idle_queue).spawned == 1) {
@@ -722,235 +720,101 @@ pub const Task = struct {
                     new_iq.pack(),
                     .relaxed,
                     .relaxed,
-                ) orelse return self.idle_semaphore.post(iq.suspended);
+                ) orelse return self.idle_semaphore.post(self.max_workers);
             }
         }
     };
 };
-
-const system = std.os.system;
-const is_linux = std.builtin.os.tag == .linux;
-const is_windows = std.builtin.os.tag == .windows;
-const is_darwin = std.Target.current.isDarwin();
-const is_freebsd = is_darwin or std.builtin.os.tag == .freebsd or .tag == .kfreebsd;
-const is_bsd = is_freebsd or std.builtin.os.tag == .openbsd or .tag == .netbsd or .tag == .dragonfly;
-const is_posix = is_linux or is_bsd or std.builtin.os.tag == .minix or .tag == .solaris or .tag == .fuchsia;
 
 const Thread = std.Thread;
 
-const Semaphore = 
-    if (is_windows) 
-        WindowsSemaphore
-    else if (std.builtin.link_libc and is_posix)
-        PosixSemaphore
-    else if (is_linux)
-        LinuxSemaphore
-    else
-        SpinSemaphore;
+const Semaphore = struct {
+    mutex: std.Mutex = std.Mutex{},
+    count: usize = 0,
+    waiters: ?*Waiter = null,
 
-const SpinSemaphore = struct {
-    counter: Atomic(u32),
-
-    fn init(self: *@This()) void {
-        self.counter.set(0);
-    }
-
-    fn deinit(self: *@This()) void {
-        self.* = undefined;
-    }
-
-    fn wait(self: *@This()) void {
-        return self.waitUsing(struct {
-            fn yield(_: anytype) void {
-                spinLoopHint();
-            }
-        });
-    }
-
-    fn waitUsing(self: *@This(), comptime yielder: anytype) void {
-        var counter = self.counter.load(.relaxed);
-        while (true) {
-            if (counter > 0) {
-                counter = self.counter.tryCompareAndSwap(
-                    counter,
-                    counter - 1,
-                    .acquire,
-                    .relaxed,
-                ) orelse return;
-            } else {
-                yielder.yield(self);
-                counter = self.counter.load(.relaxed);
-            }
-        }
-    }
-
-    fn post(self: *@This(), amount: u16) void {
-        _ = self.counter.fetchAdd(amount, .release);
-    }
-};
-
-const WindowsSemaphore = struct {
-    key: u32,
-
-    fn init(self: *@This()) void {}
-    fn deinit(self: *@This()) void {}
-
-    fn wait(self: *@This()) void {
-        const key = @ptrCast(*align(4) const c_void, &self.key);
-        const status = NtWaitForKeyedEvent(null, key, system.FALSE, null);
-        std.debug.assert(status == .SUCCESS);
-    }
-
-    fn post(self: *@This(), amount: u16) void {
-        var waiting = amount;
-        const key = @ptrCast(*align(4) const c_void, &self.key);
-
-        while (waiting > 0) : (waiting -= 1) {
-            const status = NtReleaseKeyedEvent(null, key, system.FALSE, null);
-            std.debug.assert(status == .SUCCESS);
-        }
-    }
-
-    extern "NtDll" fn NtWaitForKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
-        timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;
-
-    extern "NtDll" fn NtReleaseKeyedEvent(
-        handle: ?system.HANDLE,
-        key: ?*align(4) const c_void,
-        alertable: system.BOOLEAN,
-        timeout: ?*const system.LARGE_INTEGER,
-    ) callconv(.Stdcall) system.NTSTATUS;
-};
-
-const LinuxSemaphore = struct {
-    spin: SpinSemaphore,
-
-    fn init(self: *@This()) void {
-        self.spin.init();
-    }
-
-    fn deinit(self: *@This()) void {
-        self.spin.deinit();
-    }
-
-    fn wait(self: *@This()) void {
-        return self.spin.waitUsing(struct {
-            fn yield(spin: *SpinSemaphore) void {
-                const rc = system.futex_wait(
-                    @ptrCast(*const i32, spin),
-                    system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAIT,
-                    @as(i32, 0),
-                    null,
-                );
-
-                switch (system.getErrno(rc)) {
-                    0, system.EINTR, system.EAGAIN => {},
-                    else => unreachable,
-                }
-            }
-        });
-    }
-
-    fn post(self: *@This(), amount: u16) void {
-        self.spin.post(amount);
-
-        const ptr = @ptrCast(*const i32, &self.counter);
-        const op = system.FUTEX_PRIVATE_FLAG | system.FUTEX_WAKE;
-        const rc = system.futex_wake(ptr, op, amount);
-        std.debug.assert(rc >= 0 and rc <= amount);
-    }
-};
-
-const PosixSemaphore = struct {
-    spin: SpinSemaphore,
-    use_spin: bool,
-    cond: pthread_cond_t,
-    mutex: pthread_mutex_t,
-
-    fn init(self: *@This()) void {
-        self.use_spin = true;
-
-        if (pthread_cond_init(&self.cond, null) == 0) {
-            if (pthread_mutex_init(&self.mutex, null) == 0) {
-                self.use_spin = false;
-            } else {
-                std.debug.assert(pthread_cond_destroy(&self.cond) == 0);
-            }
-        }
-    }
-
-    fn deinit(self: *@This()) void {
-        if (self.use_spin)
-            return;
-
-        std.debug.assert(pthread_cond_destroy(&self.cond) == 0);
-        std.debug.assert(pthread_mutex_destroy(&self.mutex) == 0);
-    }
-
-    fn wait(self: *@This()) void {
-        if (self.use_spin) {
-            return self.spin.waitUsing(struct {
-                fn yield(_: anytype) void {
-                    _ = sched_yield();
-                }
-            });
-        }
-
-        std.debug.assert(pthread_mutex_lock(&self.mutex) == 0);
-        defer std.debug.assert(pthread_mutex_unlock(&self.mutex) == 0);
-
-        while (true) {
-            const counter = self.spin.counter.get();
-            if (counter > 0) {
-                return self.spin.counter.set(counter - 1);
-            } else {
-                std.debug.assert(pthread_cond_wait(&self.cond, &self.mutex) == 0);
-            }   
-        }
-    }
-
-    fn post(self: *@This(), amount: u16) void {
-        if (self.use_spin)
-            return self.spin.post(amount);
-
-        {
-            std.debug.assert(pthread_mutex_lock(&self.mutex) == 0);
-            defer std.debug.assert(pthread_mutex_unlock(&self.mutex) == 0);
-
-            const counter = self.spin.counter.get();
-            self.spin.counter.set(counter + amount);
-        }
-
-        if (amount == 1) {
-            std.debug.assert(pthread_cond_signal(&self.cond) == 0);
-        } else {
-            std.debug.assert(pthread_cond_broadcast(&self.cond) == 0);
-        }
-    }
-
-    const pthread_cond_t = pthread_t;
-    const pthread_condattr_t = pthread_t;
-
-    const pthread_mutex_t = pthread_t;
-    const pthread_mutexattr_t = pthread_t;
-
-    extern "c" fn sched_yield() callconv(.C) c_int;
-    const pthread_t = extern struct {
-        _opaque: [128]u8 align(16),
+    const Waiter = struct {
+        next: ?*Waiter,
+        tail: *Waiter,
+        amount: usize,
+        event: std.ResetEvent,
     };
 
-    extern "c" fn pthread_mutex_init(m: *pthread_mutex_t, a: ?*pthread_mutexattr_t) callconv(.C) c_int;
-    extern "c" fn pthread_mutex_lock(m: *pthread_mutex_t) callconv(.C) c_int;
-    extern "c" fn pthread_mutex_unlock(m: *pthread_mutex_t) callconv(.C) c_int;
-    extern "c" fn pthread_mutex_destroy(m: *pthread_mutex_t) callconv(.C) c_int;
+    fn wait(self: *Semaphore, amount: usize) void {
+        var waiter: Waiter = undefined;
+        var has_event = false;
+        defer if (has_event)
+            waiter.event.deinit();
 
-    extern "c" fn pthread_cond_init(c: *pthread_cond_t, a: ?*pthread_condattr_t) callconv(.C) c_int;
-    extern "c" fn pthread_cond_wait(noalias c: *pthread_cond_t, noalias m: *pthread_mutex_t) callconv(.C) c_int;
-    extern "c" fn pthread_cond_signal(c: *pthread_cond_t) callconv(.C) c_int;
-    extern "c" fn pthread_cond_broadcast(c: *pthread_cond_t) callconv(.C) c_int;
-    extern "c" fn pthread_cond_destroy(c: *pthread_cond_t) callconv(.C) c_int;
+        const event = blk: {
+            var held = self.mutex.acquire();
+            defer held.release();
+
+            while (true) {
+                if (self.count >= amount) {
+                    self.count -= amount;
+                    break;
+                }
+
+                if (has_event) {
+                    waiter.next = self.waiters;
+                    waiter.tail = if (self.waiters) |w| w.tail else &waiter;
+                    self.waiters = &waiter;
+                } else if (self.waiters) |head| {
+                    waiter.next = null;
+                    head.tail.next = &waiter;
+                    head.tail = &waiter;
+                } else {
+                    waiter.next = null;
+                    waiter.tail = &waiter;
+                    self.waiters = &waiter;
+                }
+
+                if (has_event) {
+                    waiter.event.reset();
+                } else {
+                    waiter.event = std.ResetEvent.init();
+                    waiter.amount = amount;
+                    has_event = true;
+                }
+
+                held.release();
+                waiter.event.wait();
+                held = self.mutex.acquire();
+            }
+
+            const next_waiter = self.waiters orelse break :blk null;
+            if (self.count < next_waiter.amount)
+                break :blk null;
+            
+            self.waiters = next_waiter.next;
+            if (self.waiters) |next|
+                next.tail = next_waiter.tail;
+            break :blk &next_waiter.event;
+        };
+
+        if (event) |reset_event|
+            reset_event.set();
+    }
+
+    fn post(self: *Semaphore, amount: usize) void {
+        if (amount == 0)
+            return;
+
+        const event = blk: {
+            const held = self.mutex.acquire();
+            defer held.release();
+
+            self.count += amount;
+            
+            const waiter = self.waiters orelse break :blk null;
+            self.waiters = waiter.next;
+            if (self.waiters) |head|
+                head.tail = waiter.tail;
+            break :blk &waiter.event;
+        };
+
+        if (event) |reset_event|
+            reset_event.set();
+    }
 };

@@ -430,7 +430,7 @@ pub const Task = struct {
             while (true) {
                 const should_poll = switch (self.state) {
                     .running, .waking => true,
-                    .suspended => unreachable, // worker running when suspended
+                    .suspended => std.debug.panic("worker running when suspended", .{}),
                     .stopping => false,
                     .shutdown => break,
                 };
@@ -472,7 +472,7 @@ pub const Task = struct {
                 const target = self.target orelse blk: {
                     const target = scheduler.worker_queue.load(.consume);
                     self.target = target;
-                    break :blk target orelse unreachable;
+                    break :blk target orelse std.debug.panic("no running workers found when stealing\n", .{});
                 };
 
                 self.target = target.next;
@@ -627,16 +627,15 @@ pub const Task = struct {
 
             while (true) {
                 const iq = IdleQueue.unpack(idle_queue);
-                if (iq.state == .shutdown)
-                    break;
-
-                const notified = (
+                const notified = iq.state != .shutdown and (
                     (iq.state == .suspend_notified) or
                     (worker_state == .waking and iq.state == .waking_notified)
                 );
 
                 var new_iq = iq;
-                if (notified) {
+                if (iq.state == .shutdown) {
+                    new_iq.spawned -= 1;
+                } else if (notified) {
                     new_iq.state = if (worker_state == .waking) .waking else .pending;
                 } else {
                     new_iq.suspended += 1;
@@ -644,65 +643,53 @@ pub const Task = struct {
                         new_iq.state = .pending;
                 }
 
-                worker.state = .suspended;
+                worker.state = if (iq.state == .shutdown) .stopping else .suspended;
                 if (self.idle_queue.tryCompareAndSwap(
                     idle_queue,
                     new_iq.pack(),
-                    .relaxed,
+                    .release,
                     .relaxed,
                 )) |updated| {
                     idle_queue = updated;
                     continue;
                 }
 
-                if (notified) {
-                    worker.state = worker_state;
+                if (iq.state != .shutdown) {
+                    if (notified) {
+                        worker.state = worker_state;
+                    } else {
+                        self.wait(worker);
+                    }
                     return;
                 }
 
-                self.wait(worker);
-                idle_queue = self.idle_queue.load(.relaxed);
-                worker.state = switch (IdleQueue.unpack(idle_queue).state) {
-                    .waking, .waking_notified => .waking,
-                    .shutdown => .stopping,
-                    else => unreachable,
-                };
+                if (iq.spawned == 1) {
+                    const main_worker = self.main_worker orelse std.debug.panic("no main worker when shutting down\n", .{});
+                    main_worker.event.set();
+                }
+
+                worker.event.wait();
+                if (worker.thread != null)
+                    return;
+
+                var workers = self.worker_queue.load(.consume);
+                while (workers) |idle_worker| {
+                    const shutdown_worker = idle_worker;
+                    workers = shutdown_worker.next;
+
+                    if (shutdown_worker.state != .stopping)
+                        std.debug.panic("shutting down worker with state {}\n", .{shutdown_worker.state});
+                    shutdown_worker.state = .shutdown;
+
+                    const shutdown_thread = shutdown_worker.thread;
+                    shutdown_worker.event.set();
+
+                    if (shutdown_thread) |thread|
+                        thread.wait();
+                }
 
                 return;
-            }
-
-            var spawn_iq = IdleQueue.unpack(0);
-            spawn_iq.spawned = 1;
-            worker.state = .stopping;
-            idle_queue = self.idle_queue.fetchSub(spawn_iq.pack(), .release);
-            if (IdleQueue.unpack(idle_queue).spawned == 1) {
-                const main_worker = self.main_worker orelse unreachable;
-                main_worker.event.set();
-            }
-
-            worker.event.wait();
-            if (worker.thread != null)
-                return;
-
-            idle_queue = self.idle_queue.load(.acquire);
-            if (IdleQueue.unpack(idle_queue).spawned != 0)
-                unreachable;
-
-            var workers = self.worker_queue.load(.consume);
-            while (workers) |idle_worker| {
-                const shutdown_worker = idle_worker;
-                workers = shutdown_worker.next;
-
-                if (shutdown_worker.state != .stopping)
-                    unreachable;
-                shutdown_worker.state = .shutdown;
-
-                const shutdown_thread = shutdown_worker.thread;
-                shutdown_worker.event.set();
-
-                if (shutdown_thread) |thread|
-                    thread.wait();
-            }
+            }         
         }
 
         fn shutdown(self: *Scheduler) void {
@@ -772,25 +759,33 @@ pub const Task = struct {
                     continue;
                 }
 
-                const worker = @intToPtr(*Worker, idle_stack);
+                const idle_worker = @intToPtr(*Worker, idle_stack);
                 idle_stack = self.idle_stack.tryCompareAndSwap(
                     idle_stack,
-                    worker.idle_next.load(.unordered),
-                    .release,
+                    idle_worker.idle_next.load(.unordered),
+                    .acq_rel,
                     .consume,
-                ) orelse return worker.event.set();
+                ) orelse {
+                    if (idle_worker.state != .suspended)
+                        std.debug.panic("waking worker with state: {}\n", .{idle_worker.state});
+                    idle_worker.state = .waking;
+                    return idle_worker.event.set();
+                };
             }
         }
 
         fn notifyAll(self: *Scheduler) void {
             var idle_stack = self.idle_stack.swap(IDLE_SHUTDOWN, .consume);
             if (idle_stack == IDLE_SHUTDOWN)
-                unreachable;
+                std.debug.panic("notifyAll() called when already shutdown\n", .{});
             if (idle_stack == IDLE_NOTIFIED)
                 return;
 
             while (@intToPtr(?*Worker, idle_stack)) |idle_worker| {
                 idle_stack = idle_worker.idle_next.load(.unordered);
+                if (idle_worker.state != .suspended)
+                    std.debug.panic("stopping worker with state: {}\n", .{idle_worker.state});
+                idle_worker.state = .stopping;
                 idle_worker.event.set();
             }
         }

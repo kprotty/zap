@@ -20,7 +20,7 @@ pub fn build(b: *std.build.Builder) void {
         zig_exe.single_threaded = single_threaded;
         zig_exe.setBuildMode(mode);
         zig_exe.setTarget(target);
-        zig_exe.addPackagePath("zap", "../src/zap.zig");
+        zig_exe.addPackagePath("zap", "../experimental/zap.zig");
         zig_exe.setOutputDir("zig-cache");
         zig_exe.install();
 

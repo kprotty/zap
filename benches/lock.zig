@@ -41,7 +41,31 @@ fn locker(lock: *Lock, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = ParkingLock;
+const Lock = FastLockAsync;
+
+const FastLockAsync = struct {
+    lock: FastLock = FastLock{},
+
+    fn acquireAsync(self: *FastLockAsync) void {
+        self.lock.acquire();
+    }
+
+    fn release(self: *FastLockAsync) void {
+        self.lock.release();
+    }
+};
+
+const MutexLockAsync = struct {
+    lock: std.Mutex = std.Mutex{},
+
+    fn acquireAsync(self: *@This()) void {
+        _ = self.lock.acquire();
+    }
+
+    fn release(self: *@This()) void {
+        (std.Mutex.Held{ .mutex = &self.lock }).release();
+    }
+};
 
 const FastLock = zap.runtime.sync.Lock;
 const FairLock = struct {
@@ -101,7 +125,7 @@ const FairLock = struct {
         }
         
         self.lock.release();
-        waiter.task.schedule();
+        Task.Batch.from(&waiter.task).schedule(.{ .use_lifo = true });
     }
 };
 
@@ -196,7 +220,7 @@ const ParkingLock = struct {
             }
 
             blk: {
-                self.lock.acquireAsync();
+                self.lock.acquire();
 
                 state = self.state.load(.relaxed);
                 if (state != (LOCKED | PARKED)) {
@@ -240,7 +264,7 @@ const ParkingLock = struct {
     fn releaseSlow(self: *@This()) void {
         @setCold(true);
 
-        self.lock.acquire();
+        self.lock.acquireAsync();
 
         var waiter = self.head;
         if (waiter) |w| {
@@ -250,24 +274,26 @@ const ParkingLock = struct {
         }
 
         var is_fair = false;
-        if (waiter) |w| {
-            var ts = zap.runtime.sync.OsFutex.Timestamp{};
-            ts.current();
-            const now = ts.nanos;
-            if (self.timed_out == 0) {
-                is_fair = true;
-                self.timed_out = now;
-                self.rng_seed = @truncate(u32, @ptrToInt(waiter) >> 8);
-            } else if (now > self.timed_out) {
-                is_fair = true;
-                self.timed_out = now + blk: {
-                    var x = self.rng_seed;
-                    x ^= x << 13;
-                    x ^= x >> 17;
-                    x ^= x << 5;
-                    self.rng_seed = x;
-                    break :blk (x % std.time.ns_per_ms);
-                };  
+        if (!is_fair) {
+            if (waiter) |w| {
+                var ts = zap.runtime.sync.OsFutex.Timestamp{};
+                ts.current();
+                const now = ts.nanos;
+                if (self.timed_out == 0) {
+                    is_fair = true;
+                    self.timed_out = now;
+                    self.rng_seed = @truncate(u32, @ptrToInt(waiter) >> 8);
+                } else if (now > self.timed_out) {
+                    is_fair = true;
+                    self.timed_out = now + blk: {
+                        var x = self.rng_seed;
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        self.rng_seed = x;
+                        break :blk (x % std.time.ns_per_ms);
+                    };  
+                }
             }
         }
 

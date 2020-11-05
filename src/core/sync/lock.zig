@@ -74,6 +74,7 @@ pub const Lock = extern struct {
             const Self = @This();
             const State = enum {
                 locking,
+                waiting,
                 acquired,
             };
             
@@ -86,15 +87,27 @@ pub const Lock = extern struct {
             fn poll(condition: *Condition) bool {
                 const future = @fieldParentPtr(Self, "condition", condition);
                 const lock = switch (future.state) {
-                    .locking => future.lock,
+                    .locking, .waiting => future.lock,
                     .acquired => @panic("Lock.acquire future polled after completion"),
                 };
 
                 var spin: std.math.Log2Int(usize) = 0;
-                var state = lock.state.load(.relaxed);
+                var state = switch (future.state) {
+                    .locking => lock.state.load(.relaxed),
+                    .waiting => lock.state.fetchSub(WAKING, .relaxed) - WAKING,
+                    .acquired => unreachable,
+                };
 
                 while (true) {
                     if (state & LOCKED == 0) {
+                        if (is_x86) {
+                            if (lock.tryAcquire())
+                                break;
+                            atomic.spinLoopHint();
+                            state = lock.state.load(.relaxed);
+                            continue;
+                        }
+                        
                         state = lock.state.tryCompareAndSwap(
                             state,
                             state | LOCKED,
@@ -114,6 +127,7 @@ pub const Lock = extern struct {
                         continue;
                     }
 
+                    future.state = .waiting;
                     future.waiter.prev = null;
                     future.waiter.next = head;
                     future.waiter.tail = if (head == null) &future.waiter else null;
@@ -191,10 +205,10 @@ pub const Lock = extern struct {
 
             if (tail.prev) |new_tail| {
                 head.tail = new_tail;
-                _ = self.state.fetchAnd(~@as(usize, WAKING), .release);
+                // _ = self.state.fetchAnd(~@as(usize, WAKING), .release);
             } else if (self.state.tryCompareAndSwap(
                 state,
-                UNLOCKED,
+                WAKING,
                 .consume,
                 .consume,
             )) |updated| {

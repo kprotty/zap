@@ -102,24 +102,34 @@ pub const Task = struct {
             return task;
         }
 
-        pub fn schedule(self: Batch) void {
+        pub fn schedule(self: Batch, hints: Worker.ScheduleHints) void {
             if (self.isEmpty())
                 return;
                 
             const worker = Worker.current.?;
-            const scheduler = worker.scheduler;
-
-            if (worker.run_queue.push(self)) |overflowed|
-                scheduler.run_queue.push(overflowed);
-            scheduler.resumeWorker(false);
+            worker.schedule(self, hints);
         }
     };
 
-    pub const runConcurrentlyAsync = yieldAsync;
+    pub fn schedule(self: *Task) void {
+        Batch.from(self).schedule(.{});
+    }
+
+    pub fn scheduleNext(self: *Task) void {
+        Batch.from(self).schedule(.{ .use_next = true });
+    }
+
+    pub fn runConcurrentlyAsync() void {
+        suspend {
+            var task = Task.initAsync(@frame());
+            Batch.from(&task).schedule(.{ .use_lifo = true });
+        }
+    }
+
     pub fn yieldAsync() void {
         suspend {
             var task = Task.initAsync(@frame());
-            Batch.from(&task).schedule();
+            task.schedule();
         }
     }
 
@@ -353,7 +363,7 @@ pub const Task = struct {
         }
     };
 
-    const Worker = struct {
+    pub const Worker = struct {
         thread: ?*Thread = undefined,
         event: std.AutoResetEvent = std.AutoResetEvent{},
         idle_next: Atomic(usize) = Atomic(usize).init(0),
@@ -361,6 +371,8 @@ pub const Task = struct {
         target: ?*Worker = null,
         next: ?*Worker = undefined,
         runq_tick: usize = undefined,
+        runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
+        runq_next: ?*Task = null,
         run_queue: BoundedQueue = BoundedQueue{},
 
         const Spawner = struct {
@@ -437,9 +449,52 @@ pub const Task = struct {
             }
         }
 
+        pub const ScheduleHints = struct {
+            use_next: bool = false,
+            use_lifo: bool = false,
+        };
+
+        fn schedule(self: *Worker, tasks: Batch, hints: ScheduleHints) void {
+            var batch = tasks;
+            if (batch.isEmpty())
+                return;
+
+            if (hints.use_next) {
+                const old_next = self.runq_next;
+                self.runq_next = batch.pop();
+                if (old_next) |next|
+                    batch.pushFront(next);
+                if (batch.isEmpty())
+                    return;
+            }
+
+            if (hints.use_lifo) {
+                if (self.runq_lifo.swap(batch.pop(), .release)) |old_lifo|
+                    batch.pushFront(old_lifo);
+            }
+
+            const overflowed = self.run_queue.push(batch);
+            const scheduler = self.scheduler;
+
+            if (overflowed) |overflow_batch|
+                scheduler.run_queue.push(overflow_batch);
+            scheduler.resumeWorker(false);
+        }
+
         fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
             if (self.runq_tick % 61 == 0) {
                 if (self.run_queue.tryStealUnbounded(&scheduler.run_queue)) |task|
+                    return task;
+            }
+
+            if (self.runq_next) |next| {
+                const task = next;
+                self.runq_next = null;
+                return task;
+            }
+
+            if (self.runq_lifo.load(.relaxed) != null) {
+                if (self.runq_lifo.swap(null, .relaxed)) |task|
                     return task;
             }
             
@@ -468,6 +523,10 @@ pub const Task = struct {
 
                 if (self.run_queue.tryStealBounded(&target.run_queue)) |task|
                     return task;
+                if (target.runq_lifo.load(.relaxed) != null) {
+                    if (target.runq_lifo.swap(null, .acquire)) |task|
+                        return task;
+                }
             }
 
             if (self.run_queue.tryStealUnbounded(&scheduler.run_queue)) |task|
@@ -769,3 +828,71 @@ pub const Task = struct {
         }
     };
 };
+
+pub const AsyncFutex = struct {
+    task: *Task = undefined,
+
+    pub fn wait(self: *AsyncFutex, _deadline: anytype, condition: anytype) bool {
+        var task = Task.initAsync(@frame());
+
+        suspend {
+            self.task = &task;
+            if (condition.isMet())
+                task.scheduleNext();
+        }
+
+        return true;
+    }
+
+    pub fn wake(self: *AsyncFutex) void {
+        Task.Batch.from(self.task).schedule(.{ .use_lifo = true });
+    }
+};
+
+pub const Lock = extern struct {
+    lock: core.sync.Lock = core.sync.Lock{},
+
+    pub fn tryAcquire(self: *Lock) void {
+        return self.lock.tryAcquire();
+    }
+
+    pub fn acquire(self: *Lock) void {
+        self.lock.acquire(@import("real_zap").platform.Futex);
+    }
+
+    pub fn acquireAsync(self: *Lock) void {
+        self.lock.acquire(AsyncFutex);
+    }
+
+    pub fn release(self: *Lock) void {
+        self.lock.release();
+    }
+};
+
+// pub const Lock = switch (std.builtin.os.tag) {
+//     .windows => struct {
+//         srwlock: usize = 0,
+
+//         extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+//         extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+
+//         pub fn acquire(self: *Lock) void {
+//             AcquireSRWLockExclusive(&self.srwlock);
+//         }
+
+//         pub fn release(self: *Lock) void {
+//             ReleaseSRWLockExclusive(&self.srwlock);
+//         }
+//     },
+//     else => struct {
+//         mutex: std.Mutex = std.Mutex{},
+
+//         pub fn acquire(self: *Lock) void {
+//             _ = self.mutex.acquire();
+//         }
+
+//         pub fn release(self: *Lock) void {
+//             (std.Mutex.Held{ .mutex = &self.mutex }).release();
+//         }
+//     },
+// };

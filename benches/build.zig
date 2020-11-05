@@ -17,6 +17,11 @@ pub fn build(b: *std.build.Builder) void {
         if (libc)
             zig_exe.linkLibC();
 
+        // zig_exe.addPackage(.{
+        //     .name = "zap",
+        //     .path = "../src/zap.zig",
+        // });
+
         zig_exe.addPackage(.{
             .name = "zap",
             .path = "../experimental/zap.zig",

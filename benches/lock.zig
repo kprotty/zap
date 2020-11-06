@@ -41,7 +41,7 @@ fn locker(lock: *Lock, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = FastLockAsync;
+const Lock = FairLock;
 
 const FastLockAsync = struct {
     lock: FastLock = FastLock{},
@@ -220,7 +220,7 @@ const ParkingLock = struct {
             }
 
             blk: {
-                self.lock.acquire();
+                self.lock.acquireAsync();
 
                 state = self.state.load(.relaxed);
                 if (state != (LOCKED | PARKED)) {

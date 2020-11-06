@@ -5,44 +5,6 @@ const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
 
-// const Lock = @import("real_zap").runtime.sync.Lock;
-// const Lock = struct {
-//     locked: Atomic(bool) = Atomic(bool).init(false),
-
-//     fn tryAcquire(self: *Lock) bool {
-//         return !self.locked.swap(true, .acquire);
-//     }
-
-//     fn acquire(self: *Lock) void {
-//         while (!self.tryAcquire())
-//             spinLoopHint();
-//     }
-
-//     fn release(self: *Lock) void {
-//         self.locked.store(false, .release);
-//     }
-// };
-
-const Lock = struct {
-    srwlock: usize = 0,
-
-    fn tryAcquire(self: *Lock) bool {
-        return TryAcquireSRWLockExclusive(&self.srwlock) != 0;
-    }
-
-    fn acquire(self: *Lock) void {
-        AcquireSRWLockExclusive(&self.srwlock);
-    }
-
-    fn release(self: *Lock) void {
-        ReleaseSRWLockExclusive(&self.srwlock);
-    }
-
-    extern "kernel32" fn TryAcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) u8;
-    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
-    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
-};
-
 fn panic(comptime fmt: []const u8) noreturn {
     std.debug.panic(fmt, .{});
 }
@@ -175,6 +137,92 @@ pub const Task = struct {
         }
     }
 
+    const UnboundedQueue = struct {
+        head: Atomic(*Task),
+        tail: Atomic(usize),
+        stub: Task,
+
+        const IS_LOCKED: usize = 1;
+
+        fn init(self: *UnboundedQueue) void {
+            self.head.set(&self.stub);
+            self.tail.set(@ptrToInt(&self.stub));
+            self.stub.next = null;
+        } 
+
+        fn tryAcquire(self: *UnboundedQueue) bool {
+            if (self.head.load(.relaxed) == &self.stub)
+                return false;
+
+            if (core.is_x86) {
+                return asm volatile(
+                    "lock btsw $0, %[ptr]"
+                    : [ret] "={@ccc}" (-> u8),
+                    : [ptr] "*m" (&self.tail)
+                    : "cc", "memory"
+                ) == 0;
+            }
+
+            var tail = self.tail.load(.relaxed);
+            while (true) {
+                if (tail & IS_LOCKED != 0)
+                    return false;
+                tail = self.tail.tryCompareAndSwap(
+                    tail,
+                    tail | IS_LOCKED,
+                    .acquire,
+                    .relaxed,
+                ) orelse return true;
+            }
+        }
+
+        fn release(self: *UnboundedQueue) void {
+            const unlocked_tail = self.tail.get() & ~IS_LOCKED;
+            self.tail.store(unlocked_tail, .release);
+        }
+
+        fn push(self: *UnboundedQueue, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            batch.tail.next = null;
+            const prev = self.head.swap(batch.tail, .acq_rel);
+            @ptrCast(*Atomic(?*Task), &prev.next).store(batch.head, .release);
+        }
+
+        fn pop(self: *UnboundedQueue) ?*Task {
+            var new_tail = @intToPtr(*Task, self.tail.get() & ~IS_LOCKED);
+            defer self.tail.set(@ptrToInt(new_tail) | IS_LOCKED);
+            
+            var tail = new_tail;
+            var next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+
+            if (tail == &self.stub) {
+                tail = next orelse return null;
+                new_tail = tail;
+                next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+            }
+
+            if (next) |next_tail| {
+                new_tail = next_tail;
+                return tail;
+            }
+
+            const head = self.head.load(.relaxed);
+            if (head != tail)
+                return null;
+
+            self.push(Batch.from(&self.stub));
+
+            if (@ptrCast(*Atomic(?*Task), &tail.next).load(.acquire)) |next_tail| {
+                new_tail = next_tail;
+                return tail;
+            }
+
+            return null;
+        }
+    };
+
     pub const Worker = struct {
         scheduler: *Scheduler,
         thread: ?*Thread,
@@ -188,13 +236,16 @@ pub const Task = struct {
         runq_head: Atomic(u32) = Atomic(u32).init(0),
         runq_tail: Atomic(u32) = Atomic(u32).init(0),
         runq_buffer: [256]Atomic(*Task) = undefined,
+        runq_overflow: UnboundedQueue,
 
         fn init(self: *Worker, scheduler: *Scheduler, thread: ?*Thread) void {
             self.* = Worker{
                 .scheduler = scheduler,
                 .thread = thread,
                 .runq_tick = @ptrToInt(self) *% @ptrToInt(scheduler) ^ @ptrToInt(thread),
+                .runq_overflow = undefined,
             };
+            self.runq_overflow.init();
         }
 
         fn deinit(self: *Worker) void {
@@ -253,11 +304,10 @@ pub const Task = struct {
             if (hints.use_next) {
                 const old_next = self.runq_next;
                 self.runq_next = batch.pop();
-                if (old_next) |next| {
+                if (old_next) |next|
                     batch.pushFront(next);
-                } else {
+                if (batch.isEmpty())
                     return;
-                }
             }
 
             if (hints.use_lifo) {
@@ -305,18 +355,19 @@ pub const Task = struct {
                 break;
             }
 
-            const scheduler = self.scheduler;
-            if (!batch.isEmpty()) {
-                scheduler.runq_lock.acquire();
-                defer scheduler.runq_lock.release();
-                scheduler.push(batch);
-            }
-            scheduler.resumeWorker(false);
+            self.runq_overflow.push(batch);
+            self.scheduler.resumeWorker(false);
         }
 
         fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
             if (self.runq_tick % 61 == 0) {
-                if (self.pollScheduler(scheduler)) |task| {
+                if (self.pollUnbounded(&scheduler.runq)) |task| {
+                    return task;
+                }
+            }
+
+            if (self.runq_tick % 31 == 0) {
+                if (self.pollUnbounded(&self.runq_overflow)) |task| {
                     return task;
                 }
             }
@@ -325,7 +376,7 @@ pub const Task = struct {
                 return task;
             }
 
-            if (self.pollScheduler(scheduler)) |task| {
+            if (self.pollUnbounded(&self.runq_overflow)) |task| {
                 return task;
             }
 
@@ -348,10 +399,16 @@ pub const Task = struct {
 
                 if (self.pollWorker(target)) |task| {
                     return task;
+                } else if (self.pollUnbounded(&target.runq_overflow)) |task| {
+                    return task;
+                } else if (target.runq_lifo.load(.relaxed) != null) {
+                    if (target.runq_lifo.swap(null, .acquire)) |task| {
+                        return task;
+                    }
                 }
             }
 
-            if (self.pollScheduler(scheduler)) |task| {
+            if (self.pollUnbounded(&scheduler.runq)) |task| {
                 return task;
             }
 
@@ -385,8 +442,8 @@ pub const Task = struct {
             return null;
         }
 
-        fn pollScheduler(noalias self: *Worker, noalias target: *Scheduler) ?*Task {
-            if (target.runq_head.load(.relaxed) == null)
+        fn pollUnbounded(self: *Worker, target: *UnboundedQueue) ?*Task {
+            if (!target.tryAcquire())
                 return null;
 
             const tail = self.runq_tail.get();
@@ -394,18 +451,16 @@ pub const Task = struct {
             if (tail -% head > self.runq_buffer.len)
                 panic("invalid runq size when stealing from scheduler");
 
-            var new_tail = tail;
-            var first_task: ?*Task = null;
-            if (target.runq_lock.tryAcquire()) {
-                defer target.runq_lock.release();
+            const first_task: ?*Task = target.pop();
 
-                first_task = target.pop();
-                while (new_tail -% head < self.runq_buffer.len) {
-                    const task = target.pop() orelse break;
-                    self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
-                    new_tail +%= 1;
-                }
+            var new_tail = tail;
+            while (new_tail -% head < self.runq_buffer.len) {
+                const task = target.pop() orelse break;
+                self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
+                new_tail +%= 1;
             }
+
+            target.release();
 
             if (tail != new_tail)
                 self.runq_tail.store(new_tail, .release);
@@ -424,18 +479,11 @@ pub const Task = struct {
                 const target_size = target_tail -% target_head;
 
                 var steal = target_size - (target_size / 2);
-                if (steal > target.runq_buffer.len / 2) {
-                    spinLoopHint();
-                    target_head = target.runq_head.load(.relaxed);
-                    continue;
+                if (steal == 0) {
+                    break;
                 }
 
-                if (steal == 0) {
-                    if (target.runq_lifo.load(.relaxed) == null)
-                        break;
-                    if (target.runq_lifo.swap(null, .acquire)) |task|
-                        return task;
-
+                if (steal > target.runq_buffer.len / 2) {
                     spinLoopHint();
                     target_head = target.runq_head.load(.relaxed);
                     continue;
@@ -474,10 +522,8 @@ pub const Task = struct {
 
     pub const Scheduler = struct {
         max_workers: u16,
-        runq_lock: Lock = Lock{},
-        runq_head: Atomic(?*Task) = Atomic(?*Task).init(null),
-        runq_tail: *Task = undefined,
         main_worker: ?*Worker = null,
+        runq: UnboundedQueue = undefined,
         counter: Atomic(u32) = Atomic(u32).init(0),
         idleq: Atomic(usize) = Atomic(usize).init(0),
         activeq: Atomic(?*Worker) = Atomic(?*Worker).init(null),
@@ -515,6 +561,7 @@ pub const Task = struct {
         pub fn init(self: *Scheduler, num_workers: u16) void {
             const max_workers = std.math.min(num_workers, std.math.maxInt(u14));
             self.* = Scheduler{ .max_workers = max_workers };
+            self.runq.init();
         }
 
         pub fn deinit(self: *Scheduler) void {
@@ -525,24 +572,8 @@ pub const Task = struct {
             if (batch.isEmpty())
                 return;
 
-            self.push(batch);
+            self.runq.push(batch);
             self.resumeWorker(false);
-        }
-
-        fn push(self: *Scheduler, batch: Batch) void {
-            if (self.runq_head.get() == null) {
-                self.runq_tail = batch.tail;
-                self.runq_head.store(batch.head, .relaxed);
-            } else {
-                self.runq_tail.next = batch.head;
-                self.runq_tail = batch.tail;
-            }
-        }
-
-        fn pop(self: *Scheduler) ?*Task {
-            const task = self.runq_head.get() orelse return null;
-            self.runq_head.store(task.next, .relaxed);
-            return task;
         }
 
         fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {
@@ -819,4 +850,44 @@ pub const Task = struct {
             }
         }
     };
+};
+
+pub const AsyncFutex = struct {
+    task: *Task = undefined,
+
+    pub fn wait(self: *AsyncFutex, _deadline: anytype, condition: anytype) bool {
+        var task = Task.initAsync(@frame());
+
+        suspend {
+            self.task = &task;
+            if (condition.isMet())
+                task.scheduleNext();
+        }
+
+        return true;
+    }
+
+    pub fn wake(self: *AsyncFutex) void {
+        Task.Batch.from(self.task).schedule(.{ .use_lifo = true });
+    }
+};
+
+pub const Lock = extern struct {
+    lock: core.sync.Lock = core.sync.Lock{},
+
+    pub fn tryAcquire(self: *Lock) void {
+        return self.lock.tryAcquire();
+    }
+
+    pub fn acquire(self: *Lock) void {
+        self.lock.acquire(@import("real_zap").platform.Futex);
+    }
+
+    pub fn acquireAsync(self: *Lock) void {
+        self.lock.acquire(AsyncFutex);
+    }
+
+    pub fn release(self: *Lock) void {
+        self.lock.release();
+    }
 };

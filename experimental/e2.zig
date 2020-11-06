@@ -6,21 +6,41 @@ const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
 
 // const Lock = @import("real_zap").runtime.sync.Lock;
+// const Lock = struct {
+//     locked: Atomic(bool) = Atomic(bool).init(false),
+
+//     fn tryAcquire(self: *Lock) bool {
+//         return !self.locked.swap(true, .acquire);
+//     }
+
+//     fn acquire(self: *Lock) void {
+//         while (!self.tryAcquire())
+//             spinLoopHint();
+//     }
+
+//     fn release(self: *Lock) void {
+//         self.locked.store(false, .release);
+//     }
+// };
+
 const Lock = struct {
-    locked: Atomic(bool) = Atomic(bool).init(false),
+    srwlock: usize = 0,
 
     fn tryAcquire(self: *Lock) bool {
-        return !self.locked.swap(true, .acquire);
+        return TryAcquireSRWLockExclusive(&self.srwlock) != 0;
     }
 
     fn acquire(self: *Lock) void {
-        while (!self.tryAcquire())
-            spinLoopHint();
+        AcquireSRWLockExclusive(&self.srwlock);
     }
 
     fn release(self: *Lock) void {
-        self.locked.store(false, .release);
+        ReleaseSRWLockExclusive(&self.srwlock);
     }
+
+    extern "kernel32" fn TryAcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) u8;
+    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
 };
 
 fn panic(comptime fmt: []const u8) noreturn {

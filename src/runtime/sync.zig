@@ -10,7 +10,7 @@ pub const AsyncFutex = zap.runtime.Task.AsyncFutex;
 pub const Lock = extern struct {
     lock: core.sync.Lock = core.sync.Lock{},
 
-    pub fn tryAcquire(self: *Lock) void {
+    pub fn tryAcquire(self: *Lock) bool {
         return self.lock.tryAcquire();
     }
 

@@ -4,7 +4,24 @@ const core = @import("real_zap").core;
 const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
-const Lock = @import("real_zap").runtime.sync.Lock;
+
+// const Lock = @import("real_zap").runtime.sync.Lock;
+const Lock = struct {
+    locked: Atomic(bool) = Atomic(bool).init(false),
+
+    fn tryAcquire(self: *Lock) bool {
+        return !self.locked.swap(true, .acquire);
+    }
+
+    fn acquire(self: *Lock) void {
+        while (!self.tryAcquire())
+            spinLoopHint();
+    }
+
+    fn release(self: *Lock) void {
+        self.locked.store(false, .release);
+    }
+};
 
 fn panic(comptime fmt: []const u8) noreturn {
     std.debug.panic(fmt, .{});
@@ -150,7 +167,7 @@ pub const Task = struct {
         runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
         runq_head: Atomic(u32) = Atomic(u32).init(0),
         runq_tail: Atomic(u32) = Atomic(u32).init(0),
-        runq_buffer: [256]*Atomic(*Task) = undefined,
+        runq_buffer: [256]Atomic(*Task) = undefined,
 
         fn init(self: *Worker, scheduler: *Scheduler, thread: ?*Thread) void {
             self.* = Worker{
@@ -187,7 +204,8 @@ pub const Task = struct {
 
             while (true) {
                 if (self.poll(scheduler)) |task| {
-                    if (is_waking) scheduler.resumeWorker(is_waking);
+                    if (is_waking)
+                        scheduler.resumeWorker(is_waking);
                     is_waking = false;
                     self.runq_tick +%= 1;
                     resume @intToPtr(anyframe, task.frame);
@@ -268,13 +286,12 @@ pub const Task = struct {
             }
 
             const scheduler = self.scheduler;
-            defer scheduler.resumeWorker(false);
-
             if (!batch.isEmpty()) {
                 scheduler.runq_lock.acquire();
                 defer scheduler.runq_lock.release();
                 scheduler.push(batch);
             }
+            scheduler.resumeWorker(false);
         }
 
         fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
@@ -308,6 +325,7 @@ pub const Task = struct {
                 self.target = target.active_next;
                 if (target == self)
                     continue;
+
                 if (self.pollWorker(target)) |task| {
                     return task;
                 }
@@ -387,11 +405,17 @@ pub const Task = struct {
 
                 var steal = target_size - (target_size / 2);
                 if (steal > target.runq_buffer.len / 2) {
+                    spinLoopHint();
+                    target_head = target.runq_head.load(.relaxed);
+                    continue;
+                }
+
+                if (steal == 0) {
                     if (target.runq_lifo.load(.relaxed) == null)
                         break;
                     if (target.runq_lifo.swap(null, .acquire)) |task|
                         return task;
-                    
+
                     spinLoopHint();
                     target_head = target.runq_head.load(.relaxed);
                     continue;
@@ -677,6 +701,9 @@ pub const Task = struct {
                     var worker: Worker = undefined;
                     worker.init(scheduler, thread);
                     defer worker.deinit();
+
+                    if (thread == null)
+                        scheduler.main_worker = &worker;
 
                     worker.run();
                 }

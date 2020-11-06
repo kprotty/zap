@@ -333,10 +333,9 @@ pub const Task = struct {
                     continue;
                 }
 
-                const new_head = head +% @as(u32, self.runq_buffer.len / 2);
                 if (self.runq_head.tryCompareAndSwap(
                     head,
-                    new_head,
+                    tail,
                     .relaxed,
                     .relaxed,
                 )) |updated| {
@@ -345,12 +344,22 @@ pub const Task = struct {
                 }
 
                 var overflowed = Batch{};
-                while (head != new_head) {
-                    const task = self.runq_buffer[head % self.runq_buffer.len].get();
+                var of = head +% (self.runq_buffer.len / 2);
+                while (of != tail) {
+                    const task = self.runq_buffer[of % self.runq_buffer.len].get();
                     overflowed.push(task);
-                    head +%= 1;
+                    of +%= 1;
                 }
 
+                of = tail +% (self.runq_buffer.len / 2);
+                while (tail != of) {
+                    const task = self.runq_buffer[head % self.runq_buffer.len].get();
+                    self.runq_buffer[tail % self.runq_buffer.len].store(task, .unordered);
+                    head +%= 1;
+                    tail +%= 1;
+                }
+
+                self.runq_tail.store(tail, .release);
                 batch.pushFrontMany(overflowed);
                 break;
             }

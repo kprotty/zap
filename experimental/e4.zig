@@ -1,6 +1,26 @@
 const std = @import("std");
 const core = @import("real_zap").core;
 
+const Mutex = struct {
+    srwlock: usize = 0,
+
+    fn tryAcquire(self: *Mutex) bool {
+        return TryAcquireSRWLockExclusive(&self.srwlock) != 0;
+    }
+
+    fn acquire(self: *Mutex) void {
+        AcquireSRWLockExclusive(&self.srwlock);
+    }
+
+    fn release(self: *Mutex) void {
+        ReleaseSRWLockExclusive(&self.srwlock);
+    }
+
+    extern "kernel32" fn TryAcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) u8;
+    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+};
+
 const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
@@ -61,12 +81,14 @@ pub const Task = struct {
     pub const Batch = extern struct {
         head: ?*Task = null,
         tail: *Task = undefined,
+        size: usize = 0,
 
         pub fn from(task: *Task) Batch {
             task.next = null;
             return Batch{
                 .head = task,
                 .tail = task,
+                .size = 1,
             };
         }
 
@@ -84,6 +106,7 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 self.tail.next = other.head;
                 self.tail = other.tail;
+                self.size += other.size;
             }
         }
 
@@ -97,12 +120,14 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 other.tail.next = self.head;
                 self.head = other.head;
+                self.size += other.size;
             }
         }
 
         pub fn pop(self: *Batch) ?*Task {
             const task = self.head orelse return null;
             self.head = task.next;
+            self.size -= 1;
             return task;
         }
 
@@ -138,88 +163,38 @@ pub const Task = struct {
     }
 
     const UnboundedQueue = struct {
-        head: Atomic(*Task),
-        tail: Atomic(usize),
-        stub: Task,
-
-        const IS_LOCKED: usize = 1;
+        lock: Mutex = Mutex{},
+        queue: Batch = Batch{},
+        size: Atomic(usize) = Atomic(usize).init(0),
 
         fn init(self: *UnboundedQueue) void {
-            self.head.set(&self.stub);
-            self.tail.set(@ptrToInt(&self.stub));
-            self.stub.next = null;
-        } 
+            self.* = UnboundedQueue{};
+        }
 
         fn tryAcquire(self: *UnboundedQueue) bool {
-            if (self.head.load(.relaxed) == &self.stub)
+            if (self.size.load(.acquire) == 0)
                 return false;
-
-            if (core.is_x86) {
-                return asm volatile(
-                    "lock btsw $0, %[ptr]"
-                    : [ret] "={@ccc}" (-> u8),
-                    : [ptr] "*m" (&self.tail)
-                    : "cc", "memory"
-                ) == 0;
-            }
-
-            var tail = self.tail.load(.relaxed);
-            while (true) {
-                if (tail & IS_LOCKED != 0)
-                    return false;
-                tail = self.tail.tryCompareAndSwap(
-                    tail,
-                    tail | IS_LOCKED,
-                    .acquire,
-                    .relaxed,
-                ) orelse return true;
-            }
+            return self.lock.tryAcquire();
         }
 
         fn release(self: *UnboundedQueue) void {
-            const unlocked_tail = self.tail.get() & ~IS_LOCKED;
-            self.tail.store(unlocked_tail, .release);
+            self.size.store(self.queue.size, .release);
+            self.lock.release();
         }
 
         fn push(self: *UnboundedQueue, batch: Batch) void {
             if (batch.isEmpty())
                 return;
 
-            batch.tail.next = null;
-            const prev = self.head.swap(batch.tail, .acq_rel);
-            @ptrCast(*Atomic(?*Task), &prev.next).store(batch.head, .release);
+            self.lock.acquire();
+            defer self.lock.release();
+
+            self.queue.pushMany(batch);
+            self.size.store(self.queue.size, .release);
         }
 
         fn pop(self: *UnboundedQueue) ?*Task {
-            var new_tail = @intToPtr(*Task, self.tail.get() & ~IS_LOCKED);
-            defer self.tail.set(@ptrToInt(new_tail) | IS_LOCKED);
-            
-            var tail = new_tail;
-            var next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
-
-            if (tail == &self.stub) {
-                tail = next orelse return null;
-                new_tail = tail;
-                next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
-            }
-
-            if (next) |next_tail| {
-                new_tail = next_tail;
-                return tail;
-            }
-
-            const head = self.head.load(.relaxed);
-            if (head != tail)
-                return null;
-
-            self.push(Batch.from(&self.stub));
-
-            if (@ptrCast(*Atomic(?*Task), &tail.next).load(.acquire)) |next_tail| {
-                new_tail = next_tail;
-                return tail;
-            }
-
-            return null;
+            return self.queue.pop();
         }
     };
 

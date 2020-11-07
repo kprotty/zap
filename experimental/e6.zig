@@ -1,6 +1,22 @@
 const std = @import("std");
 const core = @import("real_zap").core;
 
+
+const Mutex = struct {
+    srwlock: usize = 0,
+
+    fn acquire(self: *Mutex) void {
+        AcquireSRWLockExclusive(&self.srwlock);
+    }
+
+    fn release(self: *Mutex) void {
+        ReleaseSRWLockExclusive(&self.srwlock);
+    }
+
+    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
+};
+
 const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
@@ -61,12 +77,14 @@ pub const Task = struct {
     pub const Batch = extern struct {
         head: ?*Task = null,
         tail: *Task = undefined,
+        size: usize = 0,
 
         pub fn from(task: *Task) Batch {
             task.next = null;
             return Batch{
                 .head = task,
                 .tail = task,
+                .size = 1,
             };
         }
 
@@ -84,6 +102,7 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 self.tail.next = other.head;
                 self.tail = other.tail;
+                self.size += other.size;
             }
         }
 
@@ -97,12 +116,14 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 other.tail.next = self.head;
                 self.head = other.head;
+                self.size += other.size;
             }
         }
 
         pub fn pop(self: *Batch) ?*Task {
             const task = self.head orelse return null;
             self.head = task.next;
+            self.size -= 1;
             return task;
         }
 
@@ -137,92 +158,6 @@ pub const Task = struct {
         }
     }
 
-    const UnboundedQueue = struct {
-        head: Atomic(*Task),
-        tail: Atomic(usize),
-        stub: Task,
-
-        const IS_LOCKED: usize = 1;
-
-        fn init(self: *UnboundedQueue) void {
-            self.head.set(&self.stub);
-            self.tail.set(@ptrToInt(&self.stub));
-            self.stub.next = null;
-        } 
-
-        fn tryAcquire(self: *UnboundedQueue) bool {
-            if (self.head.load(.relaxed) == &self.stub)
-                return false;
-
-            if (core.is_x86) {
-                return asm volatile(
-                    "lock btsw $0, %[ptr]"
-                    : [ret] "={@ccc}" (-> u8),
-                    : [ptr] "*m" (&self.tail)
-                    : "cc", "memory"
-                ) == 0;
-            }
-
-            var tail = self.tail.load(.relaxed);
-            while (true) {
-                if (tail & IS_LOCKED != 0)
-                    return false;
-                tail = self.tail.tryCompareAndSwap(
-                    tail,
-                    tail | IS_LOCKED,
-                    .acquire,
-                    .relaxed,
-                ) orelse return true;
-            }
-        }
-
-        fn release(self: *UnboundedQueue) void {
-            const unlocked_tail = self.tail.get() & ~IS_LOCKED;
-            self.tail.store(unlocked_tail, .release);
-        }
-
-        fn push(self: *UnboundedQueue, batch: Batch) void {
-            if (batch.isEmpty())
-                return;
-
-            batch.tail.next = null;
-            const prev = self.head.swap(batch.tail, .acq_rel);
-            @ptrCast(*Atomic(?*Task), &prev.next).store(batch.head, .release);
-        }
-
-        fn pop(self: *UnboundedQueue) ?*Task {
-            var new_tail = @intToPtr(*Task, self.tail.get() & ~IS_LOCKED);
-            defer self.tail.set(@ptrToInt(new_tail) | IS_LOCKED);
-            
-            var tail = new_tail;
-            var next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
-
-            if (tail == &self.stub) {
-                tail = next orelse return null;
-                new_tail = tail;
-                next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
-            }
-
-            if (next) |next_tail| {
-                new_tail = next_tail;
-                return tail;
-            }
-
-            const head = self.head.load(.relaxed);
-            if (head != tail)
-                return null;
-
-            self.push(Batch.from(&self.stub));
-
-            if (@ptrCast(*Atomic(?*Task), &tail.next).load(.acquire)) |next_tail| {
-                new_tail = next_tail;
-                return tail;
-            }
-
-            return null;
-        }
-    };
-
     pub const Worker = struct {
         scheduler: *Scheduler,
         thread: ?*Thread,
@@ -235,17 +170,14 @@ pub const Task = struct {
         runq_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
         runq_head: Atomic(u32) = Atomic(u32).init(0),
         runq_tail: Atomic(u32) = Atomic(u32).init(0),
-        runq_buffer: [256]Atomic(*Task) = undefined,
-        runq_overflow: UnboundedQueue,
+        runq_buffer: [256]*Task = undefined,
 
         fn init(self: *Worker, scheduler: *Scheduler, thread: ?*Thread) void {
             self.* = Worker{
                 .scheduler = scheduler,
                 .thread = thread,
                 .runq_tick = @ptrToInt(self) *% @ptrToInt(scheduler) ^ @ptrToInt(thread),
-                .runq_overflow = undefined,
             };
-            self.runq_overflow.init();
         }
 
         fn deinit(self: *Worker) void {
@@ -316,67 +248,57 @@ pub const Task = struct {
                 }
             }
 
-            var tail = self.runq_tail.get();
-            var head = self.runq_head.load(.relaxed);
+            const scheduler = self.scheduler;
             while (!batch.isEmpty()) {
+                const head = self.runq_head.load(.acquire);
+                const steal = @bitCast([2]u16, head)[0];
+                var real = @bitCast([2]u16, head)[1];
 
-                if (tail -% head < self.runq_buffer.len) {
-                    while (tail -% head < self.runq_buffer.len) {
-                        const task = batch.pop() orelse break;
-                        self.runq_buffer[tail % self.runq_buffer.len].store(task, .unordered);
-                        tail +%= 1;
-                    }
-
-                    self.runq_tail.store(tail, .release);
-                    spinLoopHint();
-                    head = self.runq_head.load(.relaxed);
+                const tail = @truncate(u16, self.runq_tail.get());
+                if (tail -% steal < self.runq_buffer.len) {
+                    const task = batch.pop() orelse unreachable;
+                    self.runq_buffer[tail % self.runq_buffer.len] = task;
+                    self.runq_tail.store(tail +% 1, .release);
                     continue;
                 }
+                
+                if (steal != real) {
+                    scheduler.push(batch);
+                    break;
+                }
+
+                var n = @as(u16, self.runq_buffer.len / 2);
+                if (tail -% real != self.runq_buffer.len)
+                    std.debug.panic("queue is not full; tail={} head={} size={}\n", .{tail, real, tail -% real});
 
                 if (self.runq_head.tryCompareAndSwap(
                     head,
-                    tail,
+                    @bitCast(u32, [_]u16{ real +% n, real +% n }),
+                    .release,
                     .relaxed,
-                    .relaxed,
-                )) |updated| {
-                    head = updated;
+                )) |_| {
+                    spinLoopHint();
                     continue;
                 }
 
                 var overflowed = Batch{};
-                var of = head +% (self.runq_buffer.len / 2);
-                while (of != tail) {
-                    const task = self.runq_buffer[of % self.runq_buffer.len].get();
+                while (n > 0) : (n -= 1) {
+                    const task = self.runq_buffer[real % self.runq_buffer.len];
                     overflowed.push(task);
-                    of +%= 1;
+                    real +%= 1;
                 }
-
-                of = tail +% (self.runq_buffer.len / 2);
-                while (tail != of) {
-                    const task = self.runq_buffer[head % self.runq_buffer.len].get();
-                    self.runq_buffer[tail % self.runq_buffer.len].store(task, .unordered);
-                    head +%= 1;
-                    tail +%= 1;
-                }
-
-                self.runq_tail.store(tail, .release);
+                
                 batch.pushFrontMany(overflowed);
+                scheduler.push(batch);
                 break;
             }
 
-            self.runq_overflow.push(batch);
-            self.scheduler.resumeWorker(false);
+            scheduler.resumeWorker(false);
         }
 
         fn poll(self: *Worker, scheduler: *Scheduler) ?*Task {
             if (self.runq_tick % 61 == 0) {
-                if (self.pollUnbounded(&scheduler.runq)) |task| {
-                    return task;
-                }
-            }
-
-            if (self.runq_tick % 31 == 0) {
-                if (self.pollUnbounded(&self.runq_overflow)) |task| {
+                if (scheduler.pop()) |task| {
                     return task;
                 }
             }
@@ -385,7 +307,7 @@ pub const Task = struct {
                 return task;
             }
 
-            if (self.pollUnbounded(&self.runq_overflow)) |task| {
+            if (scheduler.pop()) |task| {
                 return task;
             }
 
@@ -408,8 +330,6 @@ pub const Task = struct {
 
                 if (self.pollWorker(target)) |task| {
                     return task;
-                } else if (self.pollUnbounded(&target.runq_overflow)) |task| {
-                    return task;
                 } else if (target.runq_lifo.load(.relaxed) != null) {
                     if (target.runq_lifo.swap(null, .acquire)) |task| {
                         return task;
@@ -417,7 +337,7 @@ pub const Task = struct {
                 }
             }
 
-            if (self.pollUnbounded(&scheduler.runq)) |task| {
+            if (scheduler.pop()) |task| {
                 return task;
             }
 
@@ -437,107 +357,118 @@ pub const Task = struct {
                 }
             }
 
-            var tail = self.runq_tail.get();
-            var head = self.runq_head.load(.relaxed);
-            while (tail -% head > 0) {
+            var head = self.runq_head.load(.acquire);
+            while (true) {
+                const steal = @bitCast([2]u16, head)[0];
+                const real = @bitCast([2]u16, head)[1];
+
+                const tail = @truncate(u16, self.runq_tail.get());
+                if (tail == real)
+                    break;
+
+                const new_real = real +% 1;
+                var new_steal = new_real;
+                if (steal != real) {
+                    if (steal == new_real)
+                        std.debug.panic("assert failed: steal={} != new_real={} (real={}) \n", .{steal, real, new_real});
+                    new_steal = steal;
+                }
+
                 head = self.runq_head.tryCompareAndSwap(
                     head,
-                    head +% 1,
-                    .relaxed,
-                    .relaxed,
-                ) orelse return self.runq_buffer[head % self.runq_buffer.len].get();
+                    @bitCast(u32, [2]u16{ new_steal, new_real }),
+                    .acq_rel,
+                    .acquire,
+                ) orelse return self.runq_buffer[real % self.runq_buffer.len];
             }
 
             return null;
-        }
-
-        fn pollUnbounded(self: *Worker, target: *UnboundedQueue) ?*Task {
-            if (!target.tryAcquire())
-                return null;
-
-            const tail = self.runq_tail.get();
-            const head = self.runq_head.load(.relaxed);
-            if (tail -% head > self.runq_buffer.len)
-                panic("invalid runq size when stealing from scheduler");
-
-            const first_task: ?*Task = target.pop();
-
-            var new_tail = tail;
-            while (new_tail -% head < self.runq_buffer.len) {
-                const task = target.pop() orelse break;
-                self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
-                new_tail +%= 1;
-            }
-
-            target.release();
-
-            if (tail != new_tail)
-                self.runq_tail.store(new_tail, .release);
-            return first_task;
         }
 
         fn pollWorker(noalias self: *Worker, noalias target: *Worker) ?*Task {
-            const tail = self.runq_tail.get();
-            const head = self.runq_head.load(.relaxed);
-            if (tail -% head > 0) {
-                // panic("stealing from another worker when local queue isnt empty");
-                //
-                // this seems to randomly happen, reporting size = (self.runq_buffer.len / 2) + 1 ?
-                // for now, as a hack, just poll the local queue since it somehow fills up...
-                return self.pollSelf();
+            const tail = @truncate(u16, self.runq_tail.get());
+            const steal = @bitCast([2]u16, self.runq_head.load(.acquire))[0];
+            if (tail -% steal > @as(u16, self.runq_buffer.len / 2))
+                return null;
+
+            var n = target.stealInto(self, tail);
+            if (n == 0)
+                return null;
+
+            n -= 1;
+            const task = self.runq_buffer[(tail +% n) % self.runq_buffer.len];
+            if (n != 0)
+                self.runq_tail.store(tail +% n, .release);
+            return task;
+        }
+
+        fn stealInto(noalias self: *Worker, noalias dst: *Worker, dst_tail: u16) u16 {
+            var head = self.runq_head.load(.acquire);
+
+            const n = blk: {
+                while (true) {
+                    const steal = @bitCast([2]u16, head)[0];
+                    const real = @bitCast([2]u16, head)[1];
+
+                    const tail = @truncate(u16, self.runq_tail.load(.acquire));
+                    if (steal != real)
+                        return 0;
+
+                    var n = tail -% real;
+                    n = n - (n / 2);
+                    if (n == 0)
+                        return 0;
+
+                    const new_real = real +% n;
+                    if (steal == new_real)
+                        std.debug.panic("assert fail: steal={} new_real={} (real={})\n", .{steal, new_real, real});
+
+                    const new_head = @bitCast(u32, [2]u16{ steal, new_real });
+                    head = self.runq_head.tryCompareAndSwap(
+                        head,
+                        new_head,
+                        .acq_rel,
+                        .acquire,
+                    ) orelse {
+                        head = new_head;
+                        break :blk n;
+                    };
+                }
+            };
+
+            const first = @bitCast([2]u16, head)[0];
+            var i: u16 = 0;
+            while (i < n) : (i += 1) {
+                const task = self.runq_buffer[(first +% i) % self.runq_buffer.len];
+                dst.runq_buffer[(dst_tail +% i) % dst.runq_buffer.len] = task;
             }
 
-            var target_head = target.runq_head.load(.relaxed);
             while (true) {
-                const target_tail = target.runq_tail.load(.acquire);
-                const target_size = target_tail -% target_head;
+                const h = @bitCast([2]u16, head)[1];
+                const new_head = @bitCast(u32, [2]u16{ h, h });
 
-                var steal = target_size - (target_size / 2);
-                if (steal == 0) {
-                    break;
-                }
+                head = self.runq_head.tryCompareAndSwap(
+                    head,
+                    new_head,
+                    .acq_rel,
+                    .acquire,
+                ) orelse return n;
 
-                if (steal > target.runq_buffer.len / 2) {
-                    spinLoopHint();
-                    target_head = target.runq_head.load(.relaxed);
-                    continue;
-                }
-
-                const first_task = target.runq_buffer[target_head % target.runq_buffer.len].load(.unordered);
-                var new_target_head = target_head +% 1;
-                var new_tail = tail;
-                steal -= 1;
-
-                while (new_target_head -% target_head < steal) {
-                    const task = target.runq_buffer[new_target_head % target.runq_buffer.len].load(.unordered);
-                    new_target_head +%= 1;
-                    self.runq_buffer[new_tail % self.runq_buffer.len].store(task, .unordered);
-                    new_tail +%= 1;
-                }
-
-                if (target.runq_head.tryCompareAndSwap(
-                    target_head,
-                    new_target_head,
-                    .relaxed,
-                    .relaxed,
-                )) |updated| {
-                    target_head = updated;
-                    continue;
-                }
-
-                if (new_tail != tail)
-                    self.runq_tail.store(new_tail, .release);
-                return first_task;
+                const steal = @bitCast([2]u16, head)[0];
+                const real = @bitCast([2]u16, head)[1];
+                if (steal == real)
+                    std.debug.panic("assert failed: steal={} != real={}\n", .{steal, real});
             }
-
-            return null;
         }
     };
 
     pub const Scheduler = struct {
         max_workers: u16,
         main_worker: ?*Worker = null,
-        runq: UnboundedQueue = undefined,
+        runq_head: ?*Task = null,
+        runq_tail: ?*Task = null,
+        runq_len: Atomic(usize) = Atomic(usize).init(0),
+        runq_lock: Mutex = Mutex{},
         counter: Atomic(u32) = Atomic(u32).init(0),
         idleq: Atomic(usize) = Atomic(usize).init(0),
         activeq: Atomic(?*Worker) = Atomic(?*Worker).init(null),
@@ -575,7 +506,6 @@ pub const Task = struct {
         pub fn init(self: *Scheduler, num_workers: u16) void {
             const max_workers = std.math.min(num_workers, std.math.maxInt(u14));
             self.* = Scheduler{ .max_workers = max_workers };
-            self.runq.init();
         }
 
         pub fn deinit(self: *Scheduler) void {
@@ -586,8 +516,43 @@ pub const Task = struct {
             if (batch.isEmpty())
                 return;
 
-            self.runq.push(batch);
+            self.push(batch);
             self.resumeWorker(false);
+        }
+
+        fn push(self: *Scheduler, batch: Batch) void {
+            if (batch.isEmpty())
+                return;
+
+            self.runq_lock.acquire();
+            defer self.runq_lock.release();
+
+            if (self.runq_head == null)
+                self.runq_head = batch.head;
+            if (self.runq_tail) |tail|
+                tail.next = batch.head;
+            self.runq_tail = batch.tail;
+
+            const len = self.runq_len.get();
+            self.runq_len.store(len + batch.size, .release);
+        }
+
+        fn pop(self: *Scheduler) ?*Task {
+            if (self.runq_len.load(.acquire) == 0)
+                return null;
+
+            self.runq_lock.acquire();
+            defer self.runq_lock.release();
+
+            const task = self.runq_head orelse return null;
+            self.runq_head = task.next;
+            if (self.runq_head == null)
+                self.runq_tail = null;
+
+            const len = self.runq_len.get();
+            self.runq_len.store(len - 1, .release);
+
+            return task;
         }
 
         fn resumeWorker(self: *Scheduler, is_caller_waking: bool) void {

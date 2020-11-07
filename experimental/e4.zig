@@ -1,26 +1,6 @@
 const std = @import("std");
 const core = @import("real_zap").core;
 
-const Mutex = struct {
-    srwlock: usize = 0,
-
-    fn tryAcquire(self: *Mutex) bool {
-        return TryAcquireSRWLockExclusive(&self.srwlock) != 0;
-    }
-
-    fn acquire(self: *Mutex) void {
-        AcquireSRWLockExclusive(&self.srwlock);
-    }
-
-    fn release(self: *Mutex) void {
-        ReleaseSRWLockExclusive(&self.srwlock);
-    }
-
-    extern "kernel32" fn TryAcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) u8;
-    extern "kernel32" fn AcquireSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
-    extern "kernel32" fn ReleaseSRWLockExclusive(p: *usize) callconv(.Stdcall) void;
-};
-
 const Thread = std.Thread;
 const Atomic = core.sync.atomic.Atomic;
 const spinLoopHint = core.sync.atomic.spinLoopHint;
@@ -81,14 +61,12 @@ pub const Task = struct {
     pub const Batch = extern struct {
         head: ?*Task = null,
         tail: *Task = undefined,
-        size: usize = 0,
 
         pub fn from(task: *Task) Batch {
             task.next = null;
             return Batch{
                 .head = task,
                 .tail = task,
-                .size = 1,
             };
         }
 
@@ -106,7 +84,6 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 self.tail.next = other.head;
                 self.tail = other.tail;
-                self.size += other.size;
             }
         }
 
@@ -120,14 +97,12 @@ pub const Task = struct {
             } else if (!other.isEmpty()) {
                 other.tail.next = self.head;
                 self.head = other.head;
-                self.size += other.size;
             }
         }
 
         pub fn pop(self: *Batch) ?*Task {
             const task = self.head orelse return null;
             self.head = task.next;
-            self.size -= 1;
             return task;
         }
 
@@ -163,38 +138,64 @@ pub const Task = struct {
     }
 
     const UnboundedQueue = struct {
-        lock: Mutex = Mutex{},
-        queue: Batch = Batch{},
-        size: Atomic(usize) = Atomic(usize).init(0),
+        locked: Atomic(bool),
+        head: Atomic(*Task),
+        tail: *Task,
+        stub: Task,
 
         fn init(self: *UnboundedQueue) void {
-            self.* = UnboundedQueue{};
-        }
+            self.locked.set(false);
+            self.head.set(&self.stub);
+            self.tail = &self.stub;
+            self.stub.next = null;
+        } 
 
         fn tryAcquire(self: *UnboundedQueue) bool {
-            if (self.size.load(.acquire) == 0)
+            if (self.head.load(.relaxed) == &self.stub)
                 return false;
-            return self.lock.tryAcquire();
+            return self.locked.swap(true, .acquire) == false;
         }
 
         fn release(self: *UnboundedQueue) void {
-            self.size.store(self.queue.size, .release);
-            self.lock.release();
+            self.locked.store(false, .release);
         }
 
         fn push(self: *UnboundedQueue, batch: Batch) void {
             if (batch.isEmpty())
                 return;
 
-            self.lock.acquire();
-            defer self.lock.release();
-
-            self.queue.pushMany(batch);
-            self.size.store(self.queue.size, .release);
+            batch.tail.next = null;
+            const prev = self.head.swap(batch.tail, .acq_rel);
+            @ptrCast(*Atomic(?*Task), &prev.next).store(batch.head, .release);
         }
 
         fn pop(self: *UnboundedQueue) ?*Task {
-            return self.queue.pop();
+            var tail = self.tail;
+            var next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+
+            if (tail == &self.stub) {
+                tail = next orelse return null;
+                self.tail = tail;
+                next = @ptrCast(*Atomic(?*Task), &tail.next).load(.consume);
+            }
+
+            if (next) |next_tail| {
+                self.tail = next_tail;
+                return tail;
+            }
+
+            const head = self.head.load(.relaxed);
+            if (head != tail)
+                return null;
+
+            self.push(Batch.from(&self.stub));
+
+            if (@ptrCast(*Atomic(?*Task), &tail.next).load(.acquire)) |next_tail| {
+                self.tail = next_tail;
+                return tail;
+            }
+
+            return null;
         }
     };
 

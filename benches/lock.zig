@@ -36,7 +36,7 @@ fn locker(lock: *Lock, wg: *Z.WaitGroup, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = FairLock;
+const Lock = TestFairLock;
 
 const FastLockAsync = struct {
     lock: FastLock = FastLock{},
@@ -321,16 +321,10 @@ const TestFairLock = struct {
         prev: ?*Waiter align(~WAITING + 1),
         next: ?*Waiter,
         tail: ?*Waiter,
-        started: u64,
+        attempts: usize,
         acquired: bool,
         task: Z.Task,
     };
-
-    fn nanotime() u64 {
-        var ts = Z.zap.runtime.sync.OsFutex.Timestamp{};
-        ts.current();
-        return ts.nanos;
-    }
 
     fn tryAcquireX86(self: *@This()) bool {
         return asm volatile(
@@ -365,7 +359,7 @@ const TestFairLock = struct {
 
         var waiter: Waiter = undefined;
         waiter.prev = null;
-        waiter.started = 0;
+        waiter.attempts = 0;
         waiter.acquired = false;
 
         while (!waiter.acquired) {
@@ -410,9 +404,6 @@ const TestFairLock = struct {
 
                     waiter.next = head;
                     waiter.tail = if (head == null) &waiter else null;
-                    if (waiter.started == 0)
-                        waiter.started = nanotime();
-
                     state = @cmpxchgWeak(
                         usize,
                         &self.state,
@@ -472,13 +463,7 @@ const TestFairLock = struct {
                 }
             };
 
-            const released_at = released orelse blk: {
-                const now = nanotime();
-                released = now;
-                break :blk now;
-            };
-            const eventual_fairness_timeout = 1 * Z.std.time.ns_per_ms;
-            const be_fair = (released_at - tail.started) >= eventual_fairness_timeout;
+            const be_fair = tail.attempts > 1;
 
             if (tail.prev) |new_tail| {
                 head.tail = new_tail;
@@ -500,6 +485,7 @@ const TestFairLock = struct {
             }
 
             tail.prev = null;
+            tail.attempts += 1;
             tail.acquired = be_fair;
             Z.Task.Batch.from(&tail.task).schedule(.{ .use_lifo = true });
             return;

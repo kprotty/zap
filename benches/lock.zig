@@ -36,7 +36,7 @@ fn locker(lock: *Lock, wg: *Z.WaitGroup, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = FastLock;
+const Lock = TestFairLock;
 
 const FastLockAsync = struct {
     lock: FastLock = FastLock{},
@@ -305,6 +305,204 @@ const ParkingLock = struct {
         self.lock.release();
         if (waiter) |w| {
             Z.Task.Batch.from(&w.task).schedule(.{ .use_lifo = true });
+        }
+    }
+};
+
+const TestFairLock = struct {
+    state: usize = UNLOCKED,
+
+    const UNLOCKED: usize = 0;
+    const LOCKED: usize = 1;
+    const WAITING: usize = ~LOCKED;
+
+    const is_x86 = Z.zap.core.is_x86;
+    const Waiter = struct {
+        prev: ?*Waiter align(~WAITING + 1),
+        next: ?*Waiter,
+        tail: ?*Waiter,
+        started: u64,
+        acquired: bool,
+        task: Z.Task,
+    };
+
+    fn nanotime() u64 {
+        var ts = Z.zap.runtime.sync.OsFutex.Timestamp{};
+        ts.current();
+        return ts.nanos;
+    }
+
+    fn tryAcquireX86(self: *@This()) bool {
+        return asm volatile(
+            "lock btsw $0, %[ptr]"
+            : [ret] "={@ccc}" (-> u8),
+            : [ptr] "*m" (&self.state)
+            : "cc", "memory"
+        ) == 0;
+    }
+
+    fn acquireAsync(self: *@This()) void {
+        const acquired = blk: {
+            if (is_x86)
+                break :blk self.tryAcquireX86();
+            break :blk @cmpxchgWeak(
+                usize,
+                &self.state,
+                UNLOCKED,
+                LOCKED,
+                .Acquire,
+                .Monotonic,
+            ) == null;
+        };
+
+        if (!acquired) {
+            self.acquireSlow();
+        }
+    }
+
+    fn acquireSlow(self: *@This()) void {
+        @setCold(true);
+
+        var waiter: Waiter = undefined;
+        waiter.prev = null;
+        waiter.started = 0;
+        waiter.acquired = false;
+
+        while (!waiter.acquired) {
+            waiter.task = Z.Task.initAsync(@frame());
+
+            suspend {
+                var spin: u3 = 0;
+                var state = @atomicLoad(usize, &self.state, .Monotonic);
+
+                while (true) {
+                    if (state & LOCKED == 0) {
+                        if (is_x86) {
+                            if (!self.tryAcquireX86()) {
+                                Z.std.SpinLock.loopHint(1);
+                                state = @atomicLoad(usize, &self.state, .Monotonic);
+                                continue;
+                            }
+                        } else if (@cmpxchgWeak(
+                            usize,
+                            &self.state,
+                            state,
+                            state | LOCKED,
+                            .Acquire,
+                            .Monotonic,
+                        )) |updated| {
+                            state = updated;
+                            continue;
+                        }
+
+                        waiter.acquired = true;
+                        Z.Task.Batch.from(&waiter.task).schedule(.{ .use_next = true });
+                        break;
+                    }
+
+                    const head = @intToPtr(?*Waiter, state & WAITING);
+                    if (head == null and spin <= 3) {
+                        spin += 1;
+                        Z.std.SpinLock.loopHint(@as(usize, 1) << spin);
+                        state = @atomicLoad(usize, &self.state, .Monotonic);
+                        continue;
+                    }
+
+                    waiter.next = head;
+                    waiter.tail = if (head == null) &waiter else null;
+                    if (waiter.started == 0)
+                        waiter.started = nanotime();
+
+                    state = @cmpxchgWeak(
+                        usize,
+                        &self.state,
+                        state,
+                        (state & ~WAITING) | @ptrToInt(&waiter),
+                        .Release,
+                        .Monotonic,
+                    ) orelse break;
+                }
+            }
+        }
+    }
+
+    fn release(self: *@This()) void {
+        if (@cmpxchgWeak(
+            usize,
+            &self.state,
+            LOCKED,
+            UNLOCKED,
+            .Release,
+            .Monotonic,
+        )) |_| {
+            self.releaseSlow();
+        }
+    }
+
+    fn releaseSlow(self: *@This()) void {
+        @setCold(true);
+
+        var released: ?usize = null;
+        var state = @atomicLoad(usize, &self.state, .Monotonic);
+
+        while (true) {
+            const head = @intToPtr(?*Waiter, state & WAITING) orelse {
+                state = @cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    state,
+                    state & ~LOCKED,
+                    .Release,
+                    .Monotonic,
+                ) orelse return;
+                continue;
+            };
+
+            @fence(.Acquire);
+            const tail = head.tail orelse blk: {
+                var current = head;
+                while (true) {
+                    const next = current.next.?;
+                    next.prev = current;
+                    current = next;
+                    if (current.tail) |tail| {
+                        head.tail = tail;
+                        break :blk tail;
+                    }
+                }
+            };
+
+            const released_at = released orelse blk: {
+                const now = nanotime();
+                released = now;
+                break :blk now;
+            };
+            const eventual_fairness_timeout = 1 * Z.std.time.ns_per_ms;
+            const be_fair = (released_at - tail.started) >= eventual_fairness_timeout;
+
+            if (tail.prev) |new_tail| {
+                head.tail = new_tail;
+                if (be_fair) {
+                    @fence(.Release);
+                } else {
+                    _ = @atomicRmw(usize, &self.state, .And, ~LOCKED, .Release);
+                }
+            } else if (@cmpxchgWeak(
+                usize,
+                &self.state,
+                state,
+                if (be_fair) LOCKED else UNLOCKED,
+                .Monotonic,
+                .Monotonic,
+            )) |updated| {
+                state = updated;
+                continue;
+            }
+
+            tail.prev = null;
+            tail.acquired = be_fair;
+            Z.Task.Batch.from(&tail.task).schedule(.{ .use_lifo = true });
+            return;
         }
     }
 };

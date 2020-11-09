@@ -2,16 +2,20 @@ const std = @import("std");
 const zap = @import("zap");
 
 const Task = zap.runtime.Task;
-const allocator = std.heap.page_allocator;
+const Heap = @import("./allocator.zig").Allocator;
 
 const num_tasks = 100_00;
 const num_iters = 1000;
 
 pub fn main() !void {
-    try (try Task.runAsync(.{}, asyncMain, .{}));
+    var heap: Heap = undefined;
+    try heap.init();
+    defer heap.deinit();
+
+    try (try Task.runAsync(.{}, asyncMain, .{heap.getAllocator()}));
 }
 
-fn asyncMain() !void {
+fn asyncMain(allocator: *std.mem.Allocator) !void {
     const frames = try allocator.alloc(@Frame(locker), num_tasks);
     defer allocator.free(frames);
 

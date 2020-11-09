@@ -845,6 +845,11 @@ pub const Task = struct {
 pub const AsyncFutex = struct {
     task: *Task = undefined,
 
+    pub fn yield(_: anytype) bool {
+        spinLoopHint();
+        return false;
+    }
+
     pub fn wait(self: *AsyncFutex, _deadline: anytype, condition: anytype) bool {
         var task = Task.initAsync(@frame());
 

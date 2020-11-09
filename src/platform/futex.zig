@@ -18,6 +18,28 @@ pub const Futex = extern struct {
         self.event.notify();
     }
 
+    pub fn yield(iteration: ?std.math.Log2Int(usize)) bool {
+        const i = iteration orelse {
+            if (std.builtin.os.tag == .windows) {
+                std.os.windows.kernel32.Sleep(1);
+            } else {
+                std.time.sleep(1 << 10);
+            }
+            return false;
+        };
+
+        const iter = i +% 1;
+        if (iter <= 3) {
+            std.SpinLock.loopHint(@as(usize, 1) << iter);
+            return true;
+        } else if (std.builtin.os.tag == .windows and iter < 10) {
+            std.os.windows.kernel32.Sleep(0);
+            return true;
+        }
+
+        return false;
+    }
+
     pub const Timestamp = extern struct {
         nanos: u64 = 0,
 

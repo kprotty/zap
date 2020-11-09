@@ -103,7 +103,7 @@ pub const Lock = extern struct {
                         if (is_x86) {
                             if (lock.tryAcquire())
                                 break;
-                            atomic.spinLoopHint();
+                            _ = Futex.yield(null);
                             state = lock.state.load(.relaxed);
                             continue;
                         }
@@ -118,11 +118,8 @@ pub const Lock = extern struct {
                     }
 
                     const head = @intToPtr(?*Waiter, state & WAITING);
-                    if (head == null and spin <= 3) {
+                    if (head == null and Futex.yield(spin)) {
                         spin +%= 1;
-                        var iters = @as(usize, 1) << spin;
-                        while (iters > 0) : (iters -= 1)
-                            atomic.spinLoopHint();
                         state = lock.state.load(.relaxed);
                         continue;
                     }

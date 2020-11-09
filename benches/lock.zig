@@ -36,7 +36,7 @@ fn locker(lock: *Lock, wg: *Z.WaitGroup, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = TestFairLock;
+const Lock = FairLock;
 
 const FastLockAsync = struct {
     lock: FastLock = FastLock{},

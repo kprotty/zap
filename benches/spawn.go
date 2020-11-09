@@ -1,6 +1,6 @@
 package main
 
-import "sync/atomic"
+import "sync"
 
 const (
 	num_spawners = 10
@@ -8,23 +8,18 @@ const (
 )
 
 func main() {
-	var counter uintptr = 0
-	event := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(num_spawners * num_tasks)
 	
 	for i := 0; i < num_spawners; i++ {
 		go func() {
 			for j := 0; j < num_tasks; j++ {
 				go func() {
-					if atomic.AddUintptr(&counter, 1) == num_tasks * num_spawners {
-						event <- struct{}{}
-					}
+					wg.Done()
 				}()
 			}
 		}()
 	}
 
-	<- event
-	if atomic.LoadUintptr(&counter) != num_tasks * num_spawners {
-		panic("invalid count")
-	}
+	wg.Wait()
 }

@@ -1,39 +1,30 @@
-const std = @import("std");
-const zap = @import("zap");
-
-const Task = zap.runtime.Task;
-const Heap = @import("./allocator.zig").Allocator;
+const Z = @import("./z.zig");
 
 const num_tasks = 100_00;
 const num_iters = 1000;
 
 pub fn main() !void {
-    var heap: Heap = undefined;
-    try heap.init();
-    defer heap.deinit();
-
-    try (try Task.runAsync(.{}, asyncMain, .{heap.getAllocator()}));
+    try Z.Task.runAsync(.{}, asyncMain, .{});
 }
 
-fn asyncMain(allocator: *std.mem.Allocator) !void {
-    const frames = try allocator.alloc(@Frame(locker), num_tasks);
-    defer allocator.free(frames);
-
+fn asyncMain() void {
     var lock = Lock{};
     var counter: u64 = 0;
+    var wg = Z.WaitGroup.init(num_tasks);
 
-    for (frames) |*frame| 
-        frame.* = async locker(&lock, &counter);
-    for (frames) |*frame|
-        await frame;
+    var i: usize = num_tasks;
+    while (i > 0) : (i -= 1)
+        Z.spawn(locker, .{&lock, &wg, &counter});
+
+    wg.wait();
 
     const count = counter;
     if (count != num_iters * num_tasks)
-        std.debug.panic("bad counter: {}\n", .{count});
+        @panic("bad counter");
 }
 
-fn locker(lock: *Lock, counter: *u64) void {
-    Task.runConcurrentlyAsync();
+fn locker(lock: *Lock, wg: *Z.WaitGroup, counter: *u64) void {
+    defer wg.done();
 
     var i: usize = num_iters;
     while (i != 0) : (i -= 1) {
@@ -45,7 +36,7 @@ fn locker(lock: *Lock, counter: *u64) void {
 }
 
 // const Lock = FastLock
-const Lock = FairLock;
+const Lock = FastLock;
 
 const FastLockAsync = struct {
     lock: FastLock = FastLock{},
@@ -71,7 +62,7 @@ const MutexLockAsync = struct {
     }
 };
 
-const FastLock = zap.runtime.sync.Lock;
+const FastLock = Z.zap.runtime.sync.Lock;
 const FairLock = struct {
     lock: FastLock = FastLock{},
     state: usize = UNLOCKED,
@@ -83,7 +74,7 @@ const FairLock = struct {
         aligned: void align(2),
         next: ?*Waiter,
         tail: *Waiter,
-        task: Task,
+        task: Z.Task,
     };
     
     fn acquireAsync(self: *@This()) void {
@@ -106,7 +97,7 @@ const FairLock = struct {
         }
 
         suspend {
-            waiter.task = Task.initAsync(@frame());
+            waiter.task = Z.Task.initAsync(@frame());
             self.lock.release();
         }
     }
@@ -129,7 +120,7 @@ const FairLock = struct {
         }
         
         self.lock.release();
-        Task.Batch.from(&waiter.task).schedule(.{ .use_lifo = true });
+        Z.Task.Batch.from(&waiter.task).schedule(.{ .use_lifo = true });
     }
 };
 
@@ -140,8 +131,8 @@ const ParkingLock = struct {
     rng_seed: u32 = 0,
     state: Atomic(u8) = Atomic(u8).init(UNLOCKED),
 
-    const Atomic = zap.runtime.sync.atomic.Atomic;
-    const spinLoopHint = zap.runtime.sync.atomic.spinLoopHint;
+    const Atomic = Z.zap.runtime.sync.atomic.Atomic;
+    const spinLoopHint = Z.zap.runtime.sync.atomic.spinLoopHint;
 
     const UNLOCKED: u8 = 0;
     const LOCKED: u8 = 1;
@@ -151,7 +142,7 @@ const ParkingLock = struct {
         acquired: bool,
         next: ?*Waiter,
         tail: *Waiter,
-        task: Task,
+        task: Z.Task,
     };
 
     fn tryAcquireX86(self: *@This()) bool {
@@ -164,7 +155,7 @@ const ParkingLock = struct {
     }
     
     fn acquireAsync(self: *@This()) void {
-        if (zap.core.is_x86) {
+        if (Z.zap.core.is_x86) {
             if (!self.tryAcquireX86())
                 self.acquireSlow();
             return;
@@ -183,7 +174,7 @@ const ParkingLock = struct {
     fn acquireSlow(self: *@This()) void {
         @setCold(true);
 
-        var spin: std.math.Log2Int(usize) = 0;
+        var spin: Z.std.math.Log2Int(usize) = 0;
         var state = self.state.load(.relaxed);
 
         while (true) {
@@ -244,7 +235,7 @@ const ParkingLock = struct {
                 }
 
                 suspend {
-                    waiter.task = Task.initAsync(@frame());
+                    waiter.task = Z.Task.initAsync(@frame());
                     self.lock.release();
                 }
 
@@ -280,7 +271,7 @@ const ParkingLock = struct {
         var is_fair = false;
         if (!is_fair) {
             if (waiter) |w| {
-                var ts = zap.runtime.sync.OsFutex.Timestamp{};
+                var ts = Z.zap.runtime.sync.OsFutex.Timestamp{};
                 ts.current();
                 const now = ts.nanos;
                 if (self.timed_out == 0) {
@@ -295,7 +286,7 @@ const ParkingLock = struct {
                         x ^= x >> 17;
                         x ^= x << 5;
                         self.rng_seed = x;
-                        break :blk (x % std.time.ns_per_ms);
+                        break :blk (x % Z.std.time.ns_per_ms);
                     };  
                 }
             }
@@ -313,7 +304,7 @@ const ParkingLock = struct {
 
         self.lock.release();
         if (waiter) |w| {
-            Task.Batch.from(&w.task).schedule(.{ .use_lifo = true });
+            Z.Task.Batch.from(&w.task).schedule(.{ .use_lifo = true });
         }
     }
 };

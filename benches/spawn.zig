@@ -1,49 +1,28 @@
-const std = @import("std");
-const zap = @import("zap");
-
-const Task = zap.runtime.Task;
-const Heap = @import("./allocator.zig").Allocator;
+const Z = @import("./z.zig");
 
 const num_spawners = 10;
 const num_tasks = 100_000;
 
 pub fn main() !void {
-    var heap: Heap = undefined;
-    try heap.init();
-    defer heap.deinit();
-
-    try (try Task.runAsync(.{}, asyncMain, .{heap.getAllocator()}));
+    try Z.Task.runAsync(.{}, asyncMain, .{});
 }
 
-fn asyncMain(allocator: *std.mem.Allocator) !void {
-    const frames = try allocator.alloc(@Frame(spawner), num_spawners);
-    defer allocator.free(frames);
+fn asyncMain() void {
+    var wg = Z.WaitGroup.init(num_spawners * num_tasks);
 
-    var counter: usize = num_tasks * num_spawners;
-    for (frames) |*frame|
-        frame.* = async spawner(allocator, &counter);
-    for (frames) |*frame|
-        try (await frame);
+    var i: usize = num_spawners;
+    while (i > 0) : (i -= 1)
+       Z.spawn(spawner, .{&wg});
 
-    const count = @atomicLoad(usize, &counter, .Monotonic);
-    if (count != 0)
-        std.debug.panic("bad counter", .{});
+    wg.wait();
 }
 
-fn spawner(allocator: *std.mem.Allocator, counter: *usize) !void {
-    Task.runConcurrentlyAsync();
-
-    const frames = try allocator.alloc(@Frame(runner), num_tasks);
-    defer allocator.free(frames);
-
-    for (frames) |*frame|
-        frame.* = async runner(counter);
-    for (frames) |*frame|
-        await frame;
+fn spawner(wg: *Z.WaitGroup) !void {
+    var i: usize = num_tasks;
+    while (i > 0) : (i -= 1)
+       Z.spawn(runner, .{wg});
 }
 
-fn runner(counter: *usize) void {
-    Task.runConcurrentlyAsync();
-    
-    _ =  @atomicRmw(usize, counter, .Sub, 1, .Monotonic);
+fn runner(wg: *Z.WaitGroup) void {
+    wg.done();
 }

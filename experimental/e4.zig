@@ -494,7 +494,7 @@ pub const Task = struct {
                 if (target.runq_head.tryCompareAndSwap(
                     target_head,
                     new_target_head,
-                    .relaxed,
+                    .release,
                     .relaxed,
                 )) |updated| {
                     target_head = updated;

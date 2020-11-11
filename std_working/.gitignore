@@ -1,0 +1,16 @@
+# IDE stuff
+.vscode/
+.history/
+
+# build directories
+zig-cache/
+target/
+gobuild/
+
+# build artifacts
+Cargo.lock
+NUL
+
+# testing
+main.zig
+t.zig

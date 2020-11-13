@@ -132,7 +132,7 @@ pub const Task = struct {
         return Task{ .runnable = @ptrToInt(frame) };
     }
 
-    pub const Callback = fn(*Task) callconv(.C) void;
+    pub const Callback = fn(*Task, *Worker) callconv(.C) void;
 
     pub fn initCallback(callback: Callback) Task {
         if (@alignOf(Callback) < 2)
@@ -140,13 +140,13 @@ pub const Task = struct {
         return Task{ .runnable = @ptrToInt(callback) | 1 };
     }
 
-    pub fn execute(self: *Task) void {
+    pub fn execute(self: *Task, worker: *Worker) void {
         @setRuntimeSafety(false);
 
         const runnable = self.runnable;
         if (runnable & 1 != 0) {
             const callback = @intToPtr(Callback, runnable & ~@as(usize, 1));
-            return (callback)(self);
+            return (callback)(self, worker);
         }
 
         const frame = @intToPtr(anyframe, runnable);
@@ -226,6 +226,7 @@ pub const Worker = struct {
     run_queue_overflow: UnboundedQueue = undefined,
     scheduler: *Scheduler,
     thread: ?*OsThread = undefined,
+    futex: OsFutex,
 
     threadlocal var tls_current: ?*Worker = null;
 
@@ -235,6 +236,12 @@ pub const Worker = struct {
         self.* = Worker{ .scheduler = scheduler };
         self.thread = OsThread.getSpawned();
         self.run_queue_overflow.init();
+
+        self.futex.init();
+        defer self.futex.deinit();
+
+        // register the thread onto the Scheduler
+        scheduler.active_queue.push(&self.active_node);
         
         // Set the TLS worker pointer while restoring it on exit to allow for nested Worker.run() calls.
         const old_tls_current = tls_current;
@@ -255,7 +262,7 @@ pub const Worker = struct {
                     _ = scheduler.tryResumeWorker(true);
                 }
 
-                task.execute();
+                task.execute(self);
                 run_queue_tick +%= 1;
                 continue;
             }
@@ -269,12 +276,15 @@ pub const Worker = struct {
         }
     }
 
+    /// Gets a refereence to the currently running Worker, panicking if called outside of a Worker thread.
+    /// This exists primarily due to the inability for async frames to take resume parameters (for the *Worker).
     pub fn getCurrent() *Worker {
         return tls_current orelse {
             std.debug.panic("Worker.getCurrent() called outside of the runtime", .{})
         };
     }
 
+    /// Gets a reference to the Scheduler which this worker is apart of.
     pub fn getScheduler(self: *Worker) *Scheduler {
         return self.scheduler;
     }
@@ -284,6 +294,7 @@ pub const Worker = struct {
         use_lifo: bool = false,
     };
 
+    /// Mark a batch of tasks as runnable which will eventually be executed on some Worker in the Scheduler.
     pub fn schedule(self: *Worker, entity: anytype, hints: ScheduleHints) void {
         var batch = Batch.from(entity);
         if (batch.isEmpty()) {
@@ -304,22 +315,26 @@ pub const Worker = struct {
             }
         }
 
+        // Use the "LIFO" slot when available as well, pushing the old entry out too.
         if (hints.use_lifo) {
             if (@atomicRmw(?*Task, &self.run_queue_lifo, .Xchg, batch.popFront(), .AcqRel)) |old_lifo| {
                 batch.pushFront(old_lifo);
             }
         }
 
+        // Push any remaining tasks to the local run queue, which overflows into the overflow queue when full.
         if (!batch.isEmpty()) {
             if (self.run_queue.push(batch)) |overflowed| {
                 self.run_queue_overflow.push(overflowed);
             }
         }
 
+        // Finally, try to wake up a worker to handle these newly enqueued tasks
         const scheduler = self.getScheduler();
-        scheduler.resumeWorker(false);
+        _ = scheduler.tryResumeWorker(false);
     }
 
+    /// Tries to find a runnable task in the system/scheduler the worker is apart of and dequeues it from it's run queue.
     fn poll(self: *Worker, scheduler: *Scheduler, run_queue_tick: usize, workers: *Scheduler.WorkerIter) ?*Task {
         // TODO: if single_threaded, poll for io and timer resources here
         
@@ -419,7 +434,7 @@ pub const Scheduler = struct {
     active_queue: ActiveQueue = ActiveQueue{},
     counter: u32 = (Counter{}).pack(),
     max_workers: u16,
-    coordinator: ?*Worker = null,
+    main_worker: ?*Worker = null,
 
     const Counter = struct {
         idle: u16 = 0,
@@ -451,12 +466,28 @@ pub const Scheduler = struct {
         }
     };
 
-    fn getRuntime(self: *Scheduler) *Runtime {
+    /// Get a reference to the Runtime this Scheduler is apart of
+    pub fn getRuntime(self: *Scheduler) *Runtime {
         if (self.is_blocking)
             return @fieldParentPtr(Runtime, "blocking_scheduler", self);
         return @fieldParentPtr(Runtime, "async_scheduler", self);
     }
 
+    /// Get an iterator which can be used to discover all worker's reachable from the Scheduler at the time of calling.
+    pub fn getWorkers(self: *Scheduler) WorkerIter {
+        return WorkerIter{ .iter = self.active_queue.iter() };
+    }
+
+    pub const WorkerIter = struct {
+        iter: ActiveQueue.Iter,
+
+        pub fn next(self: *WorkerIter) ?*Worker {
+            const node = self.iter.next() orelse return null;
+            return @fieldParentPtr(Worker, "active_node", node); 
+        }
+    };
+
+    /// Enqueue a batch of tasks into the scheduler and try to resume a worker in order to handle them.
     pub fn schedule(self: *Scheduler, entity: anytype) void {
         const batch = Batch.from(entity);
         if (batch.isEmpty()) {
@@ -467,6 +498,7 @@ pub const Scheduler = struct {
         _ = self.tryResumeWorker(false);
     }
 
+    /// Try to wake up or start a Worker thread in order to poll for tasks.
     fn tryResumeWorker(self: *Scheduler, is_caller_resuming: bool) bool {
         // We only need to load the max-worker value once as it never changes.
         const max_workers = self.max_workers;
@@ -519,7 +551,7 @@ pub const Scheduler = struct {
                         .notified, .shutdown => return,
                         .resumed => |idle_node| {
                             const worker = @fieldParentPtr(Worker, "idle_node", idle_node);
-                            worker.event.notify();
+                            worker.futex.wake();
                             return true;
                         },
                     };
@@ -575,8 +607,164 @@ pub const Scheduler = struct {
         }
     }
 
-    pub fn shutdown(self: *Scheduler) void {
+    const Suspend = enum {
+        retry,
+        resumed,
+        shutdown,
+    };
+
+    const SuspendCondition = struct {
+        result: ?Suspend,
+        scheduler: *Scheduler,
+        worker: *Worker,
+        is_resuming: bool,
+        is_main_worker: bool,
+
+        fn poll(condition: *Condition) bool {
+            const self = condition.scheduler;
+            const worker = condition.worker;
+            const max_workers = self.max_workers;
+            const is_resuming = condition.is_resuming;
+
+            var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+            while (true) {
+
+                const has_resumables = counter.idle > 0 or counter.spawned < max_workers;
+                const is_shutdown = counter.state == .shutdown;
+                const is_notified = switch (counter.state) {
+                    .resumer_notified => is_resuming,
+                    .suspend_notified => true,
+                    else => false,
+                };
+
+                // If we're about to suspend and someone left a notification for us in tryResumeWorker(), then consume it and don't suspend.
+                // This also deregisters ourselves from the counter if we're shutting down which is used to synchronize the scheduler joining all threads.
+                var new_counter = counter;
+                if (is_shutdown) {
+                    new_counter.spawned -= 1;
+                } else if (is_notified) {
+                    new_counter.state = if (is_resuming) .resuming else .pending;
+                } else {
+                    new_counter.state = if (has_resumables) .pending else .suspend_notified;
+                    new_counter.idle += 1;
+                }
+
+                // Set the main worker on the scheduler before updating the counter.
+                // After the update, and if we're the last to shutdown, we may end up reading it.
+                if (condition.is_main_worker) {
+                    scheduler.main_worker = worker;
+                }
+
+                // Acquire barrier to make sure any main_worker reads aren't reordered before we mark ourselves as shutdown as it may not exist yet.
+                // Release barrier to make sure the main_worker exists for the last worker to mark itself as shutdown below.
+                if (@cmpxchgWeak(
+                    u32,
+                    &self.counter,
+                    counter.pack(),
+                    new_counter.pack(),
+                    .AcqRel,
+                    .Monotonic,
+                )) |updated| {
+                    counter = Counter.unpack(updated);
+                    continue;
+                }
+
+                if (is_notified and is_resuming) {
+                    condition.result = Suspend.resumed;
+                } else if (is_notified) {
+                    condition.result = Suspend.retry;
+                } else if (is_shutdown) {
+                    condition.result = Suspend.shutdown;
+                } else {
+                    condition.result = null;
+                }
+
+                // If we're the last worker to mark ourselves as shutdown, then notify the main_worker to clean everyone up.
+                // If we *are* the main_worker, then we just dont suspend by returning true for the wait condition.
+                if (is_shutdown and counter.spawned == 0) {
+                    if (scheduler.main_worker) |main_worker| {
+                        if (worker == main_worker) {
+                            return true;
+                        } else {
+                            main_worker.futex.wake();
+                        }
+                    } else {
+                        std.debug.panic("Scheduler shutting down without a main worker", .{});
+                    }
+                }
+
+                return is_notified;
+            }
+        }
+    };
+
+    fn suspendWorker(self: *Scheduler, worker: *Worker, is_caller_resuming: bool) Suspend {
+        // The main worker is the one without a thread (e.g. the one running on the main thread)
+        const is_main_worker = worker.thread == null;
+
+        var condition = SuspendCondition{
+            .result = undefined,
+            .scheduler = self,
+            .worker = worker,
+            .is_resuming = is_caller_resuming,
+            .is_main_worker = is_main_worker,
+        };
+
+        // Wait on the worker's futex using the Suspend condition
+        worker.futex.wait(&condition);
+
+        // Get the result of the suspend condition or, if the Thread was woken up, assume its now resuming.
+        const result = condition.result orelse return .resumed;
         
+        // If the main worker was resumed for a shutdown, then it has to wake up everyone else and join/free their OS thread.
+        if (result == .shutdown and is_main_worker) {
+            var workers = self.getWorkers();
+            while (workers.next()) |idle_worker| {
+                const thread = idle_worker.thread orelse continue;
+                idle_worker.futex.wake();
+                thread.join();
+            }
+        }
+
+        return result;
+    }
+
+    /// Mark the scheduler as shutdown
+    pub fn shutdown(self: *Scheduler) void {
+        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+
+        while (true) {
+            // if the Scheduler is already shutdown then theres nothing to be done
+            if (counter.state == .shutdown) {
+                return;
+            }
+
+            // Transition the scheduler into a shutdown state, stopping future Workers from being woken up and eventually stopping the Scheduler.
+            // Acquire barrier to make sure any shutdown writes below don't get reordered before we mark the counter as shutdown.
+            var new_counter = counter;
+            new_counter.state = .shutdown;
+            if (@cmpxchgWeak(
+                u32,
+                &self.counter,
+                counter.pack(),
+                new_counter.pack(),
+                .Acquire,
+                .Monotonic,
+            )) |updated| {
+                counter = Counter.pack(updated);
+                continue;
+            }
+
+            // We marked the counter as shutdown, so no more workers will be doing into the idle_queue.
+            // Now we wake up every worker in the idle_queue so they can observe the shutdown and stop/join on the Scheduler.
+            var idle_nodes = self.idle_queue.shutdown();
+            while (idle_nodes.next()) |idle_node| {
+                const idle_worker = @fieldParentPtr(Worker, "idle_node", idle_node);
+                idle_worker.futex.wake();
+            }
+
+            return;
+        }
     }
 };
 
@@ -1079,25 +1267,25 @@ fn spinLoopHint() void {
 const OsFutex = struct {
     event: std.ResetEvent,
 
-    fn init(self: *OsEvent) void {
+    fn init(self: *OsFutex) void {
         self.event = std.ResetEvent.init();
     }
 
-    fn deinit(self: *OsEvent) void {
+    fn deinit(self: *OsFutex) void {
         self.event.deinit();
     }
 
-    fn wait(self: *OsEvent, wait_validator: anytype) void {
+    fn wait(self: *OsFutex, condition: anytype) void {
         self.event.reset();
 
-        if (!wait_validator.poll()) {
+        if (condition.poll()) {
             return;
         }
 
         self.event.wait();
     }
 
-    fn wake(self: *OsEvent) void {
+    fn wake(self: *OsFutex) void {
         self.event.set();
     }
 };

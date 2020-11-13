@@ -2,10 +2,24 @@ const std = @import("std");
 const is_debug = std.debug.runtime_safety;
 const is_single_threaded = std.builtin.single_threaded;
 
-const Runtime = @This();
+pub const Runtime = @This();
 
-async_scheduler: Scheduler,
-blocking_scheduler: if (is_single_threaded) void else Scheduler,
+async_scheduler: RuntimeScheduler,
+blocking_scheduler: if (is_single_threaded) void else RuntimeScheduler,
+blocking_thread: ?*OsThread,
+
+pub const RuntimeScheduler = struct {
+    is_blocking: bool,
+    scheduler: Scheduler,
+
+    pub fn getRuntime(self: *RuntimeScheduler) *Runtime {
+        if (self.is_blocking) {
+            return @fieldParentPtr(Runtime, "blocking_scheduler", self);
+        } else {
+            return @fieldParentPtr(Runtime, "async_scheduler", self);
+        }
+    }
+};
 
 fn ReturnTypeOf(comptime asyncFn: anytype) type {
     return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
@@ -15,7 +29,7 @@ fn ReturnTypeOf(comptime asyncFn: anytype) type {
 // Generic Runtime API
 ///////////////////////////////////////////////////////////////////////
 
-pub const Config = struct {
+pub const RunConfig = struct {
     async_pool: Pool = Pool{
         .threads = null,
         .stack_size = 16 * 1024 * 1024,
@@ -30,14 +44,14 @@ pub const Config = struct {
         stack_size: usize,
     };
 
-    pub fn run(self: Config, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
+    pub fn run(self: RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
         return self.runWithShutdown(true, asyncFn, args);
     }
 
-    pub fn runForever(self: Config, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
+    pub fn runForever(self: RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
         return self.runWithShutdown(false, asyncFn, args);
 
-    fn runWithShutdown(self: Config, shutdown_after: bool, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
+    fn runWithShutdown(self: RunConfig, shutdown_after: bool, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
         const Decorator = struct {
             fn entry(task: *Task, result: *?ReturnTypeOf(asyncFn), shutdown: bool, asyncArgs: @TypeOf(args)) void {
                 suspend task.* = Task.init(@frame());
@@ -55,7 +69,66 @@ pub const Config = struct {
         var result: ?ReturnTypeOf(asyncFn) = null;
         var frame = async Decorator.entry(&task, &result, shutdown_after, args);
 
+        self.runTasks(Batch.from(&task));
 
+        return result orelse error.DeadLocked;
+    }
+
+    pub fn runTasks(self: RunConfig, batch: Batch) void {
+        var runtime: Runtime = undefined;
+        
+        // Compute the amount of threads used for the async_scheduler
+        const async_threads: u16 = 
+            if (is_single_threaded)
+                @as(u16, 1)
+            else if (config.async_pool.threads) |threads|
+                std.math.min(Scheduler.max_workers, threads)
+            else
+                std.math.min(Scheduler.max_workers, @intCast(u16, OsThread.cpuCount() catch 1));
+
+        // Compute the amount of threads used for the blocking_scheduler
+        var blocking_threads = config.blocking_pool.threads orelse async_threads;
+        blocking_threads = std.math.min(Scheduler.max_workers, blocking_threads, true);
+        if (is_single_threaded) {
+            blocking_threads = 0;
+        }
+
+        // Try to start a blocking scheduler thread if it has any
+        const use_blocking_scheduler = !is_single_threaded and blocking_threads > 0;
+        if (use_blocking_scheduler) {
+            runtime.blocking_scheduler.is_blocking = true;
+            runtime.blocking_scheduler.scheduler.init(blocking_threads, config.blocking_pool.stack_size, true);
+
+            const StubTask = struct {
+                task: Task,
+                fn callback(_: *Task, _: *Worker) callconv(.C) void {}
+            };
+
+            // Schedule a stub task onto the blocking_scheduler in another thread so it stays running.
+            var stub_task = StubTask{ .task = Task.initCallback(StubTask.callback) };
+            runtime.blocking_thread = OsThread.spawn(
+                .{ .stack_size = config.blocking_pool.stack_size },
+                Scheduler.scheduleBatch,
+                .{&runtime.blocking_scheduler.scheduler, Batch.from(&stub_task.task)},
+            ) catch blk: {
+                runtime.blocking_scheduler.scheduler.deinit();
+                break :blk null;
+            };
+        }
+
+        // Run the async-scheduler using the main thread
+        runtime.async_scheduler.is_blocking = false;
+        runtime.async_scheduler.scheduler.init(async_threads, config.async_pool.stack_size);
+        runtime.async_scheduler.scheduler.scheduleBatch(Batch.from(task));
+        runtime.async_scheduler.scheduler.deinit();
+        
+        // Cleanup the blocking scheduler if it has one
+        if (runtime.blocking_thread) |blocking_thread| {
+            // skip shutdown() as that has a protective guard
+            runtime.blocking_scheduler.scheduler.shutdownWorkers(); 
+            bocking_thread.join();
+            runtime.blocking_scheduler.scheduler.deinit();
+        }
     }
 };
 
@@ -428,13 +501,13 @@ pub const Worker = struct {
 };
 
 pub const Scheduler = struct {
-    is_blocking: bool,
     run_queue: UnboundedQueue,
     idle_queue: IdleQueue = IdleQueue{},
     active_queue: ActiveQueue = ActiveQueue{},
     counter: u32 = (Counter{}).pack(),
     max_workers: u16,
     main_worker: ?*Worker = null,
+    is_runtime: bool = false,
 
     const Counter = struct {
         idle: u16 = 0,
@@ -466,11 +539,23 @@ pub const Scheduler = struct {
         }
     };
 
-    /// Get a reference to the Runtime this Scheduler is apart of
-    pub fn getRuntime(self: *Scheduler) *Runtime {
-        if (self.is_blocking)
-            return @fieldParentPtr(Runtime, "blocking_scheduler", self);
-        return @fieldParentPtr(Runtime, "async_scheduler", self);
+    pub fn init(self: *Scheduler, max_workers: u16, stack_size: u16, is_runtime: bool) void {
+        self.* = Scheduler{ .max_workers = max_workers };
+        self.run_queue.init();
+        self.is_runtime = is_runtime;
+    }
+
+    pub fn deinit(self: *Scheduler) void {
+        self.* = undefined;
+    }
+
+    /// Get a reference to the RuntimeScheduler if is this a runtime Scheduler..
+    pub fn getRuntimeScheduler(self: *Scheduler) *RuntimeScheduler {
+        if (self.is_runtime) {
+            return @fieldParentPtr(RuntimeScheduler, "scheduler", self);
+        } else {
+            std.debug.panic("Scheduler.getRuntimeScheduler() when not a runtime-created scheduler", .{});
+        }
     }
 
     /// Get an iterator which can be used to discover all worker's reachable from the Scheduler at the time of calling.
@@ -489,13 +574,26 @@ pub const Scheduler = struct {
 
     /// Enqueue a batch of tasks into the scheduler and try to resume a worker in order to handle them.
     pub fn schedule(self: *Scheduler, entity: anytype) void {
-        const batch = Batch.from(entity);
+        return self.scheduleBatch(Batch.from(entity));
+    }
+
+    fn scheduleBatch(self: *Scheduler, batch: Batch) void {
         if (batch.isEmpty()) {
             return;
         }
 
         self.run_queue.push(batch);
         _ = self.tryResumeWorker(false);
+    }
+
+    /// Mark the scheduler as shutdown
+    pub fn shutdown(self: *Scheduler) void {
+        // Dont allow external calls to the blocking scheduler of a Runtime to shut it down, thats the runtime's job
+        if (self.is_runtime and self.getRuntimeScheduler().is_blocking) {
+            return;
+        }
+
+        self.shutdownWorkers();
     }
 
     /// Try to wake up or start a Worker thread in order to poll for tasks.
@@ -729,10 +827,9 @@ pub const Scheduler = struct {
         return result;
     }
 
-    /// Mark the scheduler as shutdown
-    pub fn shutdown(self: *Scheduler) void {
+    /// Mark the scheduler as shutdown, waking any pending workers in the process
+    fn shutdownWorkers(self: *Scheduler) void {
         var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
-
         while (true) {
             // if the Scheduler is already shutdown then theres nothing to be done
             if (counter.state == .shutdown) {

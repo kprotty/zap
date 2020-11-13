@@ -44,6 +44,44 @@ impl<T> Lock<T> {
         self.release();
         result
     }
+    
+    #[inline]
+    fn try_acquire(&self, mut state: usize) -> bool {
+        loop {
+            if state & LOCKED != 0 {
+                return false;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                state | LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(e) => state = e,
+            }
+        }
+    }
+
+    fn yield(iteration: Option<usize>) -> bool {
+        iteration
+            .filter(|iteration| iteration < 10)
+            .map(|iteration| {
+                if iteration <= 3 {
+                    (0..(1 << iteration)).for_each(|_| spin_loop_hint());
+                } else {
+                    std::thread::yield_now();
+                }
+            })
+            .or_else(|| thread::sleep({
+                #[cfg(windows)]
+                std::time::Duration::from_millis(1)
+                #[cfg(not(windows))]
+                std::time::Duration::from_micros(1)
+            }))
+            .is_some()
+    }
 
     #[inline]
     fn acquire(&self) {
@@ -81,22 +119,18 @@ impl<T> Lock<T> {
 
         loop {
             if state & LOCKED == 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state | LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
+                if self.try_acquire() {
+                    return;
                 }
+
+                Self::yield_now(None);
+                state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
             let head = NonNull::new((state & WAITING) as *mut Waiter);
-            if head.is_null() && spin <= 3 {
+            if head.is_null() && Self::yield_now(Some(spin)) {
                 spin += 1;
-                (0..(1 << spin)).for_each(|_| spin_loop_hint());
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }

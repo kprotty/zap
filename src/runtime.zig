@@ -114,6 +114,8 @@ pub const RunConfig = struct {
                 runtime.blocking_scheduler.scheduler.deinit();
                 break :blk null;
             };
+        } else {
+            runtime.blocking_thread = null;
         }
 
         // Run the async-scheduler using the main thread

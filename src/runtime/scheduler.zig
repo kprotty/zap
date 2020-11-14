@@ -107,32 +107,39 @@ const IdleQueue = struct {
     }
 
     fn wait(self: *IdleQueue) void {
-        self.lock.acquire();
+        var next_waiter: ?*std.AutoResetEvent = undefined;
+        defer if (next_waiter) |event|
+            event.set();
 
         while (true) {
+            self.lock.acquire();
+
             if (self.counter > 0) {
                 self.counter -= 1;
-                const waiter = self.queue.popOrNull();
+                next_waiter = self.queue.popOrNull();
                 self.lock.release();
-                if (waiter) |event|
-                    event.set();
-                return;
+                break;
             }
 
-            var event = std.AutoResetEvent{};
-            self.queue.append(&event) catch unreachable;
+            var waiter = std.AutoResetEvent{};
+            self.queue.append(&waiter) catch unreachable;
             self.lock.release();
-            event.wait();
-            self.lock.acquire();
+            waiter.wait();
         }
     }
 
     fn notify(self: *IdleQueue, count: usize) void {
-        self.lock.acquire();
+        if (count == 0)
+            return;
 
-        self.counter += count;
-        const waiter = self.queue.popOrNull();
-        self.lock.release();
+        const waiter = blk: {
+            self.lock.acquire();
+            defer self.lock.release();
+
+            self.counter += count;
+            break :blk self.queue.popOrNull();
+        };
+
         if (waiter) |event|
             event.set();
     }

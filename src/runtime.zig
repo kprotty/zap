@@ -1398,14 +1398,12 @@ const OsThread = struct {
         return tls_spawned;
     }
 
-    const Affinity = struct {
-        from_cpu: u16,
-        to_cpu: u16,
-    };
+    fn cpuCount() !usize {
+        return std.Thread.cpuCount();
+    }
 
     const SpawnHints = struct {
         stack_size: ?usize = null,
-        affinity: ?Affinity = null,
     };
 
     fn spawn(hints: SpawnHints, comptime entryFn: anytype, args: anytype) !*OsThread {

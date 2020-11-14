@@ -24,7 +24,7 @@ pub fn run(comptime asyncFn: anytype, args: anytype) ReturnTypeOf(asyncFn) {
 
     var scheduler: Scheduler = undefined;
     scheduler.init();
-    scheduler.run_queue.append(frame_ptr) catch unreachable;
+    scheduler.run_queue.push(frame_ptr);
     scheduler.run();
     scheduler.deinit();
 
@@ -55,11 +55,10 @@ pub fn spawn(comptime asyncFn: anytype, args: anytype) void {
 }
 
 const Scheduler = struct {
-    lock: Lock,
     is_shutdown: bool,
+    run_queue: RunQueue,
+    idle_queue: IdleQueue,
     threads: std.ArrayList(*std.Thread),
-    run_queue: std.ArrayList(anyframe),
-    idle_queue: std.ArrayList(*std.AutoResetEvent),
 
     var instance: ?*Scheduler = null;
 
@@ -68,11 +67,10 @@ const Scheduler = struct {
 
         instance = self;
         self.* = Scheduler{
-            .lock = Lock{},
             .is_shutdown = false,
+            .run_queue = RunQueue.init(allocator),
+            .idle_queue = IdleQueue.init(allocator),
             .threads = std.ArrayList(*std.Thread).init(allocator),
-            .run_queue = std.ArrayList(anyframe).init(allocator),
-            .idle_queue = std.ArrayList(*std.AutoResetEvent).init(allocator),
         };
 
         if (!std.builtin.single_threaded) {
@@ -87,86 +85,105 @@ const Scheduler = struct {
     fn deinit(self: *Scheduler) void {
         while (self.threads.popOrNull()) |thread|
             thread.wait();
-        while (self.run_queue.popOrNull()) |frame|
-            resume frame;
+        self.idle_queue.deinit();
+        self.run_queue.deinit();
         self.* = undefined;
     }
 
     fn schedule(self: *Scheduler, frame: anyframe) void {
-        const event = blk: {
-            self.lock.acquire();
-            defer self.lock.release();
-
-            if (self.is_shutdown)
-                return;
-
-            self.run_queue.append(frame) catch unreachable;
-            break :blk self.idle_queue.popOrNull();
-        };
-
-        if (event) |auto_reset_event|
-            auto_reset_event.set();
+        self.run_queue.push(frame);
+        self.idle_queue.notify(1);
     }
 
     fn run(self: *Scheduler) void {
-        while (true) {
-            self.lock.acquire();
-
-            if (self.is_shutdown) {
-                self.lock.release();
-                return;
-            }
-
-            if (self.run_queue.popOrNull()) |frame| {
-                self.lock.release();
+        while (!@atomicLoad(bool, &self.is_shutdown, .SeqCst)) {
+            if (self.run_queue.pop()) |frame| {
                 resume frame;
-                continue;
+            } else {
+                self.idle_queue.wait();
             }
-
-            var event = std.AutoResetEvent{};
-            self.idle_queue.append(&event) catch unreachable;
-            self.lock.release();
-            event.wait();
         }
     }
 
     fn shutdown(self: *Scheduler) void {
-        var idle_queue = blk: {
+        @atomicStore(bool, &self.is_shutdown, true, .SeqCst);
+        self.idle_queue.notify(self.threads.items.len + 1);
+    }
+
+    const RunQueue = struct {
+        lock: Lock = Lock{},
+        queue: std.ArrayList(anyframe),
+
+        fn init(allocator: *std.mem.Allocator) RunQueue {
+            return RunQueue{
+                .queue = std.ArrayList(anyframe).init(allocator),
+            };
+        }
+
+        fn deinit(self: *RunQueue) void {
+            while (self.queue.popOrNull()) |frame|
+                resume frame;
+        }
+
+        fn push(self: *RunQueue, frame: anyframe) void {
             self.lock.acquire();
             defer self.lock.release();
+            self.queue.append(frame) catch unreachable;
+        }
 
-            if (self.is_shutdown)
-                return;
+        fn pop(self: *RunQueue) ?anyframe {
+            self.lock.acquire();
+            defer self.lock.release();
+            return self.queue.popOrNull();
+        }
+    };
 
-            self.is_shutdown = true;
-            break :blk &self.idle_queue;
-        };
+    const IdleQueue = struct {
+        lock: Lock = Lock{},
+        counter: usize = 0,
+        queue: std.ArrayList(*std.AutoResetEvent),
 
-        while (idle_queue.popOrNull()) |event|
-            event.set();
-    }
-};
+        fn init(allocator: *std.mem.Allocator) IdleQueue {
+            return IdleQueue{
+                .queue = std.ArrayList(*std.AutoResetEvent).init(allocator),
+            };
+        }
 
-const Heap = struct {
-    var init_lock = Lock{};
-    var is_init: bool = false;
-    var global_heap: std.heap.GeneralPurposeAllocator(.{}) = undefined;
+        fn deinit(self: *IdleQueue) void {
+            self.* = undefined;
+        }
 
-    fn getAllocator() *std.mem.Allocator {
-        if (@atomicLoad(bool, &is_init, .SeqCst))
-            return &global_heap.allocator;
+        fn wait(self: *IdleQueue) void {
+            self.lock.acquire();
 
-        init_lock.acquire();
-        defer init_lock.release();
+            while (true) {
+                if (self.counter > 0) {
+                    self.counter -= 1;
+                    const waiter = self.queue.popOrNull();
+                    self.lock.release();
+                    if (waiter) |event|
+                        event.set();
+                    return;
+                }
 
-        if (@atomicLoad(bool, &is_init, .SeqCst))
-            return &global_heap.allocator;
+                var event = std.AutoResetEvent{};
+                self.queue.append(&event) catch unreachable;
+                self.lock.release();
+                event.wait();
+                self.lock.acquire();
+            }
+        }
 
-        global_heap = std.heap.GeneralPurposeAllocator(.{}){};
-        @atomicStore(bool, &is_init, true, .SeqCst);
+        fn notify(self: *IdleQueue, count: usize) void {
+            self.lock.acquire();
 
-        return &global_heap.allocator;
-    }
+            self.counter += count;
+            const waiter = self.queue.popOrNull();
+            self.lock.release();
+            if (waiter) |event|
+                event.set();
+        }
+    };
 };
 
 pub const sync = struct {
@@ -217,5 +234,27 @@ const Lock = struct {
 
     pub fn release(self: *Lock) void {
         (std.Mutex.Held{ .mutex = &self.mutex }).release();
+    }
+};
+
+const Heap = struct {
+    var init_lock = Lock{};
+    var is_init: bool = false;
+    var global_heap: std.heap.GeneralPurposeAllocator(.{}) = undefined;
+
+    fn getAllocator() *std.mem.Allocator {
+        if (@atomicLoad(bool, &is_init, .SeqCst))
+            return &global_heap.allocator;
+
+        init_lock.acquire();
+        defer init_lock.release();
+
+        if (@atomicLoad(bool, &is_init, .SeqCst))
+            return &global_heap.allocator;
+
+        global_heap = std.heap.GeneralPurposeAllocator(.{}){};
+        @atomicStore(bool, &is_init, true, .SeqCst);
+
+        return &global_heap.allocator;
     }
 };

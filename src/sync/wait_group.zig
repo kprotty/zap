@@ -1,11 +1,13 @@
 const std = @import("std");
-const Lock = @import("../runtime/lock.zig").Lock;
 const runtime = @import("../runtime/runtime.zig");
+
+const Lock = runtime.Lock;
+const Task = runtime.executor.Task;
 
 pub const WaitGroup = struct {
     lock: Lock = Lock{},
     count: usize,
-    waiter: ?anyframe = null,
+    waiter: ?*Task = null,
 
     pub fn init(count: usize) WaitGroup {
         return WaitGroup{ .count = count };
@@ -22,8 +24,7 @@ pub const WaitGroup = struct {
             break :blk self.waiter;
         };
 
-        if (waiter) |frame|
-            runtime.schedule(frame);
+        runtime.schedule(waiter orelse return);
     }
 
     pub fn wait(self: *WaitGroup) void {
@@ -33,7 +34,8 @@ pub const WaitGroup = struct {
             return self.lock.release();
 
         suspend {
-            self.waiter = @frame();
+            var task = Task.init(@frame());
+            self.waiter = &task;
             self.lock.release();
         }
     }

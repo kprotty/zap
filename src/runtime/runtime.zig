@@ -1,55 +1,80 @@
 const std = @import("std");
-const Heap = @import("./heap.zig");
-const Scheduler = @import("./scheduler.zig").Scheduler;
 
-fn ReturnTypeOf(comptime function: anytype) type {
-    return @typeInfo(@TypeOf(function)).Fn.return_type.?;
+pub const executor = @import("./executor.zig");
+pub const Lock = @import("./lock.zig").Lock;
+pub const Semaphore = @import("./semaphore.zig").Semaphore;
+
+fn ReturnTypeOf(comptime asyncFn: anytype) type {
+    return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
 }
 
-pub fn run(comptime asyncFn: anytype, args: anytype) ReturnTypeOf(asyncFn) {
+pub fn run(config: executor.Scheduler.RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     const Args = @TypeOf(args);
     const Decorator = struct {
-        fn entry(frame_ptr: *anyframe, result_ptr: *?ReturnTypeOf(asyncFn), fn_args: Args) void {
-            suspend frame_ptr.* = @frame();
+        fn entry(task_ptr: *executor.Task, result_ptr: *?ReturnTypeOf(asyncFn), fn_args: Args) void {
+            suspend {
+                task_ptr.* = executor.Task.init(@frame());
+            }
             const result = @call(.{}, asyncFn, fn_args);
             suspend {
                 result_ptr.* = result;
-                Scheduler.instance.?.shutdown();
+                executor.Worker.getCurrent().?.getScheduler().shutdown();
             }
         }
     };
 
-    var frame_ptr: anyframe = undefined;
+    var task: executor.Task = undefined;
     var result: ?ReturnTypeOf(asyncFn) = null;
-    var frame = async Decorator.entry(&frame_ptr, &result, args);
+    var frame = async Decorator.entry(&task, &result, args);
 
-    var scheduler: Scheduler = undefined;
-    scheduler.init(Heap.getAllocator());
-    scheduler.start(frame_ptr);
-    scheduler.deinit();
+    try executor.Scheduler.run(config, task.toBatch());
     
-    return result orelse unreachable;
+    return result orelse error.DeadLocked;
 }
 
-pub fn schedule(frame: anyframe) void {
-    Scheduler.instance.?.schedule(frame);
+pub fn schedule(batchable: anytype) void {
+    const worker = executor.Worker.getCurrent() orelse {
+        std.debug.panic("runtime.schedule() when not inside a runtime scheduler", .{});
+    };
+    worker.schedule(executor.Batch.from(batchable));
 }
 
 pub fn yield() void {
-    suspend schedule(@frame());
+    const worker = executor.Worker.getCurrent() orelse {
+        std.debug.panic("runtime.yield() when not inside a runtime scheduler", .{});
+    };
+    reschedule(worker);
 }
 
-pub fn spawn(comptime asyncFn: anytype, args: anytype) void {
+fn reschedule(worker: *executor.Worker) void {
+    suspend {
+        var task = executor.Task.init(@frame());
+        const batch = executor.Batch.from(&task);
+        worker.schedule(batch);
+    }
+}
+
+pub const SpawnConfig = struct {
+    allocator: ?*std.mem.Allocator = null,
+};
+
+pub fn spawn(config: SpawnConfig, comptime asyncFn: anytype, args: anytype) !void {
     const Args = @TypeOf(args);
     const Decorator = struct {
-        fn entry(allocator: *std.mem.Allocator, fn_args: Args) void {
-            yield();
+        fn entry(allocator: *std.mem.Allocator, worker: *executor.Worker, fn_args: Args) void {
+            reschedule(worker);
             _ = @call(.{}, asyncFn, fn_args);
-            suspend allocator.destroy(@frame());
+            suspend {
+                allocator.destroy(@frame());
+            }
         }
     };
 
-    const allocator = Scheduler.instance.?.allocator;
-    var frame = allocator.create(@Frame(Decorator.entry)) catch unreachable;
-    frame.* = async Decorator.entry(allocator, args);
+    const worker = executor.Worker.getCurrent() orelse {
+        std.debug.panic("runtime.spawn() when not inside a runtime scheduler", .{});
+    };
+
+    const allocator = config.allocator orelse worker.getAllocator();
+    var frame = try allocator.create(@Frame(Decorator.entry));
+    frame.* = async Decorator.entry(allocator, worker, args);
 }

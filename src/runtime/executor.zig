@@ -20,16 +20,12 @@ pub const Task = struct {
 
     pub fn execute(self: *Task) void {
         if (self.runnable & 1 != 0) {
-            return (blk: {
-                @setRuntimeSafety(false);
-                break :blk @intToPtr(Callback, self.runnable & ~@as(usize, 1));
-            })(self);
+            const callback = @intToPtr(Callback, self.runnable & ~@as(usize, 1));
+            return (callback)(self);
         }
 
-        resume blk: {
-            @setRuntimeSafety(false);
-            break :blk @intToPtr(anyframe, self.runnable);
-        };
+        const frame = @intToPtr(anyframe, self.runnable);
+        resume frame;
     }
 
     pub fn toBatch(self: *Task) Batch {
@@ -351,7 +347,7 @@ pub const Scheduler = struct {
 
         var remaining_attempts: u8 = 3;
         var is_resuming = is_caller_resuming;
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
 
         while (true) {
             if (counter.state == .shutdown) {
@@ -376,8 +372,8 @@ pub const Scheduler = struct {
                     &self.counter,
                     counter.pack(),
                     new_counter.pack(),
-                    .Monotonic,
-                    .Monotonic,
+                    .AcqRel,
+                    .Acquire,
                 )) |updated| {
                     counter = Counter.unpack(updated);
                     continue;
@@ -423,8 +419,8 @@ pub const Scheduler = struct {
                 &self.counter,
                 counter.pack(),
                 new_counter.pack(),
-                .Monotonic,
-                .Monotonic,
+                .AcqRel,
+                .Acquire,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -443,7 +439,7 @@ pub const Scheduler = struct {
     fn trySuspendWorker(self: *Scheduler, worker: *Worker, is_resuming: bool) Suspend {
         const max_workers = self.max_workers;
         const is_main_worker = worker.thread == null;
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
 
         while (true) {
             const has_resumables = counter.idle > 0 or counter.spawned < max_workers;
@@ -474,7 +470,7 @@ pub const Scheduler = struct {
                 counter.pack(),
                 new_counter.pack(),
                 .AcqRel,
-                .Monotonic,
+                .Acquire,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -513,7 +509,7 @@ pub const Scheduler = struct {
     }
 
     pub fn shutdown(self: *Scheduler) void {
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
         while (true) {
             if (counter.state == .shutdown) {
                 return;
@@ -526,8 +522,8 @@ pub const Scheduler = struct {
                 &self.counter,
                 counter.pack(),
                 new_counter.pack(),
+                .AcqRel,
                 .Acquire,
-                .Monotonic,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -544,7 +540,7 @@ pub const Scheduler = struct {
     const IDLE_WAITING: usize = ~(IDLE_EMPTY | IDLE_NOTIFIED | IDLE_SHUTDOWN);
 
     fn idleWait(self: *Scheduler, worker: *Worker) void {
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Monotonic);
+        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN) {
@@ -557,16 +553,13 @@ pub const Scheduler = struct {
                     &self.idle_queue,
                     idle_queue,
                     IDLE_EMPTY,
-                    .Monotonic,
-                    .Monotonic,
+                    .AcqRel,
+                    .Acquire,
                 ) orelse return;
                 continue;
             }
 
-            worker.idle_next = blk: {
-                @setRuntimeSafety(false);
-                break :blk @intToPtr(?*Worker, idle_queue & IDLE_WAITING);
-            };
+            worker.idle_next = @intToPtr(?*Worker, idle_queue & IDLE_WAITING);
 
             idle_queue = @cmpxchgWeak(
                 usize,
@@ -574,7 +567,7 @@ pub const Scheduler = struct {
                 idle_queue,
                 @ptrToInt(worker),
                 .Release,
-                .Monotonic,
+                .Acquire,
             ) orelse return worker.event.wait();
         }
     }
@@ -593,38 +586,32 @@ pub const Scheduler = struct {
                     &self.idle_queue,
                     idle_queue,
                     IDLE_NOTIFIED,
-                    .Acquire,
+                    .AcqRel,
                     .Acquire,
                 ) orelse return;
                 continue;
             }
 
-            const worker = blk: {
-                @setRuntimeSafety(false);
-                break :blk @intToPtr(*Worker, idle_queue & IDLE_WAITING);
-            };
+            const worker = @intToPtr(*Worker, idle_queue & IDLE_WAITING);
 
             idle_queue = @cmpxchgWeak(
                 usize,
                 &self.idle_queue,
                 idle_queue,
                 @ptrToInt(worker.idle_next),
-                .Acquire,
+                .AcqRel,
                 .Acquire,
             ) orelse return worker.event.set();
         }
     }
 
     fn idleShutdown(self: *Scheduler) void {
-        const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .Acquire);
+        const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
 
         var idle_workers = switch (idle_queue) {
             IDLE_NOTIFIED => null,
             IDLE_SHUTDOWN => std.debug.panic("idle_queue shutdown multiple times", .{}),
-            else => blk: {
-                @setRuntimeSafety(false);
-                break :blk @intToPtr(?*Worker, idle_queue & IDLE_WAITING);
-            },
+            else => @intToPtr(?*Worker, idle_queue & IDLE_WAITING),
         };
 
         while (idle_workers) |idle_worker| {

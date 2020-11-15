@@ -2,7 +2,6 @@ const std = @import("std");
 
 pub const executor = @import("./executor.zig");
 pub const Lock = @import("./lock.zig").Lock;
-pub const Semaphore = @import("./semaphore.zig").Semaphore;
 
 fn ReturnTypeOf(comptime asyncFn: anytype) type {
     return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
@@ -27,7 +26,7 @@ pub fn run(config: executor.Scheduler.RunConfig, comptime asyncFn: anytype, args
     var result: ?ReturnTypeOf(asyncFn) = null;
     var frame = async Decorator.entry(&task, &result, args);
 
-    try executor.Scheduler.run(config, task.toBatch());
+    executor.Scheduler.run(config, task.toBatch());
     
     return result orelse error.DeadLocked;
 }

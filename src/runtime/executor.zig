@@ -540,6 +540,7 @@ pub const Scheduler = struct {
     const IDLE_WAITING: usize = ~(IDLE_EMPTY | IDLE_NOTIFIED | IDLE_SHUTDOWN);
 
     fn idleWait(self: *Scheduler, worker: *Worker) void {
+        @setCold(true);
         var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
 
         while (true) {
@@ -573,10 +574,15 @@ pub const Scheduler = struct {
     }
 
     fn idleNotify(self: *Scheduler) void {
+        @setCold(true);
         var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN) {
+                return;
+            }
+
+            if (idle_queue == IDLE_NOTIFIED) {
                 return;
             }
 
@@ -606,6 +612,7 @@ pub const Scheduler = struct {
     }
 
     fn idleShutdown(self: *Scheduler) void {
+        @setCold(true);
         const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
 
         var idle_workers = switch (idle_queue) {

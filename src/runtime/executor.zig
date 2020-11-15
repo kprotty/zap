@@ -105,7 +105,6 @@ pub const Worker = struct {
     join_event: std.AutoResetEvent = std.AutoResetEvent{},
     run_queue_overflow: UnboundedTaskQueue = undefined,
     run_queue: BoundedTaskQueue = undefined,
-    idle_queue: Semaphore = Semaphore{},
     next: ?*Worker = null,
     scheduler: *Scheduler,
     thread: ?*std.Thread,
@@ -168,7 +167,7 @@ pub const Worker = struct {
             if (@atomicLoad(bool, &scheduler.is_shutdown, .Acquire)) {
                 break;
             } else {
-                self.idle_queue.wait();
+                scheduler.idle_queue.wait();
             }
         }
 

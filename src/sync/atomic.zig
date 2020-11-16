@@ -1,5 +1,5 @@
 const builtin = @import("builtin");
-const core = @import("../core.zig");
+const core = @import("./sync.zig").core;
 
 pub fn spinLoopHint() void {
     if (core.is_x86) {

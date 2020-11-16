@@ -1,7 +1,11 @@
 const std = @import("std");
 
+const atomic = @import("../sync/sync.zig").core.atomic;
+const spinLoopHint = atomic.spinLoopHint;
+const Atomic = atomic.Atomic;
+
 pub const Task = struct {
-    next: ?*Task = undefined,
+    next_ptr: ?*Task = undefined,
     runnable: usize,
 
     pub fn init(frame: anyframe) Task {
@@ -31,6 +35,10 @@ pub const Task = struct {
     pub fn toBatch(self: *Task) Batch {
         return Batch.from(self);
     }
+
+    inline fn next(self: *Task) *Atomic(?*Task) {
+        return @ptrCast(*Atomic(?*Task), &self.next_ptr);
+    }
 };
 
 pub const Batch = struct {
@@ -42,7 +50,7 @@ pub const Batch = struct {
             return batchable;
 
         if (@TypeOf(batchable) == *Task) {
-            batchable.next = null;
+            batchable.next().set(null);
             return Batch{
                 .head = batchable,
                 .tail = batchable,
@@ -70,7 +78,7 @@ pub const Batch = struct {
         if (self.isEmpty()) {
             self.* = other;
         } else {
-            self.tail.next = other.head;
+            self.tail.next().set(other.head);
             self.tail = other.tail;
         }
     }
@@ -80,7 +88,7 @@ pub const Batch = struct {
         if (self.isEmpty()) {
             self.* = other;
         } else {
-            other.tail.next = self.head;
+            other.tail.next().set(self.head);
             self.head = other.head;
         }
     }
@@ -91,7 +99,7 @@ pub const Batch = struct {
 
     pub fn popFront(self: *Batch) ?*Task {
         const task = self.head orelse return null;
-        self.head = task.next;
+        self.head = task.next().get();
         return task;
     }
 };
@@ -144,16 +152,14 @@ pub const Worker = struct {
         tls_current = &self;
         defer tls_current = old_tls_current;
 
-        var active_queue = @atomicLoad(?*Worker, &scheduler.active_queue, .Monotonic);
+        var active_queue = scheduler.active_queue.load(.relaxed);
         while (true) {
             self.active_next = active_queue;
-            active_queue = @cmpxchgWeak(
-                ?*Worker,
-                &scheduler.active_queue,
+            active_queue = scheduler.active_queue.tryCompareAndSwap(
                 active_queue,
                 &self,
-                .Release,
-                .Monotonic,
+                .release,
+                .relaxed,
             ) orelse break;
         }
 
@@ -208,13 +214,9 @@ pub const Worker = struct {
             return task;
         }
 
-        var num_workers = blk: {
-            const counter_value = @atomicLoad(u32, &scheduler.counter, .Monotonic);
-            const counter = Scheduler.Counter.unpack(counter_value);
-            break :blk counter.spawned;
-        };
+        var active_workers = scheduler.getActiveWorkers();
+        while (active_workers > 0) : (active_workers -= 1) {
 
-        while (num_workers > 0) : (num_workers -= 1) {
             const target_worker = workers.next() orelse blk: {
                 workers.* = scheduler.getWorkers();
                 break :blk workers.next() orelse unreachable;
@@ -265,9 +267,9 @@ pub const Worker = struct {
 pub const Scheduler = struct {
     max_workers: u16,
     main_worker: ?*Worker = null,
-    idle_queue: usize = IDLE_EMPTY,
-    active_queue: ?*Worker = null,
-    counter: u32 = (Counter{}).pack(),
+    idle_queue: Atomic(usize) = Atomic(usize).init(IDLE_EMPTY),
+    active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+    counter: Atomic(u32) = Atomic(u32).init((Counter{}).pack()),
     run_queue: UnboundedTaskQueue = undefined,
 
     const Counter = struct {
@@ -323,7 +325,7 @@ pub const Scheduler = struct {
     }
 
     pub fn getWorkers(self: *Scheduler) WorkerIter {
-        const active_worker = @atomicLoad(?*Worker, &self.active_queue, .Acquire);
+        const active_worker = self.active_queue.load(.acquire);
         return WorkerIter{ .worker = active_worker };
     }
 
@@ -337,6 +339,12 @@ pub const Scheduler = struct {
         }
     };
 
+    fn getActiveWorkers(self: *const Scheduler) u16 {
+        const count = self.counter.load(.acquire);
+        const counter = Counter.unpack(count);
+        return counter.spawned;
+    }
+
     pub fn schedule(self: *Scheduler, batch: Batch) void {
         self.run_queue.push(batch);
         _ = self.tryResumeWorker(false);
@@ -347,7 +355,7 @@ pub const Scheduler = struct {
 
         var remaining_attempts: u8 = 3;
         var is_resuming = is_caller_resuming;
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
+        var counter = Counter.unpack(self.counter.load(.acquire));
 
         while (true) {
             if (counter.state == .shutdown) {
@@ -367,13 +375,11 @@ pub const Scheduler = struct {
                     new_counter.spawned += 1;
                 }
 
-                if (@cmpxchgWeak(
-                    u32,
-                    &self.counter,
+                if (self.counter.tryCompareAndSwap(
                     counter.pack(),
                     new_counter.pack(),
-                    .AcqRel,
-                    .Acquire,
+                    .acq_rel,
+                    .acquire,
                 )) |updated| {
                     counter = Counter.unpack(updated);
                     continue;
@@ -395,9 +401,9 @@ pub const Scheduler = struct {
                     return true;
                 }
 
-                std.SpinLock.loopHint(1);
+                spinLoopHint();
                 remaining_attempts -= 1;
-                counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+                counter = Counter.unpack(self.counter.load(.acquire));
                 continue;
             }
 
@@ -414,13 +420,11 @@ pub const Scheduler = struct {
 
             var new_counter = counter;
             new_counter.state = new_state;
-            if (@cmpxchgWeak(
-                u32,
-                &self.counter,
+            if (self.counter.tryCompareAndSwap(
                 counter.pack(),
                 new_counter.pack(),
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -439,7 +443,7 @@ pub const Scheduler = struct {
     fn trySuspendWorker(self: *Scheduler, worker: *Worker, is_resuming: bool) Suspend {
         const max_workers = self.max_workers;
         const is_main_worker = worker.thread == null;
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
+        var counter = Counter.unpack(self.counter.load(.acquire));
 
         while (true) {
             const has_resumables = counter.idle > 0 or counter.spawned < max_workers;
@@ -464,13 +468,11 @@ pub const Scheduler = struct {
                 self.main_worker = worker;
             }
 
-            if (@cmpxchgWeak(
-                u32,
-                &self.counter,
+            if (self.counter.tryCompareAndSwap(
                 counter.pack(),
                 new_counter.pack(),
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -509,7 +511,9 @@ pub const Scheduler = struct {
     }
 
     pub fn shutdown(self: *Scheduler) void {
-        var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
+        @setCold(true);
+        var counter = Counter.unpack(self.counter.load(.acquire));
+
         while (true) {
             if (counter.state == .shutdown) {
                 return;
@@ -517,13 +521,11 @@ pub const Scheduler = struct {
 
             var new_counter = counter;
             new_counter.state = .shutdown;
-            if (@cmpxchgWeak(
-                u32,
-                &self.counter,
+            if (self.counter.tryCompareAndSwap(
                 counter.pack(),
                 new_counter.pack(),
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             )) |updated| {
                 counter = Counter.unpack(updated);
                 continue;
@@ -541,7 +543,7 @@ pub const Scheduler = struct {
 
     fn idleWait(self: *Scheduler, worker: *Worker) void {
         @setCold(true);
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+        var idle_queue = self.idle_queue.load(.acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN) {
@@ -549,33 +551,29 @@ pub const Scheduler = struct {
             }
 
             if (idle_queue == IDLE_NOTIFIED) {
-                idle_queue = @cmpxchgWeak(
-                    usize,
-                    &self.idle_queue,
+                idle_queue = self.idle_queue.tryCompareAndSwap(
                     idle_queue,
                     IDLE_EMPTY,
-                    .AcqRel,
-                    .Acquire,
+                    .acq_rel,
+                    .acquire,
                 ) orelse return;
                 continue;
             }
 
             worker.idle_next = @intToPtr(?*Worker, idle_queue & IDLE_WAITING);
 
-            idle_queue = @cmpxchgWeak(
-                usize,
-                &self.idle_queue,
+            idle_queue = self.idle_queue.tryCompareAndSwap(
                 idle_queue,
                 @ptrToInt(worker),
-                .Release,
-                .Acquire,
+                .release,
+                .acquire,
             ) orelse return worker.event.wait();
         }
     }
 
     fn idleNotify(self: *Scheduler) void {
         @setCold(true);
-        var idle_queue = @atomicLoad(usize, &self.idle_queue, .Acquire);
+        var idle_queue = self.idle_queue.load(.acquire);
 
         while (true) {
             if (idle_queue == IDLE_SHUTDOWN) {
@@ -587,33 +585,29 @@ pub const Scheduler = struct {
             }
 
             if (idle_queue == IDLE_EMPTY) {
-                idle_queue = @cmpxchgWeak(
-                    usize,
-                    &self.idle_queue,
+                idle_queue = self.idle_queue.tryCompareAndSwap(
                     idle_queue,
                     IDLE_NOTIFIED,
-                    .AcqRel,
-                    .Acquire,
+                    .acq_rel,
+                    .acquire,
                 ) orelse return;
                 continue;
             }
 
             const worker = @intToPtr(*Worker, idle_queue & IDLE_WAITING);
 
-            idle_queue = @cmpxchgWeak(
-                usize,
-                &self.idle_queue,
+            idle_queue = self.idle_queue.tryCompareAndSwap(
                 idle_queue,
                 @ptrToInt(worker.idle_next),
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             ) orelse return worker.event.set();
         }
     }
 
     fn idleShutdown(self: *Scheduler) void {
         @setCold(true);
-        const idle_queue = @atomicRmw(usize, &self.idle_queue, .Xchg, IDLE_SHUTDOWN, .AcqRel);
+        const idle_queue = self.idle_queue.swap(IDLE_SHUTDOWN, .acq_rel);
 
         var idle_workers = switch (idle_queue) {
             IDLE_NOTIFIED => null,
@@ -630,42 +624,40 @@ pub const Scheduler = struct {
 };
 
 const UnboundedTaskQueue = struct {
-    head: usize,
-    tail: *Task,
+    head: Atomic(usize),
+    tail: Atomic(*Task),
     stub: Task,
 
     fn init(self: *UnboundedTaskQueue) void {
-        self.head = @ptrToInt(&self.stub);
-        self.tail = &self.stub;
-        self.stub.next = null;
+        self.head.set(@ptrToInt(&self.stub));
+        self.tail.set(&self.stub);
+        self.stub.next().set(null);
     }
 
     fn push(self: *UnboundedTaskQueue, batch: Batch) void {
         if (batch.isEmpty())
             return;
 
-        batch.tail.next = null;
-        const prev = @atomicRmw(*Task, &self.tail, .Xchg, batch.tail, .AcqRel);
-        @atomicStore(?*Task, &prev.next, batch.head, .Release);
+        batch.tail.next().set(null);
+        const prev = self.tail.swap(batch.tail, .acq_rel);
+        prev.next().store(batch.head, .release);
     }
 
     fn tryAcquireConsumer(self: *UnboundedTaskQueue) ?Consumer {
         const stub = &self.stub;
-        var head = @atomicLoad(usize, &self.head, .Monotonic);
+        var head = self.head.load(.relaxed);
 
         while (true) {
             if (head & 1 != 0)
                 return null;
-            if (@atomicLoad(*Task, &self.tail, .Monotonic) == stub)
+            if (self.tail.load(.relaxed) == stub)
                 return null;
 
-            head = @cmpxchgWeak(
-                usize,
-                &self.head,
+            head = self.head.tryCompareAndSwap(
                 head,
                 head | 1,
-                .Acquire,
-                .Monotonic,
+                .acquire,
+                .relaxed,
             ) orelse break;
         }
 
@@ -682,18 +674,18 @@ const UnboundedTaskQueue = struct {
         head: *Task,
 
         fn release(self: Consumer) void {
-            const head = @ptrToInt(self.head);
-            @atomicStore(usize, &self.queue.head, head, .Release);
+            const new_head = @ptrToInt(self.head);
+            self.queue.head.store(new_head, .release);
         }
 
         fn pop(self: *Consumer) ?*Task {
             var head = self.head;
-            var next = @atomicLoad(?*Task, &head.next, .Acquire);
+            var next = head.next().load(.acquire);
 
             if (head == self.stub) {
                 head = next orelse return null;
                 self.head = head;
-                next = @atomicLoad(?*Task, &head.next, .Acquire);
+                next = head.next().load(.acquire);
             }
 
             if (next) |new_head| {
@@ -701,14 +693,14 @@ const UnboundedTaskQueue = struct {
                 return head;
             }
 
-            const tail = @atomicLoad(*Task, &self.queue.tail, .Monotonic);
+            const tail = self.queue.tail.load(.relaxed);
             if (head != tail) {
                 return null;
             }
 
             self.queue.push(self.stub.toBatch());
 
-            next = @atomicLoad(?*Task, &head.next, .Acquire);
+            next = head.next().load(.acquire);
             if (next) |new_head| {
                 self.head = new_head;
                 return head;
@@ -720,9 +712,9 @@ const UnboundedTaskQueue = struct {
 };
 
 const BoundedTaskQueue = struct {
-    head: usize = 0,
-    tail: usize = 0,
-    buffer: [256]*Task = undefined,
+    head: Atomic(usize) = Atomic(usize).init(0),
+    tail: Atomic(usize) = Atomic(usize).init(0),
+    buffer: [256]Atomic(*Task) = undefined,
 
     fn init(self: *BoundedTaskQueue) void {
         self.* = BoundedTaskQueue{};
@@ -730,8 +722,8 @@ const BoundedTaskQueue = struct {
 
     fn push(self: *BoundedTaskQueue, tasks: Batch) ?Batch {
         var batch = tasks;
-        var tail = self.tail;
-        var head = @atomicLoad(usize, &self.head, .Acquire);
+        var tail = self.tail.get();
+        var head = self.head.load(.acquire);
 
         while (true) {
             if (batch.isEmpty())
@@ -743,25 +735,23 @@ const BoundedTaskQueue = struct {
 
                 while (open_slots > 0) : (open_slots -= 1) {
                     const task = batch.pop() orelse break;
-                    @atomicStore(*Task, &self.buffer[tail % self.buffer.len], task, .Unordered);
+                    self.buffer[tail % self.buffer.len].store(task, .unordered);
                     tail +%= 1;
                 }
 
-                @atomicStore(usize, &self.tail, tail, .Release);
-                std.SpinLock.loopHint(1);
-                head = @atomicLoad(usize, &self.head, .Acquire);
+                self.tail.store(tail, .release);
+                spinLoopHint();
+                head = self.head.load(.acquire);
                 continue;
             }
 
             const migrate = self.buffer.len / 2;
             const new_head = head +% migrate;
-            if (@cmpxchgWeak(
-                usize,
-                &self.head,
+            if (self.head.tryCompareAndSwap(
                 head,
                 new_head,
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             )) |updated| {
                 head = updated;
                 continue;
@@ -769,7 +759,7 @@ const BoundedTaskQueue = struct {
 
             var overflowed = Batch{};
             while (head != new_head) : (head +%= 1) {
-                const task = self.buffer[head % self.buffer.len];
+                const task = self.buffer[head % self.buffer.len].get();
                 overflowed.push(task);
             }
 
@@ -779,21 +769,19 @@ const BoundedTaskQueue = struct {
     }
 
     fn pop(self: *BoundedTaskQueue) ?*Task {
-        var tail = self.tail;
-        var head = @atomicLoad(usize, &self.head, .Acquire);
+        var tail = self.tail.get();
+        var head = self.head.load(.acquire);
 
         while (true) {
             if (tail == head)
                 return null;
 
-            const task = self.buffer[head % self.buffer.len];
-            head = @cmpxchgWeak(
-                usize,
-                &self.head,
+            const task = self.buffer[head % self.buffer.len].get();
+            head = self.head.tryCompareAndSwap(
                 head,
                 head +% 1,
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             ) orelse return task;
         }
     }
@@ -802,51 +790,49 @@ const BoundedTaskQueue = struct {
         if (target == self)
             return self.pop();
 
-        const tail = self.tail;
-        const head = @atomicLoad(usize, &self.head, .Acquire);
+        const tail = self.tail.get();
+        const head = self.head.load(.acquire);
         if (tail != head)
             return self.pop();
 
-        var target_head = @atomicLoad(usize, &target.head, .Acquire);
+        var target_head = target.head.load(.acquire);
         while (true) {
-            const target_tail = @atomicLoad(usize, &target.tail, .Acquire);
+            const target_tail = target.tail.load(.acquire);
             const target_size = target_tail -% target_head;
             if (target_size == 0)
                 return null;
 
             var steal = target_size - (target_size / 2);
             if (steal > target.buffer.len / 2) {
-                std.SpinLock.loopHint(1);
-                target_head = @atomicLoad(usize, &target.head, .Acquire);
+                spinLoopHint();
+                target_head = target.head.load(.acquire);
                 continue;
             }
 
-            const first_task = @atomicLoad(*Task, &target.buffer[target_head % target.buffer.len], .Unordered);
+            const first_task = target.buffer[target_head % target.buffer.len].load(.unordered);
             var new_target_head = target_head +% 1;
             var new_tail = tail;
             steal -= 1;
 
             while (steal > 0) : (steal -= 1) {
-                const task = @atomicLoad(*Task, &target.buffer[new_target_head % target.buffer.len], .Unordered);
+                const task = target.buffer[new_target_head % target.buffer.len].load(.unordered);
                 new_target_head +%= 1;
-                @atomicStore(*Task, &self.buffer[new_tail % self.buffer.len], task, .Unordered);
+                self.buffer[new_tail % self.buffer.len].store(task, .unordered);
                 new_tail +%= 1;
             }
 
-            if (@cmpxchgWeak(
-                usize,
-                &target.head,
+            if (target.head.tryCompareAndSwap(
                 target_head,
                 new_target_head,
-                .AcqRel,
-                .Acquire,
+                .acq_rel,
+                .acquire,
             )) |updated| {
                 target_head = updated;
                 continue;
             }
 
             if (new_tail != tail)
-                @atomicStore(usize, &self.tail, new_tail, .Release);
+                self.tail.store(new_tail, .release);
             return first_task;
         }
     }
@@ -856,18 +842,18 @@ const BoundedTaskQueue = struct {
         defer consumer.release();
 
         const first_task = consumer.pop() orelse return null;
-        const head = @atomicLoad(usize, &self.head, .Monotonic);
-        const tail = self.tail;
+        const head = self.head.load(.acquire);
+        const tail = self.tail.get();
 
         var new_tail = tail;
         while (new_tail -% head < self.buffer.len) {
             const task = consumer.pop() orelse break;
-            @atomicStore(*Task, &self.buffer[new_tail % self.buffer.len], task, .Unordered);
+            self.buffer[new_tail % self.buffer.len].store(task, .unordered);
             new_tail +%= 1;
         }
 
         if (new_tail != tail)
-            @atomicStore(usize, &self.tail, new_tail, .Release);
+            self.tail.store(new_tail, .release);
         return first_task;
     }
 };

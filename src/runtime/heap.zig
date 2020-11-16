@@ -1,5 +1,6 @@
 const std = @import("std");
 const Lock = @import("./lock.zig").Lock;
+const Atomic = @import("../sync/sync.zig").core.atomic.Atomic;
 
 const InnerHeap = 
     if (std.builtin.os.tag == .windows) WindowsHeap
@@ -7,21 +8,20 @@ const InnerHeap =
     else ThreadSafeHeap;
 
 var init_lock = Lock{};
-var is_init: bool = false;
+var is_init = Atomic(bool).init(false);
 var global_heap: InnerHeap = undefined;
 
 pub fn getAllocator() *std.mem.Allocator {
-    if (@atomicLoad(bool, &is_init, .SeqCst))
+    if (is_init.load(.seq_cst))
         return global_heap.getAllocator();
 
     init_lock.acquire();
     defer init_lock.release();
 
-    if (@atomicLoad(bool, &is_init, .SeqCst))
-        return global_heap.getAllocator();
-
-    global_heap.init();
-    @atomicStore(bool, &is_init, true, .SeqCst);
+    if (!is_init.load(.seq_cst)) {
+        global_heap.init();
+        is_init.store(true, .seq_cst);
+    }
 
     return global_heap.getAllocator();
 }

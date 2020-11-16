@@ -21,24 +21,16 @@ pub const Event = struct {
     }
 
     pub fn yield(iteration: ?usize) bool {
-        var iter = iteration orelse {
+        const iter = iteration orelse {
             _ = system.SleepEx(1, system.FALSE);
             return false;
         };
 
-        if (iter >= 10) {
+        if (iter < 4000) {
             spinLoopHint();
-            return false;
+            return true;
         }
 
-        if (iter <= 5) {
-            var spin = @as(usize, 1) << @intCast(u3, iter);
-            while (spin > 0) : (spin -= 1)
-                spinLoopHint();
-        } else {
-            _ = system.SleepEx(0, system.FALSE);
-        }
-
-        return true;
+        return false;
     }
 };

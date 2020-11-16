@@ -303,23 +303,23 @@ pub const Scheduler = struct {
     }; 
 
     pub const RunConfig = struct {
-        threads: ?u16 = null,
+        max_threads: ?u16 = null,
     };
 
     pub fn run(config: RunConfig, batch: Batch) void {
         if (batch.isEmpty())
             return;
 
-        const threads = std.math.min(std.math.maxInt(u14), (
+        const max_threads = std.math.min(std.math.maxInt(u14), (
             if (std.builtin.single_threaded) 
                 @as(u16, 1)
-            else if (config.threads) |threads|
-                std.math.max(1, threads)
+            else if (config.max_threads) |max_threads|
+                std.math.max(1, max_threads)
             else 
                 @intCast(u16, std.Thread.cpuCount() catch 1)
         ));
 
-        var self = Scheduler{ .max_workers = threads };
+        var self = Scheduler{ .max_workers = max_threads };
         self.run_queue.init();
         self.schedule(batch);
     }

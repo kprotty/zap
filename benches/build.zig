@@ -15,8 +15,8 @@ pub fn build(b: *std.build.Builder) void {
             zig_exe.linkLibC();
 
         zig_exe.addPackage(.{
-            .name = "ziggo",
-            .path = "../src/ziggo.zig",
+            .name = "zap",
+            .path = "../src/zap.zig",
         });
 
         zig_exe.single_threaded = single_threaded;

@@ -7,7 +7,11 @@ fn ReturnTypeOf(comptime asyncFn: anytype) type {
     return @typeInfo(@TypeOf(asyncFn)).Fn.return_type.?;
 }
 
-pub fn run(config: executor.Scheduler.RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
+pub const RunConfig = struct {
+    max_threads: ?u16 = null,
+};
+
+pub fn run(config: RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     const Args = @TypeOf(args);
     const Decorator = struct {
         fn entry(task_ptr: *executor.Task, result_ptr: *?ReturnTypeOf(asyncFn), fn_args: Args) void {
@@ -26,7 +30,10 @@ pub fn run(config: executor.Scheduler.RunConfig, comptime asyncFn: anytype, args
     var result: ?ReturnTypeOf(asyncFn) = null;
     var frame = async Decorator.entry(&task, &result, args);
 
-    executor.Scheduler.run(config, task.toBatch());
+    executor.Scheduler.run(
+        executor.Scheduler.RunConfig{ .max_threads = config.max_threads },
+        task.toBatch(),
+    );
     
     return result orelse error.DeadLocked;
 }

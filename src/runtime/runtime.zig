@@ -38,26 +38,25 @@ pub fn run(config: RunConfig, comptime asyncFn: anytype, args: anytype) !ReturnT
     return result orelse error.DeadLocked;
 }
 
-pub fn schedule(batchable: anytype) void {
-    const worker = executor.Worker.getCurrent() orelse {
-        std.debug.panic("runtime.schedule() when not inside a runtime scheduler", .{});
+pub fn getWorker() *executor.Worker {
+    return executor.Worker.getCurrent() orelse {
+        std.debug.panic("runtime.getWorker() called when not inside a runtime scheduler thread", .{});
     };
-    worker.schedule(executor.Batch.from(batchable));
+}
+
+pub fn schedule(batchable: anytype, hints: executor.Worker.ScheduleHints) void {
+    getWorker().schedule(executor.Batch.from(batchable), hints);
+}
+
+pub fn reschedule(hints: executor.Worker.ScheduleHints) void {
+    suspend {
+        var task = executor.Task.init(@frame());
+        schedule(&task, hints);
+    }
 }
 
 pub fn yield() void {
-    const worker = executor.Worker.getCurrent() orelse {
-        std.debug.panic("runtime.yield() when not inside a runtime scheduler", .{});
-    };
-    reschedule(worker);
-}
-
-fn reschedule(worker: *executor.Worker) void {
-    suspend {
-        var task = executor.Task.init(@frame());
-        const batch = executor.Batch.from(&task);
-        worker.schedule(batch);
-    }
+    reschedule(.{});
 }
 
 pub const SpawnConfig = struct {
@@ -67,8 +66,8 @@ pub const SpawnConfig = struct {
 pub fn spawn(config: SpawnConfig, comptime asyncFn: anytype, args: anytype) !void {
     const Args = @TypeOf(args);
     const Decorator = struct {
-        fn entry(allocator: *std.mem.Allocator, worker: *executor.Worker, fn_args: Args) void {
-            reschedule(worker);
+        fn entry(allocator: *std.mem.Allocator, fn_args: Args) void {
+            reschedule(.{ .use_lifo = true });
             _ = @call(.{}, asyncFn, fn_args);
             suspend {
                 allocator.destroy(@frame());
@@ -76,11 +75,7 @@ pub fn spawn(config: SpawnConfig, comptime asyncFn: anytype, args: anytype) !voi
         }
     };
 
-    const worker = executor.Worker.getCurrent() orelse {
-        std.debug.panic("runtime.spawn() when not inside a runtime scheduler", .{});
-    };
-
-    const allocator = config.allocator orelse worker.getAllocator();
+    const allocator = config.allocator orelse getWorker().getAllocator();
     var frame = try allocator.create(@Frame(Decorator.entry));
-    frame.* = async Decorator.entry(allocator, worker, args);
+    frame.* = async Decorator.entry(allocator, args);
 }

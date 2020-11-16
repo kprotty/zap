@@ -106,6 +106,7 @@ pub const Batch = struct {
 
 pub const Worker = struct {
     event: std.AutoResetEvent align(EVENT_ALIGN) = std.AutoResetEvent{},
+    run_queue_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
     run_queue_overflow: UnboundedTaskQueue = undefined,
     run_queue: BoundedTaskQueue = undefined,
     active_next: ?*Worker = null,
@@ -202,6 +203,12 @@ pub const Worker = struct {
             }
         }
 
+        if (self.run_queue_lifo.load(.relaxed) != null) {
+            if (self.run_queue_lifo.swap(null, .acquire)) |lifo_task| {
+                return lifo_task;
+            }
+        }
+
         if (self.run_queue.pop()) |task| {
             return task;
         }
@@ -230,6 +237,12 @@ pub const Worker = struct {
 
             if (self.run_queue.popAndStealFromUnbounded(&target_worker.run_queue_overflow)) |task|
                 return task;
+
+            if (target_worker.run_queue_lifo.load(.relaxed) != null) {
+                if (target_worker.run_queue_lifo.swap(null, .acquire)) |lifo_task| {
+                    return lifo_task;
+                }
+            }
         }
 
         if (self.run_queue.popAndStealFromUnbounded(&scheduler.run_queue)) |task| {
@@ -252,12 +265,24 @@ pub const Worker = struct {
         return @import("./heap.zig").getAllocator();
     }
 
-    pub fn schedule(self: *Worker, batch: Batch) void {
+    pub const ScheduleHints = struct {
+        use_lifo: bool = false,
+    };
+
+    pub fn schedule(self: *Worker, tasks: Batch, hints: ScheduleHints) void {
+        var batch = tasks;
         if (batch.isEmpty())
             return;
 
-        if (self.run_queue.push(batch)) |overflowed|
-            self.run_queue_overflow.push(overflowed);
+        if (hints.use_lifo) {
+            if (self.run_queue_lifo.swap(batch.pop(), .acq_rel)) |old_lifo|
+                batch.pushFront(old_lifo);
+        }
+
+        if (!batch.isEmpty()) {
+            if (self.run_queue.push(batch)) |overflowed|
+                self.run_queue_overflow.push(overflowed);
+        }
 
         const scheduler = self.getScheduler();
         _ = scheduler.tryResumeWorker(false);

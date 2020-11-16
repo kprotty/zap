@@ -24,7 +24,8 @@ pub const WaitGroup = struct {
             break :blk self.waiter;
         };
 
-        runtime.schedule(waiter orelse return);
+        const task = waiter orelse return;
+        runtime.schedule(task, .{ .use_lifo = true });
     }
 
     pub fn wait(self: *WaitGroup) void {

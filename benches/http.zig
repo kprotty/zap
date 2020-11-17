@@ -98,7 +98,7 @@ const Client = struct {
                             0 => rc,
                             std.os.EACCES => return error.AccessDenied,
                             std.os.EAGAIN => {
-                                try self.socket.writers.wait();
+                                try self.socket.writers.wait(.{ .use_lifo = true });
                                 continue :retry;
                             },
                             std.os.EALREADY => return error.FastOpenAlreadyInProgress,
@@ -139,7 +139,7 @@ const Client = struct {
 
         defer if (buf_alloc) self.allocator.free(buf);
         defer self.counter.shutdown();
-
+        
         var requests: usize = 0;
         while (true) {
             const clrf = "\r\n\r\n";
@@ -158,12 +158,15 @@ const Client = struct {
                 }
 
                 const bytes = blk: {
-                    self.counter.notify(requests);
-                    requests = 0;
+                    if (requests > 0) {
+                        self.counter.notify(requests);
+                        requests = 0;
+                    }
+
                     retry: while (true) {
                         break :blk std.os.read(self.socket.fd, buf[buf_len..]) catch |err| switch (err) {
                             error.WouldBlock => {
-                                self.socket.readers.wait() catch |e| return e;
+                                try self.socket.readers.wait(.{});
                                 continue :retry;
                             },
                             else => |e| return e,
@@ -264,6 +267,7 @@ const Client = struct {
                     const waiter = @intToPtr(*Waiter, state & ~@as(usize, 0b11));
                     waiter.responses = responses;
                     zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                    zap.runtime.yield();
                 }
 
                 return;
@@ -295,8 +299,8 @@ const Socket = struct {
 
     fn deinit(self: *Socket) void {
         std.os.close(self.fd);
-        while (true) self.readers.wait() catch break;
-        while (true) self.writers.wait() catch break;
+        while (true) self.readers.wait(.{}) catch break;
+        while (true) self.writers.wait(.{}) catch break;
     }
 
     fn read(self: *Socket, buffer: []u8) !usize {
@@ -328,7 +332,7 @@ const Socket = struct {
         retry: while (true) {
             return @call(.{}, func, args) catch |err| switch (err) {
                 error.WouldBlock => {
-                    port.wait() catch |e| return e;
+                    port.wait(.{ .use_lifo = port == &self.writers }) catch |e| return e;
                     continue :retry;
                 },
                 else => |e| return e,
@@ -349,7 +353,7 @@ const Socket = struct {
             task: zap.runtime.executor.Task,
         };
 
-        fn wait(self: *Port) !void {
+        fn wait(self: *Port, hints: zap.runtime.executor.Worker.ScheduleHints) !void {
             var waiter: Waiter = undefined;
             waiter.is_shutdown = false;
             waiter.task = @TypeOf(waiter.task).init(@frame());
@@ -376,7 +380,7 @@ const Socket = struct {
                         .Monotonic,
                     ) orelse {
                         if (new_state == EMPTY)
-                            zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                            zap.runtime.schedule(&waiter.task, hints);
                         break;
                     };
                 }

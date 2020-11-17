@@ -7,137 +7,282 @@ pub fn main() !void {
 
 fn asyncMain() !void {
     const allocator = std.heap.c_allocator;
+    const port = 8080;
 
-    var notify: Notify = undefined;
-    try notify.init(zap.runtime.executor.Worker.getCurrent().?.getScheduler());
-    defer notify.deinit();
+    var io_driver: IoDriver = undefined;
+    try io_driver.init(zap.runtime.getWorker().getScheduler());
+    defer io_driver.deinit();
 
-    const sfd = try std.os.socket(std.os.AF_INET, std.os.SOCK_STREAM | std.os.SOCK_NONBLOCK | std.os.SOCK_CLOEXEC, std.os.IPPROTO_TCP);
-    var server = Socket.init(sfd, &notify);
+    const server_fd = blk: {
+        const fd = try std.os.socket(
+            std.os.AF_INET, 
+            std.os.SOCK_STREAM | std.os.SOCK_NONBLOCK | std.os.SOCK_CLOEXEC,
+            std.os.IPPROTO_TCP,
+        );
+        var addr = try std.net.Address.parseIp("127.0.0.1", port);
+        try std.os.setsockopt(fd, std.os.SOL_SOCKET, std.os.SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try std.os.bind(fd, &addr.any, addr.getOsSockLen());
+        try std.os.listen(fd, 128);
+        break :blk fd;
+    };
+
+    var server = Socket{ .fd = server_fd };
+    try server.init(&io_driver);
     defer server.deinit();
 
-    var addr = try std.net.Address.parseIp("127.0.0.1", 8080);
-    try std.os.setsockopt(sfd, std.os.SOL_SOCKET, std.os.SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try std.os.bind(sfd, &addr.any, addr.getOsSockLen());
-    try std.os.listen(sfd, 128);
-
+    std.debug.warn("Listening on localhost:{}\n", .{port});
     while (true) {
-        const cfd = try server.call(true, std.os.accept, .{sfd, null, null, std.os.SOCK_NONBLOCK | std.os.SOCK_CLOEXEC});
-        const socket = Socket.init(cfd, &notify);
+
+        const client_fd = try server.call(&server.readers, std.os.accept, .{
+            server.fd,
+            null,
+            null,
+            std.os.SOCK_CLOEXEC | std.os.SOCK_NONBLOCK,
+        });
+
         zap.runtime.spawn(
             .{ .allocator = allocator },
-            handleClient,
-            .{ socket, allocator },
-        ) catch std.os.close(cfd);
+            Client.run,
+            .{ client_fd, &io_driver, allocator },
+        ) catch std.os.close(client_fd);
     }
 }
 
-fn handleClient(sock: Socket, allocator: *std.mem.Allocator) void {
-    handleHttpClient(sock, allocator) catch {};
-}
+const Client = struct {
+    socket: Socket,
+    counter: Counter = Counter{},
+    allocator: *std.mem.Allocator,
 
-fn handleHttpClient(sock: Socket, allocator: *std.mem.Allocator) !void {
-    var socket = sock;
-    var frame_buf: [2048]u8 = undefined;
+    fn run(fd: std.os.fd_t, io_driver: *IoDriver, allocator: *std.mem.Allocator) void {
+        var client = Client{
+            .socket = Socket{ .fd = fd },
+            .allocator = allocator,
+        };
 
-    var buf_len: usize = 0;
-    var buf: []u8 = &frame_buf;
-    var buf_alloc = false;
-    defer if (buf_alloc) allocator.free(buf);
+        client.socket.init(io_driver) catch return;
+        defer client.socket.deinit();
 
-    while (true) {
+        var read_frame = async client.reader();
+        var write_frame = async client.writer();
+
+        (await read_frame) catch {};
+        (await write_frame) catch {};
+    }
+
+    fn writer(self: *Client) !void {
+        zap.runtime.yield();
+
+        var responses: usize = 0;
+        var sock_writer = self.socket.writer();
+
+        while (true) {
+            while (responses > 0) : (responses -= 1) {
+                try sock_writer.writeAll("HTTP/1.1 200 Ok\r\nContent-Length: 11\r\n\r\nHello World");
+            }
+            responses += try self.counter.wait();
+        }
+    }
+
+    fn reader(self: *Client) !void {
+        zap.runtime.yield();
+
+        var frame_buf: [1024]u8 = undefined;
+        var buf_len: usize = 0;
+        var buf: []u8 = &frame_buf;
+        var buf_alloc = false;
+
+        defer if (buf_alloc) self.allocator.free(buf);
+        defer self.counter.shutdown();
+
+        var requests: usize = 0;
         while (true) {
             const clrf = "\r\n\r\n";
-            const request_end = std.mem.indexOf(u8, buf[0..buf_len], clrf) orelse {
+            const req_end = std.mem.indexOf(u8, buf[0..buf_len], clrf) orelse {
 
-                var empty = buf.len - buf_len;
+                const empty = buf.len - buf_len;
                 if (empty < buf.len / 2) {
-                    const new_buf = try allocator.alloc(u8, buf.len * 2);
+                    const new_buf = try self.allocator.alloc(u8, buf.len * 2);
                     std.mem.copy(u8, new_buf, buf[0..buf_len]);
                     if (buf_alloc) {
-                        allocator.free(buf);
+                        self.allocator.free(buf);
                     } else {
                         buf_alloc = true;
                     }
                     buf = new_buf;
                 }
 
-                // std.debug.warn("empty req at {}\n", .{buf_len});
+                const bytes = blk: {
+                    self.counter.notify(requests);
+                    requests = 0;
+                    retry: while (true) {
+                        break :blk std.os.read(self.socket.fd, buf[buf_len..]) catch |err| switch (err) {
+                            error.WouldBlock => {
+                                self.socket.readers.wait() catch |e| return e;
+                                continue :retry;
+                            },
+                            else => |e| return e,
+                        };
+                    }
+                };
 
-                const bytes = try socket.read(buf[buf_len..]);
                 if (bytes == 0) return;
                 buf_len += bytes;
                 continue;
             };
 
-            const req = request_end + clrf.len;
-            // std.debug.warn("consumed {}/{}\n", .{req, buf_len});
+            const req = req_end + clrf.len;
             std.mem.copy(u8, buf, buf[req..buf_len]);
             buf_len -= req;
-
-            try socket.writer().writeAll("HTTP/1.1 200 Ok\r\nContent-Length: 11\r\n\r\nHello World");
-            break;
+            requests += 1;
         }
     }
-}
+
+    const Counter = struct {
+        state: usize = 0,
+
+        const WAITING: usize = 1;
+        const SHUTDOWN: usize = 2;
+
+        const Waiter = struct {
+            is_closed: bool,
+            responses: usize,
+            task: zap.runtime.executor.Task,
+        };
+
+        fn wait(self: *Counter) !usize {
+            var waiter: Waiter = undefined;
+            waiter.responses = 0;
+            waiter.is_closed = false;
+            waiter.task = @TypeOf(waiter.task).init(@frame());
+
+            while (true) {
+                if (waiter.is_closed)
+                    return error.Closed;
+                if (waiter.responses > 0)
+                    return waiter.responses;
+
+                suspend {
+                    var state = @atomicLoad(usize, &self.state, .Monotonic);
+                    while (true) {
+                        waiter.is_closed = state & SHUTDOWN != 0;
+                        if (waiter.is_closed) {
+                            zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                            break;
+                        }
+                        
+                        if (state & WAITING != 0)
+                            unreachable;
+
+                        waiter.responses = state >> 2;
+                        const new_state = if (waiter.responses == 0) @ptrToInt(&waiter) | WAITING else 0;
+                        if (@cmpxchgWeak(
+                            usize,
+                            &self.state,
+                            state,
+                            new_state,
+                            .Release,
+                            .Monotonic,
+                        )) |updated| {
+                            state = updated;
+                            continue;
+                        }
+
+                        if (waiter.responses > 0)
+                            zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                        break;
+                    }
+                }
+            }
+        }
+
+        fn notify(self: *Counter, responses: usize) void {
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
+            while (true) {
+                if (state & SHUTDOWN != 0)
+                    return;
+
+                const new_state = if (state & WAITING != 0) 0 else (state + (responses << 2));
+                if (@cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    state,
+                    new_state,
+                    .Acquire,
+                    .Monotonic,
+                )) |updated| {
+                    state = updated;
+                    continue;
+                }
+
+                if (state & WAITING != 0) {
+                    const waiter = @intToPtr(*Waiter, state & ~@as(usize, 0b11));
+                    waiter.responses = responses;
+                    zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                }
+
+                return;
+            }
+        }
+
+        fn shutdown(self: *Counter) void {
+            const state = @atomicRmw(usize, &self.state, .Xchg, SHUTDOWN, .AcqRel);
+            if (state & WAITING != 0) {
+                const waiter = @intToPtr(*Waiter, state & ~@as(usize, 0b11));
+                waiter.is_closed = true;
+                zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+            }
+        }
+    };
+};
 
 const Socket = struct {
-    notify: *Notify,
     fd: std.os.socket_t,
-    is_registered: bool = false,
-    task: zap.runtime.executor.Task = undefined,
+    readers: Port = Port{},
+    writers: Port = Port{},
 
-    fn init(fd: std.os.socket_t, notify: *Notify) Socket {
-        return Socket{ .notify = notify, .fd = fd };
+    fn init(self: *Socket, io_driver: *IoDriver) !void {
+        try std.os.epoll_ctl(io_driver.efd, std.os.EPOLL_CTL_ADD, self.fd, &std.os.epoll_event{
+            .events = std.os.EPOLLIN | std.os.EPOLLOUT | std.os.EPOLLERR | std.os.EPOLLHUP | std.os.EPOLLET,
+            .data = .{ .ptr = @ptrToInt(self) },
+        });
     }
 
     fn deinit(self: *Socket) void {
-        if (!self.is_registered) {
-            std.os.close(self.fd);
-            return;
-        }
-
-        suspend {
-            self.task = @TypeOf(self.task).init(@frame());
-            if (std.os.epoll_ctl(self.notify.efd, std.os.EPOLL_CTL_MOD, self.fd, &std.os.epoll_event{
-                .events = std.os.EPOLLERR | std.os.EPOLLHUP | std.os.EPOLLONESHOT,
-                .data = .{ .ptr = @ptrToInt(&self.task) },
-            })) |_| {
-                std.os.close(self.fd);
-            } else |_| {
-                zap.runtime.schedule(&self.task, .{});
-            }   
-        }
+        std.os.close(self.fd);
+        while (true) self.readers.wait() catch break;
+        while (true) self.writers.wait() catch break;
     }
 
-    fn ReturnErrorUnionOf(comptime func: anytype) std.builtin.TypeInfo.ErrorUnion {
+    fn read(self: *Socket, buffer: []u8) !usize {
+        return self.call(&self.readers, std.os.recv, .{self.fd, buffer, 0});
+    }
+
+    fn reader(self: *Socket) std.io.Reader(*Socket, ErrorUnionOf(Socket.read).error_set, Socket.read) {
+        return .{ .context = self };
+    }
+
+    fn write(self: *Socket, buffer: []const u8) !usize {
+        return self.call(&self.writers, std.os.send, .{self.fd, buffer, std.os.MSG_NOSIGNAL});
+    }
+
+    fn writer(self: *Socket) std.io.Writer(*Socket, ErrorUnionOf(Socket.write).error_set, Socket.write) {
+        return .{ .context = self };
+    }
+
+    fn ErrorUnionOf(comptime func: anytype) std.builtin.TypeInfo.ErrorUnion {
         return @typeInfo(@typeInfo(@TypeOf(func)).Fn.return_type.?).ErrorUnion;
     }
 
-    fn ErrorSetOf(comptime func: anytype) type {
-        return ReturnErrorUnionOf(func).error_set;
-    }
-
-    fn call(self: *Socket, is_read: bool, comptime func: anytype, args: anytype) !ReturnErrorUnionOf(func).payload {
+    fn call(
+        self: *Socket,
+        port: *Port,
+        comptime func: anytype,
+        args: anytype,
+    ) !ErrorUnionOf(func).payload {
         retry: while (true) {
             return @call(.{}, func, args) catch |err| switch (err) {
                 error.WouldBlock => {
-                    var ctl_err: ?std.os.EpollCtlError = null; 
-                    suspend {
-                        const op: u32 = if (self.is_registered) std.os.EPOLL_CTL_MOD else std.os.EPOLL_CTL_ADD;
-                        const ev: u32 = if (is_read) std.os.EPOLLIN else std.os.EPOLLOUT;
-                        self.is_registered = true;
-                        self.task = @TypeOf(self.task).init(@frame());
-                        std.os.epoll_ctl(self.notify.efd, op, self.fd, &std.os.epoll_event{
-                            .events = ev | std.os.EPOLLERR | std.os.EPOLLHUP | std.os.EPOLLONESHOT,
-                            .data = .{ .ptr = @ptrToInt(&self.task) },
-                        }) catch |epoll_err| {
-                            ctl_err = epoll_err;
-                            self.is_registered = false;
-                            zap.runtime.schedule(&self.task, .{ .use_lifo = true });
-                        };
-                    }
-                    if (ctl_err) |e| return e;
+                    port.wait() catch |e| return e;
                     continue :retry;
                 },
                 else => |e| return e,
@@ -145,30 +290,100 @@ const Socket = struct {
         }
     }
 
-    fn reader(self: *Socket) std.io.Reader(*Socket, ErrorSetOf(Socket.read), Socket.read) {
-        return .{ .context = self };
-    }
+    const Port = struct {
+        state: usize = EMPTY,
 
-    fn read(self: *Socket, buf: []u8) !usize {
-        return self.call(true, std.os.recv, .{self.fd, buf, 0});
-    }
+        const EMPTY: usize = 0;
+        const NOTIFIED: usize = 1;
+        const SHUTDOWN: usize = 2;
+        const WAITING: usize = ~(NOTIFIED | SHUTDOWN);
 
-    fn writer(self: *Socket) std.io.Writer(*Socket, ErrorSetOf(Socket.write), Socket.write) {
-        return .{ .context = self };
-    }
+        const Waiter = struct {
+            is_shutdown: bool,
+            task: zap.runtime.executor.Task,
+        };
 
-    fn write(self: *Socket, buf: []const u8) !usize {
-        return self.call(false, std.os.send, .{self.fd, buf, std.os.MSG_NOSIGNAL});
-    }
+        fn wait(self: *Port) !void {
+            var waiter: Waiter = undefined;
+            waiter.is_shutdown = false;
+            waiter.task = @TypeOf(waiter.task).init(@frame());
+
+            suspend {
+                var state = @atomicLoad(usize, &self.state, .Monotonic);
+                while (true) {
+                    const new_state = switch (state) {
+                        EMPTY => @ptrToInt(&waiter),
+                        NOTIFIED => EMPTY,
+                        SHUTDOWN => {
+                            waiter.is_shutdown = true;
+                            zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                            break;
+                        },
+                        else => unreachable,
+                    };
+                    state = @cmpxchgWeak(
+                        usize,
+                        &self.state,
+                        state,
+                        new_state,
+                        .Release,
+                        .Monotonic,
+                    ) orelse {
+                        if (new_state == EMPTY)
+                            zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
+                        break;
+                    };
+                }
+            }
+
+            if (waiter.is_shutdown)
+                return error.Closed;
+        }
+
+        fn notify(self: *Port) ?*zap.runtime.executor.Task {
+            var state = @atomicLoad(usize, &self.state, .Monotonic);
+            while (true) {
+                const new_state = switch (state) {
+                    EMPTY => NOTIFIED,
+                    NOTIFIED, SHUTDOWN => return null,
+                    else => EMPTY,
+                };
+                state = @cmpxchgWeak(
+                    usize,
+                    &self.state,
+                    state,
+                    new_state,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse {
+                    if (new_state == NOTIFIED)
+                        return null;
+                    const waiter = @intToPtr(*Waiter, state);
+                    return &waiter.task;
+                };
+            }
+        }
+
+        fn shutdown(self: *Port) ?*zap.runtime.executor.Task {
+            return switch (@atomicRmw(usize, &self.state, .Xchg, SHUTDOWN, .AcqRel)) {
+                EMPTY, NOTIFIED, SHUTDOWN => null,
+                else => |state| {
+                    const waiter = @intToPtr(*Waiter, state);
+                    waiter.is_shutdown = false;
+                    return &waiter.task;
+                }
+            };
+        }
+    };
 };
 
-const Notify = struct {
+const IoDriver = struct {
     efd: std.os.fd_t,
     evfd: std.os.fd_t,
     thread: *std.Thread,
     scheduler: *zap.runtime.executor.Scheduler,
 
-    fn init(self: *Notify, scheduler: *zap.runtime.executor.Scheduler) !void {
+    fn init(self: *IoDriver, scheduler: *zap.runtime.executor.Scheduler) !void {
         self.efd = try std.os.epoll_create1(std.os.EPOLL_CLOEXEC);
         errdefer std.os.close(self.efd);
 
@@ -183,7 +398,7 @@ const Notify = struct {
         self.thread = try std.Thread.spawn(self, @This().run);
     }
 
-    fn deinit(self: *Notify) void {
+    fn deinit(self: *IoDriver) void {
         _ = std.os.write(self.evfd, std.mem.asBytes(&@as(u64, 1))) catch unreachable;
         self.thread.wait();
         
@@ -191,30 +406,36 @@ const Notify = struct {
         std.os.close(self.efd);
     }
 
-    fn run(self: *Notify) void {
+    fn run(self: *IoDriver) void {
         var events: [128]std.os.epoll_event = undefined;
 
         while (true) {
-            const found = blk: {
-                while (true) {
-                    const rc = std.os.linux.epoll_wait(self.efd, &events, @intCast(u32, events.len), -1);
-                    switch (std.os.linux.getErrno(rc)) {
-                        0 => break :blk @intCast(usize, rc),
-                        std.os.EINTR => continue,
-                        else => return,
-                    }
-                }
-            };
+            const count = std.os.epoll_wait(self.efd, &events, -1);
+            if (count == 0) continue;
 
-            if (found == 0) continue;
             var batch = zap.runtime.executor.Batch{};
             defer self.scheduler.schedule(batch);
 
-            for (events[0..found]) |ev| {
-                if (ev.data.ptr == 0) continue;
-                if (ev.data.ptr == @ptrToInt(self)) return;
-                const task = @intToPtr(*zap.runtime.executor.Task, ev.data.ptr);
-                batch.push(task);
+            for (events[0..count]) |event| {
+                if (event.data.ptr == @ptrToInt(self))
+                    return;
+                
+                const socket = @intToPtr(*Socket, event.data.ptr);
+                if (event.events & (std.os.EPOLLERR | std.os.EPOLLHUP) != 0) {
+                    if (socket.writers.shutdown()) |task|
+                        batch.push(task);
+                    if (socket.readers.shutdown()) |task|
+                        batch.push(task);
+                } else {
+                    if (event.events & std.os.EPOLLOUT != 0) {
+                        if (socket.writers.notify()) |task|
+                            batch.push(task);
+                    }
+                    if (event.events & std.os.EPOLLIN != 0) {
+                        if (socket.readers.notify()) |task|
+                            batch.push(task);
+                    }
+                }
             }
         }
     }

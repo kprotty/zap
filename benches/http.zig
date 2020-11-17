@@ -91,27 +91,34 @@ const Client = struct {
                 msghdr.msg_iov = &iovecs;
                 msghdr.msg_iovlen = 1;
 
-                const rc = std.os.linux.sendmsg(self.socket.fd, &msghdr, std.os.MSG_NOSIGNAL);
-                const sent = switch (std.os.linux.getErrno(rc)) {
-                    0 => rc,
-                    std.os.EACCES => return error.AccessDenied,
-                    std.os.EAGAIN => return error.WouldBlock,
-                    std.os.EALREADY => return error.FastOpenAlreadyInProgress,
-                    std.os.EBADF => unreachable, // always a race condition
-                    std.os.ECONNRESET => return error.ConnectionResetByPeer,
-                    std.os.EDESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
-                    std.os.EFAULT => unreachable, // An invalid user space address was specified for an argument.
-                    std.os.EINTR => continue,
-                    std.os.EINVAL => unreachable, // Invalid argument passed.
-                    std.os.EISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
-                    std.os.EMSGSIZE => return error.MessageTooBig,
-                    std.os.ENOBUFS => return error.SystemResources,
-                    std.os.ENOMEM => return error.SystemResources,
-                    std.os.ENOTCONN => unreachable, // The socket is not connected, and no target has been given.
-                    std.os.ENOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
-                    std.os.EOPNOTSUPP => unreachable, // Some bit in the flags argument is inappropriate for the socket type.
-                    std.os.EPIPE => return error.BrokenPipe,
-                    else => |err| return std.os.unexpectedErrno(err),
+                const sent = blk: {
+                    retry: while (true) {
+                        const rc = std.os.linux.sendmsg(self.socket.fd, &msghdr, std.os.MSG_NOSIGNAL);
+                        break :blk switch (std.os.linux.getErrno(rc)) {
+                            0 => rc,
+                            std.os.EACCES => return error.AccessDenied,
+                            std.os.EAGAIN => {
+                                try self.socket.writers.wait();
+                                continue :retry;
+                            },
+                            std.os.EALREADY => return error.FastOpenAlreadyInProgress,
+                            std.os.EBADF => unreachable, // always a race condition
+                            std.os.ECONNRESET => return error.ConnectionResetByPeer,
+                            std.os.EDESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
+                            std.os.EFAULT => unreachable, // An invalid user space address was specified for an argument.
+                            std.os.EINTR => continue,
+                            std.os.EINVAL => unreachable, // Invalid argument passed.
+                            std.os.EISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
+                            std.os.EMSGSIZE => return error.MessageTooBig,
+                            std.os.ENOBUFS => return error.SystemResources,
+                            std.os.ENOMEM => return error.SystemResources,
+                            std.os.ENOTCONN => unreachable, // The socket is not connected, and no target has been given.
+                            std.os.ENOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+                            std.os.EOPNOTSUPP => unreachable, // Some bit in the flags argument is inappropriate for the socket type.
+                            std.os.EPIPE => return error.BrokenPipe,
+                            else => |err| return std.os.unexpectedErrno(err),
+                        };
+                    }
                 };
 
                 partial = sent % resp.len;

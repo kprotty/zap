@@ -153,10 +153,10 @@ pub const Worker = struct {
         tls_current = &self;
         defer tls_current = old_tls_current;
 
-        var active_queue = scheduler.active_queue.load(.relaxed);
+        var active_queue = scheduler.active_queue().load(.relaxed);
         while (true) {
             self.active_next = active_queue;
-            active_queue = scheduler.active_queue.tryCompareAndSwap(
+            active_queue = scheduler.active_queue().tryCompareAndSwap(
                 active_queue,
                 &self,
                 .release,
@@ -293,7 +293,7 @@ pub const Scheduler = struct {
     max_workers: u16,
     main_worker: ?*Worker = null,
     idle_queue: Atomic(usize) = Atomic(usize).init(IDLE_EMPTY),
-    active_queue: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+    active_queue_ptr: ?*Worker = null,
     counter: Atomic(u32) = Atomic(u32).init((Counter{}).pack()),
     run_queue: UnboundedTaskQueue = undefined,
 
@@ -349,8 +349,12 @@ pub const Scheduler = struct {
         self.schedule(batch);
     }
 
+    inline fn active_queue(self: *Scheduler) *Atomic(?*Worker) {
+        return @ptrCast(*Atomic(?*Worker), &self.active_queue_ptr);
+    }
+
     pub fn getWorkers(self: *Scheduler) WorkerIter {
-        const active_worker = self.active_queue.load(.acquire);
+        const active_worker = self.active_queue().load(.acquire);
         return WorkerIter{ .worker = active_worker };
     }
 

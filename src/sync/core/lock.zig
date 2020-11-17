@@ -1,4 +1,7 @@
-const core = @import("./sync.zig").core;
+const core = @import("./core.zig");
+
+const Waker = core.Waker;
+const SpinWait = core.SpinWait;
 const Atomic = core.atomic.Atomic;
 const fence = core.atomic.fence;
 
@@ -14,7 +17,7 @@ pub const Lock = struct {
         prev: ?*Waiter align(~WAITING + 1) = undefined,
         next: ?*Waiter = undefined,
         tail: ?*Waiter = undefined,
-        wakeFn: fn(*Waiter) void,
+        waker: Waker,
     };
 
     pub fn tryAcquire(self: *Lock) bool {
@@ -41,31 +44,31 @@ pub const Lock = struct {
         @setCold(true);
 
         const EventWaiter = struct {
-            waiter: Waiter = Waiter{ .wakeFn = wake },
+            waiter: Waiter = Waiter{ .waker = Waker{ .wakeFn = wake } },
             event: Event = Event{},
 
-            fn wake(waiter: *Waiter) void {
+            fn wake(waker: *Waker) void {
+                const waiter = @fieldParentPtr(Waiter, "waker", waker);
                 const self = @fieldParentPtr(@This(), "waiter", waiter);
                 self.event.notify();
             }
         };
 
-        var spin: usize = 0;
         var event_waiter = EventWaiter{};
+        var spin_wait = SpinWait(Event){};
         var state = self.state.load(.relaxed);
 
         while (true) {
             if (state & LOCKED == 0) {
                 if (self.tryAcquire())
                     return;
-                _ = Event.yield(null);
+                spin_wait.yield();
                 state = self.state.load(.relaxed);
                 continue;
             }
 
             const head = @intToPtr(?*Waiter, state & WAITING);
-            if (head == null and Event.yield(spin)) {
-                spin +%= 1;
+            if (head == null and spin_wait.trySpin()) {
                 state = self.state.load(.relaxed);
                 continue;
             }
@@ -85,7 +88,7 @@ pub const Lock = struct {
                 continue;
             }
 
-            spin = 0;
+            spin_wait.reset();
             event_waiter.event.wait();
             state = self.state.load(.relaxed);
         }

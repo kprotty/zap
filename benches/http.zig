@@ -46,7 +46,9 @@ const Poller = struct {
 
             for (events[0..count]) |event| {
                 if (event.data.ptr == @ptrToInt(self)) return;
-                batch.push(@intToPtr(*zap.runtime.executor.Task, event.data.ptr));
+                const waiter = @intToPtr(*Socket.Waiter, event.data.ptr);
+                waiter.events = event.events;
+                batch.push(&waiter.task);
             }
         }
     }
@@ -65,9 +67,19 @@ const Poller = struct {
         poller: *Poller,
         is_registered: bool = false,
 
-        fn wait(self: *Socket, read: bool, write: bool) !void {
+        const Waiter = struct {
+            events: u32,
+            task: zap.runtime.executor.Task,
+        };
+
+        const Event = struct {
+            read: bool,
+            write: bool,
+        };
+
+        fn wait(self: *Socket, wait_event: Event) !Event {
+            var waiter: Waiter = undefined;
             var err: ?std.os.EpollCtlError = null;
-            var task = zap.runtime.executor.Task.init(@frame());
 
             suspend {
                 var op: u32 = std.os.EPOLL_CTL_ADD;
@@ -75,22 +87,33 @@ const Poller = struct {
                     op = std.os.EPOLL_CTL_MOD;
                 
                 var events: u32 = std.os.EPOLLERR | std.os.EPOLLHUP | std.os.EPOLLONESHOT;
-                if (read) events |= std.os.EPOLLIN;
-                if (write) events |= std.os.EPOLLOUT;
+                if (wait_event.read) events |= std.os.EPOLLIN;
+                if (wait_event.write) events |= std.os.EPOLLOUT;
 
                 self.is_registered = true;
+                waiter.task = @TypeOf(waiter.task).init(@frame());
                 std.os.epoll_ctl(self.poller.fd, op, self.fd, &std.os.epoll_event{
                     .events = events,
-                    .data = .{ .ptr = @ptrToInt(&task) },
+                    .data = .{ .ptr = @ptrToInt(&waiter) },
                 }) catch |ctl_err| {
                     err = ctl_err;
                     self.is_registered = false;
-                    zap.runtime.schedule(&task, .{ .use_lifo = true });
+                    zap.runtime.schedule(&waiter.task, .{ .use_lifo = true });
                 };
             }
 
             if (err) |e|
                 return e;
+
+            var event: Event = undefined;
+            if (waiter.events & (std.os.EPOLLERR | std.os.EPOLLHUP) != 0) {
+                event.read = true;
+                event.write = true;
+            } else {
+                if (waiter.events & std.os.EPOLLIN != 0) event.read = true;
+                if (waiter.events & std.os.EPOLLOUT != 0) event.write = true;
+            }
+            return event;
         }
     };
 };
@@ -118,7 +141,7 @@ const Server = struct {
         while (true) {
             const client_fd = std.os.accept(server_fd, null, null, flags) catch |err| switch (err) {
                 error.WouldBlock => {
-                    try event.wait(true, false);
+                    _ = try event.wait(.{ .read = true, .write = false });
                     continue;
                 },
                 else => |e| return e,
@@ -153,22 +176,22 @@ const Client = struct {
         };
 
         while (true) {
-            var wait_for_write = self.writer() catch break;
-            const wait_for_read = self.reader() catch break;
+            const event = self.socket.wait(.{ 
+                .read = true,
+                .write = self.write_bytes > 0,
+            }) catch break;
             
-            if (!wait_for_write and self.write_bytes > 0)
-                wait_for_write = self.writer() catch break;
-
-            self.socket.wait(wait_for_read, wait_for_write) catch break;
+            if (event.read)
+                self.reader() catch break;
+            if (event.write)
+                self.writer() catch break;
         }
     }
 
-    fn reader(self: *Client) !bool {
+    fn reader(self: *Client) !void {
         while (true) {
             const request_buffer = self.read_buffer[0..self.read_len];
-            const request_end = blk: {
-                break :blk std.mem.indexOf(u8, request_buffer, HTTP_CLRF);
-            };
+            const request_end: ?usize = findClrf(request_buffer);
 
             if (request_end) |end| {
                 const remaining = self.read_buffer[(end + HTTP_CLRF.len)..self.read_len];
@@ -183,7 +206,7 @@ const Client = struct {
                 return error.RequestTooLarge;
 
             const read = std.os.read(self.socket.fd, read_buffer) catch |err| switch (err) {
-                error.WouldBlock => return true,
+                error.WouldBlock => return,
                 else => |e| return e,
             };
 
@@ -193,15 +216,11 @@ const Client = struct {
         }
     }
 
-    fn writer(self: *Client) !bool {
-        const num_chunks = 256;
+    fn writer(self: *Client) !void {
+        const num_chunks = 128;
         const chunk = HTTP_RESPONSE ** num_chunks;
 
-        while (true) {
-            if (self.write_bytes == 0) {
-                return false;
-            }
-
+        while (self.write_bytes > 0) {
             var iovecs = [1]std.os.iovec_const{.{
                 .iov_base = @ptrCast([*]const u8, &chunk[0]) + self.write_partial,
                 .iov_len = std.math.min(self.write_bytes, num_chunks * HTTP_RESPONSE.len),
@@ -215,7 +234,7 @@ const Client = struct {
             const sent = switch (std.os.linux.getErrno(rc)) {
                 0 => rc,
                 std.os.EACCES => return error.AccessDenied,
-                std.os.EAGAIN => return true,
+                std.os.EAGAIN => return,
                 std.os.EALREADY => return error.FastOpenAlreadyInProgress,
                 std.os.EBADF => unreachable, // always a race condition
                 std.os.ECONNRESET => return error.ConnectionResetByPeer,
@@ -237,5 +256,36 @@ const Client = struct {
             self.write_partial = sent % HTTP_RESPONSE.len;
             self.write_bytes -= sent;
         }
-    }    
+    }
+
+    fn findClrf(request_buffer: []const u8) ?usize {
+        return std.mem.indexOf(u8, request_buffer, HTTP_CLRF);
+        // const clrf = @ptrCast(*const u32, HTTP_CLRF).*;
+        // const ptr = request_buffer.ptr;
+        // var len = request_buffer.len;
+        // var offset: usize = 0;
+
+        // while (len >= 16) : (len -= 16) {
+        //     const Chunk = std.meta.Vector(16, u8);
+        //     const chunk: Chunk = (ptr + offset)[0..16].*;
+        //     const cmp = @bitCast(std.meta.Vector(16, u1), chunk == @splat(16, HTTP_CLRF[0]));
+        //     var mask = @ptrCast(*const u16, &cmp).*;
+        //     while (mask != 0) {
+        //         const bit = @intCast(std.math.Log2Int(u16), @ctz(u16, mask));
+        //         const offs = offset + bit;
+        //         if (@ptrCast(*align(1) const u32, &ptr[offs]).* == clrf)
+        //             return offs;
+        //         mask &= ~(@as(u16, 1) << bit);
+        //     }
+        //     offset += 16;
+        // }
+        
+        // while (len >= 4) : (len -= 1) {
+        //     if (@ptrCast(*align(1) const u32, &ptr[offset]).* == clrf)
+        //         return offset;
+        //     offset += 1;
+        // }
+
+        // return null;
+    }
 };

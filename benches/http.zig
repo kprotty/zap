@@ -153,14 +153,12 @@ const Client = struct {
         };
 
         while (true) {
-            var wait_for_write = false;
-            if (self.write_bytes > 0)
-                wait_for_write = self.writer() catch break;
-
+            var wait_for_write = self.writer() catch break;
             const wait_for_read = self.reader() catch break;
+            
             if (!wait_for_write and self.write_bytes > 0)
                 wait_for_write = self.writer() catch break;
-                
+
             self.socket.wait(wait_for_read, wait_for_write) catch break;
         }
     }
@@ -196,7 +194,7 @@ const Client = struct {
     }
 
     fn writer(self: *Client) !bool {
-        const num_chunks = 64;
+        const num_chunks = 256;
         const chunk = HTTP_RESPONSE ** num_chunks;
 
         while (true) {

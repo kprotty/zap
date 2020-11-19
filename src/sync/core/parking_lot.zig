@@ -22,6 +22,7 @@ const Bucket = struct {
     }
 };
 
+// https://github.com/jstimpfle/rb3ptr/blob/master/rb3ptr.c
 const Waiter = struct {
     left: ?*Waiter,
     right: ?*Waiter,

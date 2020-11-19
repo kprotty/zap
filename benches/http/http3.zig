@@ -71,11 +71,9 @@ const Client = struct {
         (await write_frame) catch {};
     }
 
-    const HTTP_RESPONSE = "HTTP/1.1 200 Ok\r\nContent-Length: 11\r\n\r\nHello World";
+    const HTTP_RESPONSE = "HTTP/1.1 200 Ok\r\nContent-Length: 10\r\nContent-Type: text/plain; charset=utf8\r\nDate: Thu, 19 Nov 2020 14:26:34 GMT\r\nServer: fasthttp\r\n\r\nHelloWorld";
 
     fn runReader(self: *Client) !void {
-        zap.runtime.yield();
-
         defer self.process_chan.close();
 
         while (true) {
@@ -83,7 +81,9 @@ const Client = struct {
             var read_buf: [16 * 1024]u8 = undefined;
 
             do_read: while (true) {
-                const read = std.os.read(self.socket.fd, read_buf[read_len..]) catch |err| switch (err) {
+                const rc = std.os.read(self.socket.fd, read_buf[read_len..]);
+                zap.runtime.yield();
+                const read = rc catch |err| switch (err) {
                     error.WouldBlock => {
                         if (read_len > 0) {
                             const buf = try self.allocator.alloc(u8, read_len);
@@ -91,7 +91,6 @@ const Client = struct {
                             @memcpy(buf.ptr, &read_buf, read_len);
                             try self.process_chan.push(buf);
                         }
-                        zap.runtime.yield();
                         try self.socket.readers.wait(.{});
                         break :do_read;
                     },
@@ -106,8 +105,6 @@ const Client = struct {
     }
 
     fn runProcessor(self: *Client) !void {
-        zap.runtime.yield();
-
         defer self.write_chan.close();
         defer {
             self.process_chan.close();
@@ -139,13 +136,10 @@ const Client = struct {
             remain = req_buf[consumed..req_len];
             @memcpy(&req_buf, remain.ptr, remain.len);
             req_len = remain.len;
-            zap.runtime.yield();
         }
     }
 
     fn runWriter(self: *Client) !void {
-        zap.runtime.yield();
-
         defer self.write_chan.close();
 
         const Writer = struct {

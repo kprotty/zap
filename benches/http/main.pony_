@@ -1,0 +1,56 @@
+use "http_server"
+use "valbytes"
+
+actor Main
+  new create(env: Env) =>
+    let port = "9000"
+    let server = Server(
+      try env.root as AmbientAuth else return end,
+      HttpNotify(env, port),
+      HttpSession
+      where config = ServerConfig(where 
+        host' = "localhost",
+        port' = port
+      )
+    )
+
+class HttpNotify is ServerNotify
+  let _env: Env
+  let _port: String
+
+  new iso create(env: Env, port: String) =>
+    _env = env
+    _port = port
+
+  fun ref listening(server: Server ref) =>
+    _env.err.print("Listening on " + _port)
+
+class val HttpSession
+  let _msg: String = "HelloWorld"
+  let _response: ByteSeqIter = Responses.builder()
+    .set_status(StatusOK)
+    .add_header("Content-Type", "text/plain; charset=utf8")
+    .add_header("Content-Length", _msg.size().string())
+    .add_header("Date", "Thu, 19 Nov 2020 14:26:34 GMT")
+    .add_header("Server", "fasthttp")
+    .finish_headers()
+    .add_chunk(_msg.array())
+    .build()
+
+  fun apply(session: Session): Handler ref^ =>
+    HttpHandler(session, _response)
+
+class HttpHandler is Handler
+  let _session: Session
+  let _response: ByteSeqIter
+
+  new ref create(session: Session, response: ByteSeqIter) =>
+    _session = session
+    _response = response
+
+  fun ref apply(request: Request val, request_id: RequestID) =>
+    _session.send_raw(_response, request_id)
+    _session.send_finished(request_id)
+
+  fun ref finished(request_id: RequestID) => 
+    None 

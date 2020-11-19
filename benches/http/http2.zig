@@ -68,7 +68,16 @@ const Client = struct {
     const HTTP_CLRF = "\r\n\r\n";
     const HTTP_RESPONSE = "HTTP/1.1 200 Ok\r\nContent-Length: 10\r\nContent-Type: text/plain; charset=utf8\r\nDate: Thu, 19 Nov 2020 14:26:34 GMT\r\nServer: fasthttp\r\n\r\nHelloWorld";
 
+    fn runConcurrently() void {
+        suspend {
+            var task = zap.runtime.executor.Task.init(@frame());
+            zap.runtime.schedule(&task, .{ .use_lifo = true });
+        }
+    }
+
     fn runReader(self: *Client) !void {
+        runConcurrently();
+
         var length: usize = 0;
         var buffer: [4096]u8 = undefined;
         defer self.notify(true);
@@ -108,6 +117,8 @@ const Client = struct {
     }
 
     fn runWriter(self: *Client) !void {
+        runConcurrently();
+
         const num_chunks = 128;
         const chunk = HTTP_RESPONSE ** num_chunks;
 

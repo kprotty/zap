@@ -1,0 +1,11 @@
+{
+  "deps": [
+    {
+      "locator": "github.com/ponylang/net_ssl.git"
+    },
+    {
+      "locator": "github.com/ponylang/http_server.git"
+    }
+  ],
+  "info": {}
+}

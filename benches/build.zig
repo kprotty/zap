@@ -7,13 +7,11 @@ pub fn build(b: *std.build.Builder) void {
     const run = b.option(bool, "run", "Run the target example") orelse false;
     const single_threaded = b.option(bool, "single-threaded", "Assume program is single-threaded") orelse false;
 
-    inline for ([_][]const u8 {
-        "yield",
-        "http",
-        "http2",
-        "http3",
+    inline for (.{
+        .{"yield", "yield.zig"},
+        .{"http2", "http/http2.zig"},
     }) |example| {
-        const zig_exe = b.addExecutable(example, example ++ ".zig");
+        const zig_exe = b.addExecutable(example[0], example[1]);
         if (libc)
             zig_exe.linkLibC();
 
@@ -28,7 +26,7 @@ pub fn build(b: *std.build.Builder) void {
         zig_exe.setOutputDir("zig-cache");
         zig_exe.install();
 
-        const zig_step = b.step(example, "Build " ++ example ++ " Zig example");
+        const zig_step = b.step(example[0], "Build " ++ example[0] ++ " Zig example");
         zig_step.dependOn(&zig_exe.step);
         if (run)
             zig_step.dependOn(&zig_exe.run().step);

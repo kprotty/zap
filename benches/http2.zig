@@ -31,7 +31,7 @@ fn asyncMain() !void {
     while (true) {
         const fd = std.os.accept(server.fd, null, null, sock_flags) catch |err| switch (err) {
             error.WouldBlock => {
-                try server.readers.wait();
+                try server.readers.wait(.{});
                 continue;
             },
             else => |e| return e,
@@ -66,7 +66,7 @@ const Client = struct {
     }
 
     const HTTP_CLRF = "\r\n\r\n";
-    const HTTP_RESPONSE = "HTTP/1.1 200 Ok\r\nContent-Length: 11" ++ HTTP_CLRF ++ "Hello World";
+    const HTTP_RESPONSE = "HTTP/1.1 200 Ok\r\nContent-Length: 10\r\nContent-Type: text/plain; charset=utf8\r\nDate: Thu, 19 Nov 2020 14:26:34 GMT\r\nServer: fasthttp\r\n\r\nHelloWorld";
 
     fn runReader(self: *Client) !void {
         var length: usize = 0;
@@ -88,11 +88,12 @@ const Client = struct {
                 return error.RequestTooLarge;
 
             const transferred = blk: {
-                zap.runtime.yield();
                 while (true) {
-                    break :blk std.os.read(self.socket.fd, read_buf) catch |err| switch (err) {
+                    const rc = std.os.read(self.socket.fd, read_buf);
+                    zap.runtime.yield();
+                    break :blk rc catch |err| switch (err) {
                         error.WouldBlock => {
-                            try self.socket.readers.wait();
+                            try self.socket.readers.wait(.{});
                             continue;
                         },
                         else => |e| return e,
@@ -113,9 +114,10 @@ const Client = struct {
         const Writer = struct {
             fn write(client: *Client, buffer: []const u8) error{Bad}!usize {
                 retry: while (true) {
-                    return std.os.send(client.socket.fd, buffer, std.os.MSG_NOSIGNAL) catch |err| switch (err) {
+                    const rc = std.os.send(client.socket.fd, buffer, std.os.MSG_NOSIGNAL);
+                    return rc catch |err| switch (err) {
                         error.WouldBlock => {
-                            client.socket.writers.wait() catch return error.Bad;
+                            client.socket.writers.wait(.{}) catch return error.Bad;
                             continue :retry;
                         },
                         else => return error.Bad,
@@ -237,8 +239,8 @@ const Socket = struct {
         defer self.* = undefined;
 
         _ = std.os.linux.shutdown(self.fd, std.os.SHUT_RDWR);
-        while (true) self.readers.wait() catch break;
-        while (true) self.writers.wait() catch break;
+        while (true) self.readers.wait(.{ .use_next = true }) catch break;
+        while (true) self.writers.wait(.{ .use_next = true }) catch break;
         std.os.close(self.fd);
     }
 };
@@ -318,7 +320,7 @@ const Port = struct {
         task: zap.runtime.executor.Task,
     };
 
-    fn wait(self: *Port) !void {
+    fn wait(self: *Port, hints: zap.runtime.executor.Worker.ScheduleHints) !void {
         var waiter = Waiter{
             .is_shutdown = false,
             .task = zap.runtime.executor.Task.init(@frame()),
@@ -332,7 +334,7 @@ const Port = struct {
                     NOTIFIED => EMPTY,
                     SHUTDOWN => {
                         waiter.is_shutdown = true;
-                        zap.runtime.schedule(&waiter.task, .{});
+                        zap.runtime.schedule(&waiter.task, .{ .use_next = true });
                         break;
                     },
                     else => unreachable,
@@ -347,7 +349,7 @@ const Port = struct {
                     .Monotonic,
                 ) orelse {
                     if (new_state == EMPTY)
-                        zap.runtime.schedule(&waiter.task, .{});
+                        zap.runtime.schedule(&waiter.task, hints);
                     break;
                 };
             }

@@ -48,15 +48,19 @@ pub fn schedule(batchable: anytype, hints: executor.Worker.ScheduleHints) void {
     getWorker().schedule(executor.Batch.from(batchable), hints);
 }
 
-pub fn reschedule(hints: executor.Worker.ScheduleHints) void {
+pub fn yield() void {
     suspend {
         var task = executor.Task.init(@frame());
-        schedule(&task, hints);
-    }
-}
+        const worker = getWorker();
 
-pub fn yield() void {
-    reschedule(.{});
+        if (worker.run_queue_next == null)
+            worker.run_queue_next = worker.poll();
+        if (worker.run_queue_next == null) {
+            worker.run_queue_next = &task;
+        } else {
+            worker.schedule(task.toBatch(), .{});
+        }
+    }
 }
 
 pub const SpawnConfig = struct {
@@ -66,16 +70,23 @@ pub const SpawnConfig = struct {
 pub fn spawn(config: SpawnConfig, comptime asyncFn: anytype, args: anytype) !void {
     const Args = @TypeOf(args);
     const Decorator = struct {
-        fn entry(allocator: *std.mem.Allocator, fn_args: Args) void {
-            reschedule(.{ .use_lifo = true });
+        fn entry(allocator: *std.mem.Allocator, worker: *executor.Worker, fn_args: Args) void {
+            suspend {
+                var task = executor.Task.init(@frame());
+                worker.schedule(task.toBatch(), .{ .use_lifo = true });
+            }
+
             _ = @call(.{}, asyncFn, fn_args);
+
             suspend {
                 allocator.destroy(@frame());
             }
         }
     };
 
-    const allocator = config.allocator orelse getWorker().getAllocator();
+    const worker = getWorker();
+    const allocator = config.allocator orelse worker.getAllocator();
+
     var frame = try allocator.create(@Frame(Decorator.entry));
-    frame.* = async Decorator.entry(allocator, args);
+    frame.* = async Decorator.entry(allocator, worker, args);
 }

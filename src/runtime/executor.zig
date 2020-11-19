@@ -109,10 +109,14 @@ pub const Worker = struct {
     run_queue_lifo: Atomic(?*Task) = Atomic(?*Task).init(null),
     run_queue_overflow: UnboundedTaskQueue = undefined,
     run_queue: BoundedTaskQueue = undefined,
+    run_queue_tick: usize = undefined,
+    run_queue_next: ?*Task = null,
     active_next: ?*Worker = null,
     idle_next: ?*Worker = null,
     scheduler: *Scheduler,
     thread: ?*std.Thread,
+    is_resuming: bool = true,
+    workers: Scheduler.WorkerIter = undefined,
 
     const EVENT_ALIGN = std.math.max(
         ~Scheduler.IDLE_WAITING + 1,
@@ -148,6 +152,8 @@ pub const Worker = struct {
         var self = Worker{ .scheduler = scheduler, .thread = thread };
         self.run_queue_overflow.init();
         self.run_queue.init();
+        self.workers = scheduler.getWorkers();
+        self.run_queue_tick = @ptrToInt(&self) ^ @ptrToInt(scheduler);
 
         const old_tls_current = tls_current;
         tls_current = &self;
@@ -164,23 +170,13 @@ pub const Worker = struct {
             ) orelse break;
         }
 
-        var is_resuming = true;
-        var worker_iter = scheduler.getWorkers();
-        var run_tick = @ptrToInt(&self) ^ @ptrToInt(scheduler);
-
         while (true) {
-            if (self.poll(scheduler, run_tick, &worker_iter)) |task| {
-                if (is_resuming) {
-                    is_resuming = false;
-                    _ = scheduler.tryResumeWorker(true);
-                }
-
-                run_tick +%= 1;
+            if (self.poll()) |task| {
                 task.execute();
                 continue;
             }
 
-            is_resuming = switch (scheduler.trySuspendWorker(&self, is_resuming)) {
+            self.is_resuming = switch (scheduler.trySuspendWorker(&self, self.is_resuming)) {
                 .retry => false,
                 .resumed => true,
                 .shutdown => break,
@@ -188,19 +184,38 @@ pub const Worker = struct {
         }
     }
 
-    inline fn poll(self: *Worker, scheduler: *Scheduler, tick: usize, workers: *Scheduler.WorkerIter) ?*Task {
+    pub fn poll(self: *Worker) ?*Task {
+        const scheduler = self.getScheduler();
+        const task = self.pollTask(scheduler) orelse return null;
+
+        if (self.is_resuming) {
+            self.is_resuming = false;
+            _ = scheduler.tryResumeWorker(true);
+        }
+
+        self.run_queue_tick +%= 1;
+        return task;
+    }
+
+    inline fn pollTask(self: *Worker, scheduler: *Scheduler) ?*Task {
         // TODO: poll for io/timers here if single threaded
 
-        if (tick % 61 == 0) {
+        if (self.run_queue_tick % 61 == 0) {
             if (self.run_queue.popAndStealFromUnbounded(&scheduler.run_queue)) |task| {
                 return task;
             }
         }
 
-        if (tick % 31 == 0) {
+        if (self.run_queue_tick % 31 == 0) {
             if (self.run_queue.popAndStealFromUnbounded(&self.run_queue_overflow)) |task| {
                 return task;
             }
+        }
+
+        if (self.run_queue_next) |next| {
+            const task = next;
+            self.run_queue_next = null;
+            return task;
         }
 
         if (self.run_queue_lifo.load(.relaxed) != null) {
@@ -224,9 +239,9 @@ pub const Worker = struct {
         var active_workers = scheduler.getActiveWorkers();
         while (active_workers > 0) : (active_workers -= 1) {
 
-            const target_worker = workers.next() orelse blk: {
-                workers.* = scheduler.getWorkers();
-                break :blk workers.next() orelse unreachable;
+            const target_worker = self.workers.next() orelse blk: {
+                self.workers = scheduler.getWorkers();
+                break :blk self.workers.next() orelse unreachable;
             };
 
             if (target_worker == self)
@@ -267,12 +282,22 @@ pub const Worker = struct {
 
     pub const ScheduleHints = struct {
         use_lifo: bool = false,
+        use_next: bool = false,
     };
 
     pub fn schedule(self: *Worker, tasks: Batch, hints: ScheduleHints) void {
         var batch = tasks;
         if (batch.isEmpty())
             return;
+
+        if (hints.use_next) {
+            const old_next = self.run_queue_next;
+            self.run_queue_next = batch.pop();
+            if (old_next) |next|
+                batch.pushFront(next);
+            if (batch.isEmpty())
+                return;
+        }
 
         if (hints.use_lifo) {
             if (self.run_queue_lifo.swap(batch.pop(), .acq_rel)) |old_lifo|

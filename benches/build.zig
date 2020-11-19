@@ -10,6 +10,8 @@ pub fn build(b: *std.build.Builder) void {
     inline for ([_][]const u8 {
         "yield",
         "http",
+        "http2",
+        "http3",
     }) |example| {
         const zig_exe = b.addExecutable(example, example ++ ".zig");
         if (libc)

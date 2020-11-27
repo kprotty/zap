@@ -5,5 +5,11 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-pub const meta = @import("./meta.zig");
-pub const sync = @import("./sync/sync.zig");
+pub const std = @import("std");
+
+pub const min = std.math.min;
+pub const max = std.math.max;
+
+pub const Int = std.meta.Int;
+pub const maxInt = std.math.maxInt;
+pub const bitCount = std.meta.bitCount;

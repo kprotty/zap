@@ -1,10 +1,3 @@
-// Copyright 2020 kprotty
-//
-// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
-// copied, modified, or distributed except according to those terms.
-
 const builtin = @import("builtin");
 
 pub fn spinLoopHint() void {
@@ -18,17 +11,15 @@ pub fn spinLoopHint() void {
 pub const Ordering = enum {
     unordered,
     relaxed,
-    consume,
     acquire,
     release,
     acq_rel,
     seq_cst,
-
+    
     fn toBuiltin(comptime self: Ordering) builtin.AtomicOrder {
         return switch (self) {
             .unordered => .Unordered,
             .relaxed => .Monotonic,
-            .consume => .Acquire,
             .acquire => .Acquire,
             .release => .Release,
             .acq_rel => .AcqRel,
@@ -42,80 +33,61 @@ pub fn fence(comptime ordering: Ordering) void {
 }
 
 pub fn compilerFence(comptime ordering: Ordering) void {
-    switch (ordering) {
-        .unordered, .relaxed, .consume => @compileError(ordering ++ " are for atomic variables only"),
-        else => asm volatile("" ::: "memory"),
-    }
+    asm volatile("" ::: "memory");
 }
 
 pub fn Atomic(comptime T: type) type {
     return struct {
-        value: Value,
+        value: T,
 
         const Self = @This();
-        const Value = @Type(builtin.TypeInfo.Int{
-            .is_signed = false,
-            .bits = @sizeOf(T) * 8,
-        });
 
         pub fn init(value: T) Self {
-            return .{ .value = @bitCast(Value, value) };
-        }
-
-        inline fn ptr(self: *Self) *T {
-            return @ptrCast(*T, &self.value);
-        }
-
-        inline fn ptrConst(self: *const Self) *const T {
-            return @ptrCast(*const T, &self.value);
+            return Self{ .value = value };
         }
 
         pub fn get(self: Self) T {
-            return self.ptrConst().*;
+            return self.value;
         }
 
         pub fn set(self: *Self, value: T) void {
-            self.ptr().* = value;
+            self.value = value;
         }
 
         pub fn load(self: *const Self, comptime ordering: Ordering) T {
-            return @atomicLoad(T, self.ptrConst(), comptime ordering.toBuiltin());
+            return @atomicLoad(T, &self.value, comptime ordering.toBuiltin());
         }
 
         pub fn store(self: *Self, value: T, comptime ordering: Ordering) void {
-            return @atomicStore(T, self.ptr(), value, comptime ordering.toBuiltin());
+            return @atomicStore(T, &self.value, value, comptime ordering.toBuiltin());
         }
 
         pub fn swap(self: *Self, value: T, comptime ordering: Ordering) T {
-            return self.rmw(.Xchg, value, ordering);
+            return @atomicRmw(T, &self.value, .Xchg, value, comptime ordering.toBuiltin());
         }
 
         pub fn fetchAdd(self: *Self, value: T, comptime ordering: Ordering) T {
-            return self.rmw(.Add, value, ordering);
+            return @atomicRmw(T, &self.value, .Add, value, comptime ordering.toBuiltin());
         }
 
         pub fn fetchSub(self: *Self, value: T, comptime ordering: Ordering) T {
-            return self.rmw(.Sub, value, ordering);
+            return @atomicRmw(T, &self.value, .Sub, value, comptime ordering.toBuiltin());
         }
 
         pub fn fetchAnd(self: *Self, value: T, comptime ordering: Ordering) T {
-            return self.rmw(.And, value, ordering);
+            return @atomicRmw(T, &self.value, .And, value, comptime ordering.toBuiltin());
         }
 
         pub fn fetchOr(self: *Self, value: T, comptime ordering: Ordering) T {
-            return self.rmw(.Or, value, ordering);
-        }
-
-        inline fn rmw(self: *Self, comptime op: builtin.AtomicRmwOp, value: T, comptime ordering: Ordering) T {
-            return @atomicRmw(T, self.ptr(), op, value, comptime ordering.toBuiltin());
+            return @atomicRmw(T, &self.value, .Or, value, comptime ordering.toBuiltin());
         }
 
         pub fn compareAndSwap(self: *Self, cmp: T, xchg: T, comptime success: Ordering, comptime failure: Ordering) ?T {
-            return @cmpxchgStrong(T, self.ptr(), cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
+            return @cmpxchgStrong(T, &self.value, cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
         }
 
         pub fn tryCompareAndSwap(self: *Self, cmp: T, xchg: T, comptime success: Ordering, comptime failure: Ordering) ?T {
-            return @cmpxchgWeak(T, self.ptr(), cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
+            return @cmpxchgWeak(T, &self.value, cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
         }
     };
 }

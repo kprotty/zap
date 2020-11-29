@@ -1,3 +1,1 @@
-
-
-pub struct Scheduler {}
+pub(crate) struct Scheduler {}

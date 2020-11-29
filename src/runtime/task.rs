@@ -1,141 +1,70 @@
-use crate::{
-    runtime::Worker,
-    sync::utils::{AtomicUsize, Ordering, spin_loop_hint},
-};
-use std::{
-    pin::Pin,
-    cell::Cell,
-    mem::MaybeUninit,
-    ptr::{self, NonNull},
-    marker::PhantomPinned,
-};
+use super::Worker;
+use std::{marker::PhantomPinned, pin::Pin, ptr::NonNull, sync::atomic::AtomicPtr};
 
-pub(crate) struct Runnable(unsafe fn(Pin<&mut Task>, Pin<&Worker>));
+pub(crate) struct Runnable(pub(crate) unsafe fn(Pin<&mut Task>, Pin<&Worker>));
 
-#[repr(C)]
+#[repr(align(2))]
 pub(crate) struct Task {
-    next: AtomicUsize,
-    runnable: &'static Runnable,
+    pub(crate) next: AtomicPtr<Self>,
+    pub(crate) runnable: &'static Runnable,
     _pinned: PhantomPinned,
 }
 
 impl From<&'static Runnable> for Task {
     fn from(runnable: &'static Runnable) -> Self {
         Self {
-            next: AtomicUsize::new(0),
+            next: AtomicPtr::default(),
             runnable,
             _pinned: PhantomPinned,
         }
     }
 }
 
-impl Task {
-    #[inline]
-    pub(crate) unsafe fn run(self: Pin<&mut Self>, worker: Pin<&Worker>) {
-        let run_fn = self.runnable.0;
-        (run_fn)(self, worker)
-    }
-}
-
+#[derive(Default)]
 pub(crate) struct Batch {
-    head: Option<NonNull<Task>>,
-    tail: NonNull<Task>,
-}
-
-impl Default for Batch {
-    fn default() -> Self {
-        Self {
-            head: None,
-            tail: NonNull::dangling(),
-        }
-    }
+    pub(crate) head: Option<NonNull<Task>>,
+    pub(crate) tail: Option<NonNull<Task>>,
 }
 
 impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
-        let task = unsafe { Pin::get_unchecked_mut(task) };
-        task.next.with_mut(|next| *next = 0);
+        let task = unsafe { task.get_unchecked_mut() };
+        *task.next.get_mut() = std::ptr::null_mut();
 
-        let task = NonNull::from(task);
+        let task = Some(NonNull::from(task));
         Self {
-            head: Some(task),
+            head: task,
             tail: task,
         }
     }
 }
 
 impl Batch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
     pub(crate) fn empty(&self) -> bool {
         self.head.is_none()
     }
 
-    pub(crate) fn push_back(&mut self, other: Self) {
-        if let Some(_) = self.head {
-            if let Some(other_head) = other.head {
-                let tail = unsafe { &mut *self.tail.as_ptr() };
-                tail.next.with_mut(|next| *next = other_head.as_ptr() as usize);
-                self.tail = other.tail;
-            }
+    pub(crate) fn push(&mut self, batch: impl Into<Self>) {
+        let batch: Self = batch.into();
+        if let (Some(mut tail), Some(batch_head)) = (self.tail, batch.head) {
+            unsafe { *tail.as_mut().next.get_mut() = batch_head.as_ptr() };
+            self.tail = batch.tail;
         } else {
-            *self = other;
+            *self = batch;
         }
     }
 
-    pub(crate) fn push_front(&mut self, other: Self) {
-        if let Some(head) = self.head {
-            if let Some(_) = other.head {
-                let tail = unsafe { &mut *other.tail.as_ptr() };
-                tail.next.with_mut(|next| *next = head.as_ptr() as usize);
-                self.head = other.head;
+    pub(crate) fn pop(&mut self) -> Option<NonNull<Task>> {
+        self.head.map(|mut task| {
+            self.head = NonNull::new(unsafe { *task.as_mut().next.get_mut() });
+            if self.head.is_none() {
+                self.tail = None;
             }
-        } else {
-            *self = other;
-        }
-    }
-
-    pub(crate) fn pop_front(&mut self) -> Option<NonNull<Task>> {
-        self.head.map(|head| {
-            let task = unsafe { &mut *head.as_ptr() };
-            self.head = NonNull::new(task.next.with_mut(|next| *next as *mut _));
-            NonNull::from(task)
-        })
-    }
-
-    pub(crate) fn drain(&mut self) -> BatchDrain<'_> {
-        BatchDrain(self)
-    }
-
-    pub(crate) fn iter(&self) -> BatchIter<'_> {
-        BatchIter {
-            _batch: self,
-            current: self.head,
-        }
-    }
-}
-
-pub(crate) struct BatchDrain<'a>(&'a mut Batch);
-
-impl<'a> Iterator for BatchIter<'a> {
-    type Item = NonNull<Task>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.pop_front()
-    }
-}
-
-pub(crate) struct BatchIter<'a> {
-    _batch: &'a Batch,
-    current: Option<NonNull<Task>>,
-}
-
-impl<'a> Iterator for BatchIter<'a> {
-    type Item = NonNull<Task>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.current.map(|task| {
-            let task = unsafe { &mut *head.as_ptr() };
-            self.current = NonNull::new(task.next.with_mut(|next| *next as *mut _));
-            NonNull::from(task)
+            task
         })
     }
 }

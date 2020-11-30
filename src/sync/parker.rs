@@ -1,49 +1,71 @@
+use crate::time::Instant;
 use std::{
-    cell::{Cell, UnsafeCell},
     sync::atomic::{AtomicBool, Ordering},
     thread::{self, Thread},
 };
 
 pub(crate) struct Parker {
-    thread: Cell<Option<Thread>>,
-    notified: UnsafeCell<AtomicBool>,
+    thread: Option<Thread>,
+    notified: AtomicBool,
 }
 
 unsafe impl Sync for Parker {}
 
+impl Default for Parker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Parker {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            thread: Cell::new(None),
-            notified: UnsafeCell::new(AtomicBool::new(false)),
+            thread: None,
+            notified: AtomicBool::new(false),
         }
     }
 
-    pub(crate) unsafe fn prepare(&self) {
-        *(&mut *self.notified.get()).get_mut() = false;
+    pub(crate) fn prepare(&mut self) {
+        *self.notified.get_mut() = false;
 
-        let thread = self.thread.replace(None);
-        let thread = thread.unwrap_or_else(|| thread::current());
-        self.thread.set(Some(thread));
-    }
-
-    pub(crate) unsafe fn park(&self) {
-        let notified = &*self.notified.get();
-        while !notified.load(Ordering::Acquire) {
-            thread::park();
+        if self.thread.is_none() {
+            self.thread = Some(thread::current());
         }
     }
 
-    pub(crate) unsafe fn unpark(&self) {
+    pub(crate) fn park(&self, deadline: Option<Instant>) -> bool {
+        loop {
+            if self.notified.load(Ordering::Acquire) {
+                return true;
+            }
+
+            let deadline = match deadline {
+                Some(deadline) => deadline,
+                None => {
+                    thread::park();
+                    continue;
+                }
+            };
+
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+
+            let timeout = deadline - now;
+            thread::park_timeout(timeout);
+        }
+    }
+
+    pub(crate) fn unpark(&self) {
         let thread = self
             .thread
-            .replace(None)
-            .expect("Parker without associated thread");
-        self.thread.set(Some(thread.clone()));
+            .as_ref()
+            .expect("Parker::unpark() called before Parker::prepare()")
+            .clone();
 
-        let notified = &*self.notified.get();
-        notified.store(true, Ordering::Release);
+        self.notified.store(true, Ordering::Release);
 
-        thread.unpark()
+        thread.unpark();
     }
 }

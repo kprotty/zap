@@ -47,6 +47,11 @@ impl UnboundedQueue {
         let prev = self.tail.swap(batch_tail.as_ptr(), Ordering::AcqRel);
         let prev = NonNull::new(prev).unwrap_or(NonNull::from(&self.stub));
 
+        // SAFETY:
+        // We swapped this out from the tail so no producers can be storing to it at the same time.
+        //
+        // The consumer could still have a reference to this task,
+        // but it never dequeues and takes ownership of it until theres a following .next node.
         let prev = unsafe { &*prev.as_ptr() };
         prev.next.store(batch_head.as_ptr(), Ordering::Release);
     }
@@ -93,10 +98,13 @@ impl<'a> Iterator for UnboundedConsumer<'a> {
     type Item = NonNull<Task>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stub = NonNull::from(&self.queue.stub);
+        // SAFETY(head.as_ref()): 
+        // We are the only consumer so the head node should always be safe to read
+        
         let mut head = self.head;
         let mut next = NonNull::new(unsafe { head.as_ref().next.load(Ordering::Acquire) });
 
+        let stub = NonNull::from(&self.queue.stub);
         if head == stub {
             head = next?;
             self.head = head;
@@ -114,6 +122,9 @@ impl<'a> Iterator for UnboundedConsumer<'a> {
             return None;
         }
 
+        // SAFETY: 
+        // We already skipped the stub above indicating that its no longer in the queue of tasks.
+        // This means that we, as the consumer, have ownership of it so we can push it back into the queue.
         self.queue.push(unsafe {
             let stub = &mut *stub.as_ptr();
             Pin::new_unchecked(stub)
@@ -129,13 +140,17 @@ impl<'a> Iterator for UnboundedConsumer<'a> {
     }
 }
 
+/// A Single-Producer, Multi-Consumer, FIFO Queue of Task references.
 pub(crate) struct BoundedQueue {
     head: AtomicUsize,
-    tail: UnsafeCell<AtomicUsize>,
+    tail: AtomicUsize,
     buffer: [AtomicPtr<Task>; Self::CAPACITY],
 }
 
 impl BoundedQueue {
+    /// TODO:
+    /// This is currently the capacity used in Golang.
+    /// Futher testing is needed, but it should generally always be a power of two for faster hashing.
     const CAPACITY: usize = 256;
 
     pub(crate) fn new() -> Self {
@@ -143,6 +158,7 @@ impl BoundedQueue {
             head: AtomicUsize::new(0),
             tail: UnsafeCell::new(AtomicUsize::new(0)),
             buffer: unsafe {
+                // SAFETY: Rust doesn't support Default for large array sizes...
                 let mut buffer = MaybeUninit::<[AtomicPtr<Task>; Self::CAPACITY]>::uninit();
 
                 (0..Self::CAPACITY).for_each(|offset| {
@@ -156,10 +172,16 @@ impl BoundedQueue {
         }
     }
 
+    /// Create a reference to the BoundedQueue that acts as the Single-Producer
+    ///
+    /// # SAFETY: 
+    ///
+    /// The caller must ensure that this thread is the only one with a BoundedProducer
     pub(crate) unsafe fn producer(&self) -> BoundedProducer<'_> {
+        // TODO: Since we're only producer, could we get rid of the atomic load here?
         BoundedProducer {
             queue: self,
-            tail: *(*self.tail.get()).get_mut(),
+            tail: self.tail.load(Ordering::Relaxed),
         }
     }
 }
@@ -182,15 +204,15 @@ impl<'a> BoundedProducer<'a> {
             let size = self.tail.wrapping_sub(head);
             let remaining = BoundedQueue::CAPACITY - size;
             if remaining > 0 {
-                (0..remaining).filter_map(|_| batch.pop()).for_each(|task| {
-                    let index = self.tail % BoundedQueue::CAPACITY;
-                    self.queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
-                    self.tail = self.tail.wrapping_add(1);
-                });
-
-                let tail_ref = unsafe { &*self.queue.tail.get() };
-                tail_ref.store(self.tail, Ordering::Release);
-
+                (0..remaining)
+                    .filter_map(|_| batch.pop_front())
+                    .for_each(|task| {
+                        let index = self.tail % BoundedQueue::CAPACITY;
+                        self.queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
+                        self.tail = self.tail.wrapping_add(1);
+                    });
+                
+                self.queue.tail.store(self.tail, Ordering::Release);
                 head = self.queue.head.load(Ordering::Relaxed);
                 continue;
             }
@@ -210,8 +232,12 @@ impl<'a> BoundedProducer<'a> {
                 let index = head.wrapping_add(offset) % BoundedQueue::CAPACITY;
                 let slot = &self.queue.buffer[index];
                 let task = slot.load(Ordering::Relaxed);
-
-                batch.push(unsafe {
+                
+                // SAFETY: 
+                // The producing-end ensures that valid tasks are written to the queue buffer.
+                // We also marked theses tasks as consumed above using the CAS + Acquire barrier.
+                // This implies that we now have ownership over them.
+                batch.push_back(unsafe {
                     let task = NonNull::new_unchecked(task);
                     let task = &mut *task.as_ptr();
                     Pin::new_unchecked(task)
@@ -220,7 +246,7 @@ impl<'a> BoundedProducer<'a> {
                 batch
             });
 
-            overflowed.push(batch);
+            overflowed.push_back(batch);
             return Some(overflowed);
         }
     }
@@ -285,8 +311,7 @@ impl<'a> Stealable for Pin<&'a UnboundedQueue> {
 
         if new_tail != producer.tail {
             producer.tail = new_tail;
-            let tail_ref = unsafe { &*producer.queue.tail.get() };
-            tail_ref.store(new_tail, Ordering::Release);
+            producer.queue.tail.store(new_tail, Ordering::Release);
         }
 
         Some(first_task)
@@ -299,11 +324,7 @@ impl<'a> Stealable for &'a BoundedQueue {
 
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            let tail = {
-                let tail_ref = unsafe { &*self.tail.get() };
-                tail_ref.load(Ordering::Acquire)
-            };
-
+            let tail = self.tail.load(Ordering::Acquire);
             let size = tail.wrapping_sub(head);
             if size == 0 {
                 return None;
@@ -322,7 +343,7 @@ impl<'a> Stealable for &'a BoundedQueue {
                 let slot = &self.buffer[index];
                 let task = slot.load(Ordering::Relaxed);
                 new_head = new_head.wrapping_add(1);
-                unsafe { NonNull::new_unchecked(task) }
+                NonNull::new(task).unwrap()
             });
 
             let first_task = consumer.next();
@@ -343,8 +364,7 @@ impl<'a> Stealable for &'a BoundedQueue {
 
             if new_producer_tail != producer.tail {
                 producer.tail = new_producer_tail;
-                let tail_ref = unsafe { &*producer.queue.tail.get() };
-                tail_ref.store(new_producer_tail, Ordering::Release);
+                producer.queue.tail.store(new_producer_tail, Ordering::Release);
             }
 
             return first_task;

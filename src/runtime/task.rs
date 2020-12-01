@@ -28,7 +28,7 @@ pub(crate) struct Batch {
 
 impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
-        // SAFETY: 
+        // SAFETY:
         // We have ownership over the task (&mut Task)
         // and it requires unsafe to create a Pin'd reference from it due to !Unpin.
         let task = unsafe { task.get_unchecked_mut() };

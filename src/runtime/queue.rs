@@ -1,6 +1,5 @@
 use super::{Batch, Runnable, Task};
 use std::{
-    cell::UnsafeCell,
     marker::PhantomPinned,
     mem::MaybeUninit,
     pin::Pin,
@@ -98,9 +97,9 @@ impl<'a> Iterator for UnboundedConsumer<'a> {
     type Item = NonNull<Task>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // SAFETY(head.as_ref()): 
+        // SAFETY(head.as_ref()):
         // We are the only consumer so the head node should always be safe to read
-        
+
         let mut head = self.head;
         let mut next = NonNull::new(unsafe { head.as_ref().next.load(Ordering::Acquire) });
 
@@ -122,7 +121,7 @@ impl<'a> Iterator for UnboundedConsumer<'a> {
             return None;
         }
 
-        // SAFETY: 
+        // SAFETY:
         // We already skipped the stub above indicating that its no longer in the queue of tasks.
         // This means that we, as the consumer, have ownership of it so we can push it back into the queue.
         self.queue.push(unsafe {
@@ -156,7 +155,7 @@ impl BoundedQueue {
     pub(crate) fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
-            tail: UnsafeCell::new(AtomicUsize::new(0)),
+            tail: AtomicUsize::new(0),
             buffer: unsafe {
                 // SAFETY: Rust doesn't support Default for large array sizes...
                 let mut buffer = MaybeUninit::<[AtomicPtr<Task>; Self::CAPACITY]>::uninit();
@@ -174,7 +173,7 @@ impl BoundedQueue {
 
     /// Create a reference to the BoundedQueue that acts as the Single-Producer
     ///
-    /// # SAFETY: 
+    /// # SAFETY:
     ///
     /// The caller must ensure that this thread is the only one with a BoundedProducer
     pub(crate) unsafe fn producer(&self) -> BoundedProducer<'_> {
@@ -211,7 +210,7 @@ impl<'a> BoundedProducer<'a> {
                         self.queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
                         self.tail = self.tail.wrapping_add(1);
                     });
-                
+
                 self.queue.tail.store(self.tail, Ordering::Release);
                 head = self.queue.head.load(Ordering::Relaxed);
                 continue;
@@ -232,8 +231,8 @@ impl<'a> BoundedProducer<'a> {
                 let index = head.wrapping_add(offset) % BoundedQueue::CAPACITY;
                 let slot = &self.queue.buffer[index];
                 let task = slot.load(Ordering::Relaxed);
-                
-                // SAFETY: 
+
+                // SAFETY:
                 // The producing-end ensures that valid tasks are written to the queue buffer.
                 // We also marked theses tasks as consumed above using the CAS + Acquire barrier.
                 // This implies that we now have ownership over them.
@@ -282,16 +281,16 @@ impl<'a> BoundedProducer<'a> {
             return self.pop();
         }
 
-        stealable.pop_and_steal(self)
+        stealable.pop_and_steal_into(self)
     }
 }
 
 pub(crate) trait Stealable {
-    fn pop_and_steal(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>>;
+    fn pop_and_steal_into(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>>;
 }
 
 impl<'a> Stealable for Pin<&'a UnboundedQueue> {
-    fn pop_and_steal(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>> {
+    fn pop_and_steal_into(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>> {
         let mut consumer = self.consumer()?;
         let first_task = consumer.next()?;
 
@@ -319,7 +318,7 @@ impl<'a> Stealable for Pin<&'a UnboundedQueue> {
 }
 
 impl<'a> Stealable for &'a BoundedQueue {
-    fn pop_and_steal(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>> {
+    fn pop_and_steal_into(self, producer: &mut BoundedProducer<'_>) -> Option<NonNull<Task>> {
         debug_assert_eq!(producer.queue.head.load(Ordering::Relaxed), producer.tail,);
 
         let mut head = self.head.load(Ordering::Acquire);
@@ -364,7 +363,10 @@ impl<'a> Stealable for &'a BoundedQueue {
 
             if new_producer_tail != producer.tail {
                 producer.tail = new_producer_tail;
-                producer.queue.tail.store(new_producer_tail, Ordering::Release);
+                producer
+                    .queue
+                    .tail
+                    .store(new_producer_tail, Ordering::Release);
             }
 
             return first_task;

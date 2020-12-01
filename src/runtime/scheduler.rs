@@ -1,5 +1,6 @@
-use super::{ActiveStack, IdleStack};
+use super::{ActiveList, Batch, IdleList, OwnedWorkerRef, UnboundedQueue, Worker};
 use std::{
+    convert::TryInto,
     marker::PhantomPinned,
     pin::Pin,
     sync::atomic::{AtomicU32, Ordering},
@@ -60,9 +61,11 @@ impl Into<u32> for Counter {
 
 #[repr(align(4))]
 pub(crate) struct Scheduler {
+    max_workers: u16,
     counter: AtomicU32,
-    idle_stack: IdleStack,
-    active_stack: ActiveStack,
+    idle_workers: IdleList,
+    pub(crate) active_workers: ActiveList,
+    pub(crate) run_queue: UnboundedQueue,
     _pinned: PhantomPinned,
 }
 
@@ -70,15 +73,40 @@ unsafe impl Send for Scheduler {}
 unsafe impl Sync for Scheduler {}
 
 impl Scheduler {
-    pub(crate) fn notify(&self) {
-        self.notify_when(false);
+    pub(crate) fn new(max_workers: u16) -> Self {
+        Self {
+            max_workers,
+            counter: AtomicU32::new(0),
+            run_queue: UnboundedQueue::new(),
+            idle_workers: IdleList::new(),
+            active_workers: ActiveList::new(),
+            _pinned: PhantomPinned,
+        }
     }
 
-    pub(crate) fn notify_waking(&self) {
-        self.notify_when(true);
+    pub(crate) fn count_active_workers(self: Pin<&Self>) -> u16 {
+        let counter = self.counter.load(Ordering::Relaxed);
+        let Counter { spawned, idle, .. } = Counter::from(counter);
+        debug_assert!(spawned >= idle);
+        spawned - idle
     }
 
-    fn notify_when(&self, is_waking: bool) {
-        compile_error!("TODO")
+    pub(crate) fn schedule(self: Pin<&Self>, batch: impl Into<Batch>) {
+        let batch: Batch = batch.into();
+        if batch.empty() {
+            return;
+        }
+
+        let run_queue = unsafe { Pin::new_unchecked(&self.run_queue) };
+        run_queue.push(batch);
+        self.notify(false);
+    }
+
+    pub(crate) fn notify(self: Pin<&Self>, is_waking: bool) -> bool {
+        compile_error!("TODO: resumeWorker(is_waking): <resumed:bool>")
+    }
+
+    pub(crate) fn suspend(self: Pin<&Self>, worker: Pin<&Worker>) -> Option<bool> {
+        compile_error!("TODO: suspendWorker(worker): <None:shutdown | Some(is_waking)>")
     }
 }

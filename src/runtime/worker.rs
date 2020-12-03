@@ -2,7 +2,8 @@ use super::{ActiveNode, Batch, BoundedQueue, IdleNode, Scheduler, Task, Unbounde
 use std::{
     cell::{Cell, UnsafeCell},
     marker::PhantomPinned,
-    mem::{align_of, size_of},
+    mem::size_of,
+    num::NonZeroUsize,
     pin::Pin,
     ptr::null_mut,
     ptr::NonNull,
@@ -11,15 +12,15 @@ use std::{
 
 #[repr(align(4))]
 pub(crate) struct Worker {
-    state: Cell<usize>,
-    idle_node: UnsafeCell<IdleNode>,
-    active_node: UnsafeCell<ActiveNode>,
+    scheduler: NonNull<Scheduler>,
     run_queue: BoundedQueue,
     run_queue_tick: Cell<usize>,
     run_queue_prng: Cell<usize>,
     run_queue_lifo: AtomicPtr<Task>,
     run_queue_overflow: UnboundedQueue,
     run_queue_next: Cell<Option<NonNull<Task>>>,
+    pub(crate) idle_node: UnsafeCell<IdleNode>,
+    pub(crate) active_node: UnsafeCell<ActiveNode>,
     _pinned: PhantomPinned,
 }
 
@@ -27,96 +28,35 @@ unsafe impl Send for Worker {}
 unsafe impl Sync for Worker {}
 
 impl Worker {
-    pub(crate) fn new(scheduler: Pin<&Scheduler>) -> Self {
+    pub(crate) fn new(scheduler: Pin<&Scheduler>, seed: NonZeroUsize) -> Self {
         Self {
-            state: Cell::new(&*scheduler as *const _ as usize),
-            idle_node: UnsafeCell::new(IdleNode::new()),
-            active_node: UnsafeCell::new(ActiveNode::new()),
+            scheduler: NonNull::from(&*scheduler),
             run_queue: BoundedQueue::new(),
-            run_queue_tick: Cell::new(0),
-            run_queue_prng: Cell::new(0),
+            run_queue_tick: Cell::new(seed.get()),
+            run_queue_prng: Cell::new(seed.get()),
             run_queue_lifo: AtomicPtr::default(),
             run_queue_overflow: UnboundedQueue::new(),
             run_queue_next: Cell::new(None),
+            idle_node: UnsafeCell::new(IdleNode::new()),
+            active_node: UnsafeCell::new(ActiveNode::new()),
             _pinned: PhantomPinned,
         }
     }
 
     pub(crate) unsafe fn owned(self: Pin<&Worker>) -> OwnedWorkerRef<'_> {
-        OwnedWorkerRef { worker: self }
+        OwnedWorkerRef {
+            worker: self,
+            scheduler: Pin::new_unchecked(&*self.scheduler.as_ptr()),
+        }
     }
 }
 
 pub(crate) struct OwnedWorkerRef<'a> {
-    worker: Pin<&'a Worker>,
+    pub(crate) worker: Pin<&'a Worker>,
+    pub(crate) scheduler: Pin<&'a Scheduler>,
 }
 
 impl<'a> OwnedWorkerRef<'a> {
-    const STATE_WAKING: u32 = 1 << 0;
-    const STATE_ACTIVE: u32 = 1 << 1;
-
-    fn get_state(&self, state: u32) -> bool {
-        debug_assert_eq!(state & (state - 1), 0);
-        debug_assert!(align_of::<Scheduler>() > (state as usize));
-
-        let worker_state = self.worker.state.get();
-        worker_state & (state as usize) != 0
-    }
-
-    fn set_state(&mut self, state: u32, value: bool) {
-        debug_assert_eq!(state & (state - 1), 0);
-        debug_assert!(align_of::<Scheduler>() > (state as usize));
-
-        let mut worker_state = self.worker.state.get();
-        worker_state &= !(state as usize);
-        worker_state |= if value { state as usize } else { 0 };
-        self.worker.state.set(worker_state);
-    }
-
-    fn scheduler(&self) -> Pin<&'a Scheduler> {
-        unsafe {
-            let worker_state = self.worker.state.get();
-            let ptr = worker_state & !(align_of::<Scheduler>() - 1);
-            debug_assert_ne!(ptr, 0);
-
-            let ptr = NonNull::new_unchecked(ptr as *mut Scheduler);
-            Pin::new_unchecked(&mut *ptr.as_ptr())
-        }
-    }
-
-    pub(crate) fn run(&self) {
-        debug_assert!(
-            !self.get_state(Self::STATE_ACTIVE),
-            "OwnedWorkerRef::run() called more than once",
-        );
-
-        let scheduler = self.scheduler();
-        self.set_state(Self::STATE_ACTIVE, true);
-        scheduler.active_workers.push(unsafe {
-            let active_node_ptr = self.worker.active_node.get();
-            Pin::new_unchecked(&mut *active_node_ptr)
-        });
-
-        self.set_state(Self::STATE_WAKING, true);
-        self.worker.run_queue_tick.set(self as *const _ as usize);
-        self.worker.run_queue_prng.set(self as *const _ as usize);
-
-        loop {
-            if let Some(task) = self.poll() {
-                unsafe { (task.runnable.0)(task, self.worker) };
-                continue;
-            }
-
-            self.set_state(
-                Self::STATE_WAKING,
-                match scheduler.suspend(self.worker) {
-                    Some(is_waking) => is_waking,
-                    None => break,
-                },
-            );
-        }
-    }
-
     pub(crate) fn schedule(&mut self, use_next: bool, use_lifo: bool, tasks: impl Into<Batch>) {
         let mut batch: Batch = tasks.into();
         if batch.empty() {
@@ -156,7 +96,7 @@ impl<'a> OwnedWorkerRef<'a> {
         }
 
         if !batch.empty() {
-            let (run_queue, overflow_queue) = unsafe {
+            let (mut run_queue, overflow_queue) = unsafe {
                 (
                     self.worker.run_queue.producer(),
                     self.worker.map_unchecked(|w| &w.run_queue_overflow),
@@ -168,38 +108,23 @@ impl<'a> OwnedWorkerRef<'a> {
             }
         }
 
-        let scheduler = self.scheduler();
-        scheduler.notify(false);
+        self.scheduler.notify();
     }
 
     pub(crate) fn poll(&self) -> Option<Pin<&'a mut Task>> {
-        let scheduler = self.scheduler();
         let tick = self.worker.run_queue_tick.get();
-
-        self.poll_task(tick, scheduler).map(|task| {
-            // If we find a task while we're waking, then we're no longer waking anymore.
-            // When transitioning out, we attempt to move the waking state to another Worker.
-            // The new waking worker will poll for tasks, possibly find work, and wake another Worker.
-            //
-            // This handoff of the waking state helps acts as a throttling mechanism for thread park/unpark
-            // to prevent thundering herd issues on contention when work stealing.
-            if self.get_state(Self::STATE_WAKING) {
-                scheduler.notify(true);
-                self.set_state(Self::STATE_WAKING, false);
-            }
-
-            // SAFETY: we should have ownership of the polled task
+        self.poll_task(tick).map(|task| {
             self.worker.run_queue_tick.set(tick.wrapping_add(1));
             unsafe { Pin::new_unchecked(&mut *task.as_ptr()) }
         })
     }
 
-    fn poll_task(&self, tick: usize, scheduler: Pin<&Scheduler>) -> Option<NonNull<Task>> {
-        let (run_queue, overflow_queue, shared_queue) = unsafe {
+    fn poll_task(&self, tick: usize) -> Option<NonNull<Task>> {
+        let (mut run_queue, overflow_queue, shared_queue) = unsafe {
             (
                 self.worker.run_queue.producer(),
                 self.worker.map_unchecked(|w| &w.run_queue_overflow),
-                scheduler.map_unchecked(|s| &s.run_queue),
+                self.scheduler.map_unchecked(|s| &s.run_queue),
             )
         };
 
@@ -251,35 +176,20 @@ impl<'a> OwnedWorkerRef<'a> {
         }
 
         let num_workers = {
-            let active_workers = scheduler.count_active_workers();
+            let active_workers = self.scheduler.count_active_workers();
             debug_assert!(active_workers > 0);
             active_workers as usize
         };
 
         // Create a cyclic iterator of all the observable active workers in the scheduler.
         // Then skip a random amount for the starting point in order to reduce contention.
-        let mut worker_iter = scheduler.active_workers.iter();
+        let mut worker_iter = self.scheduler.workers();
         let mut workers = (0..)
             .map(|_| {
                 worker_iter.next().unwrap_or_else(|| {
-                    worker_iter = scheduler.active_workers.iter();
-                    worker_iter
-                        .next()
-                        .expect("No workers found when work stealing")
+                    worker_iter = self.scheduler.workers();
+                    worker_iter.next().expect("no workers when stealing")
                 })
-            })
-            .map(|active_node| unsafe {
-                // SAFETY:
-                // This materializes Pin<&Worker>s from Pin<&ActiveNode> using offsetof magic.
-                // This is safe due to only active_nodes from workers being present in the scheduler's ActiveList.
-                let node_offset = {
-                    let node_ptr = self.worker.active_node.get() as usize;
-                    let worker_ptr = (&*self.worker) as *const _ as usize;
-                    node_ptr - worker_ptr
-                };
-                let node_ptr = &*active_node as *const _ as usize;
-                let worker_ptr = node_ptr - node_offset;
-                Pin::new_unchecked(&*(worker_ptr as *const Worker))
             })
             .skip({
                 // Xorshift PRNG which supports most architectures
@@ -287,6 +197,7 @@ impl<'a> OwnedWorkerRef<'a> {
                     8 => (13, 7, 17),
                     4 => (13, 17, 5),
                     2 => (7, 9, 8),
+                    _ => unreachable!("platform not supported"),
                 };
                 let mut prng = self.worker.run_queue_prng.get();
                 prng ^= prng << a;

@@ -26,7 +26,7 @@ pub(crate) struct ActiveList {
 }
 
 impl ActiveList {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             head: AtomicPtr::default(),
         }
@@ -178,21 +178,19 @@ impl IdleList {
                 return;
             }
 
-            let head = match NonNull::new((state & IDLE_WAITING) as *mut IdleNode) {
-                Some(node) => node,
-                None => match self.state.compare_exchange_weak(
+            let node = NonNull::new((state & IDLE_WAITING) as *mut IdleNode);
+            if node.is_none() {
+                match self.state.compare_exchange_weak(
                     state,
                     (state & IDLE_WAKING) | IDLE_NOTIFIED,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => return,
-                    Err(e) => {
-                        state = e;
-                        continue;
-                    }
-                },
-            };
+                    Err(e) => state = e,
+                }
+                continue;
+            }
 
             if state & IDLE_WAKING != 0 {
                 return;

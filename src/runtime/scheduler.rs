@@ -2,10 +2,10 @@ use super::{ActiveList, Batch, IdleList, IdleNode, UnboundedQueue, Worker};
 use std::{
     cell::Cell,
     convert::TryInto,
-    ptr::NonNull,
     marker::PhantomPinned,
     num::{NonZeroU16, NonZeroUsize},
     pin::Pin,
+    ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
 

@@ -1,7 +1,9 @@
 const zap = @import("../zap.zig");
+const Event = zap.runtime.Event;
 const Thread = zap.runtime.Thread;
 const target = zap.runtime.target;
 const atomic = zap.sync.atomic;
+const parking_lot = zap.sync.parking_lot;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
@@ -104,11 +106,54 @@ pub const Worker = struct {
     };
 
     pub fn schedule(self: *Worker, hint: ScheduleHint, batchable: anytype) void {
+        var batch = Task.Batch.from(batchable);
+        if (batch.isEmpty())
+            return;
 
+        var sched_hint = hint;
+        while (true) {
+            switch (sched_hint) {
+                .next => {
+                    const new_next = batch.popFront();
+                    const old_next = self.run_queue_next;
+                    self.run_queue_next = new_next;
+                    if (old_next) |task|
+                        batch.pushFront(task);
+                    break;
+                },
+                .lifo => {
+                    const new_lifo = batch.popFront();
+                    const old_lifo = atomic.swap(&self.run_queue_lifo, new_lifo, .acq_rel);
+                    if (old_lifo) |task|
+                        batch.pushFront(task);
+                    break;
+                },
+                .fifo => {
+                    // the default is FIFO
+                    break;
+                },
+                .yield => {
+                    const new_next = self.poll() orelse batch.popFront();
+                    batch.pushFront(new_next);
+                    sched_hint = .next;
+                    continue;
+                },
+            }
+        }
+
+        if (!batch.isEmpty()) {
+            if (self.run_queue.push(batch)) |overflowed|
+                self.run_queue_overflow.push(overflowed);
+        } else if (sched_hint == .next) {
+            return;
+        }
+
+        const pool = self.pool;
+        _ = pool.tryResume(self);
     }
 
     fn run(pool: *Pool) void {
-
+        @compileError("TODO");
     }
 
     fn poll(self: *Worker) ?*Task {
@@ -242,7 +287,12 @@ pub const Pool = struct {
     }
 
     pub fn schedule(self: *Pool, batchable: anytype) void {
+        const batch = Task.Batch.from(batchable);
+        if (batch.isEmpty())
+            return;
 
+        self.run_queue.push(batch);
+        _ = self.tryResume(null);
     }
 
     fn tryResume(self: *Pool, worker: ?*Worker) bool {
@@ -263,6 +313,7 @@ pub const Pool = struct {
                 new_idle_queue.state = .waking;
                 if (idle_queue.idle > 0) {
                     new_idle_queue.idle -= 1;
+                    new_idle_queue.notified = true;
                 } else {
                     new_idle_queue.spawned += 1;
                 }
@@ -362,14 +413,42 @@ pub const Pool = struct {
                 return true;
             if (is_notified)
                 return false;
+
             if (!is_shutdown) {
-                self.wait();
+                self.wait() orelse {
+                    idle_queue = IdleQueue.unpack(self.idle_queue.load(.relaxed));
+                    continue;
+                };
                 return true;
             }
 
+            const is_root_worker = worker.active_next == null;
+            const wait_address = @ptrToInt(&self.active_queue);
+
             if (new_idle_queue.counter == 0) {
-                const root_worker = atomic.load()
+                if (is_root_worker)
+                    return;
+                parking_lot.unparkAll(wait_address);
             }
+
+            if (is_root_worker) {
+                _ = parking_lot.parkConditionally(Event, wait_address, null, struct {
+                    pool: *Pool,
+
+                    pub fn onTimeout(self: @This()) void {}
+                    pub fn onBeforeSleep(self: @This()) void {}
+                    pub fn onValidate(self: @This()) ?usize {
+                        const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
+                        if (idleq.spawned == 0)
+                            return null;
+                        return 0;
+                    }
+                }{
+                    .pool = self,
+                });
+            }
+
+            return;
         }
     }
 
@@ -377,12 +456,56 @@ pub const Pool = struct {
 
     }
 
-    fn wait(self: *Pool) void {
+    fn wait(self: *Pool) ?void {
+        @setCold(true);
 
+        // TODO: use io-driver if present
+        // TODO: integrate with timers
+
+        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
+        while (true) {
+            if (idle_queue.state == .shutdown)
+                return null;
+
+            if (idle_queue.notified) {
+                var new_idle_queue = idle_queue;
+                new_idle_queue.notified = false;
+                idle_queue = IdleQueue.unpack(atomic.tryCompareAndSwap(
+                    idle_queue.pack(),
+                    new_idle_queue.pack(),
+                    .relaxed,
+                    .relaxed,
+                ) orelse return);
+                continue;
+            }
+
+            const wait_address = @ptrToInt(&self.idle_queue);
+            _ = parking_lot.parkConditionally(Event, wait_address, null, struct {
+                pool: *Pool,
+
+                pub fn onTimeout(self: @This()) void {}
+                pub fn onBeforeSleep(self: @This()) void {}
+                pub fn onValidate(self: @This()) ?usize {
+                    const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
+                    if (idleq.notified or idleq.state == .shutdown)
+                        return null;
+                    return 0;
+                }
+            }{
+                .pool = self,
+            });
+
+            idle_queue = IdleQueue.unpack(self.idle_queue.load(.relaxed));
+        }
     }
 
     fn notify(self: *Pool) void {
+        @setCold(true);
 
+        const wait_address = @ptrToInt(&self.idle_queue);
+        parking_lot.unparkOne(wait_address, struct {
+            pub fn onUnpark(self: @This(), result: parking_lot.UnparkResult) void {}
+        }{});
     }
 };
 

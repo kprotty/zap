@@ -46,11 +46,12 @@ const WaitBucket = struct {
     }
 };
 
-const WaitTree = struct {
+// TODO: use red-black-tree instead of linear scan
+pub const WaitTree = struct {
     bucket: *WaitBucket,
     root: WaitRoot,
 
-    fn acquire(address: usize) WaitTree {
+    pub fn acquire(address: usize) WaitTree {
         const bucket = WaitBucket.get(address);
         bucket.lock.acquire();
         return WaitTree{
@@ -59,31 +60,9 @@ const WaitTree = struct {
         };
     }
 
-    fn release(self: WaitTree) void {
+    pub fn release(self: WaitTree) void {
         self.bucket.root = self.root.pack();
         self.bucket.lock.release();
-    }
-
-    fn lookup(self: *WaitTree, address: usize, parent: *?*WaitNode, is_left: *bool) ?*WaitNode {
-        const root = switch (self.root) {
-            .prng => @as(?*WaitNode, null),
-            .tree => |root| root,
-        };
-        
-        parent.* = root;
-        is_left.* = false;
-        var node = root;
-
-        while (node) |current| {
-            if (current.address == address)
-                return current;
-
-            parent.* = current;
-            is_left.* = current.address > address;
-            node = current.children[@boolToInt(!is_left.*)];
-        }
-
-        return null;
     }
 
     fn setRoot(self: *WaitTree, new_root: ?*WaitNode) void {
@@ -114,239 +93,155 @@ const WaitTree = struct {
         };
     }
 
-    fn rotate(self: *WaitTree, node: *WaitNode, is_left: bool) {
-        const next = node.children[@boolToInt(!is_left)] orelse unreachable;
+    pub fn shouldBeFair(self: *WaitTree) bool {
+        const root = switch (self.root) {
+            .prng => return false,
+            .tree => |root| root orelse return false,
+        };
 
-        if (node.getParent()) |parent| {
-            parent.children[@boolToInt(parent.children[0] != node)] = next;
-            next.setParent(parent);
-        } else {
-            self.setRoot(next);
-            next.setParent(null);
-        }
+        const now = nanotime();
+        if (now < root.times_out)
+            return false;
 
-        node.setParent(next);
-        const update = next.children[@boolToInt(is_left)];
-        node.children[@boolToInt(!is_left)] = update;
-        if (update) |updated|
-            updated.setParent(node);
-        next.children[@boolToInt(is_left)] = node;
+        root.times_out = now + root.genTimeout();
+        return true;
     }
 
-    fn find(self: *WaitTree, address: usize) WaitList {
-        var is_left: bool = undefined;
-        var parent: ?*WaitNode = undefined;
+    fn lookup(self: *WaitTree, address: usize, prev: *?*WaitNode) ?*WaitNode {
+        var current = switch (self.root) {
+            .prng => null,
+            .tree => |root| root,
+        };
 
+        prev.* = null;
+        while (current) |node| {
+            if (node.address == address)
+                return node;
+            prev.* = node;
+            current = node.root_next;
+        }
+
+        return null;
+    }
+
+    pub fn find(self: *WaitTree, address: usize) WaitList {
         return WaitList{
             .tree = self,
-            .head = self.lookup(address, &parent, &is_left),
+            .head = blk: {
+                var prev: ?*WaitNode = undefined;
+                break :blk self.lookup(address, &prev);
+            },
         };
     }
 
-    fn insert(self: *WaitTree, address: usize, node: *WaitNode) void {
-        @setRuntimeSafety(false);
-
+    pub fn insert(self: *WaitTree, address: usize, node: *WaitNode) void {
         node.address = address;
-        node.next = null;
+        node.head = node;
         node.tail = node;
-
-        {
-            var is_left: bool = undefined;
-            var parent: ?*WaitNode = undefined;
-            if (self.lookup(address, &parent, &is_left)) |head| {
-                node.prev = head.tail;
-                head.tail.next = node;
-                head.tail = node;
-                return;
-            }
-
-            node.prev = null;
-            node.setColor(.red);
-            node.setParent(parent);
-            node.children = [_]?*WaitNode{null, null};
-            
-            if (parent) |p| {
-                p.children[@boolToInt(!is_left)] = node;
-            } else {
-                self.setRoot(node);
-            }
+        node.next = null;
+        node.prev = null;
+        
+        if (self.lookup(address, &node.root_prev)) |head| {
+            const tail = head.tail orelse unreachable;
+            node.head = head;
+            node.prev = tail;
+            tail.next = node;
+            head.tail = node;
+            return;
         }
 
-        var current = node;
-        while (current.getParent()) |p| {
-            var parent = p;
-            if (parent.getColor() == .black)
-                break;
-            
-            const grand_parent = parent.getParent() orelse unreachable;
-            const is_left = grand_parent.children[0] == parent;
-
-            if (grand_parent.children[@boolToInt(is_left)]) |uncle| {
-                if (uncle.getColor() == .black)
-                    break;
-                parent.setColor(.black);
-                uncle.setColor(.black);
-                grand_parent.setColor(.red);
-                current = grand_parent;
-            } else {
-                if (current == parent.children[@boolToInt(is_left)]) {
-                    self.rotate(parent, is_left);
-                    current = parent;
-                    parent = current.getParent() orelse unreachable;
-                }
-                parent.setColor(.black);
-                grand_parent.setColor(.red);
-                self.rotate(grand_parent, !is_left);
-            }
-        }
-
-        switch (self.root) {
-            .prng => unreachable,
-            .tree => |root_node| {
-                const root = root_node orelse unreachable;
-                root.setColor(.black);
-            },
+        node.root_next = null;
+        if (node.root_prev) |prev| {
+            prev.root_next = node;
+        } else {
+            self.setRoot(node);
         }
     }
 
-    fn remove(self: *WaitTree, node: *WaitNode) void {
-        @setRuntimeSafety(false);
-
-        var new_node: ?*WaitNode = node;
-        var color: Color = undefined;
-        var new_parent: ?*WaitNode = node.getParent();
-
-        if (node.children[0] == null and node.children[1] == null) {
-            if (new_parent) |parent| {
-                parent.children[@boolToInt(parent.children[0] != node)] = null;
-            } else {
-                self.setRoot(null);
-            }
-            color = node.getColor();
-            new_node = null;
-        } else {
-            var next: *WaitNode = undefined;
-            if (node.children[0] == null) {
-                next = node.children[1] orelse unreachable;
-            } else if (node.children[1] == null) {
-                next = node.children[0] orelse unreachable;
-            } else {
-                next = blk: {
-                    var current = node.children[1] orelse unreachable;
-                    while (current.children[0]) |left|
-                        current = left;
-                    break :blk current;
-                };
-            }
-
-            if (new_parent) |parent| {
-                parent.children[@boolToInt(parent.children[0] != node)] = next;
-            } else {
-                self.setRoot(null);
-            }
-
-            if (node.children[0] != null and node.children[1] != null) {
-                const left =  orelse unreachable;
-                const right = node.children[1] orelse unreachable;
-
-                color = next.getColor();
-                next.setColor(node.getColor());
-                next.children[0] = left;
-                left.setParent(next);
-
-                if (next != right) {
-                    const parent = next.getParent() orelse unreachable;
-                    next.setParent(node.getParent());
-                    new_node = next.children[1];
-                    parent.children[0] = node;
-                    next.children[1] = right;
-                    right.setParent(next);
-                } else {
-                    next.setParent(new_parent);
-                    new_parent = next;
-                    new_node = next.children[1];
-                }
-            } else {
-                color = node.getColor();
-                new_node = next;
-            }
-        }
-
-        if (new_node) |n|
-            n.setParent(new_parent);
-        if (color == .red)
-            return;
-        
-        @compileError("TODO")
+    pub fn remove(self: *WaitTree, node: *WaitNode) void {
+        if (node.root_prev) |prev|
+            prev.root_next = node.root_next;
+        if (node.root_next) |next|
+            next.root_prev = node.root_prev;
+        if (node.root_prev == null) 
+            self.setRoot(null);
     }
 };
 
-const WaitList = struct {
+pub const WaitList = struct {
     tree: *WaitTree,
     head: ?*WaitNode,
 
-    fn remove(self: *WaitList, node: *WaitNode) void {
+    pub fn iter(self: *WaitList) WaitIter {
+        return WaitIter{
+            .list = self,
+            .node = self.head,
+        };
+    }
 
+    pub fn remove(self: *WaitList, node: *WaitNode) void {
+        const head = self.head orelse return;
+        defer node.tail = null;
 
-        if (self.head == null)  
+        if (node.next) |next|
+            next.prev = node.prev;
+        if (node.prev) |prev|
+            prev.next = node.next;
+
+        if (node == head) {
+            self.head = node.next;
+        } else if (node == head.tail) {
+            head.tail = node.prev;
+        }
+
+        if (self.head) |new_head| {
+            new_tail.tail.head = new_head;
+        } else {
             self.tree.remove(node);
+        }
     }
 };
 
-const WaitIter = struct {
+pub const WaitIter = struct {
     list: *WaitList,
-    node: *WaitNode,
+    node: ?*WaitNode,
 
-    fn next(self: *WaitIter) WaitNodeRef {
+    pub fn next(self: *WaitIter) ?WaitNodeRef {
+        const node = self.node orelse return null;
+        self.node = node.next;
 
+        return WaitNodeRef{
+            .iter = self,
+            .node = node,
+        };
     }
 };
 
-const WaitNodeRef = struct {
+pub const WaitNodeRef = struct {
     iter: *WaitIter,
     node: *WaitNode,
 
-    fn remove(self: WaitNodeRef) void {
+    pub fn get(self: WaitNodeRef) *WaitNode {
+        return self.node;
+    }
+
+    pub fn remove(self: WaitNodeRef) void {
         self.iter.list.remove(self.node);
     }
 };
 
 const WaitNode = struct {
     address: usize align(8),
-    token: usize,
     prng: usize,
     times_out: u64,
+    root_prev: ?*WaitNode,
+    root_next: ?*WaitNode,
     prev: ?*WaitNode,
     next: ?*WaitNode,
-    tail: *allowzero WaitNode,
-    parent_color: usize,
-    children: [2]?*WaitNode,
+    tail: ?*WaitNode,
+    head: *WaitNode,
+    token: usize,
     wakeFn: fn(*WaitNode) void,
-
-    const Color = enum {
-        red,
-        black,
-    };
-
-    fn getColor(self: WaitNode) Color {
-        return @intToEnum(Color, @truncate(u1, self.parent_color));
-    }
-
-    fn setColor(self: *WaitNode, color: Color) void {
-        self.parent_color &= ~@as(usize, 1);
-        self.parent_color |= @enumToInt(color);
-    }
-
-    fn getParent(self: WaitNode) ?*WaitNode {
-        @setRuntimeSafety(false);
-        const ptr = self.parent_color & ~@as(usize, 1);
-        return @intToPtr(?*WaitNode, ptr);
-    }
-
-    fn setParent(self: *WaitNode, parent: ?*WaitNode) void {
-        self.parent_color &= @as(usize, 1);
-        self.parent_color |= @ptrToInt(parent);
-    }
 
     fn genTimeout(self: WaitNode, now: u64) u32 {
         switch (@sizeOf(usize)) {
@@ -381,25 +276,169 @@ pub fn parkConditionally(
     deadline: ?u64,
     context: anytype,
 ) bool {
+    var tree = WaitTree.acquire(address);
 
+    const token: usize = context.onValidate() orelse {
+        tree.release();
+        return true;
+    };
+
+    const Context = @TypeOf(context);
+    const Waiter = struct {
+        event: Event,
+        node: WaitNode,
+
+        fn wake(node: *WaitNode) void {
+            const self = @fieldParentPtr(@This(), "node", node);
+            self.event.notify();
+        }
+    };
+
+    var waiter: Waiter = undefined;
+    waiter.node.token = token;
+    waiter.node.wakeFn = Waiter.wake;
+    tree.insert(address, &waiter.node);
+
+    waiter.event = Event{};
+    var notified: bool = waiter.event.wait(deadline, struct {
+        wait_tree: *WaitTree,
+        ctx: Context,
+
+        pub fn wait(self: @This()) bool {
+            self.wait_tree.release();
+            self.ctx.onBeforeWait();
+            return true;
+        }
+    }{
+        .wait_tree = &tree,
+        .ctx = context, 
+    });
+
+    if (notified)
+        return true;
+
+    wait_tree = WaitTree.acquire(address);
+
+    if (waiter.node.tail != null) {
+        var wait_list = WaitList{
+            .tree = &wait_tree,
+            .head = waiter.node.head,
+        };
+        wait_list.remove(&waiter.node);
+        context.onTimeout();
+        wait_tree.release();
+        return false;
+    }
+
+    notified = waiter.event.wait(null, struct {
+        wait_tree: *WaitTree,
+
+        pub fn wait(self: @This()) bool {
+            self.wait_tree.release();
+            return true;
+        }
+    }{
+        .wait_tree = &tree,
+    });
+
+    if (!notified)
+        unreachable;
+    return true;
 }
+
+pub const UnparkFilter = enum {
+    stop,
+    skip,
+    unpark,
+};
 
 pub fn unparkFilter(
     address: usize,
     context: anytype,
 ) void {
+    var wait_tree = WaitTree.acquire(address);
+    var wait_list = wait_tree.find(address);
+    
+    var wake_list: ?*WaitNode = null;
+    var wait_iter = wait_list.iter();
+    while (wait_iter.next()) |wait_node_ref| {
 
+        const node = wait_node_ref.get();
+        const result: UnparkFilter = context.onFilter(&node.token);
+        switch (result) {
+            .stop => break,
+            .skip => continue,
+            .unpark => {
+                wait_node_ref.remove();
+                node.next = wake_list;
+                wake_list = node;
+            }
+        }
+    }
+
+    context.onBeforeWake();
+    wait_tree.release();
+
+    while (wake_list) |wake_node| {
+        const node = wake_node;
+        wake_list = node.next;
+        (node.wakeFn)(node);
+    }
 }
+
+pub const UnparkResult = struct {
+    be_fair: bool = false,
+    has_more: bool = false,
+    did_unpark: bool = false,
+};
 
 pub fn unparkOne(
     address: usize,
     context: anytype,
-) void  {
+) void {
+    var wait_tree = WaitTree.acquire(address);
+    var wait_list = wait_tree.find(address);
+    var wait_iter = wait_list.iter();
+    
+    var result = UnparkResult{};
 
+    var wait_node: ?*WaitNode = null;
+    if (wait_iter.next()) |wait_node_ref| {
+        wait_node = wait_node_ref.get();
+        result.be_fair = wait_list.shouldBeFair();
+        wait_node_ref.remove();
+        result.has_more = wait_list.head != null;
+    }
+
+    const token: usize = context.onUnpark(result);
+    wait_tree.release();
+
+    if (wait_node) |node| {
+        node.token = token;
+        (node.wakeFn)(node);
+    }
 }
 
 pub fn unparkAll(
     address: usize,
 ) void {
+    var wait_tree = WaitTree.acquire(address);
+    var wait_list = wait_tree.find(address);
+    var wait_iter = wait_list.iter();
 
+    var wake_list: ?*WaitNode = null;
+    while (wait_iter.next()) |wait_node_ref| {
+        const node = wait_node_ref.get();
+        wait_node_ref.remove();
+        node.next = wake_list;
+        wake_list = node;
+    }
+
+    wait_tree.release();
+
+    while (wake_list) |wake_node| {
+        const node = wake_node;
+        wake_list = node.next;
+        (node.wakeFn)(node);
+    }
 }

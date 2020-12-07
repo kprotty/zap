@@ -436,7 +436,7 @@ pub const Pool = struct {
                     pool: *Pool,
 
                     pub fn onTimeout(self: @This()) void {}
-                    pub fn onBeforeSleep(self: @This()) void {}
+                    pub fn onBeforeWait(self: @This()) void {}
                     pub fn onValidate(self: @This()) ?usize {
                         const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
                         if (idleq.spawned == 0)
@@ -484,7 +484,7 @@ pub const Pool = struct {
                 pool: *Pool,
 
                 pub fn onTimeout(self: @This()) void {}
-                pub fn onBeforeSleep(self: @This()) void {}
+                pub fn onBeforeWait(self: @This()) void {}
                 pub fn onValidate(self: @This()) ?usize {
                     const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
                     if (idleq.notified or idleq.state == .shutdown)
@@ -504,7 +504,9 @@ pub const Pool = struct {
 
         const wait_address = @ptrToInt(&self.idle_queue);
         parking_lot.unparkOne(wait_address, struct {
-            pub fn onUnpark(self: @This(), result: parking_lot.UnparkResult) void {}
+            pub fn onUnpark(self: @This(), result: parking_lot.UnparkResult) usize {
+                return 0;
+            }
         }{});
     }
 };

@@ -387,9 +387,9 @@ pub fn unparkFilter(
 }
 
 pub const UnparkResult = struct {
+    token: ?usize = null,
     be_fair: bool = false,
     has_more: bool = false,
-    did_unpark: bool = false,
 };
 
 pub fn unparkOne(
@@ -405,6 +405,7 @@ pub fn unparkOne(
     var wait_node: ?*WaitNode = null;
     if (wait_iter.next()) |wait_node_ref| {
         wait_node = wait_node_ref.get();
+        result.token = wait_node.token;
         result.be_fair = wait_list.shouldBeFair();
         wait_node_ref.remove();
         result.has_more = wait_list.head != null;

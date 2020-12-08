@@ -4,6 +4,13 @@ pub const DWORD = u32;
 pub const DWORD64 = u64;
 pub const SIZE_T = usize;
 
+pub const BYTE = CHAR;
+pub const SHORT = WORD;
+pub const LONG = i32;
+pub const ULONG = DWORD;
+pub const LONGLONG = i64;
+pub const ULONGLONG = u64;
+
 pub const BOOL = u8;
 pub const TRUE = 1;
 pub const FALSE = 0;

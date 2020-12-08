@@ -1,6 +1,7 @@
 const zap = @import("../zap.zig");
 const target = zap.runtime.target;
 const atomic = zap.sync.atomic;
+const system = zap.runtime.system;
 const nanotime = zap.runtime.nanotime;
 
 pub const Event = 
@@ -47,17 +48,24 @@ const WindowsEvent = struct {
             .notified => return true,
         }
 
-        while (self.state == .waiting) {
+        while (true) {
+            switch (self.state) {
+                .empty => unreachable,
+                .waiting => {},
+                .notified => return true,
+            }
+
             var timeout = system.INFINITE;
             if (deadline) |deadline_ns| {
                 const now = nanotime();
                 if (now > deadline_ns) {
                     self.state = .empty;
                     return false;
-                } else {
-                    const timeout_ns = deadline_ns - now;
-                    timeout = @divFloor(timeout_ns, 1_000_000); 
                 }
+
+                const timeout_ms = @divFloor(deadline_ns - now, 1_000_000); 
+                if (timeout_ms <= ~@as(@TypeOf(timeout), 0))
+                    timeout = @intCast(@TypeOf(timeout), timeout_ms);
             }
 
             const status = system.SleepConditionVariableSRW(&self.cond, &self.lock, timeout, 0);

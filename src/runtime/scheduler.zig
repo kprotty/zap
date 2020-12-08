@@ -91,7 +91,7 @@ pub const Task = extern struct {
 pub const Worker = struct {
     pool: *Pool,
     state: usize = undefined,
-    target: ?*Worker = null,
+    target_worker: ?*Worker = null,
     active_next: ?*Worker = null,
     run_queue: BoundedQueue = BoundedQueue{},
     run_queue_next: ?*Task = null,
@@ -109,7 +109,39 @@ pub const Worker = struct {
     }
 
     fn run(pool: *Pool) void {
-        @compileError("TODO");
+        var self = Worker{ .pool = pool };
+        self.state = blk: {
+            const is_waking = true;
+            const tick = @ptrToInt(&self);
+            break :blk (tick << 1) | @boolToInt(is_waking);
+        };
+
+        const old_tls_current = tls_current;
+        tls_current = &self;
+        defer tls_current = old_tls_current;
+
+        var active_queue = atomic.load(&pool.active_queue, .relaxed);
+        while (true) {
+            self.active_next = active_queue;
+            active_queue = atomic.tryCompareAndSwap(
+                &pool.active_queue,
+                active_queue,
+                &self,
+                .release,
+                .relaxed,
+            ) orelse break;
+        }
+
+        while (true) {
+            if (self.poll()) |task| {
+                task.run();
+                continue;
+            }
+
+            const is_waking = pool.trySuspend(&self) orelse break;
+            self.state &= ~@as(usize, 1);
+            self.state |= @boolToInt(is_waking);
+        }
     }
 
     fn poll(self: *Worker) ?*Task {
@@ -163,23 +195,23 @@ pub const Worker = struct {
             
         var num_workers = Pool.IdleQueue.unpack(atomic.load(&pool.idle_queue, .relaxed)).spawned;
         while (num_workers > 0) : (num_workers -= 1) {
-            const target = self.target 
+            const target_worker = self.target_worker
                 orelse atomic.load(&pool.active_queue, .consume)
                 orelse @panic("no active workers when work-stealing");
 
-            self.target = target.active_next;
-            if (target == self)
+            self.target_worker = target_worker.active_next;
+            if (target_worker == self)
                 continue;
 
-            if (self.run_queue.popAndStealBounded(&target.run_queue)) |task|
+            if (self.run_queue.popAndStealBounded(&target_worker.run_queue)) |task|
                 return task;
 
-            if (self.run_queue.popAndStealUnbounded(&target.run_queue_overflow)) |task|
+            if (self.run_queue.popAndStealUnbounded(&target_worker.run_queue_overflow)) |task|
                 return task;
 
-            if (atomic.load(&target.run_queue_lifo) != null) {
+            if (atomic.load(&target_worker.run_queue_lifo, .relaxed) != null) {
                 atomic.spinLoopHint();
-                if (atomic.swap(&target.run_queue_lifo, null, .consume)) |task|
+                if (atomic.swap(&target_worker.run_queue_lifo, null, .consume)) |task|
                     return task;
             }
         }
@@ -411,7 +443,7 @@ pub const Pool = struct {
 
     fn trySuspend(self: *Pool, worker: *Worker) ?bool {
         const is_waking = worker.state & 1 != 0;
-        var idle_queue = IdleQueue.unpack(self.idle_queue.load(.relaxed));
+        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
 
         while (true) {
             const can_wake = idle_queue.idle > 0 or idle_queue.spawned < self.max_workers;
@@ -433,6 +465,7 @@ pub const Pool = struct {
             }
 
             if (atomic.tryCompareAndSwap(
+                &self.idle_queue,
                 idle_queue.pack(),
                 new_idle_queue.pack(),
                 .acq_rel,
@@ -449,7 +482,7 @@ pub const Pool = struct {
 
             if (!is_shutdown) {
                 self.wait() orelse {
-                    idle_queue = IdleQueue.unpack(self.idle_queue.load(.relaxed));
+                    idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
                     continue;
                 };
                 return true;
@@ -458,9 +491,9 @@ pub const Pool = struct {
             const is_root_worker = worker.active_next == null;
             const wait_address = @ptrToInt(&self.active_queue);
 
-            if (new_idle_queue.counter == 0) {
+            if (new_idle_queue.spawned == 0) {
                 if (is_root_worker)
-                    return;
+                    return null;
                 parking_lot.unparkAll(wait_address);
             }
 
@@ -481,12 +514,35 @@ pub const Pool = struct {
                 });
             }
 
-            return;
+            return null;
         }
     }
 
     pub fn shutdown(self: *Pool) void {
-        @compileError("TODO");
+        @setCold(true);
+
+        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
+
+        while (true) {
+            if (idle_queue.state == .shutdown)
+                return;
+
+            var new_idle_queue = idle_queue;
+            new_idle_queue.state = .shutdown;
+            if (atomic.tryCompareAndSwap(
+                &self.idle_queue,
+                idle_queue.pack(),
+                new_idle_queue.pack(),
+                .relaxed,
+                .relaxed,
+            )) |updated| {
+                idle_queue = IdleQueue.unpack(updated);
+                continue;
+            }
+
+            self.notifyAll();
+            return;
+        }
     }
 
     fn wait(self: *Pool) ?void {
@@ -504,6 +560,7 @@ pub const Pool = struct {
                 var new_idle_queue = idle_queue;
                 new_idle_queue.notified = false;
                 idle_queue = IdleQueue.unpack(atomic.tryCompareAndSwap(
+                    &self.idle_queue,
                     idle_queue.pack(),
                     new_idle_queue.pack(),
                     .relaxed,
@@ -528,7 +585,7 @@ pub const Pool = struct {
                 .pool = self,
             });
 
-            idle_queue = IdleQueue.unpack(self.idle_queue.load(.relaxed));
+            idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
         }
     }
 
@@ -541,6 +598,13 @@ pub const Pool = struct {
                 return 0;
             }
         }{});
+    }
+
+    fn notifyAll(self: *Pool) void {
+        @setCold(true);
+
+        const wait_address = @ptrToInt(&self.idle_queue);
+        parking_lot.unparkAll(wait_address);
     }
 };
 
@@ -579,6 +643,7 @@ const UnboundedQueue = struct {
 
             head = atomic.tryCompareAndSwap(
                 &self.head,
+                head,
                 new_head,
                 .acquire,
                 .relaxed,
@@ -696,6 +761,7 @@ const BoundedQueue = struct {
                 return null;
 
             if (atomic.tryCompareAndSwap(
+                &self.head,
                 head,
                 head +% 1,
                 .acquire,
@@ -709,8 +775,8 @@ const BoundedQueue = struct {
         }
     }
 
-    fn popAndStealUnbounded(self: *BoundedQueue, target: *UnboundedQueue) ?*Task {
-        var consumer = target.tryAcquireConsumer() orelse return null;
+    fn popAndStealUnbounded(self: *BoundedQueue, target_queue: *UnboundedQueue) ?*Task {
+        var consumer = target_queue.tryAcquireConsumer() orelse return null;
         defer consumer.release();
 
         const tail = self.tail;
@@ -741,15 +807,15 @@ const BoundedQueue = struct {
         return first_task;
     }
 
-    fn popAndStealBounded(self: *BoundedQueue, target: *BoundedQueue) ?*Task {
+    fn popAndStealBounded(self: *BoundedQueue, target_queue: *BoundedQueue) ?*Task {
         const tail = self.tail;
         const head = atomic.load(&self.head, .relaxed);
         if (tail != head)
             return self.pop();
 
-        var target_head = atomic.load(&target.head, .acquire);
+        var target_head = atomic.load(&target_queue.head, .acquire);
         while (true) {
-            const target_tail = atomic.load(&target.tail, .acquire);
+            const target_tail = atomic.load(&target_queue.tail, .acquire);
             if (target_head == target_tail)
                 return null;
 
@@ -757,13 +823,13 @@ const BoundedQueue = struct {
             var steal = size - (size / 2);
             if (steal > self.buffer.len / 2) {
                 atomic.spinLoopHint();
-                target_head = atomic.load(&target.head, .acquire);
+                target_head = atomic.load(&target_queue.head, .acquire);
                 continue;
             }
 
             var new_target_head = target_head;
             const first_task = blk: {
-                const slot = &target.buffer[new_target_head % target.buffer.len];
+                const slot = &target_queue.buffer[new_target_head % target_queue.buffer.len];
                 const task = atomic.load(slot, .unordered);
                 new_target_head +%= 1;
                 steal -= 1;
@@ -772,13 +838,14 @@ const BoundedQueue = struct {
 
             var new_tail = tail;
             while (steal > 0) : (steal -= 1) {
-                const task = atomic.load(&target.buffer[new_target_head % target.buffer.len], .unordered);
+                const task = atomic.load(&target_queue.buffer[new_target_head % target_queue.buffer.len], .unordered);
                 atomic.store(&self.buffer[new_tail % self.buffer.len], task, .unordered);
                 new_target_head +%= 1;
                 new_tail +%= 1;
             }
 
             if (atomic.tryCompareAndSwap(
+                &target_queue.head,
                 target_head,
                 new_target_head,
                 .acq_rel,

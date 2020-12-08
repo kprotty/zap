@@ -319,16 +319,16 @@ pub fn parkConditionally(
     if (notified)
         return true;
 
-    wait_tree = WaitTree.acquire(address);
+    tree = WaitTree.acquire(address);
 
     if (waiter.node.tail != null) {
         var wait_list = WaitList{
-            .tree = &wait_tree,
+            .tree = &tree,
             .head = waiter.node.head,
         };
         wait_list.remove(&waiter.node);
         context.onTimeout();
-        wait_tree.release();
+        tree.release();
         return false;
     }
 

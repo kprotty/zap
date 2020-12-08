@@ -52,6 +52,9 @@ const PosixLock = struct {
         next: ?*Waiter,
         tail: ?*Waiter,
         event: usize,
+
+        const EVENT_WAITING = 0;
+        const EVENT_NOTIFIED = 1;
     };
 
     pub fn tryAcquire(self: *Lock) bool {

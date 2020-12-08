@@ -322,7 +322,7 @@ pub const Pool = struct {
                     &self.idle_queue,
                     idle_queue,
                     new_idle_queue,
-                    .relaxed,
+                    .acquire,
                     .relaxed,
                 )) |updated| {
                     idle_queue = IdleQueue.unpack(updated);

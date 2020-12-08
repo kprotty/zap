@@ -22,6 +22,8 @@ pub const WAIT_ABANDONED = 0x80;
 pub const WAIT_TIMEOUT = 0x102;
 pub const WAIT_FAILED = ~@as(DWORD, 0);
 
+pub const ERROR_TIMEOUT = 0x5B4;
+
 pub const SRWLOCK = ?PVOID;
 pub const SRWLOCK_INIT: SRWLOCK = null;
 

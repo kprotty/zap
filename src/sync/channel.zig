@@ -22,15 +22,19 @@ pub fn Channel(comptime T: type) type {
             is_closed: bool = false,
             has_buffer: bool = false,
 
+            const max_capacity = ~@as(usize, 0) >> 3;
+
             fn boundCapacity(capacity: usize) usize {
-                const max_capacity = ~@as(usize, 0) >> 3;
                 if (capacity < max_capacity)
                     return capacity;
                 return max_capacity;
             }
 
             fn growCapacity(capacity: usize) usize {
-
+                const new_capacity = boundCapacity(capacity << 1);
+                if (new_capacity > capacity)
+                    return new_capacity;
+                return max_capacity;
             }
 
             fn pack(self: State) usize {
@@ -93,10 +97,13 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn tryPush(self: *Self, item: T) error{Closed, Full, OutOfMemory}!void {
-            var locked: bool = undefined;
-            const result = self.doTryPush(item, &locked);
-            if (locked) self.lock.release();
-            return result;
+            return self.doTryPush(item) catch |err| switch (err) {
+                error.Full => {
+                    self.lock.release();
+                    return error.Full;
+                },
+                else => |e| return e,
+            };
         }
 
         pub fn tryPushFor(self: *Self, comptime Event: type, duration: u64, item: T) error{Closed, TimedOut, OutOfMemory}!void {
@@ -115,10 +122,13 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn tryPop(self: *Self) error{Closed, Empty}!T {
-            var locked: bool = undefined;
-            const result = self.doTryPop(&locked);
-            if (locked) self.lock.release();
-            return result;
+            return self.doTryPop() catch |err| switch (err) {
+                error.Empty => {
+                    self.lock.release();
+                    return error.Empty;
+                },
+                else => |e| return e,
+            };
         }
 
         pub fn tryPopFor(self: *Self, comptime Event: type, duration: u64) error{Closed, TimedOut}!T {
@@ -135,14 +145,7 @@ pub fn Channel(comptime T: type) type {
             self.lock.acquire();
             
             var state = State.unpack(self.state);
-            defer self.doClose(&state);
-
-            if (@sizeOf(T) > 0 and state.has_buffer and state.capacity > 1) {
-                if (self.allocator) |allocator| {
-                    allocator.free(self.buffer[0..state.capacity]);
-                    state.has_buffer = false;
-                }
-            }
+            self.doClose(&state, true);
         }
 
         pub fn close(self: *Self) void {
@@ -159,17 +162,24 @@ pub fn Channel(comptime T: type) type {
             if (state.is_closed) {
                 self.lock.release();
             } else {
-                self.doClose(&state);
+                self.doClose(&state, false);
             }
         }
 
-        fn doClose(self: *Self, state: *State) void {
+        fn doClose(self: *Self, state: *State, free_buffer: bool) void {
             var waiters: ?*Waiter = self.readers;
             self.readers = null;
 
-            const target = if (waiters) |head| @ptrCast(*?*Waiter, &head.tail) else &waiters;
+            const target = if (waiters) |head| &head.tail else &waiters;
             target.* = self.writers;
             self.writers = null;
+
+            if (free_buffer and @sizeOf(T) > 0 and state.has_buffer and state.capacity > 1) {
+                if (self.allocator) |allocator| {
+                    allocator.free(self.buffer[0..state.capacity]);
+                    state.has_buffer = false;
+                }
+            }
 
             state.is_closed = true;
             atomic.store(&self.state, state.pack(), .relaxed);
@@ -198,7 +208,7 @@ pub fn Channel(comptime T: type) type {
         }
 
         fn popItem(self: *Self, state: *State) ?T {
-            if (state.is_empty)
+            if (state.is_empty or state.capacity == 0 or !state.has_buffer)
                 return null;
 
             var item: T = undefined;
@@ -217,31 +227,29 @@ pub fn Channel(comptime T: type) type {
             return item;
         }
 
-        fn doTryPush(self: *Self, item: T, locked: *bool) error{Closed, Full, OutOfMemory}!void {
+        fn doTryPush(self: *Self, item: T) error{Closed, Full, OutOfMemory}!void {
             if (blk: {
                 const state = atomic.load(&self.state, .relaxed);
                 break :blk State.unpack(state).is_closed;
             }) {
-                locked.* = false;
                 return error.Closed;
             }
 
             self.lock.acquire();
-            locked.* = true;
 
             var state = CapState.unpack(self.state);
-            if (state.is_closed)
+            if (state.is_closed) {
+                self.lock.release();
                 return error.Closed;
+            }
 
             if (self.readers) |reader| {
                 const waiter = reader;
-                self.readers = waiter.next;
-                if (self.readers) |head|
-                    head.tail = waiter.tail;
-
+                _ = self.tryRemoveQueue(&self.readers, waiter);
                 self.lock.release();
-                locked.* = false;
+
                 waiter.item = item;
+                (waiter.wakeFn)(waiter);
                 return;
             }
 
@@ -249,8 +257,11 @@ pub fn Channel(comptime T: type) type {
                 return error.Full;
 
             if (!state.has_buffer) {
-                const allocator = self.allocator orelse return error.Full;
-                self.buffer = allocator.alloc(T, state.capacity) catch return error.OutOfMemory;
+                const allocator = self.allocator orelse unreachable;
+                self.buffer = allocator.alloc(T, state.capacity) catch {
+                    self.lock.release();
+                    return error.OutOfMemory;
+                };
                 state.has_buffer = true;
                 atomic.store(&self.state, state.pack(), .relaxed);
             }
@@ -261,49 +272,98 @@ pub fn Channel(comptime T: type) type {
                 if (new_capacity == state.capacity)
                     return error.Full;
 
-                const new_buffer = allocator.alloc(T, new_capacity) catch return error.OutOfMemory;
+                var new_buffer: [*]T = undefined;
+                if (@sizeOf(T) > 0) {
+                    new_buffer = allocator.alloc(T, new_capacity) catch {
+                        self.lock.release();
+                        return error.OutOfMemory;
+                    };
+                }
+
                 var new_tail: usize = 0;
                 while (self.popItem(&state)) |item| {
                     if (@sizeOf(T) > 0)
                         new_buffer[new_tail] = item;
                     new_tail += 1;
                 }
+                
+                if (@sizeOf(T) > 0)
+                    allocator.free(self.buffer[0..state.capacity]);
 
-                allocator.free(self.buffer[0..state.capacity]);
                 self.buffer = new_buffer;
-
                 self.head = 0;
                 self.tail = new_tail;
                 state.capacity = new_capacity;
                 atomic.store(&self.state, state.pack(), .relaxed);
             }
 
-            self.pushItem(&state, item);
+            return self.pushItem(&state, item);
         }
 
-        fn doTryPop(self: *Self, locked: *bool) error{Closed, Empty}!T {
+        fn tryRemoveQueue(self: *Self, queue: *?*Waiter, waiter: *Waiter) bool {
+            const head = queue.* orelse return false;
+            if (waiter.tail == null)
+                return false;
 
+            if (waiter.prev) |prev|
+                prev.next = waiter.next;
+            if (waiter.next) |next|
+                next.prev = waiter.prev;
+
+            if (waiter == head) {
+                queue.* = waiter.next;
+                if (queue.*) |new_head|
+                    new_head.tail = waiter.tail;
+            } else if (waiter == head.tail) {
+                head.tail = waiter.prev;
+            }
+
+            waiter.tail = null;
+            return true;
+        }
+
+        fn doTryPop(self: *Self) error{Closed, Empty}!T {
+            self.lock.acquire();
+
+            var state = State.unpack(self.state);
+            if (self.popItem(&state)) |item| {
+                self.lock.release();
+                return item;
+            }
+
+            if (self.writers) |writer| {
+                const waiter = writer;
+                _ = self.tryRemoveQueue(&self.writers, waiter);
+                self.lock.release();
+
+                const item = waiter.item;
+                (waiter.wakeFn)(waiter);
+                return item;
+            }
+
+            if (state.is_closed) {
+                self.lock.release();
+                return error.Closed;
+            }
+
+            return error.Empty;
         }
 
         fn doPush(self: *Self, comptime Event: type, deadline: ?u64, item: T) error{Closed, TimedOut, OutOfMemory}!void {
-            var locked: bool = undefined;
-            if (self.doTryPush(item)) |_| {
-                return;
-            } else |err| {
-                switch (err) {
-                    error.Full => {},
-                    error.Closed, error.OutOfMemory => {
-                        if (locked) self.lock.release();
-                        return err;
-                    },
-                }
-            }
-
-            _ = try self.wait(&self.writers, Event, deadline, item);
+            return self.doTryPush(item) catch |err| switch (err) {
+                error.Full => {
+                    _ = try self.wait(&self.writers, Event, deadline, item);
+                    return;
+                },
+                else => |e| return e,
+            };
         }
 
         fn doPop(self: *Self, comptime Event: type, deadline: ?u64) error{Closed, TimedOut}!T {
-
+            return self.doTryPop() catch |err| switch (err) {
+                error.Empty => return self.wait(&self.readers, Event, deadline, undefined),
+                else => |e| return e,
+            };
         }
 
         fn wait(self: *Self, queue: *?*Waiter, comptime Event: type, deadline: ?u64, item: T) error{Closed, TimedOut}!T {
@@ -312,10 +372,16 @@ pub fn Channel(comptime T: type) type {
             const EventWaiter = struct {
                 waiter: Waiter,
                 event: Event,
+                channel: *Self,
 
                 fn wake(waiter: *Waiter) void {
                     const self = @fieldParentPtr(@This(), "waiter", waiter);
                     self.event.notify();
+                }
+
+                fn wait(self: *@This()) bool {
+                    self.channel.lock.release();
+                    return true;
                 }
             };
 
@@ -339,28 +405,20 @@ pub fn Channel(comptime T: type) type {
             }
             
             event.* = Event{};
-            var notified = event.wait(deadline, struct {
-                channel: *Self,
-                
-                pub fn wait(this: @This()) bool {
-                    this.channel.lock.release();
-                    return true;
-                }
-            } {
-                .channel = self,
-            });
+            event_waiter.channel = self;
 
-            blk: {
-                if (notified)
-                    break :blk;
-
+            var notified = event.wait(deadline, &event_waiter);
+            if (!notified) {
                 self.lock.acquire();
-                if (waiter.tail == null) {
+                
+                if (self.tryRemoveQueue(queue, waiter)) {
                     self.lock.release();
-                    break :blk;
+                    return error.TimedOut;
                 }
 
-                @compileError("TODO: remove")
+                notified = event.wait(null, &event_waiter);
+                if (!notified)
+                    unreachable;
             }
 
             if (waiter.is_closed)

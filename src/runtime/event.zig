@@ -24,9 +24,15 @@ const LinuxEvent = struct {
 };
 
 const WindowsEvent = struct {
-    waiting: bool = false,
+    state: State = .empty,
     lock: system.SRWLOCK = system.SRWLOCK_INIT,
     cond: system.CONDITION_VARIABLE = system.CONDITION_VARIABLE_INIT,
+
+    const State = enum {
+        empty = 0,
+        waiting,
+        notified,
+    };
 
     pub fn wait(self: *Event, deadline: ?u64, condition: anytype) bool {
         system.AcquireSRWLockExclusive(&self.lock);
@@ -35,14 +41,18 @@ const WindowsEvent = struct {
         if (!condition.wait())
             return true;
 
-        self.waiting = true;
-        while (self.waiting) {
+        switch (self.state) {
+            .empty => self.state = .waiting,
+            .waiting => unreachable,
+            .notified => return true,
+        }
 
+        while (self.state == .waiting) {
             var timeout = system.INFINITE;
             if (deadline) |deadline_ns| {
                 const now = nanotime();
                 if (now > deadline_ns) {
-                    self.waiting = false;
+                    self.state = .empty;
                     return false;
                 } else {
                     const timeout_ns = deadline_ns - now;
@@ -65,8 +75,10 @@ const WindowsEvent = struct {
         system.AcquireSRWLockExclusive(&self.lock);
         defer system.ReleaseSRWLockExclusive(&self.lock);
 
-        if (self.waiting) {
-            self.waiting = false;
+        const old_state = self.state;
+        self.state = .notified;
+
+        if (old_state == .waiting) {
             system.WakeConditionVariable(&self.cond);
         }
     }

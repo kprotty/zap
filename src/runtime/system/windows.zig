@@ -8,8 +8,8 @@ pub const BOOL = u8;
 pub const TRUE = 1;
 pub const FALSE = 0;
 
-pub const VOID = c_void;
-pub const PVOID = *VOID;
+pub const VOID = void;
+pub const PVOID = *c_void;
 pub const HANDLE = PVOID;
 pub const HMODULE = HANDLE;
 
@@ -55,6 +55,14 @@ pub extern "kernel32" fn SleepConditionVariableSRW(
 
 pub extern "kernel32" fn GetLastError() callconv(.Stdcall) DWORD;
 
+pub extern "kernel32" fn QueryPerformanceCounter(
+    counter: *LARGE_INTEGER,
+) callconv(.Stdcall) BOOL;
+
+pub extern "kernel32" fn QueryPerformanceFrequency(
+    counter: *LARGE_INTEGER,
+) callconv(.Stdcall) BOOL;
+
 pub extern "kernel32" fn CloseHandle(
     handle: HANDLE,
 ) callconv(.Stdcall) BOOL;
@@ -66,10 +74,10 @@ pub extern "kernel32" fn WaitForSingleObjectEx(
 ) callconv(.Stdcall) DWORD;
 
 pub extern "kernel32" fn CreateThread(
-    lpThreadAttributes: PVOID,
+    lpThreadAttributes: ?PVOID,
     dwStackSize: SIZE_T,
-    lpStartAddress: fn(PVOID) callconv(.C) DWORD,
-    lpParameter: PVOID,
+    lpStartAddress: fn(?PVOID) callconv(.C) DWORD,
+    lpParameter: ?PVOID,
     dwCreationFlags: DWORD,
     lpThreadId: ?*DWORD,
 ) callconv(.Stdcall) ?HANDLE;

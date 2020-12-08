@@ -39,8 +39,7 @@ const PosixLock = struct {
         or switch (target.arch) {
             .s380x => true,
             else => false,
-        }
-    );
+        };
 
     const UNLOCKED = 0;
     const LOCKED = 1;
@@ -142,7 +141,7 @@ const PosixLock = struct {
                         system.SWITCH_OPTION_DEPRESS,
                         @as(system.mac_msg_timeout_t, 1),
                     );
-                } else if  {
+                } else if (target.is_posix) {
                     _ = system.sched_yield();
                 }
 

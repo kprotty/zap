@@ -17,7 +17,7 @@ pub const Ordering = enum {
     acq_rel,
     seq_cst,
 
-    fn toBuiltin(comptime self: Ordering) std.builtin.AtomicOrder {
+    fn toBuiltin(comptime self: Ordering) builtin.AtomicOrder {
         return switch (self) {
             .unordered => .Unordered,
             .relaxed => .Monotonic,
@@ -76,9 +76,9 @@ inline fn atomicRmw(comptime T: type, ptr: *T, comptime op: builtin.AtomicRmwOp,
 }
 
 pub fn compareAndSwap(ptr: anytype, cmp: @TypeOf(ptr.*), xchg: @TypeOf(ptr.*), comptime success: Ordering, comptime failure: Ordering) ?@TypeOf(ptr.*) {
-    return @cmpxchgStrong(@TypeOf(ptr.*), cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
+    return @cmpxchgStrong(@TypeOf(ptr.*), ptr, cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
 }
 
 pub fn tryCompareAndSwap(ptr: anytype, cmp: @TypeOf(ptr.*), xchg: @TypeOf(ptr.*), comptime success: Ordering, comptime failure: Ordering) ?@TypeOf(ptr.*) {
-    return @cmpxchgStrong(@TypeOf(ptr.*), cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
+    return @cmpxchgStrong(@TypeOf(ptr.*), ptr, cmp, xchg, comptime success.toBuiltin(), comptime failure.toBuiltin());
 }

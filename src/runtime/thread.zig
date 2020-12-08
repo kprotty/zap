@@ -18,8 +18,8 @@ const WindowsThread = struct {
     pub fn spawn(stack_size: u32, param: anytype, comptime entryFn: anytype) !Handle {
         const Parameter = @TypeOf(param);
         const Decorator = struct {
-            fn entry(raw_arg: system.PVOID) callconv(.C) system.DWORD {
-                const parameter = @ptrCast(Parameter, @alignCast(@alignOf(Parameter), raw_arg));
+            fn entry(raw_arg: ?system.PVOID) callconv(.C) system.DWORD {
+                const parameter = @ptrCast(Parameter, @alignCast(@alignOf(Parameter), raw_arg orelse unreachable));
                 _ = @call(.{}, entryFn, .{parameter});
                 return 0;
             }

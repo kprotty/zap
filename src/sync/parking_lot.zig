@@ -15,9 +15,8 @@ const WaitRoot = union(enum) {
 
     fn unpack(value: usize) WaitRoot {
         return switch (@truncate(u1, value)) {
-            0 => WaitRoot{ .tree = @intToPtr(?*WaitRoot, value & ~@as(usize, 1)) },
+            0 => WaitRoot{ .tree = @intToPtr(?*WaitNode, value & ~@as(usize, 1)) },
             1 => WaitRoot{ .prng = value >> 1 },
-            else => unreachable,
         };
     }
 };
@@ -26,7 +25,7 @@ const WaitBucket = struct {
     lock: Lock = Lock{},
     root: usize = (WaitRoot{ .tree = null }).pack(),
 
-    var array = [256]WaitBucket{WaitBucket{}};
+    var array = [_]WaitBucket{WaitBucket{}} ** 256;
 
     fn get(address: usize) *WaitBucket {
         const index = blk: {
@@ -190,15 +189,18 @@ pub const WaitList = struct {
 
         if (node == head) {
             self.head = node.next;
+            if (self.head) |new_head| {
+                new_head.tail = node.tail;
+                if (node.tail) |tail|
+                    tail.head = new_head;
+            } else {
+                self.tree.remove(node);
+            }
         } else if (node == head.tail) {
             head.tail = node.prev;
         }
 
-        if (self.head) |new_head| {
-            new_tail.tail.head = new_head;
-        } else {
-            self.tree.remove(node);
-        }
+        
     }
 };
 
@@ -243,7 +245,7 @@ const WaitNode = struct {
     token: usize,
     wakeFn: fn(*WaitNode) void,
 
-    fn genTimeout(self: WaitNode, now: u64) u32 {
+    fn genTimeout(self: *WaitNode) u32 {
         switch (@sizeOf(usize)) {
             8 => {
                 var x = @truncate(u32, self.prng);
@@ -404,10 +406,14 @@ pub fn unparkOne(
 
     var wait_node: ?*WaitNode = null;
     if (wait_iter.next()) |wait_node_ref| {
-        wait_node = wait_node_ref.get();
-        result.token = wait_node.token;
-        result.be_fair = wait_list.shouldBeFair();
+        const node = wait_node_ref.get();
+        wait_node = node;
+        
+        const be_fair = wait_tree.shouldBeFair();
         wait_node_ref.remove();
+
+        result.token = node.token;
+        result.be_fair = be_fair;
         result.has_more = wait_list.head != null;
     }
 

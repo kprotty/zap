@@ -12,7 +12,7 @@ pub const Task = extern struct {
     pub fn init(frame: anyframe) Task {
         if (@alignOf(anyframe) < 2)
             @compileError("anyframe is not properly aligned");
-        return Task{ .runnable = @ptrToInt(runnable) };
+        return Task{ .runnable = @ptrToInt(frame) };
     }
 
     pub const Callback = fn(*Task) callconv(.C) void;
@@ -98,58 +98,14 @@ pub const Worker = struct {
     run_queue_lifo: ?*Task = null,
     run_queue_overflow: UnboundedQueue = UnboundedQueue{},
 
-    pub const ScheduleHint = enum {
-        next,
-        lifo,
-        fifo,
-        yield,
-    };
+    threadlocal var tls_current: ?*Worker = null;
 
-    pub fn schedule(self: *Worker, hint: ScheduleHint, batchable: anytype) void {
-        var batch = Task.Batch.from(batchable);
-        if (batch.isEmpty())
-            return;
+    pub fn getCurrent() ?*Worker {
+        return tls_current;
+    }
 
-        var sched_hint = hint;
-        while (true) {
-            switch (sched_hint) {
-                .next => {
-                    const new_next = batch.popFront();
-                    const old_next = self.run_queue_next;
-                    self.run_queue_next = new_next;
-                    if (old_next) |task|
-                        batch.pushFront(task);
-                    break;
-                },
-                .lifo => {
-                    const new_lifo = batch.popFront();
-                    const old_lifo = atomic.swap(&self.run_queue_lifo, new_lifo, .acq_rel);
-                    if (old_lifo) |task|
-                        batch.pushFront(task);
-                    break;
-                },
-                .fifo => {
-                    // the default is FIFO
-                    break;
-                },
-                .yield => {
-                    const new_next = self.poll() orelse batch.popFront();
-                    batch.pushFront(new_next);
-                    sched_hint = .next;
-                    continue;
-                },
-            }
-        }
-
-        if (!batch.isEmpty()) {
-            if (self.run_queue.push(batch)) |overflowed|
-                self.run_queue_overflow.push(overflowed);
-        } else if (sched_hint == .next) {
-            return;
-        }
-
-        const pool = self.pool;
-        _ = pool.tryResume(self);
+    pub fn getPool(self: *Worker) *Pool {
+        return self.pool;
     }
 
     fn run(pool: *Pool) void {
@@ -160,7 +116,7 @@ pub const Worker = struct {
         var tick = self.state >> 1;
         var is_waking = self.state & 1 != 0;
 
-        const pool = self.pool;
+        const pool = self.getPool();
         const task = self.pollRunnable(tick, pool) orelse return null;
 
         if (is_waking) {
@@ -233,6 +189,60 @@ pub const Worker = struct {
 
         return null;
     }
+
+    pub const ScheduleHint = enum {
+        next,
+        lifo,
+        fifo,
+        yield,
+    };
+
+    pub fn schedule(self: *Worker, hint: ScheduleHint, batchable: anytype) void {
+        var batch = Task.Batch.from(batchable);
+        if (batch.isEmpty())
+            return;
+
+        var sched_hint = hint;
+        while (true) {
+            switch (sched_hint) {
+                .next => {
+                    const new_next = batch.popFront();
+                    const old_next = self.run_queue_next;
+                    self.run_queue_next = new_next;
+                    if (old_next) |task|
+                        batch.pushFront(task);
+                    break;
+                },
+                .lifo => {
+                    const new_lifo = batch.popFront();
+                    const old_lifo = atomic.swap(&self.run_queue_lifo, new_lifo, .acq_rel);
+                    if (old_lifo) |task|
+                        batch.pushFront(task);
+                    break;
+                },
+                .fifo => {
+                    // the default is FIFO
+                    break;
+                },
+                .yield => {
+                    const new_next = self.poll() orelse batch.popFront();
+                    batch.pushFront(new_next);
+                    sched_hint = .next;
+                    continue;
+                },
+            }
+        }
+
+        if (!batch.isEmpty()) {
+            if (self.run_queue.push(batch)) |overflowed|
+                self.run_queue_overflow.push(overflowed);
+        } else if (sched_hint == .next) {
+            return;
+        }
+
+        const pool = self.getPool();
+        _ = pool.tryResume(self);
+    }
 };
 
 pub const Pool = struct {
@@ -245,6 +255,7 @@ pub const Pool = struct {
     const IdleQueue = struct {
         idle: u16 = 0,
         spawned: u16 = 0,
+        notified: bool = false,
         state: State = .pending,
 
         const State = enum(u4) {
@@ -258,6 +269,7 @@ pub const Pool = struct {
         fn pack(self: IdleQueue) u32 {
             var value: u32 = 0;
             value |= @enumToInt(self.state);
+            value |= @as(u32, @boolToInt(self.notified)) << 3;
             value |= @as(u32, @intCast(u14, self.idle)) << 4;
             value |= @as(u32, @intCast(u14, self.spawned)) << (14 + 4);
             return value;
@@ -265,21 +277,41 @@ pub const Pool = struct {
 
         fn unpack(value: u32) IdleQueue {
             return IdleQueue{
-                .state = @intToEnum(State, @truncate(u4, value)),
+                .state = @intToEnum(State, @truncate(u3, value)),
+                .notified = value & (1 << 3) != 0,
                 .idle = @truncate(u14, value >> 4),
                 .spawned = @truncate(u14, value >> (4 + 14)),
             };
         }
     };
 
-    pub fn run(max_workers: u16, stack_size: u32, batchable: anytype) void {
+    pub const Config = struct {
+        max_threads: ?u16 = null,
+        stack_size: ?u32 = null,
+    };
+
+    pub fn run(config: Config, batchable: anytype) void {
         const batch = Task.Batch.from(batchable);
         if (batch.isEmpty())
             return;
 
+        const stack_size: u32 =
+            if (config.stack_size) |stack_size|
+                @import("std").math.max(16 * 1024, stack_size)
+            else
+                @as(u32, 1 * 1024 * 1024);
+
+        const max_threads: u16 =
+            if (!target.is_parallel) 
+                @as(u16, 1)
+            else if (config.max_threads) |max_threads|
+                @import("std").math.max(1, max_threads)
+            else
+                @intCast(u16, @import("std").Thread.cpuCount() catch 1); 
+
         var pool = Pool{
             .stack_size = stack_size,
-            .max_workers = max_workers,
+            .max_workers = max_threads,
         };
 
         pool.run_queue.push(batch);
@@ -320,8 +352,8 @@ pub const Pool = struct {
 
                 if (atomic.tryCompareAndSwap(
                     &self.idle_queue,
-                    idle_queue,
-                    new_idle_queue,
+                    idle_queue.pack(),
+                    new_idle_queue.pack(),
                     .acquire,
                     .relaxed,
                 )) |updated| {
@@ -363,6 +395,7 @@ pub const Pool = struct {
             };
 
             if (atomic.tryCompareAndSwap(
+                &self.idle_queue,
                 idle_queue.pack(),
                 new_idle_queue.pack(),
                 .relaxed,
@@ -383,7 +416,7 @@ pub const Pool = struct {
         while (true) {
             const can_wake = idle_queue.idle > 0 or idle_queue.spawned < self.max_workers;
             const is_shutdown = idle_queue.state == .shutdown;
-            const is_notified => switch (idle_queue.state) {
+            const is_notified = switch (idle_queue.state) {
                 .waker_notified => is_waking,
                 .notified => true,
                 else => false,
@@ -435,10 +468,10 @@ pub const Pool = struct {
                 _ = parking_lot.parkConditionally(Event, wait_address, null, struct {
                     pool: *Pool,
 
-                    pub fn onTimeout(self: @This()) void {}
-                    pub fn onBeforeWait(self: @This()) void {}
-                    pub fn onValidate(self: @This()) ?usize {
-                        const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
+                    pub fn onTimeout(this: @This()) void {}
+                    pub fn onBeforeWait(this: @This()) void {}
+                    pub fn onValidate(this: @This()) ?usize {
+                        const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
                         if (idleq.spawned == 0)
                             return null;
                         return 0;
@@ -453,7 +486,7 @@ pub const Pool = struct {
     }
 
     pub fn shutdown(self: *Pool) void {
-
+        @compileError("TODO");
     }
 
     fn wait(self: *Pool) ?void {
@@ -483,10 +516,10 @@ pub const Pool = struct {
             _ = parking_lot.parkConditionally(Event, wait_address, null, struct {
                 pool: *Pool,
 
-                pub fn onTimeout(self: @This()) void {}
-                pub fn onBeforeWait(self: @This()) void {}
-                pub fn onValidate(self: @This()) ?usize {
-                    const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
+                pub fn onTimeout(this: @This()) void {}
+                pub fn onBeforeWait(this: @This()) void {}
+                pub fn onValidate(this: @This()) ?usize {
+                    const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
                     if (idleq.notified or idleq.state == .shutdown)
                         return null;
                     return 0;
@@ -504,7 +537,7 @@ pub const Pool = struct {
 
         const wait_address = @ptrToInt(&self.idle_queue);
         parking_lot.unparkOne(wait_address, struct {
-            pub fn onUnpark(self: @This(), result: parking_lot.UnparkResult) usize {
+            pub fn onUnpark(this: @This(), result: parking_lot.UnparkResult) usize {
                 return 0;
             }
         }{});

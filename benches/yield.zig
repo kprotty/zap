@@ -28,6 +28,4 @@ fn asyncMain() !void {
         frame.* = async Yielder.run();
     for (frames) |*frame|
         await frame;
-
-    std.debug.warn("done\n", .{});
 }

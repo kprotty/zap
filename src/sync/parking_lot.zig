@@ -5,8 +5,6 @@ const nanotime = zap.runtime.nanotime;
 const Bucket = struct {
     lock: Lock = Lock{},
     queue: Queue = Queue{},
-    times_out: u64 = 0,
-    prng: u32 = 0,
 
     var array = [_]Bucket{Bucket{}} ** 256;
 
@@ -17,36 +15,91 @@ const Bucket = struct {
         const index = (address *% seed) >> (max - bits);
         return &array[index];
     }
-
-    fn shouldBeFair(self: *Bucket) bool {
-        if (self.times_out == 0)
-            self.prng = @truncate(u32, @ptrToInt(self)) | 1;
-
-        const now = nanotime();
-        if (now < self.times_out)
-            return false;
-
-        const rand = blk: {
-            var x = self.prng;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            self.prng = x;
-            break :blk x;
-        };
-
-        const timeout = rand % 1_000_000;
-        self.times_out = now + timeout;
-        return true;
-    }
 };
 
 // TODO: use red-black tree instead of linear-scan per address in bucket
 const Queue = struct {
-    head: ?*Waiter = null,
+    root: usize = (Root{ .empty = {} }).pack(),
+
+    const Root = union(enum) {
+        empty: void,
+        prng: u16,
+        waiter: *Waiter,
+
+        fn pack(self: Root) usize {
+            return switch (self) {
+                .empty => 0,
+                .prng => |prng| (@as(usize, prng) << 1) | 1,
+                .waiter => |waiter| @ptrToInt(waiter),
+            };
+        }
+
+        fn unpack(value: usize) Root {
+            return switch (@truncate(u1, value)) {
+                1 => Root{ .prng = @truncate(u16, value >> 1) },
+                0 => switch (value) {
+                    0 => .empty,
+                    else => Root{ .waiter = @intToPtr(*Waiter, value), },
+                },
+            };
+        }
+    };
+
+    fn setRoot(self: *Queue, waiter: ?*Waiter) void {
+        var root_waiter: ?*Waiter = null;
+        const prng = switch (Root.unpack(self.root)) {
+            .empty => @truncate(u16, @ptrToInt(self) >> @alignOf(Waiter)) | 1,
+            .prng => |prng| prng,
+            .waiter => |w| blk: {
+                root_waiter = w;
+                break :blk w.prng;
+            },
+        };
+
+        const pending_waiter = waiter orelse {
+            self.root = (Root{ .prng = prng }).pack();
+            return;
+        };
+
+        pending_waiter.prng = prng;
+        pending_waiter.times_out = if (root_waiter) |w| w.times_out else 0;
+        self.root = (Root{ .waiter = pending_waiter }).pack();
+    }
+
+    fn shouldBeFair(self: *Queue) bool {
+        const root_waiter = switch (Root.unpack(self.root)) {
+            .empty, .prng => return false,
+            .waiter => |waiter| waiter,
+        };
+
+        const now = nanotime();
+        if (now < root_waiter.times_out)
+            return false;
+        
+        const rand = blk: {
+            var x = root_waiter.prng;
+            var rand: [2]u16 = undefined;
+            for (rand) |*r| { 
+                x ^= x << 7;
+                x ^= x >> 9;
+                x ^= x << 8;
+                r.* = x;
+            }
+            root_waiter.prng = x;
+            break :blk @bitCast(u32, rand);
+        };
+
+        const timeout = rand % 1_000_000;
+        root_waiter.times_out = now + timeout;
+        return true;
+    }
 
     fn find(self: *Queue, address: usize, tail: ?*?*Waiter) ?*Waiter {
-        var waiter = self.head;
+        var waiter = switch (Root.unpack(self.root)) {
+            .empty, .prng => null,
+            .waiter => |waiter| waiter,
+        };
+
         if (tail) |t|
             t.* = waiter;
 
@@ -79,7 +132,7 @@ const Queue = struct {
         if (waiter.root_prev) |root_prev| {
             root_prev.root_next = waiter;
         } else {
-            self.head = waiter;
+            self.setRoot(waiter);
         }
     }
 
@@ -126,6 +179,8 @@ const Queue = struct {
                 self.head = waiter.next;
                 if (self.head) |new_head| {
                     new_head.tail = waiter.tail;
+                    new_head.prng = waiter.prng;
+                    new_head.times_out = waiter.times_out;
                     new_head.root_next = waiter.root_next;
                     new_head.root_prev = waiter.root_prev;
                 }
@@ -139,14 +194,14 @@ const Queue = struct {
                 if (waiter.root_next) |root_next|
                     root_next.root_prev = waiter.root_prev;
                 if (waiter.root_prev == null)
-                    self.queue.head = null;
+                    self.queue.setRoot(null);
             } else if (self.head != head) {
                 if (waiter.root_prev) |root_prev|
                     root_prev.root_next = self.head;
                 if (waiter.root_next) |root_next|
                     root_next.root_prev = self.head;
                 if (waiter.root_prev == null)
-                    self.queue.head = self.head;
+                    self.queue.setRoot(self.head);
             }
 
             waiter.tail = null;
@@ -163,6 +218,8 @@ const Waiter = struct {
     tail: ?*Waiter,
     token: usize,
     address: usize,
+    prng: u16,
+    times_out: u64,
     wakeFn: fn(*Waiter) void,
 
     fn wake(self: *Waiter) void {
@@ -256,11 +313,12 @@ pub fn unparkOne(address: usize, context: anytype) void {
     
     if (iter.next()) |pending_waiter| {
         waiter = pending_waiter;
+        const be_fair = bucket.queue.shouldBeFair();
         if (!iter.remove(pending_waiter))
             unreachable;
 
         result = UnparkResult{
-            .be_fair = bucket.shouldBeFair(),
+            .be_fair = be_fair,
             .has_more = iter.isEmpty(),
             .token = pending_waiter.token,
         };

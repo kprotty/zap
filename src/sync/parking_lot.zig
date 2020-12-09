@@ -41,65 +41,123 @@ const Bucket = struct {
     }
 };
 
+// TODO: use red-black tree instead of linear-scan per address in bucket
 const Queue = struct {
     head: ?*Waiter = null,
+
+    fn find(self: *Queue, address: usize, tail: ?*?*Waiter) ?*Waiter {
+        var waiter = self.head;
+        if (tail) |t|
+            t.* = waiter;
+
+        while (true) {
+            const pending_waiter = waiter orelse return null;
+            if (pending_waiter.address == address)
+                return pending_waiter;
+
+            waiter = pending_waiter.root_next;
+            if (tail) |t|
+                t.* = pending_waiter;
+        }
+    }
 
     fn insert(self: *Queue, address: usize, waiter: *Waiter) void {
         waiter.next = null;
         waiter.tail = waiter;
         waiter.address = address;
+        waiter.root_next = null;
 
-        if (self.head) |head| {
+        if (self.find(address, &waiter.root_prev)) |head| {
             const tail = head.tail orelse unreachable;
             tail.next = waiter;
             waiter.prev = tail;
             head.tail = waiter;
+            return;
+        }
+
+        waiter.prev = null;
+        if (waiter.root_prev) |root_prev| {
+            root_prev.root_next = waiter;
         } else {
-            waiter.prev = null;
             self.head = waiter;
         }
     }
 
-    fn remove(self: *Queue, waiter: *Waiter) bool {
-        const head = self.head orelse return false;
-        const tail = waiter.tail orelse return false;
+    fn iter(self: *Queue, address: usize) Iter {
+        const head = self.find(address, null);
 
-        if (waiter.prev) |prev|
-            prev.next = waiter.next;
-        if (waiter.next) |next|
-            next.prev = waiter.prev;
-
-        if (head == waiter) {
-            self.head = waiter.next;
-            if (self.head) |new_head|
-                new_head.tail = tail;
-        } else if (head.tail == waiter) {
-            head.tail = waiter.prev;
-        }
-
-        waiter.tail = null;
-        return true;
-    }
-
-    fn iter(self: *Queue) Iter {
-        return Iter{ .waiter = self.head };
+        return Iter{
+            .head = head,
+            .waiter = head,
+            .address = address,
+            .queue = self,
+        };
     }
 
     const Iter = struct {
-        waiter: ?*Waiter = null,
+        head: ?*Waiter,
+        waiter: ?*Waiter,
+        address: usize,
+        queue: *Queue,
 
-        fn next(self: *Iter, address: usize) ?*Waiter {
-            while (true) {
-                const waiter = self.waiter orelse return null;
+        fn next(self: *Iter) ?*Waiter {
+            const waiter = self.waiter orelse return null;
+            self.waiter = waiter.next;
+            return waiter;
+        }
+
+        fn isEmpty(self: Iter) bool {
+            return self.head == null;
+        }
+
+        fn remove(self: *Iter, waiter: *Waiter) bool {
+            const head = self.head orelse return false;
+            if (waiter.tail == null or waiter.address != self.address)
+                return false;
+
+            if (waiter.prev) |qprev|
+                qprev.next = waiter.next;
+            if (waiter.next) |qnext|
+                qnext.prev = waiter.prev;
+            if (self.waiter == waiter)
                 self.waiter = waiter.next;
-                if (waiter.address == address)
-                    return waiter;
+
+            if (head == waiter) {
+                self.head = waiter.next;
+                if (self.head) |new_head| {
+                    new_head.tail = waiter.tail;
+                    new_head.root_next = waiter.root_next;
+                    new_head.root_prev = waiter.root_prev;
+                }
+            } else if (head.tail == waiter) {
+                head.tail = waiter.prev;
             }
+
+            if (self.head == null) {
+                if (waiter.root_prev) |root_prev|
+                    root_prev.root_next = waiter.root_next;
+                if (waiter.root_next) |root_next|
+                    root_next.root_prev = waiter.root_prev;
+                if (waiter.root_prev == null)
+                    self.queue.head = null;
+            } else if (self.head != head) {
+                if (waiter.root_prev) |root_prev|
+                    root_prev.root_next = self.head;
+                if (waiter.root_next) |root_next|
+                    root_next.root_prev = self.head;
+                if (waiter.root_prev == null)
+                    self.queue.head = self.head;
+            }
+
+            waiter.tail = null;
+            return true;
         }
     };
 };
 
 const Waiter = struct {
+    root_prev: ?*Waiter,
+    root_next: ?*Waiter,
     prev: ?*Waiter,
     next: ?*Waiter,
     tail: ?*Waiter,
@@ -168,8 +226,9 @@ pub fn parkConditionally(
     bucket = Bucket.get(address);
     bucket.lock.acquire();
 
-    if (bucket.queue.remove(&event_waiter.waiter)) {
-        context.onTimeout(token, bucket.queue.iter().next(address) != null);
+    var iter = bucket.queue.iter(address);
+    if (iter.remove(&event_waiter.waiter)) {
+        context.onTimeout(token, !iter.isEmpty());
         bucket.lock.release();
         return .timed_out;
     }
@@ -193,17 +252,16 @@ pub fn unparkOne(address: usize, context: anytype) void {
 
     var waiter: ?*Waiter = null;
     var result = UnparkResult{};
-    var iter = bucket.queue.iter();
+    var iter = bucket.queue.iter(address);
     
-    if (iter.next(address)) |pending_waiter| {
+    if (iter.next()) |pending_waiter| {
         waiter = pending_waiter;
-        const next = iter.next(address);
-        if (!bucket.queue.remove(pending_waiter))
+        if (!iter.remove(pending_waiter))
             unreachable;
 
         result = UnparkResult{
             .be_fair = bucket.shouldBeFair(),
-            .has_more = next != null,
+            .has_more = iter.isEmpty(),
             .token = pending_waiter.token,
         };
     }
@@ -222,13 +280,11 @@ pub fn unparkAll(address: usize) void {
     bucket.lock.acquire();
 
     var wake_list: ?*Waiter = null;
-    var iter = bucket.queue.iter();
-    var next_waiter: ?*Waiter = iter.next(address);
+    var iter = bucket.queue.iter(address);
 
     while (true) {
-        const pending_waiter = next_waiter orelse break;
-        next_waiter = iter.next(address);
-        if (!bucket.queue.remove(pending_waiter))
+        const pending_waiter = iter.next() orelse break;
+        if (!iter.remove(pending_waiter))
             unreachable;
 
         pending_waiter.next = wake_list;

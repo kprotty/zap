@@ -380,6 +380,7 @@ pub const Pool = struct {
                 new_idle_queue.state = .waking;
                 if (idle_queue.idle > 0) {
                     new_idle_queue.idle -= 1;
+                    new_idle_queue.notified = true;
                 } else {
                     new_idle_queue.spawned += 1;
                 }
@@ -513,7 +514,6 @@ pub const Pool = struct {
         @setCold(true);
 
         var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
-
         while (true) {
             if (idle_queue.state == .shutdown)
                 return;
@@ -541,8 +541,8 @@ pub const Pool = struct {
 
         // TODO: use io-driver if enabled from pool init instead of wait_queue
         // TODO: re-use wait_queue ptr as io-driver ptr?
-        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
 
+        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
         while (true) {
             if (idle_queue.state == .shutdown)
                 return;
@@ -571,9 +571,7 @@ pub const Pool = struct {
                         return null;
                     return 0;
                 }
-            } {
-                .pool = self,
-            });
+            } { .pool = self });
 
             idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
         }
@@ -581,13 +579,6 @@ pub const Pool = struct {
 
     fn idleNotify(self: *Pool) void {
         @setCold(true);
-
-        _ = atomic.fetchOr(
-            &self.idle_queue,
-            (IdleQueue{ .notified = true }).pack(),
-            .relaxed,
-        );
-
         parking_lot.unparkOne(@ptrToInt(&self.idle_queue), struct {
             pub fn onUnpark(this: @This(), result: parking_lot.UnparkResult) usize {
                 return 0;
@@ -597,7 +588,6 @@ pub const Pool = struct {
 
     fn idleShutdown(self: *Pool) void {
         @setCold(true);
-
         parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
     }
 };

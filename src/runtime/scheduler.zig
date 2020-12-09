@@ -537,25 +537,25 @@ pub const Pool = struct {
     }
 
     const WAIT_EMPTY: usize = 0;
-    const WAIT_WAKING: usize = 1;
-    const WAIT_NOTIFIED: usize = 2;
-    const WAIT_SHUTDOWN: usize = 4;
-    const WAIT_MASK = ~(WAIT_WAKING | WAIT_NOTIFIED | WAIT_SHUTDOWN);
+    const WAIT_NOTIFIED: usize = 1;
+    const WAIT_SHUTDOWN: usize = 2;
 
     fn idleWait(self: *Pool, worker: *Worker) void {
+        @setCold(true);
+
+        // TODO: use io-driver if enabled from pool init instead of wait_queue
+        // TODO: re-use wait_queue ptr as io-driver ptr?
+
         var wait_queue = atomic.load(&self.wait_queue, .relaxed);
-
         while (true) {
-            if (wait_queue & WAIT_SHUTDOWN != 0)
-                return;
-
-            var new_wait_queue: usize = undefined;
-            if (wait_queue & WAIT_NOTIFIED != 0) {
-                new_wait_queue = wait_queue & ~WAIT_NOTIFIED;
-            } else {
-                worker.idle_next = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
-                new_wait_queue = @ptrToInt(worker) | (wait_queue & WAIT_WAKING);
-            }
+            const new_wait_queue = switch (wait_queue) {
+                WAIT_SHUTDOWN => return,
+                WAIT_NOTIFIED => WAIT_EMPTY,
+                else => blk: {
+                    atomic.store(&worker.idle_next, @intToPtr(?*Worker, wait_queue), .unordered);
+                    break :blk @ptrToInt(worker);
+                },
+            };
 
             if (atomic.tryCompareAndSwap(
                 &self.wait_queue,
@@ -568,102 +568,55 @@ pub const Pool = struct {
                 continue;
             }
 
-            if (wait_queue & WAIT_NOTIFIED == 0)
+            if (wait_queue != WAIT_NOTIFIED)
                 worker.signal.wait();
             return;
         }
     }
 
     fn idleNotify(self: *Pool) void {
-        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
+        @setCold(true);
 
+        var wait_queue = atomic.load(&self.wait_queue, .consume);
         while (true) {
-            if (wait_queue & (WAIT_SHUTDOWN | WAIT_NOTIFIED | WAIT_WAKING) != 0)
-                return;
-
-            var new_wait_queue: usize = wait_queue & WAIT_MASK;
-            if (new_wait_queue != 0) {
-                new_wait_queue |= WAIT_WAKING;
-            } else {
-                new_wait_queue |= WAIT_NOTIFIED;
-            }
+            const new_wait_queue = switch (wait_queue) {
+                WAIT_SHUTDOWN, WAIT_NOTIFIED => return,
+                WAIT_EMPTY => WAIT_NOTIFIED,
+                else => blk: {
+                    const worker = @intToPtr(*Worker, wait_queue);
+                    break :blk @ptrToInt(atomic.load(&worker.idle_next, .unordered));
+                },
+            };
 
             if (atomic.tryCompareAndSwap(
                 &self.wait_queue,
                 wait_queue,
                 new_wait_queue,
                 .consume,
-                .relaxed,
+                .consume,
             )) |updated| {
                 wait_queue = updated;
                 continue;
             }
 
-            wait_queue = new_wait_queue;
-            if (wait_queue & WAIT_NOTIFIED != 0)
-                return;
-
-            while (true) {
-                if (wait_queue & WAIT_SHUTDOWN != 0)
-                    break;
-                if (wait_queue & WAIT_WAKING == 0)
-                    unreachable;
-
-                const worker = @intToPtr(*Worker, wait_queue & WAIT_MASK);
-                new_wait_queue = @ptrToInt(worker.idle_next) | (wait_queue & WAIT_NOTIFIED);
-
-                if (atomic.tryCompareAndSwap(
-                    &self.wait_queue,
-                    wait_queue,
-                    new_wait_queue,
-                    .consume,
-                    .consume,
-                )) |updated| {
-                    wait_queue = updated;
-                    continue;
-                }
-
+            if (@intToPtr(?*Worker, wait_queue)) |worker|
                 worker.signal.notify();
-                return;
-            }
-
-            var idle_workers = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
-            while (true) {
-                const worker = idle_workers orelse return;
-                idle_workers = worker.idle_next;
-                worker.signal.notify();
-            } 
+            return;
         }
     }
 
     fn idleShutdown(self: *Pool) void {
-        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
+        @setCold(true);
+
+        var idle_workers = switch (atomic.swap(&self.wait_queue, WAIT_SHUTDOWN, .acq_rel)) {
+            WAIT_NOTIFIED, WAIT_SHUTDOWN => return,
+            else => |wait_queue| @intToPtr(?*Worker, wait_queue),
+        };
 
         while (true) {
-            if (wait_queue & WAIT_SHUTDOWN != 0)
-                return;
-
-            const new_wait_queue = wait_queue | WAIT_SHUTDOWN;
-            if (atomic.tryCompareAndSwap(
-                &self.wait_queue,
-                wait_queue,
-                new_wait_queue,
-                .consume,
-                .relaxed,
-            )) |updated| {
-                wait_queue = updated;
-                continue;
-            }
-
-            if (wait_queue & WAIT_WAKING != 0)
-                return;
-
-            var idle_workers = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
-            while (true) {
-                const worker = idle_workers orelse return;
-                idle_workers = worker.idle_next;
-                worker.signal.notify();
-            }
+            const worker = idle_workers orelse break;
+            idle_workers = atomic.load(&worker.idle_next, .unordered);
+            worker.signal.notify();
         }
     }
 };

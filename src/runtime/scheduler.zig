@@ -4,6 +4,7 @@ const Event = zap.runtime.Event;
 const Thread = zap.runtime.Thread;
 const target = zap.runtime.target;
 const atomic = zap.sync.atomic;
+const parking_lot = zap.sync.parking_lot;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
@@ -284,7 +285,6 @@ pub const Pool = struct {
     max_workers: u16,
     idle_queue: u32 = 0,
     active_queue: ?*Worker = null,
-    wait_queue: usize = WAIT_EMPTY,
     run_queue: UnboundedQueue = UnboundedQueue{},
     
     const IdleQueue = struct {
@@ -536,88 +536,69 @@ pub const Pool = struct {
         }
     }
 
-    const WAIT_EMPTY: usize = 0;
-    const WAIT_NOTIFIED: usize = 1;
-    const WAIT_SHUTDOWN: usize = 2;
-
     fn idleWait(self: *Pool, worker: *Worker) void {
         @setCold(true);
 
         // TODO: use io-driver if enabled from pool init instead of wait_queue
         // TODO: re-use wait_queue ptr as io-driver ptr?
+        var idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
 
-        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
         while (true) {
-            const new_wait_queue = switch (wait_queue) {
-                WAIT_SHUTDOWN => return,
-                WAIT_NOTIFIED => WAIT_EMPTY,
-                else => blk: {
-                    atomic.store(&worker.idle_next, @intToPtr(?*Worker, wait_queue), .unordered);
-                    break :blk @ptrToInt(worker);
-                },
-            };
+            if (idle_queue.state == .shutdown)
+                return;
 
-            if (atomic.tryCompareAndSwap(
-                &self.wait_queue,
-                wait_queue,
-                new_wait_queue,
-                .release,
-                .relaxed,
-            )) |updated| {
-                wait_queue = updated;
+            if (idle_queue.notified) {
+                var new_idle_queue = idle_queue;
+                new_idle_queue.notified = false;
+                idle_queue = IdleQueue.unpack(atomic.tryCompareAndSwap(
+                    &self.idle_queue,
+                    idle_queue.pack(),
+                    new_idle_queue.pack(),
+                    .relaxed,
+                    .relaxed,
+                ) orelse return);
                 continue;
             }
 
-            if (wait_queue != WAIT_NOTIFIED)
-                worker.signal.wait();
-            return;
+            _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
+                pool: *Pool,
+
+                pub fn onBeforeWait(this: @This()) void {}
+                pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
+                pub fn onValidate(this: @This()) ?usize {
+                    const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
+                    if (idleq.state == .shutdown or idleq.notified)
+                        return null;
+                    return 0;
+                }
+            } {
+                .pool = self,
+            });
+
+            idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
         }
     }
 
     fn idleNotify(self: *Pool) void {
         @setCold(true);
 
-        var wait_queue = atomic.load(&self.wait_queue, .consume);
-        while (true) {
-            const new_wait_queue = switch (wait_queue) {
-                WAIT_SHUTDOWN, WAIT_NOTIFIED => return,
-                WAIT_EMPTY => WAIT_NOTIFIED,
-                else => blk: {
-                    const worker = @intToPtr(*Worker, wait_queue);
-                    break :blk @ptrToInt(atomic.load(&worker.idle_next, .unordered));
-                },
-            };
+        _ = atomic.fetchOr(
+            &self.idle_queue,
+            (IdleQueue{ .notified = true }).pack(),
+            .relaxed,
+        );
 
-            if (atomic.tryCompareAndSwap(
-                &self.wait_queue,
-                wait_queue,
-                new_wait_queue,
-                .consume,
-                .consume,
-            )) |updated| {
-                wait_queue = updated;
-                continue;
+        parking_lot.unparkOne(@ptrToInt(&self.idle_queue), struct {
+            pub fn onUnpark(this: @This(), result: parking_lot.UnparkResult) usize {
+                return 0;
             }
-
-            if (@intToPtr(?*Worker, wait_queue)) |worker|
-                worker.signal.notify();
-            return;
-        }
+        }{});
     }
 
     fn idleShutdown(self: *Pool) void {
         @setCold(true);
 
-        var idle_workers = switch (atomic.swap(&self.wait_queue, WAIT_SHUTDOWN, .acq_rel)) {
-            WAIT_NOTIFIED, WAIT_SHUTDOWN => return,
-            else => |wait_queue| @intToPtr(?*Worker, wait_queue),
-        };
-
-        while (true) {
-            const worker = idle_workers orelse break;
-            idle_workers = atomic.load(&worker.idle_next, .unordered);
-            worker.signal.notify();
-        }
+        parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
     }
 };
 

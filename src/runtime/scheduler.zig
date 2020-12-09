@@ -560,7 +560,7 @@ pub const Pool = struct {
             if (atomic.tryCompareAndSwap(
                 &self.wait_queue,
                 wait_queue,
-                @ptrToInt(worker),
+                new_wait_queue,
                 .release,
                 .relaxed,
             )) |updated| {
@@ -643,10 +643,11 @@ pub const Pool = struct {
             if (wait_queue & WAIT_SHUTDOWN != 0)
                 return;
 
+            const new_wait_queue = wait_queue | WAIT_SHUTDOWN;
             if (atomic.tryCompareAndSwap(
                 &self.wait_queue,
                 wait_queue,
-                wait_queue | WAIT_SHUTDOWN,
+                new_wait_queue,
                 .consume,
                 .relaxed,
             )) |updated| {

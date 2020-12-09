@@ -90,7 +90,6 @@ pub const Task = extern struct {
 
 pub const Worker = struct {
     pool: *Pool,
-    thread: ?Thread.Handle = null,
     state: usize = undefined,
     signal: Signal = Signal{},
     idle_next: ?*Worker = null,
@@ -111,42 +110,8 @@ pub const Worker = struct {
         return self.pool;
     }
 
-    fn spawn(pool: *Pool, use_caller_thread: bool) bool {
-        if (use_caller_thread) {
-            Worker.run(pool, null);
-            return true;
-        }
-
-        const Spawner = struct {
-            pool: *Pool,
-            spawn_signal: Signal = Signal{},
-            thread_signal: Signal = Signal{},
-            thread: Thread.Handle = undefined,
-
-            fn entry(self: *@This()) void {
-                self.thread_signal.wait();
-                const thread = self.thread;
-
-                const _pool = self.pool;
-                self.spawn_signal.notify();
-
-                return Worker.run(_pool, thread);
-            }
-        };
-
-        var spawner = Spawner{ .pool = pool };
-        spawner.thread = Thread.spawn(pool.stack_size, &spawner, Spawner.entry) catch return false;
-        spawner.thread_signal.notify();
-        spawner.spawn_signal.wait();
-        return true;
-    }
-
-    fn run(pool: *Pool, thread: ?Thread.Handle) void {
-        var self = Worker{
-            .pool = pool,
-            .thread = thread,
-        };
-
+    fn run(pool: *Pool) void {
+        var self = Worker{ .pool = pool };
         self.state = blk: {
             const is_waking = true;
             const tick = @ptrToInt(&self);
@@ -377,7 +342,7 @@ pub const Pool = struct {
             else if (config.max_threads) |max_threads|
                 @import("std").math.max(1, max_threads)
             else
-                @intCast(u16, @import("std").Thread.cpuCount() catch 1); 
+                @intCast(u16, Thread.getCpuCount()); 
 
         var pool = Pool{
             .stack_size = stack_size,
@@ -435,10 +400,14 @@ pub const Pool = struct {
                     return true;
                 }
 
-                const use_caller_thread = !target.is_parallel or idle_queue.spawned == 0;
-                if (Worker.spawn(self, use_caller_thread)) {
+                if (!target.is_parallel or idle_queue.spawned == 0) {
+                    Worker.run(self);
                     return true;
                 }
+
+                if (Thread.spawn(self.stack_size, self, Worker.run)) |_| {
+                    return true;
+                } else |_| {}
 
                 is_waking = true;
                 remaining_attempts -= 1;
@@ -493,7 +462,8 @@ pub const Pool = struct {
                 new_idle_queue.state = if (is_waking) .waking else .pending;
             } else {
                 new_idle_queue.idle += 1;
-                new_idle_queue.state = if (can_wake) .pending else .notified;
+                if (is_waking)
+                    new_idle_queue.state = if (can_wake) .pending else .notified;
             }
 
             if (atomic.tryCompareAndSwap(
@@ -527,14 +497,11 @@ pub const Pool = struct {
             worker.signal.wait();
 
             if (worker.active_next == null) {
-                var pending_workers = atomic.load(&self.active_queue, .consume);
-                while (pending_workers) |pending_worker| {
-                    const active_worker = pending_worker;
-                    pending_workers = worker.active_next;
-
-                    const handle = worker.thread orelse continue;
-                    worker.signal.notify();
-                    Thread.join(handle);
+                var idle_workers = atomic.load(&self.active_queue, .consume);
+                while (true) {
+                    const idle_worker = idle_workers orelse break;
+                    idle_workers = idle_worker.active_next;
+                    idle_worker.signal.notify();
                 }
             }
 
@@ -737,7 +704,7 @@ const Signal = struct {
     fn notify(self: *Signal) void {
         switch (atomic.swap(&self.state, NOTIFIED, .acq_rel)) {
             EMPTY => {},
-            NOTIFIED => unreachable,
+            NOTIFIED => {},
             else => |state| @intToPtr(*Waiter, state).event.notify(),
         }
     }

@@ -22,13 +22,6 @@ pub const HMODULE = HANDLE;
 
 pub const LARGE_INTEGER = i64;
 pub const INFINITE = ~@as(DWORD, 0);
-
-pub const WAIT_OBJECT_0 = 0x0;
-pub const WAIT_IO_COMPLETION = 0xC0;
-pub const WAIT_ABANDONED = 0x80;
-pub const WAIT_TIMEOUT = 0x102;
-pub const WAIT_FAILED = ~@as(DWORD, 0);
-
 pub const ERROR_TIMEOUT = 0x5B4;
 
 pub const SRWLOCK = ?PVOID;
@@ -36,6 +29,19 @@ pub const SRWLOCK_INIT: SRWLOCK = null;
 
 pub const CONDITION_VARIABLE = ?PVOID;
 pub const CONDITION_VARIABLE_INIT: CONDITION_VARIABLE = null;
+
+pub const SYSTEM_INFO = extern struct {
+    dwOemId: DWORD,
+    dwPageSize: DWORD,
+    lpMinimumApplicationAddress: PVOID,
+    lpMaximumApplicationAddress: PVOID,
+    dwActiveProcessorMask: SIZE_T,
+    dwNumberOfProcessors: DWORD,
+    dwProcessorType: DWORD,
+    dwAllocationGranularity: DWORD,
+    wProcessorLevel: WORD,
+    wProcessorRevision: WORD,
+};
 
 pub extern "kernel32" fn TryAcquireSRWLockExclusive(
     lock: *SRWLOCK,
@@ -74,11 +80,9 @@ pub extern "kernel32" fn CloseHandle(
     handle: HANDLE,
 ) callconv(.Stdcall) BOOL;
 
-pub extern "kernel32" fn WaitForSingleObjectEx(
-    handle: HANDLE,
-    dwMilliseconds: DWORD,
-    bAlertable: BOOL,
-) callconv(.Stdcall) DWORD;
+pub extern "kernel32" fn GetSystemInfo(
+    lpSystemInfo: *SYSTEM_INFO,
+) callconv(.Stdcall) VOID;
 
 pub extern "kernel32" fn CreateThread(
     lpThreadAttributes: ?PVOID,

@@ -13,9 +13,13 @@ pub const Thread =
         @compileError("OS not supported for threading");
 
 const WindowsThread = struct {
-    pub const Handle = system.HANDLE;
+    pub fn getCpuCount() usize {
+        var system_info: system.SYSTEM_INFO = undefined;
+        system.GetSystemInfo(&system_info);
+        return system_info.dwNumberOfProcessors;
+    }
 
-    pub fn spawn(stack_size: u32, param: anytype, comptime entryFn: anytype) !Handle {
+    pub fn spawn(stack_size: u32, param: anytype, comptime entryFn: anytype) !void {
         const Parameter = @TypeOf(param);
         const Decorator = struct {
             fn entry(raw_arg: ?system.PVOID) callconv(.C) system.DWORD {
@@ -34,19 +38,6 @@ const WindowsThread = struct {
             null,
         ) orelse return error.SpawnError;
 
-        return handle;
-    }
-
-    pub fn join(handle: Handle) void {
-        switch (system.WaitForSingleObjectEx(handle, system.INFINITE, system.FALSE)) {
-            system.WAIT_OBJECT_0 => {},
-            system.WAIT_ABANDONED => unreachable,
-            system.WAIT_IO_COMPLETION => unreachable,
-            system.WAIT_TIMEOUT => unreachable,
-            system.WAIT_FAILED => unreachable,
-            else => unreachable,
-        }
-        
         if (system.CloseHandle(handle) != system.TRUE)
             unreachable;
     }

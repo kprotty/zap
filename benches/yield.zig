@@ -6,7 +6,7 @@ pub fn main() !void {
 }
 
 fn asyncMain() !void {
-    const num_tasks = 50;
+    const num_tasks = 100_000;
     const num_yields = 100;
 
     const Yielder = struct {

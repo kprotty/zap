@@ -493,8 +493,7 @@ pub const Pool = struct {
                 new_idle_queue.state = if (is_waking) .waking else .pending;
             } else {
                 new_idle_queue.idle += 1;
-                if (is_waking)
-                    new_idle_queue.state = if (can_wake) .pending else .notified;
+                new_idle_queue.state = if (can_wake) .pending else .notified;
             }
 
             if (atomic.tryCompareAndSwap(
@@ -777,20 +776,16 @@ const UnboundedQueue = struct {
             if (tail == @as(?*Task, stub) or tail == null)
                 return null;
 
-            var new_head = head | IS_CONSUMING;
-            if (head == 0)
-                new_head |= @ptrToInt(stub);
-
             head = atomic.tryCompareAndSwap(
                 &self.head,
                 head,
-                new_head,
+                head | IS_CONSUMING,
                 .acquire,
                 .relaxed,
             ) orelse return Consumer{
                 .queue = self,
                 .stub = stub,
-                .head = @intToPtr(*Task, new_head & ~IS_CONSUMING),
+                .head = @intToPtr(?*Task, head & ~IS_CONSUMING) orelse stub,
             };
         }
     }
@@ -920,31 +915,32 @@ const BoundedQueue = struct {
         var consumer = target_queue.tryAcquireConsumer() orelse return null;
         defer consumer.release();
 
-        const tail = self.tail;
+        var tail = self.tail;
         var new_tail = tail;
         var first_task: ?*Task = null;
         var head = atomic.load(&self.head, .relaxed);
-
+        
         while (true) {
+            if (first_task != null and (new_tail -% head >= self.buffer.len)) {
+                head = atomic.load(&self.head, .relaxed);
+                if (new_tail -% head < self.buffer.len)
+                    continue;
+                break;
+            }
+
             const task = consumer.pop() orelse break;
             if (first_task == null) {
                 first_task = task;
                 continue;
             }
 
-            if (new_tail -% head < self.buffer.len) {
-                const slot = &self.buffer[new_tail % self.buffer.len];
-                atomic.store(slot, task, .unordered);
-                new_tail +%= 1;
-                continue;
-            }
-
-            atomic.spinLoopHint();
-            head = atomic.load(&self.head, .relaxed);
-            if (new_tail -% head == self.buffer.len)
-                break;
+            const slot = &self.buffer[new_tail % self.buffer.len];
+            atomic.store(slot, task, .unordered);
+            new_tail +%= 1;
         }
 
+        if (new_tail != tail)
+            atomic.store(&self.tail, new_tail, .release);
         return first_task;
     }
 

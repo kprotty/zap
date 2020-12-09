@@ -624,10 +624,7 @@ pub const Pool = struct {
 const UnboundedQueue = struct {
     head: usize = 0,
     tail: ?*Task = null,
-    stub: Task = Task{
-        .next = null,
-        .runnable = undefined,
-    },
+    stub_next: ?*Task = null,
 
     fn push(self: *UnboundedQueue, batchable: anytype) void {
         const batch = Task.Batch.from(batchable);
@@ -636,14 +633,14 @@ const UnboundedQueue = struct {
 
         batch.tail.next = null;
         const prev_tail = atomic.swap(&self.tail, batch.tail, .acq_rel);
-        const prev = prev_tail orelse &self.stub;
+        const prev = prev_tail orelse @fieldParentPtr(Task, "next", &self.stub_next);
         atomic.store(&prev.next, batch.head, .release);
     }
 
     const IS_CONSUMING: usize = 1;
 
     fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
-        const stub = &self.stub;
+        const stub = @fieldParentPtr(Task, "next", &self.stub_next);
         var head = atomic.load(&self.head, .relaxed);
 
         while (true) {
@@ -800,6 +797,7 @@ const BoundedQueue = struct {
         
         while (true) {
             if (first_task != null and (new_tail -% head >= self.buffer.len)) {
+                atomic.spinLoopHint();
                 head = atomic.load(&self.head, .relaxed);
                 if (new_tail -% head < self.buffer.len)
                     continue;

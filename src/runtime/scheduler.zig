@@ -92,8 +92,6 @@ pub const Task = extern struct {
 pub const Worker = struct {
     pool: *Pool,
     state: usize = undefined,
-    signal: Signal = Signal{},
-    idle_next: ?*Worker = null,
     active_next: ?*Worker = null,
     target_worker: ?*Worker = null,
     run_queue: BoundedQueue = BoundedQueue{},
@@ -488,22 +486,51 @@ pub const Pool = struct {
                 return true;
             }
 
-            if (new_idle_queue.spawned == 0) {
-                var root_worker = worker;
-                while (root_worker.active_next) |next_worker|
-                    root_worker = next_worker;
-                root_worker.signal.notify();
+            const is_root_worker = worker.active_next == null;
+            const was_last_worker = new_idle_queue.spawned == 0;
+
+            // the root worker waits for other workers to shutdown on the idle queue
+            if (is_root_worker and !was_last_worker) {
+                _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
+                    pool: *Pool,
+
+                    pub fn onBeforeWait(this: @This()) void {}
+                    pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
+                    pub fn onValidate(this: @This()) ?usize {
+                        const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
+                        if (idleq.spawned == 0)
+                            return null;
+                        return 0;
+                    }
+                } { .pool = self });
             }
 
-            worker.signal.wait();
+            // the last worker to shutdown that isnt the root worker, wakes up the root worker
+            if (!is_root_worker and was_last_worker) {
+                parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
+            }
+            
+            // non root-workers wait for the root worker to shut down the queue
+            if (!is_root_worker) {
+                _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
+                    pool: *Pool,
 
-            if (worker.active_next == null) {
-                var idle_workers = atomic.load(&self.active_queue, .consume);
-                while (true) {
-                    const idle_worker = idle_workers orelse break;
-                    idle_workers = idle_worker.active_next;
-                    idle_worker.signal.notify();
-                }
+                    pub fn onBeforeWait(this: @This()) void {}
+                    pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
+                    pub fn onValidate(this: @This()) ?usize {
+                        const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
+                        if (idleq.notified)
+                            return null;
+                        return 0;
+                    }
+                } { .pool = self });
+            }
+
+            // the root worker shuts down the queue for non-root workers
+            if (is_root_worker) {
+                new_idle_queue = IdleQueue{ .notified = true };
+                atomic.store(&self.idle_queue, new_idle_queue.pack(), .release);
+                parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
             }
 
             return null;
@@ -520,6 +547,8 @@ pub const Pool = struct {
 
             var new_idle_queue = idle_queue;
             new_idle_queue.state = .shutdown;
+            new_idle_queue.notified = false;
+
             if (atomic.tryCompareAndSwap(
                 &self.idle_queue,
                 idle_queue.pack(),
@@ -589,49 +618,6 @@ pub const Pool = struct {
     fn idleShutdown(self: *Pool) void {
         @setCold(true);
         parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
-    }
-};
-
-const Signal = struct {
-    state: usize = EMPTY,
-
-    const EMPTY: usize = 0;
-    const NOTIFIED: usize = 1;
-
-    const Waiter = struct {
-        event: Event align(@import("std").math.max(2, @alignOf(Event))),
-        signal: *Signal,
-
-        pub fn wait(self: *Waiter) bool {
-            return atomic.swap(&self.signal.state, @ptrToInt(self), .acq_rel) == EMPTY;
-        }
-    };
-
-    fn wait(self: *Signal) void {
-        defer atomic.store(&self.state, EMPTY, .relaxed);
-
-        if (atomic.load(&self.state, .acquire) == NOTIFIED)
-            return;
-
-        var waiter: Waiter = undefined;
-        waiter.signal = self;
-        waiter.event.init();
-        defer waiter.event.deinit();
-
-        if (atomic.load(&self.state, .acquire) == NOTIFIED)
-            return;
-        
-        const notified = waiter.event.wait(null, &waiter);
-        if (!notified)
-            unreachable;
-    }
-
-    fn notify(self: *Signal) void {
-        switch (atomic.swap(&self.state, NOTIFIED, .acq_rel)) {
-            EMPTY => {},
-            NOTIFIED => {},
-            else => |state| @intToPtr(*Waiter, state).event.notify(),
-        }
     }
 };
 

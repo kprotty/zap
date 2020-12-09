@@ -25,15 +25,27 @@ const LinuxEvent = struct {
 };
 
 const WindowsEvent = struct {
-    state: State = .empty,
-    lock: system.SRWLOCK = system.SRWLOCK_INIT,
-    cond: system.CONDITION_VARIABLE = system.CONDITION_VARIABLE_INIT,
+    state: State,
+    lock: system.SRWLOCK,
+    cond: system.CONDITION_VARIABLE,
 
     const State = enum {
         empty = 0,
         waiting,
         notified,
     };
+
+    pub fn init(self: *Event) void {
+        self.* = Event{
+            .state = .empty,
+            .lock = system.SRWLOCK_INIT,
+            .cond = system.CONDITION_VARIABLE_INIT,
+        };
+    }
+
+    pub fn deinit(self: *Event) void {
+        self.* = undefined;
+    }
 
     pub fn wait(self: *Event, deadline: ?u64, condition: anytype) bool {
         system.AcquireSRWLockExclusive(&self.lock);

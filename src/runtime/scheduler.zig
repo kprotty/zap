@@ -90,9 +90,12 @@ pub const Task = extern struct {
 
 pub const Worker = struct {
     pool: *Pool,
+    thread: ?Thread.Handle = null,
     state: usize = undefined,
-    target_worker: ?*Worker = null,
+    signal: Signal = Signal{},
+    idle_next: ?*Worker = null,
     active_next: ?*Worker = null,
+    target_worker: ?*Worker = null,
     run_queue: BoundedQueue = BoundedQueue{},
     run_queue_next: ?*Task = null,
     run_queue_lifo: ?*Task = null,
@@ -108,8 +111,42 @@ pub const Worker = struct {
         return self.pool;
     }
 
-    fn run(pool: *Pool) void {
-        var self = Worker{ .pool = pool };
+    fn spawn(pool: *Pool, use_caller_thread: bool) bool {
+        if (use_caller_thread) {
+            Worker.run(pool, null);
+            return true;
+        }
+
+        const Spawner = struct {
+            pool: *Pool,
+            spawn_signal: Signal = Signal{},
+            thread_signal: Signal = Signal{},
+            thread: Thread.Handle = undefined,
+
+            fn entry(self: *@This()) void {
+                self.thread_signal.wait();
+                const thread = self.thread;
+
+                const _pool = self.pool;
+                self.spawn_signal.notify();
+
+                return Worker.run(_pool, thread);
+            }
+        };
+
+        var spawner = Spawner{ .pool = pool };
+        spawner.thread = Thread.spawn(pool.stack_size, &spawner, Spawner.entry) catch return false;
+        spawner.thread_signal.notify();
+        spawner.spawn_signal.wait();
+        return true;
+    }
+
+    fn run(pool: *Pool, thread: ?Thread.Handle) void {
+        var self = Worker{
+            .pool = pool,
+            .thread = thread,
+        };
+
         self.state = blk: {
             const is_waking = true;
             const tick = @ptrToInt(&self);
@@ -282,7 +319,7 @@ pub const Pool = struct {
     max_workers: u16,
     idle_queue: u32 = 0,
     active_queue: ?*Worker = null,
-    wait_queue: WaitQueue = WaitQueue{},
+    wait_queue: usize = WAIT_EMPTY,
     run_queue: UnboundedQueue = UnboundedQueue{},
     
     const IdleQueue = struct {
@@ -291,7 +328,7 @@ pub const Pool = struct {
         notified: bool = false,
         state: State = .pending,
 
-        const State = enum(u4) {
+        const State = enum(u3) {
             pending = 0,
             notified,
             waking,
@@ -378,7 +415,6 @@ pub const Pool = struct {
                 new_idle_queue.state = .waking;
                 if (idle_queue.idle > 0) {
                     new_idle_queue.idle -= 1;
-                    new_idle_queue.notified = true;
                 } else {
                     new_idle_queue.spawned += 1;
                 }
@@ -395,19 +431,14 @@ pub const Pool = struct {
                 }
 
                 if (idle_queue.idle > 0) {
-                    self.notify();
+                    self.idleNotify();
                     return true;
                 }
 
-                if (!target.is_parallel or idle_queue.spawned == 0) {
-                    Worker.run(self);
+                const use_caller_thread = !target.is_parallel or idle_queue.spawned == 0;
+                if (Worker.spawn(self, use_caller_thread)) {
                     return true;
                 }
-
-                if (Thread.spawn(self.stack_size, self, Worker.run)) |thread| {
-                    Thread.detach(thread);
-                    return true;
-                } else |_| {}
 
                 is_waking = true;
                 remaining_attempts -= 1;
@@ -461,8 +492,9 @@ pub const Pool = struct {
             } else if (is_notified) {
                 new_idle_queue.state = if (is_waking) .waking else .pending;
             } else {
-                new_idle_queue.state = if (can_wake) .pending else .notified;
                 new_idle_queue.idle += 1;
+                if (is_waking)
+                    new_idle_queue.state = if (can_wake) .pending else .notified;
             }
 
             if (atomic.tryCompareAndSwap(
@@ -482,20 +514,30 @@ pub const Pool = struct {
                 return false;
 
             if (!is_shutdown) {
-                self.wait() orelse {
-                    idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
-                    continue;
-                };
+                self.idleWait(worker);
                 return true;
             }
 
-            const is_root_worker = worker.active_next == null;
+            if (new_idle_queue.spawned == 0) {
+                var root_worker = worker;
+                while (root_worker.active_next) |next_worker|
+                    root_worker = next_worker;
+                root_worker.signal.notify();
+            }
 
-            if (new_idle_queue.spawned == 0 and !is_root_worker)
-                self.notifyShutdown();
+            worker.signal.wait();
 
-            if (new_idle_queue.spawned > 0 and is_root_worker)
-                self.waitShutdown();
+            if (worker.active_next == null) {
+                var pending_workers = atomic.load(&self.active_queue, .consume);
+                while (pending_workers) |pending_worker| {
+                    const active_worker = pending_worker;
+                    pending_workers = worker.active_next;
+
+                    const handle = worker.thread orelse continue;
+                    worker.signal.notify();
+                    Thread.join(handle);
+                }
+            }
 
             return null;
         }
@@ -523,198 +565,209 @@ pub const Pool = struct {
                 continue;
             }
 
-            self.notifyAll();
+            self.idleShutdown();
             return;
         }
     }
 
-    fn wait(self: *Pool) ?void {
-        @setCold(true);
-        self.wait_queue.wait() catch return null;
+    const WAIT_EMPTY: usize = 0;
+    const WAIT_WAKING: usize = 1;
+    const WAIT_NOTIFIED: usize = 2;
+    const WAIT_SHUTDOWN: usize = 4;
+    const WAIT_MASK = ~(WAIT_WAKING | WAIT_NOTIFIED | WAIT_SHUTDOWN);
+
+    fn idleWait(self: *Pool, worker: *Worker) void {
+        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
+
+        while (true) {
+            if (wait_queue & WAIT_SHUTDOWN != 0)
+                return;
+
+            var new_wait_queue: usize = undefined;
+            if (wait_queue & WAIT_NOTIFIED != 0) {
+                new_wait_queue = wait_queue & ~WAIT_NOTIFIED;
+            } else {
+                worker.idle_next = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
+                new_wait_queue = @ptrToInt(worker) | (wait_queue & WAIT_WAKING);
+            }
+
+            if (atomic.tryCompareAndSwap(
+                &self.wait_queue,
+                wait_queue,
+                @ptrToInt(worker),
+                .release,
+                .relaxed,
+            )) |updated| {
+                wait_queue = updated;
+                continue;
+            }
+
+            if (wait_queue & WAIT_NOTIFIED == 0)
+                worker.signal.wait();
+            return;
+        }
     }
 
-    fn notify(self: *Pool) void {
-        @setCold(true);
-        self.wait_queue.notify();
+    fn idleNotify(self: *Pool) void {
+        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
+
+        while (true) {
+            if (wait_queue & (WAIT_SHUTDOWN | WAIT_NOTIFIED | WAIT_WAKING) != 0)
+                return;
+
+            var new_wait_queue: usize = wait_queue & WAIT_MASK;
+            if (new_wait_queue != 0) {
+                new_wait_queue |= WAIT_WAKING;
+            } else {
+                new_wait_queue |= WAIT_NOTIFIED;
+            }
+
+            if (atomic.tryCompareAndSwap(
+                &self.wait_queue,
+                wait_queue,
+                new_wait_queue,
+                .consume,
+                .relaxed,
+            )) |updated| {
+                wait_queue = updated;
+                continue;
+            }
+
+            wait_queue = new_wait_queue;
+            if (wait_queue & WAIT_NOTIFIED != 0)
+                return;
+
+            while (true) {
+                if (wait_queue & WAIT_SHUTDOWN != 0)
+                    break;
+                if (wait_queue & WAIT_WAKING == 0)
+                    unreachable;
+
+                const worker = @intToPtr(*Worker, wait_queue & WAIT_MASK);
+                new_wait_queue = @ptrToInt(worker.idle_next) | (wait_queue & WAIT_NOTIFIED);
+
+                if (atomic.tryCompareAndSwap(
+                    &self.wait_queue,
+                    wait_queue,
+                    new_wait_queue,
+                    .consume,
+                    .consume,
+                )) |updated| {
+                    wait_queue = updated;
+                    continue;
+                }
+
+                worker.signal.notify();
+                return;
+            }
+
+            var idle_workers = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
+            while (true) {
+                const worker = idle_workers orelse return;
+                idle_workers = worker.idle_next;
+                worker.signal.notify();
+            } 
+        }
     }
 
-    fn notifyAll(self: *Pool) void {
-        @setCold(true);
-        self.wait_queue.shutdown();
-    }
+    fn idleShutdown(self: *Pool) void {
+        var wait_queue = atomic.load(&self.wait_queue, .relaxed);
 
-    fn waitShutdown(self: *Pool) void {
-        @setCold(true);
-        self.wait_queue.waitForShutdown();
-    }
+        while (true) {
+            if (wait_queue & WAIT_SHUTDOWN != 0)
+                return;
 
-    fn notifyShutdown(self: *Pool) void {
-        @setCold(true);
-        self.wait_queue.notifyShutdown();
+            if (atomic.tryCompareAndSwap(
+                &self.wait_queue,
+                wait_queue,
+                wait_queue | WAIT_SHUTDOWN,
+                .consume,
+                .relaxed,
+            )) |updated| {
+                wait_queue = updated;
+                continue;
+            }
+
+            if (wait_queue & WAIT_WAKING != 0)
+                return;
+
+            var idle_workers = @intToPtr(?*Worker, wait_queue & WAIT_MASK);
+            while (true) {
+                const worker = idle_workers orelse return;
+                idle_workers = worker.idle_next;
+                worker.signal.notify();
+            }
+        }
     }
 };
 
-const WaitQueue = struct {
-    lock: Lock = Lock{},
-    state: State = .pending,
-    waiters: ?*Waiter = null,
+const Signal = struct {
+    state: usize = EMPTY,
 
-    const State = enum {
-        pending,
-        notified,
-        shutdown,
-        terminated,
-    };
+    const EMPTY: usize = 0;
+    const NOTIFIED: usize = 1;
 
     const Waiter = struct {
-        next: ?*Waiter = null,
-        tail: *Waiter = undefined,
-        event: Event = Event{},
-        queue: *WaitQueue,
-        is_shutdown: bool = false,
+        event: Event align(@import("std").math.max(2, @alignOf(Event))),
+        signal: *Signal,
 
         pub fn wait(self: *Waiter) bool {
-            self.queue.lock.release();
-            return true;
+            return atomic.swap(&self.signal.state, @ptrToInt(self), .acq_rel) == EMPTY;
         }
     };
 
-    fn wait(self: *WaitQueue) error{Shutdown}!void {
-        self.lock.acquire();
+    fn wait(self: *Signal) void {
+        defer atomic.store(&self.state, EMPTY, .relaxed);
 
-        switch (self.state) {
-            .pending => {},
-            .notified => {
-                self.state = .pending;
-                return self.lock.release();
-            },
-            .shutdown => {
-                self.lock.release();
-                return error.Shutdown;
-            },
-            .terminated => unreachable,
-        }
+        if (atomic.load(&self.state, .acquire) == NOTIFIED)
+            return;
 
-        var waiter = Waiter{ .queue = self };
-        if (self.waiters) |head| {
-            head.tail.next = &waiter;
-            head.tail = &waiter;
-        } else {
-            waiter.tail = &waiter;
-            self.waiters = &waiter;
-        }
+        var waiter: Waiter = undefined;
+        waiter.signal = self;
+        waiter.event.init();
+        defer waiter.event.deinit();
+
+        if (atomic.load(&self.state, .acquire) == NOTIFIED)
+            return;
         
         const notified = waiter.event.wait(null, &waiter);
         if (!notified)
             unreachable;
-        if (waiter.is_shutdown)
-            return error.Shutdown;
     }
 
-    fn notify(self: *WaitQueue) void {
-        self.lock.acquire();
-
-        switch (self.state) {
-            .pending => {
-                const waiter = self.waiters orelse {
-                    self.state = .notified;
-                    return self.lock.release();
-                };
-
-                self.waiters = waiter.next;
-                if (self.waiters) |head|
-                    head.tail = waiter.tail;
-
-                self.lock.release();
-                return waiter.event.notify();
-            },
-            .notified, .shutdown => {
-                return self.lock.release();
-            },
-            .terminated => unreachable,
+    fn notify(self: *Signal) void {
+        switch (atomic.swap(&self.state, NOTIFIED, .acq_rel)) {
+            EMPTY => {},
+            NOTIFIED => unreachable,
+            else => |state| @intToPtr(*Waiter, state).event.notify(),
         }
-    }
-
-    fn shutdown(self: *WaitQueue) void {
-        self.lock.acquire();
-
-        switch (self.state) {
-            .pending, .notified => {},
-            .shutdown => return self.lock.release(),
-            .terminated => unreachable,
-        }
-
-        self.state = .shutdown;
-        var waiters = self.waiters;
-        self.waiters = null;
-        self.lock.release();
-
-        while (waiters) |pending_waiter| {
-            const waiter = pending_waiter;
-            waiters = waiter.next;
-            waiter.is_shutdown = true;
-            waiter.event.notify();
-        }
-    }
-
-    fn waitForShutdown(self: *WaitQueue) void {
-        self.lock.acquire();
-
-        switch (self.state) {
-            .pending => unreachable,
-            .notified => unreachable,
-            .shutdown => {},
-            .terminated => return self.lock.release(),
-        }
-
-        var waiter = Waiter{ .queue = self };
-        self.waiters = &waiter;
-
-        const notified = waiter.event.wait(null, &waiter);
-        if (!notified)
-            unreachable;
-    }
-
-    fn notifyShutdown(self: *WaitQueue) void {
-        self.lock.acquire();
-
-        switch (self.state) {
-            .pending => unreachable,
-            .notified => unreachable,
-            .shutdown => {},
-            .terminated => unreachable,
-        }
-
-        self.state = .terminated;
-        const waiters = self.waiters;
-        self.waiters = null;
-        self.lock.release();
-
-        if (waiters) |waiter|
-            waiter.event.notify();
     }
 };
 
 const UnboundedQueue = struct {
     head: usize = 0,
     tail: ?*Task = null,
-    stub_next: ?*Task = null,
+    stub: Task = Task{
+        .next = null,
+        .runnable = undefined,
+    },
 
     fn push(self: *UnboundedQueue, batchable: anytype) void {
         const batch = Task.Batch.from(batchable);
         if (batch.isEmpty())
             return;
 
+        batch.tail.next = null;
         const prev_tail = atomic.swap(&self.tail, batch.tail, .acq_rel);
-        const prev_next = if (prev_tail) |t| &t.next else &self.stub_next;
-        atomic.store(prev_next, batch.head, .release);
+        const prev = prev_tail orelse &self.stub;
+        atomic.store(&prev.next, batch.head, .release);
     }
 
     const IS_CONSUMING: usize = 1;
 
     fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
+        const stub = &self.stub;
         var head = atomic.load(&self.head, .relaxed);
-        const stub = @fieldParentPtr(Task, "next", &self.stub_next);
 
         while (true) {
             if (head & IS_CONSUMING != 0)
@@ -772,8 +825,8 @@ const UnboundedQueue = struct {
                 return null;
 
             self.queue.push(self.stub);
-            next = atomic.load(&head.next, .acquire);
 
+            next = atomic.load(&head.next, .acquire);
             if (next) |new_head| {
                 self.head = new_head;
                 return head;
@@ -785,9 +838,9 @@ const UnboundedQueue = struct {
 };
 
 const BoundedQueue = struct {
-    head: u32 = 0,
-    tail: u32 = 0,
-    buffer: [128]*Task = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    buffer: [256]*Task = undefined,
 
     fn push(self: *BoundedQueue, batchable: anytype) ?Task.Batch {
         var batch = Task.Batch.from(batchable);

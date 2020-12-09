@@ -37,11 +37,6 @@ const WindowsThread = struct {
         return handle;
     }
 
-    pub fn detach(handle: Handle) void {
-        if (system.CloseHandle(handle) != system.TRUE)
-            unreachable;
-    }
-
     pub fn join(handle: Handle) void {
         switch (system.WaitForSingleObjectEx(handle, system.INFINITE, system.FALSE)) {
             system.WAIT_OBJECT_0 => {},

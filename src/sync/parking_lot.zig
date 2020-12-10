@@ -1,6 +1,6 @@
 const zap = @import("../zap.zig");
 const Lock = zap.runtime.Lock;
-const nanotime = zap.runtime.nanotime;
+const nanotime = zap.runtime.Clock.nanotime;
 
 const Bucket = struct {
     lock: Lock = Lock{},

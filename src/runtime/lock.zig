@@ -211,6 +211,7 @@ const PosixLock = struct {
             if ((state & WAITING == 0) or (state & (LOCKED | WAKING) != 0))
                 return;
             state = atomic.tryCompareAndSwap(
+                &self.state,
                 state,
                 state | WAKING,
                 .acquire,

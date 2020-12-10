@@ -1,6 +1,6 @@
 const zap = @import("../zap.zig");
 const atomic = zap.sync.atomic;
-const nanotime = zap.runtime.nanotime;
+const nanotime = zap.runtime.Clock.nanotime;
 const Lock = zap.runtime.Lock;
 const Allocator = zap.runtime.Allocator;
 

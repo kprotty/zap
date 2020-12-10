@@ -6,6 +6,10 @@ pub usingnamespace
         @import("./windows.zig")
     else if (target.is_linux)
         @import("./linux.zig")
+    else if (target.is_darwin)
+        @import("./darwin.zig")
+    else if (target.is_bsd)
+        @import("./bsd.zig")
     else if (target.has_libc and target.is_posix)
         @import("./posix.zig")
     else

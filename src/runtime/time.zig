@@ -2,31 +2,42 @@ const zap = @import("../zap.zig");
 const target = zap.runtime.target;
 const system = zap.runtime.system;
 const atomic = zap.sync.atomic;
+const ns_per_s = zap.time.ns_per_s;
 
-pub const nanotime = 
+pub const Clock = 
     if (target.is_windows)
-        WindowsClock.nanotime
+        WindowsClock
     else if (target.is_darwin)
-        DarwinClock.nanotime
+        DarwinClock
     else if (target.is_posix)
-        PosixClock.nanotime
+        PosixClock
     else
-        @compileError("OS not supported for monotonic timers");
+        @compileError("OS not supported for monotonic clocks");
 
 const PosixClock = struct {
-    fn nanotime() u64 {
+    pub const is_monotonic = switch (target.os) {
+        .linux => switch (target.arch) {
+            .s390x, .aarch64 => false,
+            else => target.abi != .android,
+        },
+        .openbsd => target.arch != .x86_64,
+        else => true,
+    };
+
+    pub fn nanotime() u64 {
 
     }
 };
 
 const WindowsClock = struct {
-    fn nanotime() u64 {
+    pub const is_monotonic = false;
+
+    pub fn nanotime() u64 {
         const frequency = 
             if (@sizeOf(usize) < 8) getFrequencyTLS()
             else getFrequencyGlobal();
         const counter = getCounter();
-        const nanos_per_sec = 1_000_000_000;
-        return @divFloor(counter *% nanos_per_sec, frequency);
+        return @divFloor(counter *% ns_per_s, frequency);
     }
 
     fn getFrequencyTLS() u64 {
@@ -71,7 +82,9 @@ const WindowsClock = struct {
 };
 
 const DarwinClock = struct {
-    fn nanotime() u64 {
+    pub const is_monotonic = true;
+
+    pub fn nanotime() u64 {
 
     }
 };

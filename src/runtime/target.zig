@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 
 pub const os = builtin.os.tag;
 pub const arch = builtin.arch;
+pub const abi = builtin.abi;
 pub const has_libc = builtin.link_libc;
 pub const is_parallel = !builtin.single_threaded;
 

@@ -1,12 +1,12 @@
 
 pub const Lock = @import("./lock.zig").Lock;
+pub const Clock = @import("./time.zig").Clock;
 pub const Event = @import("./event.zig").Event;
 pub const Thread = @import("./thread.zig").Thread;
 pub const Allocator = @import("std").mem.Allocator;
 pub const target = @import("./target.zig");
 pub const scheduler = @import("./scheduler.zig");
 pub const system = @import("./system/system.zig");
-pub const nanotime = @import("./time.zig").nanotime;
 
 pub const RunConfig = struct {
     run_forever: bool = false,

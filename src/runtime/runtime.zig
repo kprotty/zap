@@ -3,10 +3,11 @@ pub const Lock = @import("./lock.zig").Lock;
 pub const Clock = @import("./time.zig").Clock;
 pub const Event = @import("./event.zig").Event;
 pub const Thread = @import("./thread.zig").Thread;
-pub const Allocator = @import("std").mem.Allocator;
+pub const Allocator = @import("./heap.zig").Allocator;
 pub const target = @import("./target.zig");
 pub const scheduler = @import("./scheduler.zig");
 pub const system = @import("./system/system.zig");
+pub const allocator = @import("./heap.zig").allocator;
 
 pub const RunConfig = struct {
     run_forever: bool = false,
@@ -76,7 +77,7 @@ pub fn runConcurrentlyAsync() void {
 }
 
 pub const SpawnConfig = struct {
-    allocator: *Allocator,
+    allocator: *heap.Allocator,
     use_lifo: bool = true,
 };
 

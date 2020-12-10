@@ -1,4 +1,3 @@
-const std = @import("std");
 const zap = @import("zap");
 
 pub fn main() !void {
@@ -20,7 +19,7 @@ fn asyncMain() !void {
         }
     };
 
-    const allocator = std.heap.page_allocator;
+    const allocator = zap.runtime.allocator;
     const frames = try allocator.alloc(@Frame(Yielder.run), num_tasks);
     defer allocator.free(frames);
 

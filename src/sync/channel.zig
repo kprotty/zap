@@ -2,7 +2,7 @@ const zap = @import("../zap.zig");
 const atomic = zap.sync.atomic;
 const nanotime = zap.runtime.Clock.nanotime;
 const Lock = zap.runtime.Lock;
-const Allocator = zap.runtime.Allocator;
+const Allocator = zap.runtime.heap.Allocator;
 
 pub fn Channel(comptime T: type) type {
     return struct {

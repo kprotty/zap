@@ -135,17 +135,21 @@ const PosixLock = struct {
                     var iter = @as(usize, 1) << @intCast(u3, spin);
                     while (iter != 0) : (iter -= 1)
                         atomic.spinLoopHint();
-                } else if (target.is_darwin) {
-                    _ = system.thread_switch(
-                        system.MACH_PORT_NULL,
-                        system.SWITCH_OPTION_DEPRESS,
-                        @as(system.mac_msg_timeout_t, 1),
-                    );
+                } else if (spin < max_spin) {
+                    if (target.is_darwin) {
+                        _ = system.thread_switch(
+                            system.MACH_PORT_NULL,
+                            system.SWITCH_OPTION_DEPRESS,
+                            @as(system.mac_msg_timeout_t, 1),
+                        );
+                    } else if (target.is_posix) {
+                        _ = system.sched_yield();
+                    }
                 } else if (target.is_posix) {
-                    _ = system.sched_yield();
+                    _ = system.usleep(1);
                 }
 
-                spin += if (spin == max_spin) 0 else 1;
+                spin += if (spin == max_spin) @as(u8, 0) else 1;
                 state = atomic.load(&self.state, .relaxed);
                 continue;
             }
@@ -229,7 +233,7 @@ const PosixLock = struct {
                 while (true) {
                     const next = current.next orelse unreachable;
                     next.prev = current;
-                    next = current;
+                    current = next;
                     if (current.tail) |tail| {
                         head.tail = tail;
                         break :blk tail;
@@ -239,6 +243,7 @@ const PosixLock = struct {
 
             if (state & LOCKED != 0) {
                 state = atomic.tryCompareAndSwap(
+                    &self.state,
                     state,
                     state & ~@as(usize, LOCKED),
                     .release,
@@ -251,6 +256,7 @@ const PosixLock = struct {
                 head.tail = new_tail;
                 atomic.fence(.release);
             } else if (atomic.tryCompareAndSwap(
+                &self.state,
                 state,
                 WAKING,
                 .release,

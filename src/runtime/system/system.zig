@@ -10,7 +10,5 @@ pub usingnamespace
         @import("./darwin.zig")
     else if (target.is_bsd)
         @import("./bsd.zig")
-    else if (target.has_libc and target.is_posix)
-        @import("./posix.zig")
     else
-        struct {};
+        @compileError("Operating system not supported yet");

@@ -1,1 +1,2 @@
-pub usingnamespace @import("./pthread.zig");
+pub usingnamespace @import("./posix.zig");
+

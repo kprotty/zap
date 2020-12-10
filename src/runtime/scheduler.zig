@@ -2,6 +2,7 @@ const zap = @import("../zap.zig");
 const Lock = zap.runtime.Lock;
 const Event = zap.runtime.Event;
 const Thread = zap.runtime.Thread;
+const max = zap.meta.max;
 const target = zap.runtime.target;
 const atomic = zap.sync.atomic;
 const parking_lot = zap.sync.parking_lot;
@@ -330,7 +331,7 @@ pub const Pool = struct {
 
         const stack_size: u32 =
             if (config.stack_size) |stack_size|
-                @import("std").math.max(16 * 1024, stack_size)
+                max(16 * 1024, stack_size)
             else
                 @as(u32, 1 * 1024 * 1024);
 
@@ -338,7 +339,7 @@ pub const Pool = struct {
             if (!target.is_parallel) 
                 @as(u16, 1)
             else if (config.max_threads) |max_threads|
-                @import("std").math.max(1, max_threads)
+                max(1, max_threads)
             else
                 @intCast(u16, Thread.getCpuCount()); 
 

@@ -1,3 +1,6 @@
+const zap = @import("../../zap.zig");
+const target = zap.runtime.target;
+
 pub const CHAR = u8;
 pub const WORD = u16;
 pub const DWORD = u32;
@@ -43,46 +46,48 @@ pub const SYSTEM_INFO = extern struct {
     wProcessorRevision: WORD,
 };
 
+pub const WINAPI = if (target.arch == .i386) .Stdcall else .C;
+
 pub extern "kernel32" fn TryAcquireSRWLockExclusive(
     lock: *SRWLOCK,
-) callconv(.Stdcall) BOOL;
+) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn AcquireSRWLockExclusive(
     lock: *SRWLOCK,
-) callconv(.Stdcall) VOID;
+) callconv(WINAPI) VOID;
 
 pub extern "kernel32" fn ReleaseSRWLockExclusive(
     lock: *SRWLOCK,
-) callconv(.Stdcall) VOID;
+) callconv(WINAPI) VOID;
 
 pub extern "kernel32" fn WakeConditionVariable(
     cond: *CONDITION_VARIABLE,
-) callconv(.Stdcall) VOID;
+) callconv(WINAPI) VOID;
 
 pub extern "kernel32" fn SleepConditionVariableSRW(
     cond: *CONDITION_VARIABLE,
     lock: *SRWLOCK,
     dwMilliseconds: DWORD,
     flags: ULONG, 
-) callconv(.Stdcall) BOOL;
+) callconv(WINAPI) BOOL;
 
-pub extern "kernel32" fn GetLastError() callconv(.Stdcall) DWORD;
+pub extern "kernel32" fn GetLastError() callconv(WINAPI) DWORD;
 
 pub extern "kernel32" fn QueryPerformanceCounter(
     counter: *LARGE_INTEGER,
-) callconv(.Stdcall) BOOL;
+) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn QueryPerformanceFrequency(
     counter: *LARGE_INTEGER,
-) callconv(.Stdcall) BOOL;
+) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn CloseHandle(
     handle: HANDLE,
-) callconv(.Stdcall) BOOL;
+) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn GetSystemInfo(
     lpSystemInfo: *SYSTEM_INFO,
-) callconv(.Stdcall) VOID;
+) callconv(WINAPI) VOID;
 
 pub extern "kernel32" fn CreateThread(
     lpThreadAttributes: ?PVOID,
@@ -91,4 +96,4 @@ pub extern "kernel32" fn CreateThread(
     lpParameter: ?PVOID,
     dwCreationFlags: DWORD,
     lpThreadId: ?*DWORD,
-) callconv(.Stdcall) ?HANDLE;
+) callconv(WINAPI) ?HANDLE;

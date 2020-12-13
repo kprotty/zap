@@ -1,11 +1,20 @@
-const zap = @import("../zap.zig");
-const Lock = zap.runtime.Lock;
-const Event = zap.runtime.Event;
-const Thread = zap.runtime.Thread;
-const max = zap.meta.max;
-const target = zap.runtime.target;
-const atomic = zap.sync.atomic;
-const parking_lot = zap.sync.parking_lot;
+const builtin = @import("builtin");
+
+const Lock = @import("./lock.zig").Lock;
+const Event = @import("./event.zig").Event;
+const Thread = @import("./thread.zig").Thread;
+
+const sync = @import("../../sync/sync.zig");
+const atomic = sync.atomic;
+const parking_lot = sync.ParkingLot(.{
+    .Lock = Lock,
+    .eventually_fair_after = 0,
+    .nanotime = struct {
+        fn nanotime() u64 {
+            return 0;
+        }
+    }.nanotime,
+});
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
@@ -329,6 +338,12 @@ pub const Pool = struct {
         if (batch.isEmpty())
             return;
 
+        const max = struct {
+            fn max(x: anytype, y: anytype) @TypeOf(y) {
+                return if (x > y) x else y;
+            }
+        }.max;
+
         const stack_size: u32 =
             if (config.stack_size) |stack_size|
                 max(16 * 1024, stack_size)
@@ -336,7 +351,7 @@ pub const Pool = struct {
                 @as(u32, 1 * 1024 * 1024);
 
         const max_threads: u16 =
-            if (!target.is_parallel) 
+            if (builtin.single_threaded) 
                 @as(u16, 1)
             else if (config.max_threads) |max_threads|
                 max(1, max_threads)
@@ -400,7 +415,7 @@ pub const Pool = struct {
                     return true;
                 }
 
-                if (!target.is_parallel or idle_queue.spawned == 0) {
+                if (builtin.single_threaded or idle_queue.spawned == 0) {
                     Worker.run(self);
                     return true;
                 }

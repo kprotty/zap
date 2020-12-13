@@ -1,10 +1,11 @@
-const zap = @import("../zap.zig");
-const atomic = zap.sync.atomic;
-const nanotime = zap.runtime.Clock.nanotime;
-const Lock = zap.runtime.Lock;
-const Allocator = zap.runtime.heap.Allocator;
+const atomic = @import("./atomic.zig");
 
-pub fn Channel(comptime T: type) type {
+pub fn Channel(comptime config: anytype) type {
+    const T = config.Item;
+    const Lock = config.Lock;
+    const nanotime = config.nanotime;
+    const Allocator = config.Allocator;
+
     return struct {
         lock: Lock = Lock{},
         buffer: [*]T = undefined,
@@ -13,7 +14,7 @@ pub fn Channel(comptime T: type) type {
         tail: usize = 0,
         readers: ?*Waiter = null,
         writers: ?*Waiter = null,
-        allocator: ?*Allocator = null,
+        allocator: ?Allocator = null,
 
         const Self = @This();
         const State = struct {

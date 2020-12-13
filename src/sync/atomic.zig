@@ -1,11 +1,11 @@
 const builtin = @import("builtin");
-const target = @import("../zap.zig").runtime.target;
 
 pub fn spinLoopHint() void {
-    if (target.is_x86) 
-        asm volatile("pause");
-    if (target.is_arm)
-        asm volatile("yield");
+    switch (builtin.arch) {
+        .i386, .x86_64 => asm volatile("pause"),
+        .arm, .aarch64 => asm volatile("yield"),
+        else => {},
+    }
 }
 
 pub const Ordering = enum {

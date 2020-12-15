@@ -1,20 +1,8 @@
 const builtin = @import("builtin");
 
-const Lock = @import("./lock.zig").Lock;
 const Event = @import("./event.zig").Event;
 const Thread = @import("./thread.zig").Thread;
-
-const sync = @import("../../sync/sync.zig");
-const atomic = sync.atomic;
-const parking_lot = sync.ParkingLot(.{
-    .Lock = Lock,
-    .eventually_fair_after = 0,
-    .nanotime = struct {
-        fn nanotime() u64 {
-            return 0;
-        }
-    }.nanotime,
-});
+const atomic = @import("../../sync/sync.zig").atomic;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
@@ -102,11 +90,12 @@ pub const Task = extern struct {
 pub const Worker = struct {
     pool: *Pool,
     state: usize = undefined,
+    signal: Signal = Signal{},
     active_next: ?*Worker = null,
     target_worker: ?*Worker = null,
     run_queue: BoundedQueue = BoundedQueue{},
-    run_queue_next: ?*Task = null,
     run_queue_lifo: ?*Task = null,
+    run_queue_next: Task.Batch = Task.Batch{},
     run_queue_overflow: UnboundedQueue = UnboundedQueue{},
 
     threadlocal var tls_current: ?*Worker = null;
@@ -234,38 +223,51 @@ pub const Worker = struct {
     }
 
     pub const ScheduleHint = enum {
+        // schedule the tasks to be executed as soon as possible on the local Worker
         next,
+        // schedule the tasks to be executed before existing scheduled tasks excluding those scheduled with `next`
         lifo,
+        // schedule the tasks to be executed in general after any other scheduled tasks
         fifo,
+        // schedule the tasks to either be run next or after existing tasks in the system if there are any
         yield,
     };
 
     pub fn schedule(self: *Worker, hint: ScheduleHint, batchable: anytype) void {
-        var batch = Task.Batch.from(batchable);
-        if (batch.isEmpty())
-            return;
-
         var sched_hint = hint;
-        while (true) {
+        var batch = Task.Batch.from(batchable);
+        
+        while (!batch.isEmpty()) {
             switch (sched_hint) {
                 .next => {
-                    const new_next = batch.popFront();
-                    const old_next = self.run_queue_next;
-                    self.run_queue_next = new_next;
-                    if (old_next) |task|
-                        batch.pushFront(task);
-                    break;
+                    self.run_queue_next.push(batch);
+                    return;
                 },
                 .lifo => {
-                    const new_lifo = batch.popFront();
-                    const old_lifo = atomic.swap(&self.run_queue_lifo, new_lifo, .acq_rel);
-                    if (old_lifo) |task|
-                        batch.pushFront(task);
-                    break;
+                    defer _ = self.getPool().tryResume(self);
+                    var run_queue_lifo = atomic.load(&self.run_queue_lifo, .relaxed);
+                    while (true) {
+                        batch.tail.next = run_queue_lifo;
+                        
+                        if (run_queue_lifo == null) {
+                            atomic.store(&self.run_queue_lifo, batch.head, .release);
+                            return;
+                        }
+
+                        run_queue_lifo = atomic.tryCompareAndSwap(
+                            &self.run_queue_lifo,
+                            run_queue_lifo,
+                            batch.head,
+                            .release,
+                            .relaxed,
+                        ) orelse return;
+                    }
                 },
                 .fifo => {
-                    // the default is FIFO
-                    break;
+                    if (self.run_queue.push(batch)) |overflowed|
+                        self.run_queue_overflow.push(overflowed);
+                    _ = self.getPool().tryResume(self);
+                    return;
                 },
                 .yield => {
                     const new_next = self.poll() orelse batch.popFront();
@@ -275,16 +277,6 @@ pub const Worker = struct {
                 },
             }
         }
-
-        if (!batch.isEmpty()) {
-            if (self.run_queue.push(batch)) |overflowed|
-                self.run_queue_overflow.push(overflowed);
-        } else if (sched_hint == .next) {
-            return;
-        }
-
-        const pool = self.getPool();
-        _ = pool.tryResume(self);
     }
 };
 

@@ -90,7 +90,6 @@ pub const Task = extern struct {
 pub const Worker = struct {
     pool: *Pool,
     state: usize = undefined,
-    signal: Signal = Signal{},
     active_next: ?*Worker = null,
     target_worker: ?*Worker = null,
     run_queue: BoundedQueue = BoundedQueue{},
@@ -283,8 +282,10 @@ pub const Worker = struct {
 pub const Pool = struct {
     stack_size: u32,
     max_workers: u16,
+    shutdown_event: ?*Event = null,
     idle_queue: u32 = 0,
     active_queue: ?*Worker = null,
+    wait_queue: WaitQueue = WaitQueue{},
     run_queue: UnboundedQueue = UnboundedQueue{},
     
     const IdleQueue = struct {
@@ -494,51 +495,28 @@ pub const Pool = struct {
                 return true;
             }
 
-            const is_root_worker = worker.active_next == null;
+            // if this is the last worker to shutdown from the pool, notify the root worker
             const was_last_worker = new_idle_queue.spawned == 0;
-
-            // the root worker waits for other workers to shutdown on the idle queue
-            if (is_root_worker and !was_last_worker) {
-                _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
-                    pool: *Pool,
-
-                    pub fn onBeforeWait(this: @This()) void {}
-                    pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
-                    pub fn onValidate(this: @This()) ?usize {
-                        const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
-                        if (idleq.spawned == 0)
-                            return null;
-                        return 0;
-                    }
-                } { .pool = self });
+            if (was_last_worker) {
+                if (atomic.swap(&self.shutdown_event, &@as(Event, undefined))) |root_worker_event| {
+                    root_worker_event.notify();
+                }
             }
 
-            // the last worker to shutdown that isnt the root worker, wakes up the root worker
-            if (!is_root_worker and was_last_worker) {
-                parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
-            }
-            
-            // non root-workers wait for the root worker to shut down the queue
-            if (!is_root_worker) {
-                _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
-                    pool: *Pool,
-
-                    pub fn onBeforeWait(this: @This()) void {}
-                    pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
-                    pub fn onValidate(this: @This()) ?usize {
-                        const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
-                        if (idleq.notified)
-                            return null;
-                        return 0;
-                    }
-                } { .pool = self });
-            }
-
-            // the root worker shuts down the queue for non-root workers
+            // if this is the root worker, wait for all workers to have shutdown from (& stop being able to reference) the pool.
+            const is_root_worker = worker.active_next == null;
             if (is_root_worker) {
-                new_idle_queue = IdleQueue{ .notified = true };
-                atomic.store(&self.idle_queue, new_idle_queue.pack(), .release);
-                parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
+                var event = Event{};
+                event.wait(null, struct {
+                    pool: *Pool,
+                    ptr: *Event,
+                    pub fn wait(this: @This()) bool {
+                        return atomic.swap(&this.pool.shutdown_event, this.ptr, .release) == null;
+                    }
+                }{
+                    .pool = self,
+                    .ptr = &event,
+                }) catch unreachable;
             }
 
             return null;
@@ -589,43 +567,150 @@ pub const Pool = struct {
                 new_idle_queue.notified = false;
                 idle_queue = IdleQueue.unpack(atomic.tryCompareAndSwap(
                     &self.idle_queue,
-                    idle_queue.pack(),
-                    new_idle_queue.pack(),
+                    idle_queue,
+                    new_idle_queue,
                     .relaxed,
                     .relaxed,
                 ) orelse return);
                 continue;
             }
 
-            _ = parking_lot.parkConditionally(Event, @ptrToInt(&self.idle_queue), null, struct {
+            self.wait_queue.wait(struct {
                 pool: *Pool,
-
-                pub fn onBeforeWait(this: @This()) void {}
-                pub fn onTimeout(this: @This(), token: usize, has_more: bool) void {}
-                pub fn onValidate(this: @This()) ?usize {
-                    const idleq = IdleQueue.unpack(atomic.load(&this.pool.idle_queue, .relaxed));
-                    if (idleq.state == .shutdown or idleq.notified)
-                        return null;
-                    return 0;
+                pub fn validate(self: @This()) bool {
+                    const idleq = IdleQueue.unpack(atomic.load(&self.pool.idle_queue, .relaxed));
+                    return !(idleq.state == .shutdown or idleq.notified);
                 }
-            } { .pool = self });
+            }{ .pool = self });
 
+            atomic.spinLoopHint();
             idle_queue = IdleQueue.unpack(atomic.load(&self.idle_queue, .relaxed));
         }
     }
 
     fn idleNotify(self: *Pool) void {
         @setCold(true);
-        parking_lot.unparkOne(@ptrToInt(&self.idle_queue), struct {
-            pub fn onUnpark(this: @This(), result: parking_lot.UnparkResult) usize {
-                return 0;
-            }
-        }{});
+        self.wait_queue.notify();
     }
 
     fn idleShutdown(self: *Pool) void {
         @setCold(true);
-        parking_lot.unparkAll(@ptrToInt(&self.idle_queue));
+        self.wait_queue.shutdown();
+    }
+};
+
+const WaitQueue = struct {
+    state: usize = EMPTY,
+
+    const EMPTY: usize = 0;
+    const NOTIFIED: usize = 1;
+    const SHUTDOWN: usize = 2;
+    const WAITING: usize = ~(EMPTY | NOTIFIED | SHUTDOWN);
+
+    const Waiter = struct {
+        next: ?*Waiter align(if (@alignOf(usize) < 4) 4 else @alignOf(usize)),
+        event: Event,
+    };
+
+    fn wait(self: *WaitQueue, wait_validator: anytype) void {
+        var has_event = false;
+        var waiter: Waiter = undefined;
+        var state = atomic.load(&self.state, .relaxed);
+
+        while (true) {
+            if (!wait_validator.validate())
+                return;
+
+            if (state & SHUTDOWN != 0)
+                return;
+
+            const head = @intToPtr(?*Waiter, state & WAITING);
+            if (state & NOTIFIED != 0 and head == null) {
+                state = atomic.tryCompareAndSwap(
+                    &self.state,
+                    state,
+                    state & ~NOTIFIED,
+                    .relaxed,
+                    .relaxed,
+                ) orelse return;
+                continue;
+            }
+
+            waiter.next = head;
+            if (!has_event) {
+                has_event = true;
+                waiter.event = Event{};
+            }
+
+            if (atomic.tryCompareAndSwap(
+                &self.state,
+                state,
+                (state & ~WAITING) | @ptrToInt(&waiter),
+                .release,
+                .relaxed,
+            )) |updated| {
+                state = updated;
+                continue;
+            }
+
+            return waiter.event.wait(null, struct {
+                pub fn wait(self: @This()) bool {
+                    return true;
+                }
+            }{}) catch unreachable;
+        }
+    }
+    
+    fn notify(self: *WaitQueue) void {
+        var state = atomic.load(&self.state, .relaxed);
+        while (true) {
+            if (state & (SHUTDOWN | NOTIFIED) != 0)
+                return;
+
+            if (atomic.tryCompareAndSwap(
+                &self.state,
+                state,
+                state | NOTIFIED,
+                .acquire,
+                .relaxed,
+            )) |updated| {
+                state = updated;
+                continue;
+            }
+
+            while (true) {
+                const waiter = @intToPtr(?*Waiter, state & WAITING) orelse return;
+                state = atomic.tryCompareAndSwap(
+                    &self.state,
+                    state,
+                    (state & ~(WAITING | NOTIFIED)) | @ptrToInt(&waiter.next),
+                    .release,
+                    .relaxed,
+                ) orelse return waiter.event.notify();
+                if (state & SHUTDOWN != 0)
+                    break;
+            }
+
+            var waiters = @intToPtr(?*Waiter, state & WAITING);
+            while (true) {
+                const waiter = waiters orelse return;
+                waiters = waiter.next;
+                waiter.event.notify();
+            }
+        }
+    }
+
+    fn shutdown(self: *WaitQueue) void {
+        const state = atomic.fetchOr(&self.state, SHUTDOWN, .acquire);
+        if (state & NOTIFIED != 0)
+            return;
+
+        var waiters = @intToPtr(?*Waiter, state & WAITING);
+        while (true) {
+            const waiter = waiters orelse return;
+            waiters = waiter.next;
+            waiter.event.notify();
+        }
     }
 };
 

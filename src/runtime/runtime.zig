@@ -1,9 +1,5 @@
 
-pub const Lock = @import("./lock.zig");
-pub const Event = @import("./event.zig").Event;
-pub const Thread = @import("./thread.zig").Thread;
-pub const time = @import("./time.zig");
-pub const scheduler = @import("./scheduler.zig");
+pub const scheduler = @import("./internal/scheduler.zig");
 
 pub const RunConfig = struct {
     run_forever: bool = false,

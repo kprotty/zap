@@ -21,9 +21,9 @@ pub fn runAsync(config: RunConfig, comptime asyncFn: anytype, args: anytype) !Re
     const Args = @TypeOf(args);
     const Result = ReturnTypeOf(asyncFn);
     const Decorator = struct {
-        fn entry(fnArgs: Args, shutdown: bool, task: *scheduler.Task, result: *?Result) void {
+        fn entry(fnArgs: Args, shutdown: bool, task: *scheduler.Task.Async, result: *?Result) void {
             suspend {
-                task.* = scheduler.Task.initAsync(@frame());
+                task.* = scheduler.Task.Async.init(@frame());
             }
 
             const ret_val = @call(.{}, asyncFn, fnArgs);
@@ -36,7 +36,7 @@ pub fn runAsync(config: RunConfig, comptime asyncFn: anytype, args: anytype) !Re
     };
 
     var result: ?Result = null;
-    var task: scheduler.Task = undefined;
+    var task: scheduler.Task.Async = undefined;
     var frame = async Decorator.entry(args, !config.run_forever, &task, &result);
 
     scheduler.Pool.run(config.default, &task);
@@ -55,16 +55,16 @@ pub fn yieldAsync() void {
     const next_task = worker.poll() orelse return;
 
     suspend {
-        var self = scheduler.Task.initAsync(@frame());
+        var self = scheduler.Task.Async.init(@frame());
         worker.schedule(.next, next_task);
-        worker.schedule(.fifo, &self);
+        worker.schedule(.fifo, &self.task);
     }
 }
 
 pub fn runConcurrentlyAsync() void {
     suspend {
-        var self = scheduler.Task.initAsync(@frame());
-        getCurrentWorker().schedule(.lifo, &self);
+        var self = scheduler.Task.Async.init(@frame());
+        getCurrentWorker().schedule(.lifo, &self.task);
     }
 }
 

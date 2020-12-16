@@ -6,35 +6,26 @@ const atomic = @import("../../sync/sync.zig").atomic;
 
 pub const Task = extern struct {
     next: ?*Task = undefined,
-    runnable: usize,
-
-    pub fn initAsync(frame: anyframe) Task {
-        if (@alignOf(anyframe) < 2)
-            @compileError("anyframe is not properly aligned");
-        return Task{ .runnable = @ptrToInt(frame) };
-    }
+    callback: Callback,
 
     pub const Callback = fn(*Task) callconv(.C) void;
 
-    pub fn initCallback(callback: Callback) Task {
-        if (@alignOf(Callback) < 2)
-            @compileError("Callback functions are not properly aligned");
-        return Task{ .runnable = @ptrToInt(callback) | 1 };
-    } 
-
-    fn run(self: *Task) void {
-        if (self.runnable & 1 != 0) {
-            return (blk: {
-                @setRuntimeSafety(false);
-                break :blk @intToPtr(Callback, self.runnable & ~@as(usize, 1));
-            })(self);
-        } 
-
-        resume blk: {
-            @setRuntimeSafety(false);
-            break :blk @intToPtr(anyframe, self.runnable);
-        };
+    pub fn init(callback: Callback) Task {
+        return Task{ .callback = callback };
     }
+
+    pub const Async = struct {
+        task: Task = Task{ .callback = Async.callback },
+        frame: anyframe,
+
+        pub fn init(frame: anyframe) Async {
+            return Async{ .frame = frame };
+        }
+
+        fn callback(task: *Task) callconv(.C) void {
+            resume @fieldParentPtr(Async, "task", task).frame;
+        }
+    };
 
     pub const Batch = struct {
         head: ?*Task = null,
@@ -133,7 +124,7 @@ pub const Worker = struct {
 
         while (true) {
             if (self.poll()) |task| {
-                task.run();
+                (task.callback)(task);
                 continue;
             }
 

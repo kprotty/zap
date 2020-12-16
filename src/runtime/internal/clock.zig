@@ -57,7 +57,7 @@ const DarwinClock = struct {
         numer: u32,
         denom: u32,
     };
-
+    
     extern "c" fn mach_absolute_time() callconv(.C) u64;
     extern "c" fn mach_timebase_info(
         data: ?*mach_timebase_info_data_t,

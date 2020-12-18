@@ -19,12 +19,9 @@ const OpenBSDEvent = @compileError("TODO: thrsleep/thrwakeup");
 const DragonflyEvent = @compileError("TODO: sys_umtx_op");
 
 const WindowsEvent = extern struct {
-    thread_id: u32 = 0,
+    key: u32 = undefined,
 
     pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
-        if (self.thread_id == 0)
-            self.thread_id = GetCurrentThreadIdFast();
-        
         if (!condition.wait())
             return;
 
@@ -41,8 +38,15 @@ const WindowsEvent = extern struct {
             timeout = -@intCast(i64, @divFloor((now - deadline_ns), 100);
         }
 
-        const deadline_ns = switch (NtWaitForAlertByThreadId(0, timeout_ptr)) {
-            STATUS_ALERTED => return,
+        // NtWaitForKeyedEvent has no spurious wakeups.
+        // We use a NULL event handle to represent the global one (\KernelObjects\CritSecOutOfMemoryEvent)
+        // http://joeduffyblog.com/2006/11/28/windows-keyed-events-critical-sections-and-new-vista-synchronization-features/
+        const handle = @as(?*c_void, null);
+        const key = @ptrCast(?*align(4) const c_void, &self.key);
+        const status = NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
+
+        const deadline_ns = switch (status) {
+            STATUS_SUCCESS => return,
             STATUS_TIMEOUT => deadline_ns orelse unreachable,
             else => unreachable,
         };
@@ -53,99 +57,32 @@ const WindowsEvent = extern struct {
     }
 
     pub fn notify(self: *Event) void {
-        const status = NtAlertThreadByThreadId(self.thread_id);
-        if (status != 0)
+        const handle = @as(?*c_void, null);
+        const key = @ptrCast(?*align(4) const c_void, &self.key);
+        const status = NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
+
+        if (status != STATUS_SUCCESS)
             unreachable;
     }
 
-    inline fn GetCurrentThreadIdFast() u32 {
-        // https://en.wikipedia.org/wiki/Win32_Thread_Information_Block
-        return switch (builtin.arch) {
-            .i386 => asm volatile (
-                \\ movl %%fs:0x24, %[tid]
-                : [tid] "=r" (-> u32)
-            ),
-            .x86_64 => asm volatile (
-                \\ movl %%gs:0x48, %[tid]
-                : [tid] "=r" (-> u32)
-            ),
-            else => GetCurrentThreadId(),
-        };
-    }
 
-    const STATUS_ALERTED = 0x101;
+    const STATUS_SUCCESS = 0x000;
     const STATUS_TIMEOUT = 0x102;
     const WINAPI = if (builtin.arch == .i386) .Stdcall else .C;
 
-    extern "kernel32" fn GetCurrentThreadId() callconv(WINAPI) u32;
-    extern "NtDll" fn NtAlertThreadByThreadId(
-        thread_id: usize,
+    extern "NtDll" fn NtWaitForKeyedEvent(
+        handle: ?*c_void,
+        key: ?*align(4) const c_void,
+        alertable: c_int,
+        timeout: ?*const i64,
     ) callconv(WINAPI) u32;
-    extern "NtDll" fn NtWaitForAlertByThreadId(
-        address: usize,
+    extern "NtDll" fn NtReleaseKeyedEvent(
+        handle: ?*c_void,
+        key: ?*align(4) const c_void,
+        alertable: c_int,
         timeout: ?*const i64,
     ) callconv(WINAPI) u32;
 };
-
-fn FutexEvent(comptime Futex: type) type {
-    return extern struct {
-        state: State = .empty,
-
-        const Self = @This();
-        const State = enum(i32) {
-            empty = 0,
-            waiting = 1,
-            notified = 2,
-        };
-
-        pub fn wait(self: *Self, deadline: ?u64, condition: anytype) error{TimedOut}!void {            
-            if (!condition.wait())
-                return;
-
-            switch (atomic.swap(&self.state, .waiting, .acquire)) {
-                .empty => {},
-                .waiting => {},
-                .notified => return,
-            }
-
-            while (true) {
-                var timeout_ns: ?u64 = null;
-                if (deadline) |deadline_ns| {
-                    const now = nanotime();
-                    if (now > deadline_ns) {
-                        return switch (atomic.swap(&self.state, .empty, .acquire)) {
-                            .empty => unreachable,
-                            .waiting => error.TimedOut,
-                            .notified => {},
-                        };
-                    } else {
-                        timeout_ns = deadline_ns - now;
-                    }
-                }
-
-                Futex.wait(
-                    @ptrCast(*const i32, &self.state),
-                    @enumToInt(State.waiting),
-                    timeout_ns,
-                );
-
-                switch (atomic.load(&self.state, .acquire)) {
-                    .empty => unreachable,
-                    .waiting => {},
-                    .notified => return,
-                }
-            }
-        }
-
-        pub fn notify(self: *Self) void {
-            switch (atomic.swap(&self.state, .notified, .release)) {
-                .empty => {},
-                .waiting => Futex.wake(@ptrCast(*const i32, &self.state)),
-                .notified => unreachable,
-            }
-        }
-    };
-}
 
 const DarwinEvent = FutexEvent(struct {
     pub fn wait(ptr: *const i32, cmp: i32, timeout_ns: ?u64) void {
@@ -217,4 +154,62 @@ const DarwinEvent = FutexEvent(struct {
 const LinuxEvent = FutexEvent(@compileError("TODO: futex()"));
 
 
+fn FutexEvent(comptime Futex: type) type {
+    return extern struct {
+        state: State = .empty,
 
+        const Self = @This();
+        const State = enum(i32) {
+            empty = 0,
+            waiting = 1,
+            notified = 2,
+        };
+
+        pub fn wait(self: *Self, deadline: ?u64, condition: anytype) error{TimedOut}!void {            
+            if (!condition.wait())
+                return;
+
+            switch (atomic.swap(&self.state, .waiting, .acquire)) {
+                .empty => {},
+                .waiting => {},
+                .notified => return,
+            }
+
+            while (true) {
+                var timeout_ns: ?u64 = null;
+                if (deadline) |deadline_ns| {
+                    const now = nanotime();
+                    if (now > deadline_ns) {
+                        return switch (atomic.swap(&self.state, .empty, .acquire)) {
+                            .empty => unreachable,
+                            .waiting => error.TimedOut,
+                            .notified => {},
+                        };
+                    } else {
+                        timeout_ns = deadline_ns - now;
+                    }
+                }
+
+                Futex.wait(
+                    @ptrCast(*const i32, &self.state),
+                    @enumToInt(State.waiting),
+                    timeout_ns,
+                );
+
+                switch (atomic.load(&self.state, .acquire)) {
+                    .empty => unreachable,
+                    .waiting => {},
+                    .notified => return,
+                }
+            }
+        }
+
+        pub fn notify(self: *Self) void {
+            switch (atomic.swap(&self.state, .notified, .release)) {
+                .empty => {},
+                .waiting => Futex.wake(@ptrCast(*const i32, &self.state)),
+                .notified => unreachable,
+            }
+        }
+    };
+}

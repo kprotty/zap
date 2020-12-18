@@ -27,8 +27,10 @@ const WindowsClock = struct {
 
             // non-matching high bits means the kernel wrote a new value
             const now_high = @intCast(u32, kernel_now >> 32);
-            if (now_high != kernel_high)
+            if (now_high != kernel_high) {
+                atomic.spinLoopHint();
                 continue;
+            }
 
             // kernel value stored as units of 100ns
             return kernel_now *% 100;
@@ -72,6 +74,8 @@ const PosixClock = struct {
 
 const LinuxClock = struct {
     pub fn nanotime() u64 {
-
+        // VDSO thoughts: 
+        // https://paste.rs/bSN.C
+        // https://kernel.googlesource.com/pub/scm/linux/kernel/git/luto/misc-tests/+/5655bd41ffedc002af69e3a8d1b0a168c22f2549/dump-vdso.c
     }
 };

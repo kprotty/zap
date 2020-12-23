@@ -19,7 +19,7 @@ fn asyncMain() !void {
         }
     };
 
-    const allocator = zap.runtime.allocator;
+    const allocator = @import("std").heap.allocator;
     const frames = try allocator.alloc(@Frame(Yielder.run), num_tasks);
     defer allocator.free(frames);
 

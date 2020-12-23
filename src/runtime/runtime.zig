@@ -46,7 +46,7 @@ pub fn runAsync(config: RunConfig, comptime asyncFn: anytype, args: anytype) !Re
 
 pub fn getCurrentWorker() *scheduler.Worker {
     return scheduler.Worker.getCurrent() orelse {
-        @panic("runtime.getCurrentWorker() called outside of a thread pool (scheduler.Pool)");
+        @panic("runtime.getCurrentWorker() called outside of the scheduler.Pool");
     };
 }
 

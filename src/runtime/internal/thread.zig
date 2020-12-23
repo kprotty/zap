@@ -1,4 +1,5 @@
 const builtin = @import("builtin");
+const system = @import("./system.zig");
 
 pub const Thread = switch (builtin.os.tag) {
     .linux => LinuxThread,
@@ -39,29 +40,29 @@ const WindowsThread = struct {
         comptime entryFn: fn(usize) void,
     ) !void {
         const Wrapper = struct {
-            fn entry(raw_arg: ?*c_void) callconv(.C) u32 {
+            fn entry(raw_arg: ?system.PVOID) callconv(.C) system.DWORD {
                 entryFn(@ptrToInt(raw_arg));
                 return 0;
             }
         };
         
         // Create an OS thread and defaults the stack size to the one encoded in the current executable.
-        const handle = CreateThread(
+        const handle = system.CreateThread(
             null,
             stack_size orelse 0,
             Wrapper.entry,
-            @intToPtr(?*c_void, parameter),
-            @as(u32, 0),
+            @intToPtr(?system.PVOID, parameter),
+            @as(system.DWORD, 0),
             null,
         ) orelse return error.SpawnError;
 
         // Try to set the thread's cpu affinity based on the provided NUMA node number.
         // Given its just a hint, and the thread could exit before this, dont check result.
         if (numa_node) |node| {
-            if (node <= @as(usize, ~@as(u16, 0))) {
-                var affinity: GROUP_AFFINITY = undefined;
-                if (GetNumaNodeProcessorMaskEx(@intCast(u16, node), &affinity) != 0) {
-                    _ = SetThreadGroupAffinity(handle, &affinity, null);
+            if (node <= @as(usize, ~@as(system.WORD, 0))) {
+                var affinity: system.GROUP_AFFINITY = undefined;
+                if (system.GetNumaNodeProcessorMaskEx(@intCast(system.WORD, node), &affinity) != 0) {
+                    _ = system.SetThreadGroupAffinity(handle, &affinity, null);
                 }
             }
         }
@@ -69,12 +70,12 @@ const WindowsThread = struct {
         // Try to set the ideal processor for the thread.
         // Given its just a hint, and the thread could exit before this, dont check result.
         if (ideal_cpu) |cpu| {
-            if ((cpu / 64) <= @as(usize, ~@as(u16, 0))) {
-                _ = SetThreadIdealProcessorEx(
+            if ((cpu / 64) <= @as(usize, ~@as(system.WORD, 0))) {
+                _ = system.SetThreadIdealProcessorEx(
                     handle,
-                    &PROCESSOR_NUMBER{
-                        .Group = @intCast(u16, cpu / 64),
-                        .Number = @intCast(u8, cpu % 64),
+                    &system.PROCESSOR_NUMBER{
+                        .Group = @intCast(system.WORD, cpu / 64),
+                        .Number = @intCast(system.BYTE, cpu % 64),
                         .Reserved = 0,
                     },
                     null,
@@ -83,45 +84,7 @@ const WindowsThread = struct {
         }
 
         // Close the handle to detach the thread & prevent resource leaks
-        if (CloseHandle(handle) == 0)
+        if (system.CloseHandle(handle) == system.FALSE)
             unreachable;
     }
-    
-    const WINAPI = if (builtin.arch == .i386) .Stdcall else .C;
-    const PROCESSOR_NUMBER = extern struct {
-        Group: u16,
-        Number: u8,
-        Reserved: u8,
-    };
-    const GROUP_AFFINITY = extern struct {
-        Mask: usize,
-        Group: u16,
-        Reserved: [3]u16,
-    };
-
-    extern "kernel32" fn CloseHandle(
-        handle: ?*c_void,
-    ) callconv(WINAPI) c_int;
-    extern "kernel32" fn CreateThread(
-        lpThreadAttributes: ?*c_void,
-        dwStackSize: usize,
-        lpStartAddress: fn(?*c_void) callconv(.C) u32,
-        lpParameter: ?*c_void,
-        dwCreationFlags: u32,
-        dwThreadId: ?*u32,
-    ) callconv(WINAPI) ?*c_void;
-    extern "kernel32" fn GetNumaNodeProcessorMaskEx(
-        nNode: u16,
-        pProcessorMask: ?*GROUP_AFFINITY,
-    ) callconv(WINAPI) c_int;
-    extern "kernel32" fn SetThreadIdealProcessorEx(
-        hThread: ?*c_void,
-        lpIdealProcessor: ?*const PROCESSOR_NUMBER,
-        lpPrevIdealProcessor: ?*PROCESSOR_NUMBER,
-    ) callconv(WINAPI) c_int;
-    extern "kernel32" fn SetThreadGroupAffinity(
-        hThread: ?*c_void,
-        lpGroupAffinity: ?*const GROUP_AFFINITY,
-        lpPrevGroupAffinity: ?*GROUP_AFFINITY,
-    ) callconv(WINAPI) c_int;
 };

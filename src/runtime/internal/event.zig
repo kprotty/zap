@@ -1,4 +1,5 @@
 const builtin = @import("builtin");
+const system = @import("./system.zig");
 const atomic = @import("../../sync/atomic.zig");
 const nanotime = @import("./clock.zig").nanotime;
 
@@ -43,11 +44,11 @@ const WindowsEvent = extern struct {
         // http://joeduffyblog.com/2006/11/28/windows-keyed-events-critical-sections-and-new-vista-synchronization-features/
         const handle = @as(?*c_void, null);
         const key = @ptrCast(?*align(4) const c_void, &self.key);
-        const status = NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
+        const status = system.NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
 
         const deadline_ns = switch (status) {
-            STATUS_SUCCESS => return,
-            STATUS_TIMEOUT => deadline_ns orelse unreachable,
+            system.STATUS_SUCCESS => return,
+            system.STATUS_TIMEOUT => deadline_ns orelse unreachable,
             else => unreachable,
         };
         
@@ -59,33 +60,16 @@ const WindowsEvent = extern struct {
     pub fn notify(self: *Event) void {
         const handle = @as(?*c_void, null);
         const key = @ptrCast(?*align(4) const c_void, &self.key);
-        const status = NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
 
-        if (status != STATUS_SUCCESS)
+        const status = system.NtWaitForKeyedEvent(null, key, 0, timeout_ptr);
+        if (status != system.STATUS_SUCCESS)
             unreachable;
     }
-
-
-    const STATUS_SUCCESS = 0x000;
-    const STATUS_TIMEOUT = 0x102;
-    const WINAPI = if (builtin.arch == .i386) .Stdcall else .C;
-
-    extern "NtDll" fn NtWaitForKeyedEvent(
-        handle: ?*c_void,
-        key: ?*align(4) const c_void,
-        alertable: c_int,
-        timeout: ?*const i64,
-    ) callconv(WINAPI) u32;
-    extern "NtDll" fn NtReleaseKeyedEvent(
-        handle: ?*c_void,
-        key: ?*align(4) const c_void,
-        alertable: c_int,
-        timeout: ?*const i64,
-    ) callconv(WINAPI) u32;
 };
 
 const DarwinEvent = FutexEvent(struct {
     pub fn wait(ptr: *const i32, cmp: i32, timeout_ns: ?u64) void {
+        // __ulock works with timeouts in microseconds
         var timeout_us = ~@as(u32, 0);
         if (timeout_ns) |timeout| {
             const wait_us = @divFloor(timeout, 1000);
@@ -93,8 +77,8 @@ const DarwinEvent = FutexEvent(struct {
                 timeout_us = @intCast(u32, wait_us);
         }
         
-        const status = __ulock_wait(
-            UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
+        const status = system.__ulock_wait(
+            system.UL_COMPARE_AND_WAIT | system.ULF_NO_ERRNO,
             @ptrCast(?*const c_void, ptr),
             @intCast(u32, cmp),
             timeout_us,
@@ -102,8 +86,8 @@ const DarwinEvent = FutexEvent(struct {
 
         if (status < 0) {
             switch (-status) {
-                EINTR => {},
-                ETIMEDOUT => {},
+                system.EINTR => {},
+                system.ETIMEDOUT => {},
                 else => unreachable,
             }
         }
@@ -111,8 +95,8 @@ const DarwinEvent = FutexEvent(struct {
 
     pub fn wake(ptr: *const i32) void {
         while (true) {
-            const status = __ulock_wake(
-                UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
+            const status = system.__ulock_wake(
+                system.UL_COMPARE_AND_WAIT | system.ULF_NO_ERRNO,
                 @ptrCast(?*const c_void, ptr),
                 @as(u32, 0),
                 @as(u32, 0),
@@ -120,8 +104,8 @@ const DarwinEvent = FutexEvent(struct {
 
             if (status < 0) {
                 switch (-status) {
-                    ENOENT => {},
-                    EINTR => continue,
+                    system.ENOENT => {},
+                    system.EINTR => continue,
                     else => unreachable,
                 }
             }
@@ -129,26 +113,6 @@ const DarwinEvent = FutexEvent(struct {
             return;
         }
     }
-
-    // https://opensource.apple.com/source/xnu/xnu-6153.81.5/bsd/sys/ulock.h.auto.html
-
-    const EINTR = 4;
-    const ENOENT = 2;
-    const ETIMEDOUT = 60;
-    const ULF_NO_ERRNO = 0x1000000;
-    const UL_COMPARE_AND_WAIT = 0x1;
-    
-    extern "c" fn __ulock_wait(
-        operation: u32,
-        address: ?*const c_void,
-        value: u64,
-        timeout_us: u32,
-    ) callconv(.C) c_int;
-    extern "c" fn __ulock_wake(
-        operation: u32,
-        address: ?*const c_void,
-        value: u64,
-    ) callconv(.C) c_int;
 });
 
 const LinuxEvent = FutexEvent(@compileError("TODO: futex()"));

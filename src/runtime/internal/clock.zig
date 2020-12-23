@@ -1,4 +1,5 @@
 const builtin = @import("builtin");
+const system = @import("./system.zig");
 const atomic = @import("../../sync/atomic.zig");
 
 pub usingnamespace switch (builtin.os.tag) {
@@ -41,12 +42,12 @@ const WindowsClock = struct {
 const DarwinClock = struct {
     pub fn nanotime() u64 {
         // This does global caching for us internally
-        var info: mach_timebase_info_data_t = undefined;
-        if (mach_timebase_info(&info) != 0)
+        var info: system.mach_timebase_info_data_t = undefined;
+        if (system.mach_timebase_info(&info) != 0)
             unreachable;
         
         // Only do the scaling if there is some to be done (as mul/div can be expensive)
-        var now = mach_absolute_time();
+        var now = system.mach_absolute_time();
         if (info.numer != 1)
             now *= info.numer;
         if (info.denom != 1)
@@ -54,16 +55,6 @@ const DarwinClock = struct {
 
         return now;
     }
-
-    const mach_timebase_info_data_t = extern struct {
-        numer: u32,
-        denom: u32,
-    };
-    
-    extern "c" fn mach_absolute_time() callconv(.C) u64;
-    extern "c" fn mach_timebase_info(
-        data: ?*mach_timebase_info_data_t,
-    ) callconv(.C) c_int;
 };
 
 const PosixClock = struct {

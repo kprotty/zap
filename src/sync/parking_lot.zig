@@ -1,77 +1,56 @@
 
 pub fn ParkingLot(comptime config: anytype) type {
     const Lock = config.Lock;
-    const buckets = config.buckets;
-    const nanotime = config.nanotime;
-    const eventually_fair_after = config.eventually_fair_after;
+    const bucket_count: usize = config.bucket_count;
+    const eventually_fair_after: u64 = config.eventually_fair_after;
 
     return struct {
         const Bucket = struct {
-            lock: Lock = Lock{},
-            queue: Queue = Queue{},
-            times_out: u64 = 0,
-            prng: u32 = 0,
+            lock: Lock = .{},
+            tree: Tree = .{},
+            fairness: Fairness = .{},
 
-            var array = [_]Bucket{Bucket{}} ** buckets;
+            var array = [_]Bucket{Bucket{}} ** bucket_count;
 
-            fn get(address: usize) *Bucket {
+            pub fn get(address: usize) *Bucket {
                 const seed = @truncate(usize, 0x9E3779B97F4A7C15);
                 const max = @popCount(usize, ~@as(usize, 0));
                 const bits = @ctz(usize, array.len);
                 const index = (address *% seed) >> (max - bits);
                 return &array[index];
             }
+        };
 
-            fn shouldBeFair(self: *Bucket) bool {
-                if (self.times_out == 0)
-                    self.prng = @truncate(u32, @ptrToInt(self)) | 1;
+        const Fairness = struct {
+            xorshift: u32 = 0,
+            times_out: u64 = 0,
 
-                const now = nanotime();
-                if (now < self.times_out)
+            pub fn expired(self: *Fairness, now: u64) bool {
+                if (now <= self.times_out)
                     return false;
 
-                const rand = blk: {
-                    var x = self.prng;
-                    x ^= x << 13;
-                    x ^= x >> 17;
-                    x ^= x << 5;
-                    self.prng = x;
-                    break :blk x;
-                };
+                if (self.xorshift == 0)
+                    self.xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(u32));
+                self.xorshift ^= self.xorshift << 13;
+                self.xorshift ^= self.xorshift >> 17;
+                self.xorshift ^= self.xorshift << 5;
 
-                const timeout = rand % eventually_fair_after;
-                self.times_out = now + timeout;
+                const fair_timeout = self.xorshift % eventually_fair_after;
+                self.times_out = now + fair_timeout;
                 return true;
             }
         };
 
-        // TODO: use red-black tree instead of linear-scan per address in bucket
-        const Queue = struct {
-            head: ?*Waiter = null,
+        const Tree = struct {
+            tree_head: ?*Waiter = null,
 
-            fn find(self: *Queue, address: usize, tail: ?*?*Waiter) ?*Waiter {
-                var waiter = self.head;
-                if (tail) |t|
-                    t.* = waiter;
-
-                while (true) {
-                    const pending_waiter = waiter orelse return null;
-                    if (pending_waiter.address == address)
-                        return pending_waiter;
-
-                    waiter = pending_waiter.root_next;
-                    if (tail) |t|
-                        t.* = pending_waiter;
-                }
-            }
-
-            fn insert(self: *Queue, address: usize, waiter: *Waiter) void {
+            pub fn insert(self: *Tree, address: usize, waiter: *Waiter) void {
+                waiter.address = address;
+                waiter.tree_next = null;
                 waiter.next = null;
                 waiter.tail = waiter;
-                waiter.address = address;
-                waiter.root_next = null;
 
-                if (self.find(address, &waiter.root_prev)) |head| {
+                if (self.lookup(address, &waiter.tree_prev)) |head| {
                     const tail = head.tail orelse unreachable;
                     tail.next = waiter;
                     waiter.prev = tail;
@@ -80,104 +59,156 @@ pub fn ParkingLot(comptime config: anytype) type {
                 }
 
                 waiter.prev = null;
-                if (waiter.root_prev) |root_prev| {
-                    root_prev.root_next = waiter;
+                if (waiter.tree_prev) |prev| {
+                    prev.tree_next = waiter;
                 } else {
-                    self.head = waiter;
-                }
+                    self.tree_head = waiter;
+                }            
             }
 
-            fn iter(self: *Queue, address: usize) Iter {
-                const head = self.find(address, null);
+            pub fn iter(self: *Tree, address: usize) Iter {
+                const head = self.lookup(address, null);
 
-                return Iter{
+                return .{
                     .head = head,
-                    .waiter = head,
-                    .address = address,
-                    .queue = self,
+                    .iter = head,
+                    .tree = self,
                 };
             }
 
-            const Iter = struct {
-                head: ?*Waiter,
-                waiter: ?*Waiter,
-                address: usize,
-                queue: *Queue,
+            fn lookup(self: *Tree, address: usize, parent: ?*?*Waiter) ?*Waiter {
+                var waiter = self.tree_head;
+                if (parent) |p|
+                    p.* = waiter;
 
-                fn next(self: *Iter) ?*Waiter {
-                    const waiter = self.waiter orelse return null;
-                    self.waiter = waiter.next;
-                    return waiter;
+                while (true) {
+                    const head = waiter orelse return null;
+                    if (head.address == address)
+                        return head;
+                    
+                    waiter = head.tree_next;
+                    if (parent) |p|
+                        p.* = head;
                 }
+            }
 
-                fn isEmpty(self: Iter) bool {
-                    return self.head == null;
-                }
+            fn replace(self: *Tree, waiter: *Waiter, new_waiter: *Waiter) void {
+                new_waiter.tree_next = waiter.tree_next;
+                new_waiter.tree_prev = waiter.tree_prev;
 
-                fn remove(self: *Iter, waiter: *Waiter) bool {
-                    const head = self.head orelse return false;
-                    if (waiter.tail == null or waiter.address != self.address)
-                        return false;
+                if (new_waiter.tree_prev) |prev|
+                    prev.tree_next = new_waiter;
 
-                    if (waiter.prev) |qprev|
-                        qprev.next = waiter.next;
-                    if (waiter.next) |qnext|
-                        qnext.prev = waiter.prev;
-                    if (self.waiter == waiter)
-                        self.waiter = waiter.next;
+                if (new_waiter.tree_next) |next|
+                    next.tree_prev = new_waiter;
 
-                    if (head == waiter) {
-                        self.head = waiter.next;
-                        if (self.head) |new_head| {
-                            new_head.tail = waiter.tail;
-                            new_head.root_next = waiter.root_next;
-                            new_head.root_prev = waiter.root_prev;
-                        }
-                    } else if (head.tail == waiter) {
-                        head.tail = waiter.prev;
-                    }
+                if (self.tree_head == waiter)
+                    self.tree_head = new_waiter;
+            }
 
-                    if (self.head == null) {
-                        if (waiter.root_prev) |root_prev|
-                            root_prev.root_next = waiter.root_next;
-                        if (waiter.root_next) |root_next|
-                            root_next.root_prev = waiter.root_prev;
-                        if (waiter.root_prev == null)
-                            self.queue.head = null;
-                    } else if (self.head != head) {
-                        if (waiter.root_prev) |root_prev|
-                            root_prev.root_next = self.head;
-                        if (waiter.root_next) |root_next|
-                            root_next.root_prev = self.head;
-                        if (waiter.root_prev == null)
-                            self.queue.head = self.head;
-                    }
+            fn remove(self: *Tree, waiter: *Waiter) void {
+                if (waiter.tree_next) |next|
+                    next.tree_prev = waiter.tree_prev;
 
-                    waiter.tail = null;
-                    return true;
-                }
-            };
-        };
+                if (waiter.tree_prev) |prev|
+                    prev.tree_next = waiter.tree_next;
 
-        const Waiter = struct {
-            root_prev: ?*Waiter,
-            root_next: ?*Waiter,
-            prev: ?*Waiter,
-            next: ?*Waiter,
-            tail: ?*Waiter,
-            token: usize,
-            address: usize,
-            wakeFn: fn(*Waiter) void,
-
-            fn wake(self: *Waiter) void {
-                return (self.wakeFn)(self);
+                if (self.tree_head == waiter)
+                    self.tree_head = null;
             }
         };
 
-        pub const ParkResult = union(enum){
-            unparked: usize,
-            timed_out: void,
-            invalidated: void,
+        const Iter = struct {
+            head: ?*Waiter,
+            iter: ?*Waiter,
+            tree: *Tree,
+
+            pub fn isEmpty(self: Iter) bool {
+                return self.iter == null;
+            }
+
+            pub fn next(self: *Iter) ?*Waiter {
+                const waiter = self.iter orelse return null;
+                self.iter = waiter.next;
+                return waiter;
+            }
+
+            pub fn isQueueEmpty(self: Iter) bool {
+                return self.head == null;
+            }
+
+            pub fn tryQueueRemove(self: *Iter, waiter: *Waiter) bool {
+                const head = self.head orelse return false;
+                if (waiter.tail == null)
+                    return false;
+                
+                if (self.iter == waiter)
+                    self.iter = waiter.next;
+                if (waiter.prev) |p|
+                    p.next = waiter.next;
+                if (waiter.next) |n|
+                    n.prev = waiter.prev;
+
+                if (waiter == head) {
+                    self.head = waiter.next;
+                } else if (waiter == head.tail) {
+                    head.tail = waiter.prev orelse unreachable;
+                }
+
+                if (waiter == head) {
+                    if (self.head) |new_head| {
+                        new_head.tail = waiter.tail;
+                        self.tree.replace(waiter, new_head);
+                    } else {
+                        self.tree.remove(waiter);
+                    }
+                }
+
+                waiter.tail = null;
+                return true;
+            }
+        };
+
+        const Waiter = struct {
+            tree_prev: ?*Waiter,
+            tree_next: ?*Waiter,
+            prev: ?*Waiter,
+            next: ?*Waiter,
+            tail: ?*Waiter,
+            address: usize,
+            token: usize,
+            eventFn: fn(*Waiter, EventOp) u64,
+
+            const EventOp = enum {
+                wake,
+                nanotime,
+            };
+
+            fn wake(self: *Waiter) void {
+                _ = (self.eventFn)(self, .wake);
+            }
+
+            fn nanotime(self: *Waiter) u64 {
+                return (self.eventFn)(self, .nanotime);
+            }
+        };
+
+        pub const UnparkContext = struct {
+            iter: *Iter,
+            waiter: *Waiter,
+            fairness: *Fairness,
+
+            pub fn getToken(self: UnparkContext) usize {
+                return self.waiter.token;
+            }
+
+            pub fn hasMore(self: UnparkContext) bool {
+                return !self.iter.isEmpty();
+            }
+
+            pub fn beFair(self: UnparkContext) bool {
+                return self.fairness.expired(self.waiter.nanotime());
+            }
         };
 
         pub fn parkConditionally(
@@ -185,123 +216,166 @@ pub fn ParkingLot(comptime config: anytype) type {
             address: usize,
             deadline: ?u64,
             context: anytype,
-        ) ParkResult {
+        ) error{TimedOut}!usize {
             var bucket = Bucket.get(address);
             bucket.lock.acquire();
 
             const token: usize = context.onValidate() orelse {
                 bucket.lock.release();
-                return .invalidated;
+                return null;
             };
-            
-            const Context = @TypeOf(context);
-            const EventWaiter = struct {
+
+            var event_waiter: struct {
                 event: Event,
                 waiter: Waiter,
+
+                fn eventFn(waiter: *Waiter, op: Waiter.EventOp) u64 {
+                    const this = @fieldParentPtr(@This(), "waiter", waiter);
+                    switch (op) {
+                        .wake => this.event.notify(),
+                        .nanotime => return Event.nanotime(),
+                    }
+                    return 0;
+                }
+            } = undefined;
+            
+            const waiter = &event_waiter.waiter;
+            waiter.token = token;
+            waiter.eventFn = @TypeOf(event_waiter).eventFn;
+            bucket.tree.insert(address, &waiter);
+
+            const event = &event_waiter.event;
+            event.init();
+            defer event.deinit();
+
+            const Context = @TypeOf(context);
+            const WaitCondition = struct {
                 bucket_ref: *Bucket,
                 context_ref: ?Context,
 
-                pub fn wait(self: *@This()) bool {
-                    self.bucket_ref.lock.release();
-                    if (self.context_ref) |ctx|
+                pub fn wait(this: @This()) bool {
+                    if (this.context_ref) |ctx|
                         ctx.onBeforeWait();
+                    this.bucket_ref.lock.release();
                     return true;
-                }
-
-                pub fn wake(waiter: *Waiter) void {
-                    const self = @fieldParentPtr(@This(), "waiter", waiter);
-                    self.event.notify();
                 }
             };
 
-            var event_waiter: EventWaiter = undefined;
-            event_waiter.bucket_ref = bucket;
-            event_waiter.waiter.wakeFn = EventWaiter.wake;
-            event_waiter.event.init();
-            defer event_waiter.event.deinit();
+            var timed_out = false;
+            event.wait(deadline, WaitCondition{
+                .bucket_ref = bucket,
+                .context_ref = context,
+            }) catch {
+                timed_out = true;
+            };
 
-            event_waiter.waiter.token = token;
-            bucket.queue.insert(address, &event_waiter.waiter);
+            if (timed_out) {
+                bucket = Bucket.get(address);
+                bucket.lock.acquire();
+                
+                var iter = bucket.tree.iter(address);
+                if (iter.tryQueueRemove(&waiter)) {
+                    context.onTimeout(!iter.isEmpty());
+                    bucket.lock.release();
+                    return null;
+                }
 
-            event_waiter.context_ref = context;
-            if (event_waiter.event.wait(deadline, &event_waiter))
-                return .{ .unparked = event_waiter.waiter.token };
-
-            bucket = Bucket.get(address);
-            bucket.lock.acquire();
-
-            var iter = bucket.queue.iter(address);
-            if (iter.remove(&event_waiter.waiter)) {
-                context.onTimeout(token, !iter.isEmpty());
-                bucket.lock.release();
-                return .timed_out;
+                event.wait(null, WaitCondition{
+                    .bucket_ref = bucket,
+                    .context_ref = null,
+                }) catch unreachable;
             }
-
-            event_waiter.context_ref = null;
-            if (event_waiter.event.wait(null, &event_waiter))
-                return .{ .unparked = event_waiter.waiter.token };
-
-            unreachable;
+            
+            return waiter.token;
         }
 
-        pub const UnparkResult = struct {
-            token: ?usize = null,
-            be_fair: bool = false,
-            has_more: bool = false,
+        pub const UnparkFilter = union(enum) {
+            stop: void,
+            skip: void,
+            unpark: usize,
         };
 
-        pub fn unparkOne(address: usize, context: anytype) void {
-            const bucket = Bucket.get(address);
-            bucket.lock.acquire();
-
-            var waiter: ?*Waiter = null;
-            var result = UnparkResult{};
-            var iter = bucket.queue.iter(address);
-            
-            if (iter.next()) |pending_waiter| {
-                waiter = pending_waiter;
-                if (!iter.remove(pending_waiter))
-                    unreachable;
-
-                result = UnparkResult{
-                    .be_fair = bucket.shouldBeFair(),
-                    .has_more = iter.isEmpty(),
-                    .token = pending_waiter.token,
-                };
-            }
-
-            const token: usize = context.onUnpark(result);
-            bucket.lock.release();
-
-            if (waiter) |pending_waiter| {
-                pending_waiter.token = token;
-                pending_waiter.wake();
-            }
-        }
-
-        pub fn unparkAll(address: usize) void {
+        pub fn unparkFilter(address: usize, context: anytype) void {
             const bucket = Bucket.get(address);
             bucket.lock.acquire();
 
             var wake_list: ?*Waiter = null;
-            var iter = bucket.queue.iter(address);
-
-            while (true) {
-                const pending_waiter = iter.next() orelse break;
-                if (!iter.remove(pending_waiter))
-                    unreachable;
-
-                pending_waiter.next = wake_list;
-                wake_list = pending_waiter;
+            var iter = bucket.tree.iter(address);
+            
+            while (iter.next()) |waiter| {
+                switch (@as(UnparkFilter, context.onFilter(UnparkContext{
+                    .iter = &iter,
+                    .waiter = waiter,
+                    .fairness = &bucket.fairness,
+                }))) {
+                    .stop => break,
+                    .skip => continue,
+                    .unpark => |new_token| {
+                        assert(iter.tryQueueRemove(waiter));
+                        waiter.token = new_token;
+                        waiter.next = wake_list;
+                        wake_list = waiter;
+                    },
+                }
             }
 
+            context.onBeforeWake();
             bucket.lock.release();
 
             while (true) {
-                const pending_waiter = wake_list orelse break;
-                wake_list = pending_waiter.next;
-                pending_waiter.wake();
+                const waiter = wake_list orelse break;
+                wake_list = waiter.next;
+                waiter.wake();
             }
+        }
+
+        pub const UnparkResult = struct {
+            token: ?usize = null,
+            has_more: bool = false,
+            be_fair: bool = false,
+        };
+
+        pub fn unparkOne(address: usize, context: anytype) void {
+            const Context = @TypeOf(context);
+            const Filter = struct {
+                ctx: Context,
+                called_unpark: bool = false,
+
+                pub fn onFilter(this: *@This(), unpark_context: UnparkContext) UnparkFilter {
+                    if (this.called_unpark)
+                        return .stop;
+
+                    const unpark_token: usize = this.ctx.onUnpark(UnparkResult{
+                        .token = unpark_context.getToken(),
+                        .has_more = unpark_context.hasMore(),
+                        .be_fair = unpark_context.beFair(),
+                    });
+
+                    this.called_unpark = true;
+                    return .{ .unpark = unpark_token };
+                }
+
+                pub fn onBeforeWake(this: @This()) void {
+                    if (!this.called_unpark) {
+                        _ = this.ctx.onUnpark(UnparkResult{});
+                    }
+                }
+            };
+
+            var filter = Filter{ .ctx = context };
+            return unparkFilter(address, &filter);
+        }
+
+        pub fn unparkAll(address: usize) void {
+            const Filter = struct {
+                pub fn onBeforeWake(this: @This()) void {}
+                pub fn onFilter(this: @This(), _: UnparkContext) UnparkFilter {
+                    return .{ .unpark = 0 };
+                }
+            };
+            
+            var filter = Filter{};
+            return unparkFilter(address, filter);
         }
     };
 }

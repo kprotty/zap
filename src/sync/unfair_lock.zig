@@ -1,7 +1,8 @@
 const builtin = @import("builtin");
+const meta = @import("../meta.zig");
 const atomic = @import("./atomic.zig");
 
-pub const Lock = struct {
+pub const UnfairLock = extern struct {
     state: usize = UNLOCKED,
 
     const UNLOCKED = 0;
@@ -10,7 +11,7 @@ pub const Lock = struct {
     const WAITING = ~@as(usize, (1 << 9) - 1);
 
     const Waiter = struct {
-        prev: ?*Waiter align(std.math.max(@alignOf(usize), ~WAITING + 1)),
+        prev: ?*Waiter align(meta.max(@alignOf(usize), ~WAITING + 1)),
         next: ?*Waiter,
         tail: ?*Waiter,
         wakeFn: fn(*Waiter) void,
@@ -34,7 +35,7 @@ pub const Lock = struct {
                 defer event.deinit();
 
                 const WaitCondition = struct {
-                    signal_ptr: *Waiter,
+                    signal_ptr: *Self,
                     event_ptr: *Event,
 
                     pub fn wait(this: @This()) bool {
@@ -66,10 +67,10 @@ pub const Lock = struct {
                     event.notify();
                 }
             }
-        }
+        };
     }
 
-    pub fn tryAcquire(self: *Lock) bool {
+    pub fn tryAcquire(self: *UnfairLock) bool {
         switch (builtin.arch) {
             .i386, .x86_64 => {
                 return atomic.bitSet(
@@ -85,15 +86,15 @@ pub const Lock = struct {
                     .acquire,
                 ) == UNLOCKED;
             },
-        };
+        }
     }
 
-    pub fn acquire(self: *Lock, comptime Event: type) void {
+    pub fn acquire(self: *UnfairLock, comptime Event: type) void {
         if (!self.tryAcquire())
             self.acquireSlow(Event);
     }
 
-    pub fn release(self: *Lock) void {
+    pub fn release(self: *UnfairLock) void {
         atomic.store(@ptrCast(*u8, &self.state), UNLOCKED, .release);
 
         const state = atomic.load(&self.state, .relaxed);
@@ -101,7 +102,7 @@ pub const Lock = struct {
             self.releaseSlow();
     }
 
-    fn acquireSlow(self: *Lock, comptime Event: type) void {
+    fn acquireSlow(self: *UnfairLock, comptime Event: type) void {
         @setCold(true);
 
         var wait_signal: struct {
@@ -145,7 +146,7 @@ pub const Lock = struct {
             state = atomic.tryCompareAndSwap(
                 &self.state,
                 state,
-                (state & ~WAITING) | @ptrToInt(&waiter),
+                (state & ~WAITING) | @ptrToInt(waiter),
                 .release,
                 .relaxed,
             ) orelse blk: {
@@ -156,7 +157,7 @@ pub const Lock = struct {
         }
     }
 
-    fn releaseSlow(self: *Lock) void {
+    fn releaseSlow(self: *UnfairLock) void {
         @setCold(true);
 
         var state = atomic.load(&self.state, .relaxed);

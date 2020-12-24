@@ -29,7 +29,7 @@ pub fn max(x: anytype, y: anytype) @TypeOf(x, y) {
 }
 
 pub fn bitCount(comptime T: type) comptime_int {
-    return @typeInto(T).Int.bits;
+    return @typeInfo(T).Int.bits;
 }
 
 pub fn Int(comptime signedness: builtin.Signedness, comptime bits: u16) type {

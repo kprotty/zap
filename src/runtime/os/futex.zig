@@ -14,6 +14,42 @@ pub const Futex = switch (builtin.os.tag) {
     else => ParkingFutex,
 };
 
+const DarwinFutex = struct {
+    pub fn wait(ptr: *const u32, cmp: u32, timeout: ?u64) error{TimedOut}!void {
+        @compileError("TODO");
+    }
+
+    pub fn wake(ptr: *const u32) void {
+        @compileError("TODO");
+    }
+
+    pub fn yield(iteration: ?usize) bool {
+        @compileError("TODO");
+    }
+
+    pub fn nanotime() u64 {
+        return Clock.nanoTime();
+    }
+};
+
+const LinuxFutex = struct {
+    pub fn wait(ptr: *const u32, cmp: u32, timeout: ?u64) error{TimedOut}!void {
+        @compileError("TODO");
+    }
+
+    pub fn wake(ptr: *const u32) void {
+        @compileError("TODO");
+    }
+
+    pub fn yield(iteration: ?usize) bool {
+        @compileError("TODO");
+    }
+
+    pub fn nanotime() u64 {
+        return Clock.nanoTime();
+    }
+};
+
 const ParkingFutex = struct {
     const ParkingLock = struct {
         lock: UnfairLock = .{},
@@ -58,12 +94,15 @@ const ParkingFutex = struct {
             deadline = now + timeout_ns;
         }
 
-        _ = try parking_lot.parkConditionally(
+        _ = parking_lot.parkConditionally(
             Event,
             @ptrToInt(ptr),
             deadline,
             parker,
-        );
+        ) catch |err| switch (err) {
+            error.Invalid => {},
+            error.TimedOut => return error.TimedOut,
+        };
     }
 
     pub fn wake(ptr: *const u32) void {
@@ -78,40 +117,12 @@ const ParkingFutex = struct {
             Unparker{},
         );
     }
-};
-
-const DarwinFutex = struct {
-    pub fn wait(ptr: *const u32, cmp: u32, timeout: ?u64) error{TimedOut}!void {
-        @compileError("TODO");
-    }
-
-    pub fn wake(ptr: *const u32) void {
-        @compileError("TODO");
-    }
 
     pub fn yield(iteration: ?usize) bool {
-        @compileError("TODO");
+        return Event.yield(iteration);
     }
 
     pub fn nanotime() u64 {
-        @compileError("TODO");
-    }
-};
-
-const LinuxFutex = struct {
-    pub fn wait(ptr: *const u32, cmp: u32, timeout: ?u64) error{TimedOut}!void {
-        @compileError("TODO");
-    }
-
-    pub fn wake(ptr: *const u32) void {
-        @compileError("TODO");
-    }
-
-    pub fn yield(iteration: ?usize) bool {
-        @compileError("TODO");
-    }
-
-    pub fn nanotime() u64 {
-        @compileError("TODO");
+        return Event.nanotime();
     }
 };

@@ -24,7 +24,7 @@ pub const SpinEvent = extern struct {
                     return error.TimedOut;
             }
 
-            atoimc.spinLoopHint();
+            atomic.spinLoopHint();
         }
     }
 

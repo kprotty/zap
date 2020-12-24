@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 const atomic = @import("./atomic.zig");
 
-pub fn Mutex(comptime parking_lot: anytype) {
+pub fn Mutex(comptime parking_lot: anytype) type {
     return extern struct {
         state: u8 = UNLOCKED,
 
@@ -92,7 +92,7 @@ pub fn Mutex(comptime parking_lot: anytype) {
                 UNLOCKED,
                 .release,
                 .relaxed,
-            ) == null,
+            ) == null;
         }
 
         fn acquireInnerSlow(self: *Self, comptime Event: type, deadline: ?u64) error{TimedOut}!void {
@@ -151,12 +151,15 @@ pub fn Mutex(comptime parking_lot: anytype) {
                     }
                 };
 
-                const token = try parking_lot.parkConditionally(
+                const token = parking_lot.parkConditionally(
                     Event,
                     @ptrToInt(self),
                     deadline,
                     Parker{ .mutex = self },
-                );
+                ) catch |err| switch (err) {
+                    error.Invalid => TOKEN_RETRY,
+                    error.TimedOut => return error.TimedOut,
+                };
                 
                 switch (token) {
                     TOKEN_RETRY => {},

@@ -137,11 +137,16 @@ fn atomicBit(comptime T: type, ptr: *T, comptime op: AtomicBitOp, bit: meta.Log2
             else => unreachable,
         };
 
+        const Bit = meta.Int(
+            .unsigned,
+            meta.max(2, bytes) * 8,
+        );
+
         return @intCast(u1, asm volatile(
             instruction ++ suffix ++ " %[bit], %[ptr]"
             : [result] "={@ccc}" (-> u8)
             : [ptr] "*p" (ptr),
-              [bit] "X" (bit)
+              [bit] "X" (@as(Bit, bit))
             : "cc", "memory"
         ));
     }
@@ -153,5 +158,5 @@ fn atomicBit(comptime T: type, ptr: *T, comptime op: AtomicBitOp, bit: meta.Log2
         .Toggle => fetchXor(ptr, mask, ordering),
     };
 
-    return @bitToInt(value & mask != 0);
+    return @boolToInt(value & mask != 0);
 }

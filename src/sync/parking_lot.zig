@@ -216,13 +216,13 @@ pub fn ParkingLot(comptime config: anytype) type {
             address: usize,
             deadline: ?u64,
             context: anytype,
-        ) error{TimedOut}!usize {
+        ) error{TimedOut, Invalid}!usize {
             var bucket = Bucket.get(address);
             bucket.lock.acquire();
 
             const token: usize = context.onValidate() orelse {
                 bucket.lock.release();
-                return null;
+                return error.Invalid;
             };
 
             var event_waiter: struct {
@@ -242,7 +242,7 @@ pub fn ParkingLot(comptime config: anytype) type {
             const waiter = &event_waiter.waiter;
             waiter.token = token;
             waiter.eventFn = @TypeOf(event_waiter).eventFn;
-            bucket.tree.insert(address, &waiter);
+            bucket.tree.insert(address, waiter);
 
             const event = &event_waiter.event;
             event.init();
@@ -274,10 +274,10 @@ pub fn ParkingLot(comptime config: anytype) type {
                 bucket.lock.acquire();
                 
                 var iter = bucket.tree.iter(address);
-                if (iter.tryQueueRemove(&waiter)) {
+                if (iter.tryQueueRemove(waiter)) {
                     context.onTimeout(!iter.isEmpty());
                     bucket.lock.release();
-                    return null;
+                    return error.TimedOut;
                 }
 
                 event.wait(null, WaitCondition{
@@ -311,7 +311,8 @@ pub fn ParkingLot(comptime config: anytype) type {
                     .stop => break,
                     .skip => continue,
                     .unpark => |new_token| {
-                        assert(iter.tryQueueRemove(waiter));
+                        if (!iter.tryQueueRemove(waiter))
+                            unreachable;
                         waiter.token = new_token;
                         waiter.next = wake_list;
                         wake_list = waiter;

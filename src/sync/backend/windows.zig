@@ -1,74 +1,25 @@
-const builtin = @import("builtin");
-const system = @import("./system.zig");
-const Futex = @import("./futex.zig").Futex;
-const Clock = @import("./clock.zig").Clock;
+const zap = @import(".../zap.zig");
+const atomic = zap.sync.atomic;
+const Clock = zap.time.OsClock;
+const system = zap.system;
 
-const sync = @import("../../sync/sync.zig");
-const atomic = sync.atomic;
+pub const Lock = extern struct {
+    srwlock: system.SRWLOCK = system.SRWLOCK_INIT,
 
-pub const Event = switch (builtin.os.tag) {
-    // TODO: .openbsd => OpenbsdEvent,
-    // TODO: .dragonfly => DragonflyEvent,
-    // TODO: .kfreebsd, .freebsd => FutexEvent
-    .macos, .ios, .watchos, .tvos => FutexEvent,
-    .windows => WindowsEvent,
-    .linux => FutexEvent,
-    else => PosixEvent,
-};
-
-const PosixEvent = extern struct {
-    pub fn init(self: *Event) void {
-        @compileError("TODO");
-    }
-    
-    pub fn deinit(self: *Event) void {
-        @compileError("TODO");
+    pub fn acquire(self: *Lock) void {
+        system.AcquireSRWLockExclusive(&self.srwlock);
     }
 
-    pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
-        @compileError("TODO");
+    pub fn tryAcquire(self: *Lock) bool {
+        return system.TryAcquireSRWLockExclusive(&self.srwlock) == system.TRUE;
     }
 
-    pub fn notify(self: *Event) void {
-        @compileError("TODO");
-    }
-
-    pub fn yield(iteration: ?usize) bool {
-        @compileError("TODO");
-    }
-
-    pub fn nanotime() u64 {
-        return Clock.nanoTime();
+    pub fn release(self: *Lock) void {
+        system.ReleaseSRWLockExclusive(&self.srwlock);
     }
 };
 
-const FutexEvent = extern struct {
-    pub fn init(self: *Event) void {
-        @compileError("TODO");
-    }
-    
-    pub fn deinit(self: *Event) void {
-        @compileError("TODO");
-    }
-
-    pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
-        @compileError("TODO");
-    }
-
-    pub fn notify(self: *Event) void {
-        @compileError("TODO");
-    }
-
-    pub fn yield(iteration: ?usize) bool {
-        return Futex.yield(iteration);
-    }
-
-    pub fn nanotime() u64 {
-        return Futex.nanotime();
-    }
-};
-
-const WindowsEvent = extern struct {
+pub const Event = extern struct {
     state: extern enum(u32){
         empty,
         waiting,
@@ -167,7 +118,7 @@ const WindowsEvent = extern struct {
 
     pub fn yield(iteration: ?usize) bool {
         const iter = iteration orelse {
-            _ = system.NtDelayExecution(system.FALSE, &@as(system.LARGE_INTEGER, -0));
+            _ = system.NtYieldExecution();
             return false;
         };
 

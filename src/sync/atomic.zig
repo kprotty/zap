@@ -1,5 +1,6 @@
-const builtin = @import("builtin");
-const meta = @import("../meta.zig");
+const zap = @import("../zap");
+const builtin = zap.builtin;
+const meta = zap.meta;
 
 const AtomicOrder = builtin.AtomicOrder;
 const AtomicRmwOp = builtin.AtomicRmwOp;

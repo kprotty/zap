@@ -1,5 +1,6 @@
-const builtin = @import("builtin");
-const atomic = @import("./atomic.zig");
+const zap = @import(".../zap");
+const builtin = zap.builtin;
+const atomic = zap.sync.atomic;
 
 pub fn Mutex(comptime parking_lot: anytype) type {
     return extern struct {
@@ -46,7 +47,7 @@ pub fn Mutex(comptime parking_lot: anytype) type {
         }
 
         pub fn tryAcquireFor(self: *Self, comptime Event: type, duration: u64) error{TimedOut}!void {
-            return self.tryAcquireUntil(Event, Event.nanotime() + duration);
+            return self.tryAcquireUntil(Event, parking_lot.nanotime() + duration);
         }
 
         pub fn tryAcquireUntil(self: *Self, comptime Event: type, deadline: u64) error{TimedOut}!void {

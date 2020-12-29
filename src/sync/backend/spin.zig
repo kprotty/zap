@@ -1,12 +1,36 @@
-const atomic = @import("./atomic.zig");
+const zap = @import(".../zap");
+const atomic = zap.sync.atomic;
 
-pub const SpinEvent = extern struct {
+pub const Lock = extern struct {
+    locked: bool = false,
+
+    pub fn tryAcquire(self: *Lock) bool {
+        return atomic.compareAndSwap(
+            &self.locked,
+            false,
+            true,
+            .acquire,
+            .relaxed,
+        ) == null;
+    }
+
+    pub fn acquire(self: *Lock) void {
+        while (atomic.swap(&self.locked, true, .acquire))
+            atomic.spinLoopHint();
+    }
+
+    pub fn release(self: *Lock) void {
+        atomic.store(&self.locked, false, .release);
+    }
+};
+
+pub const Event = extern struct {
     is_notified: bool,
 
-    pub fn init(self: *SpinEvent) void {}
-    pub fn deinit(self: *SpinEvent) void {}
+    pub fn init(self: *Event) void {}
+    pub fn deinit(self: *Event) void {}
 
-    pub fn wait(self: *SpinEvent, deadline: ?u64, condition: anytype) error{TimedOut}!void {
+    pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
         self.is_notified = false;
 
         if (!condition.wait()) {
@@ -28,7 +52,7 @@ pub const SpinEvent = extern struct {
         }
     }
 
-    pub fn notify(self: *SpinEvent) void {
+    pub fn notify(self: *Event) void {
         atomic.store(&self.is_notified, true, .release);
     }
 

@@ -1,8 +1,9 @@
-const builtin = @import("builtin");
-const meta = @import("../meta.zig");
-const atomic = @import("./atomic.zig");
+const zap = @import(".../zap");
+const meta = zap.meta;
+const builtin = zap.builtin;
+const atomic = zap.sync.atomic;
 
-pub const UnfairLock = extern struct {
+pub const EventLock = extern struct {
     state: usize = UNLOCKED,
 
     const UNLOCKED = 0;
@@ -70,7 +71,7 @@ pub const UnfairLock = extern struct {
         };
     }
 
-    pub fn tryAcquire(self: *UnfairLock) bool {
+    pub fn tryAcquire(self: *EventLock) bool {
         switch (builtin.arch) {
             .i386, .x86_64 => {
                 return atomic.bitSet(
@@ -89,12 +90,12 @@ pub const UnfairLock = extern struct {
         }
     }
 
-    pub fn acquire(self: *UnfairLock, comptime Event: type) void {
+    pub fn acquire(self: *EventLock, comptime Event: type) void {
         if (!self.tryAcquire())
             self.acquireSlow(Event);
     }
 
-    pub fn release(self: *UnfairLock) void {
+    pub fn release(self: *EventLock) void {
         atomic.store(@ptrCast(*u8, &self.state), UNLOCKED, .release);
 
         const state = atomic.load(&self.state, .relaxed);
@@ -102,7 +103,7 @@ pub const UnfairLock = extern struct {
             self.releaseSlow();
     }
 
-    fn acquireSlow(self: *UnfairLock, comptime Event: type) void {
+    fn acquireSlow(self: *EventLock, comptime Event: type) void {
         @setCold(true);
 
         var wait_signal: struct {
@@ -157,7 +158,7 @@ pub const UnfairLock = extern struct {
         }
     }
 
-    fn releaseSlow(self: *UnfairLock) void {
+    fn releaseSlow(self: *EventLock) void {
         @setCold(true);
 
         var state = atomic.load(&self.state, .relaxed);

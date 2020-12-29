@@ -8,9 +8,9 @@ This project explicitly makes an effort to optimize for resource efficiency and 
 * In order to achieve resource efficiency, maximum performance or ease of use may be sacrificed when reasonable.
 * Optimizing for resource efficiency should not completely neglect performance and ease of use as these are practically important.
 
-The term "resource efficiency" refers to using the least amount of system resources (i.e. Compute, Memory, IO, etc.) to achieve similar functionality. This often includes tricks such as caching computed values, using special CPU instructions, favoring intrusively provided memory and amortizing synchronization or syscalls.
+The term "resource efficiency" here refers to using the least amount of system resources (i.e. Compute, Memory, IO, etc.) to achieve similar functionality. This often includes tricks such as caching computed values, using special CPU instructions, favoring intrusively provided memory and amortizing synchronization or syscalls.
 
-Aligning with the [Zen of Ziglang](https://ziglang.org/documentation/master/#Zen), this should aid in driving forward the ability to program software which utilizes the hardware better on average than the existing software standards.
+Aligning with the [Zen of Ziglang](https://ziglang.org/documentation/master/#Zen), this should aid in easing the ability to program software which utilizes the hardware better on average than before.
 
 ## License
 

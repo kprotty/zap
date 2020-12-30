@@ -1,5 +1,6 @@
 const zap = @import(".../zap.zig");
 const sync = zap.sync;
+const time = zap.time;
 
 pub fn Generic(comptime config: anytype) type {
     return struct {
@@ -12,7 +13,7 @@ pub fn Generic(comptime config: anytype) type {
             inner: switch (@hasField(@TypeOf(config), "Lock")) {
                 true => config.Lock,
                 else => extern struct {
-                    inner: sync.generic.EventLock = .{},
+                    inner: sync.generic.Lock = .{},
 
                     fn tryAcquire(self: *@This()) bool {
                         return self.inner.tryAcquire();
@@ -52,27 +53,7 @@ pub fn Generic(comptime config: anytype) type {
             }  
         };
 
-        pub const Signal = extern struct {
-            inner: sync.generic.EventSignal = .{},
-
-            pub fn wait(self: *Signal) void {
-                return self.inner.wait(Event);
-            }
-
-            pub fn tryWaitFor(self: *Signal, duration: u64) error{TimedOut}!void {
-                return self.inner.tryWaitFor(Event, duration);
-            }
-
-            pub fn tryWaitUntil(self: *Signal, deadline: u64) error{TimedOut}!void {
-                return self.inner.tryWaitUntl(Event, deadline);
-            }
-
-            pub fn notify(self: *Signal) void {
-                return self.inner.notify();
-            }
-        };
-
-        pub const parking_lot = sync.ParkingLot(.{
+        pub const parking_lot = sync.generic.ParkingLot(.{
             .Lock = Lock,
             .bucket_count = switch (@hasField(@TypeOf(config), "bucket_count")) {
                 true => config.bucket_count,
@@ -80,7 +61,7 @@ pub fn Generic(comptime config: anytype) type {
             },
             .eventually_fair_after = switch (@hasField(@TypeOf(config), "eventually_fair_after")) {
                 true => config.eventually_fair_after,
-                else => 1_000_000, // 1ms
+                else => 1 * time.ns_per_ms,
             },
         });
 

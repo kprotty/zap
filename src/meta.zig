@@ -1,6 +1,7 @@
 
 
-const builtin = @import("builtin");
+const zap = @import("./zap.zig");
+const builtin = zap.builtin;
 
 pub fn Min(comptime A: type, comptime B: type) type {
     switch (@typeInfo(A)) {

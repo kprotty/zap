@@ -3,7 +3,6 @@ const builtin = zap.builtin;
 const system = zap.system;
 
 pub const atomic = @import("./atomic.zig");
-pub const ParkingLot = @import("./parking_lot.zig").ParkingLot;
 
 pub const backend = struct {
     pub const spin = @import("./backend/spin.zig");
@@ -21,9 +20,9 @@ pub const backend = struct {
 
 pub const generic = struct {
     pub const Generic = @import("./generic/Generic.zig").Generic;
-    pub const EventLock = @import("./generic/EventLock.zig").EventLock;
-    pub const EventSignal = @import("./generic/EventSignal.zig").EventSignal;
+    pub const Lock = @import("./generic/Lock.zig").EventLock;
     
+    pub const ParkingLot = @import("./parking_lot.zig").ParkingLot;
     pub const Mutex = @import("./generic/Mutex.zig").Mutex;
 };
 

@@ -2,15 +2,15 @@ const zap = @import(".../zap.zig");
 const system = zap.system;
 const atomic = zap.sync.atomic;
 
-pub fn nanoTime() u64 {
-    return readKernelTime(0x08);
+pub fn readMonotonicTime() u64 {
+    return readUserDataTimeAt(0x08);
 }
 
-pub fn systemTime() u64 {
-    return readKernelTime(0x14);
+pub fn readSystemTime() u64 {
+    return readUserDataTimeAt(0x14);
 }
 
-fn readKernelTime(comptime offset: comptime_int) u64 {
+fn readUserDataTimeAt(comptime offset: comptime_int) u64 {
     // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/structs/kuser_shared_data/index.htm
     const KUSER_DATA_PTR = 0x7FFE0000;
     const KTIME_PTR = @intToPtr(

@@ -27,16 +27,19 @@ pub const Lock = extern struct {
 pub const Event = extern struct {
     is_notified: bool,
 
-    pub fn init(self: *Event) void {}
-    pub fn deinit(self: *Event) void {}
+    pub fn init(self: *Event) void {
+        self.reset();
+    }
 
-    pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
+    pub fn deinit(self: *Event) void {
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *Event) void {
         self.is_notified = false;
+    }
 
-        if (!condition.wait()) {
-            return;
-        }
-
+    pub fn wait(self: *Event, deadline: ?u64) error{TimedOut}!void {
         while (true) {
             if (atomic.load(&self.is_notified, .acquire)) {
                 return;

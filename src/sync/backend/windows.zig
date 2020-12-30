@@ -131,6 +131,6 @@ pub const Event = extern struct {
     }
 
     pub fn nanotime() u64 {
-        return Clock.nanoTime();
+        return Clock.readMonotonicTime();
     }
 };

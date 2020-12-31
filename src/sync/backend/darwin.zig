@@ -34,6 +34,6 @@ pub const Event = futex.Event(struct {
     }
 
     pub fn nanotime() u64 {
-        return Clock.readMonotonicTime();
+        return Clock.nanoTime();
     }
 });

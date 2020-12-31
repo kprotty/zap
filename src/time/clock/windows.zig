@@ -2,11 +2,11 @@ const zap = @import(".../zap.zig");
 const system = zap.system;
 const atomic = zap.sync.atomic;
 
-pub fn readMonotonicTime() u64 {
+pub fn nanoTime() u64 {
     return readUserDataTimeAt(0x08);
 }
 
-pub fn readSystemTime() u64 {
+pub fn systemTime() u64 {
     return readUserDataTimeAt(0x14);
 }
 

@@ -27,17 +27,18 @@ pub const Event = extern struct {
     } align(4),
 
     pub fn init(self: *Event) void {
-        self.state = .empty;
+        self.reset();
     }
 
     pub fn deinit(self: *Event) void {
         self.* = undefined;
     }
 
-    pub fn wait(self: *Event, deadline: ?u64, condition: anytype) error{TimedOut}!void {
-        if (!condition.wait())
-            return;
+    pub fn reset(self: *Event) void {
+        self.state = .empty;
+    }
 
+    pub fn wait(self: *Event, deadline: ?u64) error{TimedOut}!void {
         if (atomic.compareAndSwap(
             &self.state,
             .empty,
@@ -75,27 +76,26 @@ pub const Event = extern struct {
             }
         }
 
-        if (atomic.compareAndSwap(
+        const state = atomic.compareAndSwap(
             &self.state,
             .waiting,
             .empty,
             .acquire,
             .acquire,
-        )) |state| {
-            if (state != .notified)
-                unreachable;
-            switch (system.NtWaitForKeyedEvent(
-                @as(?system.HANDLE, null),
-                @ptrCast(*align(4) const c_void, &self.state),
-                system.FALSE,
-                @as(?*const system.LARGE_INTEGER, null),
-            )) {
-                system.STATUS_SUCCESS => return,
-                else => unreachable,
-            }
-        }
+        ) orelse return error.TimedOut;
 
-        return error.TimedOut;
+        if (state != .notified)
+            unreachable;
+
+        switch (system.NtWaitForKeyedEvent(
+            @as(?system.HANDLE, null),
+            @ptrCast(*align(4) const c_void, &self.state),
+            system.FALSE,
+            @as(?*const system.LARGE_INTEGER, null),
+        )) {
+            system.STATUS_SUCCESS => return,
+            else => unreachable,
+        }
     }
 
     pub fn notify(self: *Event) void {
@@ -131,6 +131,6 @@ pub const Event = extern struct {
     }
 
     pub fn nanotime() u64 {
-        return Clock.readMonotonicTime();
+        return Clock.nanoTime();
     }
 };

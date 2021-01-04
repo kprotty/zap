@@ -21,10 +21,10 @@ pub const is_posix = is_linux or is_bsd or switch (builtin.os.tag) {
 };
 
 pub usingnamespace if (is_windows)
-    @import("./system/windows.zig")
+    @import("./windows.zig")
 else if (is_linux)
-    @import("./system/linux.zig")
+    @import("./linux.zig")
 else if (is_darwin)
-    @import("./system/darwin.zig")
+    @import("./darwin.zig")
 else
     struct {};

@@ -45,3 +45,41 @@ pub fn Int(comptime signedness: builtin.Signedness, comptime bits: u16) type {
 pub fn Log2Int(comptime T: type) type {
     return Int(.unsigned, @popCount(usize, bitCount(T)));
 }
+
+pub fn refAllDeclsRecursive(comptime T: type) void {
+    if (!builtin.is_test)
+        return;
+
+    @setEvalBranchQuota(2000);
+    comptime var stack: []const type = &[_]type{T};
+    comptime var decls: []const type = &[_]type{T};
+
+    inline while (stack.len > 0) {
+        const top = stack[0];
+        decls = decls ++ &[_]type{top};
+        stack = stack[1..];
+
+        inline for (switch (@typeInfo(top)) {
+            .Struct => |info| info.decls,
+            else => [_]builtin.TypeInfo.Declaration{},
+        }) |decl| {
+            if (!decl.is_pub)
+                continue;
+            const decl_type = switch (decl.data) {
+                .Type => |ty| ty,
+                else => continue,
+            };
+
+            if (decl_type == zap or decl_type == builtin)
+                continue;
+            switch (@typeInfo(decl_type)) {
+                .Struct => stack = stack ++ &[_]type{decl_type},
+                else => {},
+            }
+        }
+    }
+
+    inline for (decls) |decl| {
+        _ = decl;
+    }
+}

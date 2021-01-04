@@ -1,4 +1,4 @@
-const zap = @import(".../zap.zig");
+const zap = @import("../../zap.zig");
 const sync = zap.sync;
 const time = zap.time;
 

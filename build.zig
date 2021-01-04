@@ -2,7 +2,9 @@ const std = @import("std");
 
 pub fn build(b: *std.build.Builder) void {
     // A group of shared settings that can be applied to any LibExeObjStep (for future use)
+    const entry_point = "src/zap.zig";
     const shared = struct {
+        run: bool,
         libc: bool,
         single_threaded: bool,
         mode: std.builtin.Mode,
@@ -18,6 +20,7 @@ pub fn build(b: *std.build.Builder) void {
         .mode = b.standardReleaseOptions(),
         .target = b.standardTargetOptions(.{}),
         .libc = b.option(bool, "c", "Link libc") orelse false,
+        .run = b.option(bool, "run", "run the given benchmark") orelse false,
         .single_threaded = b.option(bool, "single-threaded", "Assume program is single-threaded") orelse false,
     };
 
@@ -39,13 +42,36 @@ pub fn build(b: *std.build.Builder) void {
         const exe = b.addExecutable(benchmark, path);
         exe.addPackage(.{
             .name = "zap",
-            .path = "src/zap.zig",
+            .path = entry_point,
         });
         shared.apply(exe);
         exe.install();
 
         // Optionally run the benchmark after creation
-        if (b.option(bool, "run", "run the given benchmark") orelse false)
+        if (shared.run)
             b.default_step.dependOn(&exe.run().step);
     }
+
+    {
+        // Create the test step
+        const step = b.step("test", "Build and run tests");
+
+        // create the test executuable
+        const exe = b.addTest(entry_point);
+        shared.apply(exe);
+        step.dependOn(&exe.step);
+
+        // support test filters
+        if (b.option([]const u8, "filter", "Filter tests to matching pattern")) |filter| {
+            if (!std.mem.eql(u8, filter, "*")) {
+                exe.setFilter(filter);
+            }
+        }
+
+        // Optionally run the test after creation
+        if (shared.run)
+            step.dependOn(&exe.run().step);
+    }
+
+    
 }

@@ -1,4 +1,4 @@
-const zap = @import(".../zap");
+const zap = @import("../../zap.zig");
 const builtin = zap.builtin;
 const atomic = zap.sync.atomic;
 

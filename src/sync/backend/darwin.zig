@@ -1,4 +1,4 @@
-const zap = @import(".../zap.zig");
+const zap = @import("../../zap.zig");
 const futex = @import("./futex.zig");
 const atomic = zap.sync.atomic;
 const Clock = zap.time.OsClock;
@@ -22,15 +22,15 @@ pub const Lock = extern struct {
 
 pub const Event = futex.Event(struct {
     pub fn wait(ptr: *const i32, cmp: i32, deadline: ?u64) error{TimedOut}!void {
-
+        @compileError("TODO");
     }
 
     pub fn wake(ptr: *const i32) void {
-
+        @compileError("TODO");
     }
 
     pub fn yield(iteration: ?usize) bool {
-
+        @compileError("TODO");
     }
 
     pub fn nanotime() u64 {

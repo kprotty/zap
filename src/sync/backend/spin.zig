@@ -1,4 +1,4 @@
-const zap = @import(".../zap");
+const zap = @import("../../zap.zig");
 const atomic = zap.sync.atomic;
 
 pub const Lock = extern struct {

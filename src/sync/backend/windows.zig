@@ -1,4 +1,4 @@
-const zap = @import(".../zap.zig");
+const zap = @import("../../zap.zig");
 const atomic = zap.sync.atomic;
 const Clock = zap.time.OsClock;
 const system = zap.system;

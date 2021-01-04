@@ -1,4 +1,4 @@
-const zap = @import(".../zap");
+const zap = @import("../../zap.zig");
 const meta = zap.meta;
 const builtin = zap.builtin;
 const atomic = zap.sync.atomic;
@@ -6,7 +6,7 @@ const atomic = zap.sync.atomic;
 pub const Lock = extern struct {
     /// This is an unfair mutex lock implementation inspired by:
     ///  - parking_lot's WordLock: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
-    ///  - locklessinc's KeyedEventLock: http://www.locklessinc.com/articles/keyed_events/
+    ///  - locklessinc's KeyedLock: http://www.locklessinc.com/articles/keyed_events/
     ///
     /// [  remaining: uX   | is_waking: u1 |  ignored: u7  | is_locked: u1 ]: usize
     ///
@@ -50,7 +50,7 @@ pub const Lock = extern struct {
     };
 
     /// Try to acquire the lock if its unlocked.
-    pub fn tryAcquire(self: *EventLock) bool {
+    pub fn tryAcquire(self: *Lock) bool {
         switch (builtin.arch) {
             // On x86, its better to use `lock bts` over `lock xchg`
             // as the former requires less instructions (lock-bts, jz)
@@ -77,13 +77,13 @@ pub const Lock = extern struct {
     }
 
     /// Acquire ownership of the Lock, using the Event to implement blocking.
-    pub fn acquire(self: *EventLock, comptime Event: type) void {
+    pub fn acquire(self: *Lock, comptime Event: type) void {
         if (!self.tryAcquire())
             self.acquireSlow(Event);
     }
     
     /// Release ownership of the Lock, assuming already acquired.
-    pub fn release(self: *EventLock) void {
+    pub fn release(self: *Lock) void {
         atomic.store(
             @ptrCast(*u8, &self.state),
             UNLOCKED,
@@ -97,7 +97,7 @@ pub const Lock = extern struct {
             self.releaseSlow();
     }
 
-    fn acquireSlow(self: *EventLock, comptime Event: type) void {
+    fn acquireSlow(self: *Lock, comptime Event: type) void {
         @setCold(true);
 
         // This type bundles the Event (wakeup mechanism) with the Waiter node.
@@ -183,7 +183,7 @@ pub const Lock = extern struct {
         }
     }
 
-    fn releaseSlow(self: *EventLock) void {
+    fn releaseSlow(self: *Lock) void {
         @setCold(true);
 
         // Try to grab the WAKING bit, bailing under a few conditions:

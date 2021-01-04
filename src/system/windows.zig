@@ -1,4 +1,4 @@
-const zap = @import(".../zap.zig");
+const zap = @import("../../zap.zig");
 const builtin = zap.builtin;
 
 pub const WINAPI = switch (builtin.arch) {

@@ -1,4 +1,4 @@
-const zap = @import("../zap");
+const zap = @import("../zap.zig");
 const builtin = zap.builtin;
 const system = zap.system;
 
@@ -20,14 +20,16 @@ pub const backend = struct {
 
 pub const generic = struct {
     pub const Generic = @import("./generic/Generic.zig").Generic;
-    pub const Lock = @import("./generic/Lock.zig").EventLock;
+    pub const Lock = @import("./generic/Lock.zig").Lock;
     
-    pub const ParkingLot = @import("./parking_lot.zig").ParkingLot;
+    pub const ParkingLot = @import("./generic/ParkingLot.zig").ParkingLot;
     pub const Mutex = @import("./generic/Mutex.zig").Mutex;
 };
 
-pub const spin = Generic(.{});
-pub const os = Generic(.{
-    .Lock = backend.os.Lock,
-    .Event = backend.os.Event,
-});
+pub const primitives = struct {
+    pub const spin = generic.Generic(.{});
+    pub const os = generic.Generic(.{
+        .Lock = backend.os.Lock,
+        .Event = backend.os.Event,
+    });
+};

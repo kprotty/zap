@@ -9,329 +9,326 @@
 /// A caller can use `parkConditionally` in order to suspend execution on a wait queue until notified.
 /// Another execution unit uses one of the `unpark*` functions to then resume execution of previously parked callers.
 pub fn ParkingLot(comptime config: anytype) type {
-    /// The mutex lock type used to synchronize access for each WaitBucket.
-    /// When provided by the user, it must have at least 2 associated functions:
-    /// - acquire(): mark caller as having exclusive ownership, blocking until its available.
-    /// - release(): release exclusive ownership rights after an acquire, unblocking a node when possible.
-    const Lock = config.Lock;
-
-    /// Th amount of WaitBuckets that are stored globally for this ParkingLot type.
-    /// A WaitBucket represents a collection of wait queues that a wait-address can hash into.
-    /// The higher the bucket count, the lower the chance of WaitBucket lock contention, but also the larger global memory footprint.
-    const bucket_count: usize = config.bucket_count;
-
-    /// The maximum amount of time the internal WaitBucket timer can elapse before it signals fairness.
-    /// Callers of the `unpark*` functions are exposed a function which can query this timer in order to implement eventual fairness.
-    /// At each expiry of this internal WaitBucket timer:
-    /// - the `unpark` call can be hinted at to perform a "fair" (FIFO) wake-up if necessary.
-    /// - the timer is set to next expire at some random time between (0ns - {eventually_fair_after}ns) in the future. 
-    const eventually_fair_after: u64 = config.eventually_fair_after;
-
-    /// A WaitBucket holds a collection of WaitQueues which multiple addresses may map to.
-    const WaitBucket = struct {
-        lock: Lock = .{},
-        xorshift: u32 = 0,
-        times_out: u64 = 0,
-        tree_head: ?*WaitNode = null,
-
-        var array = [_]WaitBucket{WaitBucket{}} ** bucket_count;
-
-        /// Hash a wait-address to a wait-bucket.
-        /// This uses the same method as seen in Amanieu's port of WTF::ParkingLot:
-        /// https://github.com/Amanieu/parking_lot/blob/master/core/src/parking_lot.rs
-        fn from(address: usize) *WaitBucket {
-            const seed = @truncate(usize, 0x9E3779B97F4A7C15);
-            const max = @popCount(usize, ~@as(usize, 0));
-            const bits = @ctz(usize, array.len);
-            const index = (address *% seed) >> (max - bits);
-            return &array[index];
-        }
-
-        /// On expiry, returns true and updates the next timeout to be
-        /// a random point in time 0ns..{eventually_fair_after}ns in the future.
-        fn expired(self: *WaitBucket, now: u64) bool {
-            if (now <= self.times_out)
-                return false;
-
-            // On first invocation, use the bucket pointer itself as the seed.
-            // We mask out the unused bits to get a more unique value.
-            //
-            // This is fine as the entropy of the seed (or random gen quality really)
-            // doesn't actually matter all that much given the entire goal of the 
-            // randomness applied to the timeout is for jitter purposes.
-            if (self.xorshift == 0)
-                self.xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(usize));
-
-            self.xorshift ^= self.xorshift << 13;
-            self.xorshift ^= self.xorshift >> 17;
-            self.xorshift ^= self.xorshift << 5;
-
-            const fair_timeout = self.xorshift % eventually_fair_after;
-            self.times_out = now + fair_timeout;
-            return true;
-        }
-
-        /// A reference to the WaitQueue living inside a WaitBucket
-        const Queue = struct {
-            head: ?*WaitNode,
-            prev: ?*WaitNode,
-        };
-
-        // Compute a reference to the WaitQueue (or where it would otherwise be) for the given address.
-        //
-        // TODO:
-        // Use binary search instead of linear traversal.
-        // This is OK for now, as each traversed WaitNode represents the entire WaitQueue for each address,
-        // but it could be more efficient to make this O(log n) as, especially for async, there could be many WaitQueues.
-        fn find(self: *WaitBucket, address: usize) Queue {
-            var head = self.tree_head;
-            var prev = head;
-
-            while (true) {
-                const node = head orelse break;
-                if (node.address == address)
-                    break;
-
-                prev = node;
-                head = node.tree_next;
-            }
-
-            return Queue{
-                .head = head,
-                .prev = prev,
-            };
-        }
-
-        /// Insert the WaitQueue reference into the WaitBucket.
-        ///
-        /// TODO:
-        /// Use a self-balancing binary-search tree for insert() and remove().
-        /// Recommendation: red-black-tree
-        fn insert(self: *WaitBucket, queue: *Queue) void {
-            const node = queue.head orelse unreachable;
-            if (node.tree_prev != null)
-                unreachable;
-
-            node.tree_prev = queue.prev;
-            node.tree_next = null;
-
-            if (node.tree_prev) |prev| {
-                prev.tree_next = node;
-            } else {
-                self.tree_head = node;
-            }
-        }
-
-        /// Remove the WaitQueue reference from the WaitBucket.
-        ///
-        /// TODO:
-        /// Use a self-balancing binary-search tree for insert() and remove().
-        /// Recommendation: red-black-tree
-        fn remove(self: *WaitBucket, queue: *Queue) void {
-            const node = queue.head orelse unreachable;
-            if ((node.tree_prev == null) and (node != self.tree_head))
-                unreachable;
-
-            if (node.tree_next) |next|
-                next.tree_prev = node.tree_prev;
-
-            if (node.tree_prev) |prev|
-                prev.tree_next = node.tree_next;
-
-            if (self.tree_head == node)
-                self.tree_head = null;
-        }
-        
-        /// Update the head of a WaitQueue reference with a new WaitNode.
-        ///
-        /// This is often done when the existing head WaitNode of a WaitQueue
-        /// is being dequeued and the next new head needs to inherit its values
-        /// in order to keep the internal links consistent.
-        fn update(self: *WaitBucket, queue: *Queue, new_head: *WaitNode) void {
-            const node = queue.head orelse unreachable;
-            const new_node = new_head;
-
-            if (new_node != node)
-                return;
-            if (new_node.address != node.address)
-                unreachable;
-            if (new_node != node.next)
-                unreachable;
-
-            new_node.tree_next = node.tree_next;
-            new_node.tree_prev = node.tree_prev;
-
-            if (new_node.tree_prev) |prev|
-                prev.tree_next = new_node;
-
-            if (new_node.tree_next) |next|
-                next.tree_prev = new_node;
-
-            if (self.tree_head == node)
-                self.tree_head = new_node;
-        }
-    };
-    
-    /// A WaitQueue represents an ordered collection of WaitNodes waiting on the same address.
-    const WaitQueue = struct {
-        address: usize,
-        bucket: *WaitBucket,
-        bucket_queue: ?WaitBucket.Queue,
-
-        /// Lookup and exclusive acquire ownership for the WaitQueue associated with this address.
-        /// The caller can then perform operations on the WaitQueue without worry for synchronization.
-        pub fn acquire(address: usize) WaitQueue {
-            const bucket = WaitBucket.from(address);
-            bucket.lock.acquire();
-            
-            return WaitQueue{
-                .address = address,
-                .bucket = bucket,
-                .bucket_queue = null,
-            };
-        }
-
-        /// Release exclusive ownership of the WaitQueue, allowing another execution unit to use it.
-        /// After this call, the caller must no longer use any operations on the wait queue.
-        pub fn release(self: WaitQueue) void {
-            self.bucket.lock.release();
-        }
-
-        /// Queries the internal WaitBucket timer, returning true if the fairness timeout elapsed. 
-        pub fn shouldBeFair(self: WaitQueue, now: u64) bool {
-            return self.bucket.expired(now);
-        }
-
-        inline fn getBucketQueueRef(self: *WaitQueue) *WaitBucket.Queue {
-            if (self.bucket_queue) |*bucket_queue|
-                return bucket_queue;
-            return self.getBucketQueueRefSlow();
-        }
-
-        fn getBucketQueueRefSlow(self: *WaitQueue) *WaitBucket.Queue {
-            @setCold(true);
-
-            self.bucket_queue = self.bucket.find(self.address);
-            if (self.bucket_queue) |*bucket_queue|
-                return bucket_queue;
-
-            unreachable;
-        }
-
-        /// Create an iterator which iterates the WaitNodes in this WaitQueue.
-        pub fn iter(self: WaitQueue) Iter {
-            const queue = self.getBucketQueueRef();
-            return .{ .node = queue.head };
-        }
-
-        /// Returns true if this WaitQueue has no WaitNodes.
-        pub fn isEmpty(self: WaitQueue) bool {
-            return self.iter().isEmpty();
-        }
-
-        /// Insert a (previously uninserted) WaitNode into this WaitQueue. 
-        pub fn insert(self: *WaitQueue, node: *WaitNode) void {
-            node.prev = null;
-            node.next = null;
-            node.tail = node;
-            node.address = self.address;
-
-            const queue = self.getBucketQueueRef();
-            const head = queue.head orelse {
-                queue.head = node;
-                self.bucket.insert(queue);
-                return;
-            };
-
-            const tail = head.tail orelse unreachable;
-            node.prev = tail;
-            tail.next = node;
-            head.tail = node;
-        }
-
-        /// Remove a (previously inserted) WaitNode from this WaitNode.
-        pub fn remove(self: *WaitQueue, node: *WaitNode) void {
-            const queue = self.getBucketQueueRef();
-            const head = queue.head orelse unreachable;
-            
-            if (node.address != self.address)
-                unreachable;
-            if ((node.prev == null) and (node != head))
-                unreachable;
-
-            if (node.prev) |p|
-                p.next = node.next;
-            if (node.next) |n|
-                n.prev = node.prev;
-
-            if (node == head) {
-                queue.head = node.next;
-                if (queue.head) |new_head| {
-                    new_head.tail = node.tail;
-                    self.bucket.replace(queue, new_head);
-                } else {
-                    self.bucket.remove(queue);
-                }
-            } else if (node == head.tail) {
-                head.tail = node.prev orelse unreachable;
-            }
-
-            node.tail = null;
-            return true;
-        }
-
-        /// Returns true if this WaitNode is still inserted in the WaitQueue.
-        /// This remains correct as long as the caller doesn't tamper with internal node state.
-        pub fn hasInserted(self: WaitQueue, node: *WaitNode) bool {
-            return node.tail == node;
-        }
-
-        /// An iterator which iterates over the WaitNodes in a WaitQueue
-        const Iter = struct {
-            node: ?*WaitNode,
-
-            /// Returns true if the iterator sees no more WaitNode
-            pub fn isEmpty(self: Iter) bool {
-                return self.node == null;
-            }
-
-            /// Get the next WaitNode iterating the WaitQueue.
-            pub fn next(self: *Iter) ?*WaitNode {
-                const node = self.node orelse return null;
-                self.node = node.next;
-                return node;
-            }
-        };
-    };
-
-    /// A WaitNode represents a single waiter waiting in a WaitQueue
-    const WaitNode = struct {
-        tree_prev: ?*WaitNode,
-        tree_next: ?*WaitNode,
-        prev: ?*WaitNode,
-        next: ?*WaitNode,
-        tail: ?*WaitNode,
-        address: usize,
-        token: usize,
-        eventFn: fn(*WaitNode, EventOp) u64,
-
-        const EventOp = enum {
-            wake,
-            nanotime,
-        };
-        
-        /// Wake up the waiter waiting on this WaitNode
-        fn wake(self: *WaitNode) void {
-            _ = (self.eventFn)(self, .wake);
-        }
-
-        /// Query the current nanosecond timestamp using the waiter for this WaitNode
-        fn nanotime(self: *WaitNode) u64 {
-            return (self.eventFn)(self, .nanotime);
-        }
-    };
-
     return struct {
+        /// The mutex lock type used to synchronize access for each WaitBucket.
+        /// When provided by the user, it must have at least 2 associated functions:
+        /// - acquire(): mark caller as having exclusive ownership, blocking until its available.
+        /// - release(): release exclusive ownership rights after an acquire, unblocking a node when possible.
+        const Lock = config.Lock;
+
+        /// Th amount of WaitBuckets that are stored globally for this ParkingLot type.
+        /// A WaitBucket represents a collection of wait queues that a wait-address can hash into.
+        /// The higher the bucket count, the lower the chance of WaitBucket lock contention, but also the larger global memory footprint.
+        const bucket_count: usize = config.bucket_count;
+
+        /// The maximum amount of time the internal WaitBucket timer can elapse before it signals fairness.
+        /// Callers of the `unpark*` functions are exposed a function which can query this timer in order to implement eventual fairness.
+        /// At each expiry of this internal WaitBucket timer:
+        /// - the `unpark` call can be hinted at to perform a "fair" (FIFO) wake-up if necessary.
+        /// - the timer is set to next expire at some random time between (0ns - {eventually_fair_after}ns) in the future. 
+        const eventually_fair_after: u64 = config.eventually_fair_after;
+
+        /// A WaitBucket holds a collection of WaitQueues which multiple addresses may map to.
+        const WaitBucket = struct {
+            lock: Lock = .{},
+            xorshift: u32 = 0,
+            times_out: u64 = 0,
+            tree_head: ?*WaitNode = null,
+
+            var array = [_]WaitBucket{WaitBucket{}} ** bucket_count;
+
+            /// Hash a wait-address to a wait-bucket.
+            /// This uses the same method as seen in Amanieu's port of WTF::ParkingLot:
+            /// https://github.com/Amanieu/parking_lot/blob/master/core/src/parking_lot.rs
+            fn from(address: usize) *WaitBucket {
+                const seed = @truncate(usize, 0x9E3779B97F4A7C15);
+                const max = @popCount(usize, ~@as(usize, 0));
+                const bits = @ctz(usize, array.len);
+                const index = (address *% seed) >> (max - bits);
+                return &array[index];
+            }
+
+            /// On expiry, returns true and updates the next timeout to be
+            /// a random point in time 0ns..{eventually_fair_after}ns in the future.
+            fn expired(self: *WaitBucket, now: u64) bool {
+                if (now <= self.times_out)
+                    return false;
+
+                // On first invocation, use the bucket pointer itself as the seed.
+                // We mask out the unused bits to get a more unique value.
+                //
+                // This is fine as the entropy of the seed (or random gen quality really)
+                // doesn't actually matter all that much given the entire goal of the 
+                // randomness applied to the timeout is for jitter purposes.
+                if (self.xorshift == 0)
+                    self.xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(usize));
+
+                self.xorshift ^= self.xorshift << 13;
+                self.xorshift ^= self.xorshift >> 17;
+                self.xorshift ^= self.xorshift << 5;
+
+                const fair_timeout = self.xorshift % eventually_fair_after;
+                self.times_out = now + fair_timeout;
+                return true;
+            }
+
+            /// A reference to the WaitQueue living inside a WaitBucket
+            const Queue = struct {
+                head: ?*WaitNode,
+                prev: ?*WaitNode,
+            };
+
+            // Compute a reference to the WaitQueue (or where it would otherwise be) for the given address.
+            //
+            // TODO:
+            // Use binary search instead of linear traversal.
+            // This is OK for now, as each traversed WaitNode represents the entire WaitQueue for each address,
+            // but it could be more efficient to make this O(log n) as, especially for async, there could be many WaitQueues.
+            fn find(self: *WaitBucket, address: usize) Queue {
+                var head = self.tree_head;
+                var prev = head;
+
+                while (true) {
+                    const node = head orelse break;
+                    if (node.address == address)
+                        break;
+
+                    prev = node;
+                    head = node.tree_next;
+                }
+
+                return Queue{
+                    .head = head,
+                    .prev = prev,
+                };
+            }
+
+            /// Insert the WaitQueue reference into the WaitBucket.
+            ///
+            /// TODO:
+            /// Use a self-balancing binary-search tree for insert() and remove().
+            /// Recommendation: red-black-tree
+            fn insert(self: *WaitBucket, queue: *Queue) void {
+                const node = queue.head orelse unreachable;
+                if (node.tree_prev != null)
+                    unreachable;
+
+                node.tree_prev = queue.prev;
+                node.tree_next = null;
+
+                if (node.tree_prev) |prev| {
+                    prev.tree_next = node;
+                } else {
+                    self.tree_head = node;
+                }
+            }
+
+            /// Remove the WaitQueue reference from the WaitBucket.
+            ///
+            /// TODO:
+            /// Use a self-balancing binary-search tree for insert() and remove().
+            /// Recommendation: red-black-tree
+            fn remove(self: *WaitBucket, queue: *Queue) void {
+                const node = queue.head orelse unreachable;
+                if ((node.tree_prev == null) and (node != self.tree_head))
+                    unreachable;
+
+                if (node.tree_next) |next|
+                    next.tree_prev = node.tree_prev;
+
+                if (node.tree_prev) |prev|
+                    prev.tree_next = node.tree_next;
+
+                if (self.tree_head == node)
+                    self.tree_head = null;
+            }
+            
+            /// Update the head of a WaitQueue reference with a new WaitNode.
+            ///
+            /// This is often done when the existing head WaitNode of a WaitQueue
+            /// is being dequeued and the next new head needs to inherit its values
+            /// in order to keep the internal links consistent.
+            fn update(self: *WaitBucket, queue: *Queue, new_head: *WaitNode) void {
+                const node = queue.head orelse unreachable;
+                const new_node = new_head;
+
+                if (new_node != node)
+                    return;
+                if (new_node.address != node.address)
+                    unreachable;
+                if (new_node != node.next)
+                    unreachable;
+
+                new_node.tree_next = node.tree_next;
+                new_node.tree_prev = node.tree_prev;
+
+                if (new_node.tree_prev) |prev|
+                    prev.tree_next = new_node;
+
+                if (new_node.tree_next) |next|
+                    next.tree_prev = new_node;
+
+                if (self.tree_head == node)
+                    self.tree_head = new_node;
+            }
+        };
+        
+        /// A WaitQueue represents an ordered collection of WaitNodes waiting on the same address.
+        const WaitQueue = struct {
+            address: usize,
+            bucket: *WaitBucket,
+            has_bucket_queue: bool = false,
+            bucket_queue: WaitBucket.Queue = undefined,
+
+            /// Lookup and exclusive acquire ownership for the WaitQueue associated with this address.
+            /// The caller can then perform operations on the WaitQueue without worry for synchronization.
+            pub fn acquire(address: usize) WaitQueue {
+                const bucket = WaitBucket.from(address);
+                bucket.lock.acquire();
+                
+                return WaitQueue{
+                    .address = address,
+                    .bucket = bucket,
+                };
+            }
+
+            /// Release exclusive ownership of the WaitQueue, allowing another execution unit to use it.
+            /// After this call, the caller must no longer use any operations on the wait queue.
+            pub fn release(self: WaitQueue) void {
+                self.bucket.lock.release();
+            }
+
+            /// Queries the internal WaitBucket timer, returning true if the fairness timeout elapsed. 
+            pub fn shouldBeFair(self: WaitQueue, now: u64) bool {
+                return self.bucket.expired(now);
+            }
+
+            inline fn getBucketQueueRef(self: *WaitQueue) *WaitBucket.Queue {
+                if (self.has_bucket_queue)
+                    return &self.bucket_queue;
+                return self.getBucketQueueRefSlow();
+            }
+
+            fn getBucketQueueRefSlow(self: *WaitQueue) *WaitBucket.Queue {
+                @setCold(true);
+                self.bucket_queue = self.bucket.find(self.address);
+                self.has_bucket_queue = true;
+                return &self.bucket_queue;
+            }
+
+            /// Create an iterator which iterates the WaitNodes in this WaitQueue.
+            pub fn iter(self: *WaitQueue) Iter {
+                const queue = self.getBucketQueueRef();
+                return .{ .node = queue.head };
+            }
+
+            /// Returns true if this WaitQueue has no WaitNodes.
+            pub fn isEmpty(self: *WaitQueue) bool {
+                return self.iter().isEmpty();
+            }
+
+            /// Insert a (previously uninserted) WaitNode into this WaitQueue. 
+            pub fn insert(self: *WaitQueue, node: *WaitNode) void {
+                node.prev = null;
+                node.next = null;
+                node.tail = node;
+                node.address = self.address;
+
+                const queue = self.getBucketQueueRef();
+                const head = queue.head orelse {
+                    queue.head = node;
+                    self.bucket.insert(queue);
+                    return;
+                };
+
+                const tail = head.tail orelse unreachable;
+                node.prev = tail;
+                tail.next = node;
+                head.tail = node;
+            }
+
+            /// Remove a (previously inserted) WaitNode from this WaitNode.
+            pub fn remove(self: *WaitQueue, node: *WaitNode) void {
+                const queue = self.getBucketQueueRef();
+                const head = queue.head orelse unreachable;
+                
+                if (node.address != self.address)
+                    unreachable;
+                if ((node.prev == null) and (node != head))
+                    unreachable;
+
+                if (node.prev) |p|
+                    p.next = node.next;
+                if (node.next) |n|
+                    n.prev = node.prev;
+
+                if (node == head) {
+                    queue.head = node.next;
+                    if (queue.head) |new_head| {
+                        new_head.tail = node.tail;
+                        self.bucket.replace(queue, new_head);
+                    } else {
+                        self.bucket.remove(queue);
+                    }
+                } else if (node == head.tail) {
+                    head.tail = node.prev orelse unreachable;
+                }
+
+                node.tail = null;
+                return true;
+            }
+
+            /// Returns true if this WaitNode is still inserted in the WaitQueue.
+            /// This remains correct as long as the caller doesn't tamper with internal node state.
+            pub fn hasInserted(self: WaitQueue, node: *WaitNode) bool {
+                return node.tail == node;
+            }
+
+            /// An iterator which iterates over the WaitNodes in a WaitQueue
+            const Iter = struct {
+                node: ?*WaitNode,
+
+                /// Returns true if the iterator sees no more WaitNode
+                pub fn isEmpty(self: Iter) bool {
+                    return self.node == null;
+                }
+
+                /// Get the next WaitNode iterating the WaitQueue.
+                pub fn next(self: *Iter) ?*WaitNode {
+                    const node = self.node orelse return null;
+                    self.node = node.next;
+                    return node;
+                }
+            };
+        };
+
+        /// A WaitNode represents a single waiter waiting in a WaitQueue
+        const WaitNode = struct {
+            tree_prev: ?*WaitNode,
+            tree_next: ?*WaitNode,
+            prev: ?*WaitNode,
+            next: ?*WaitNode,
+            tail: ?*WaitNode,
+            address: usize,
+            token: usize,
+            eventFn: fn(*WaitNode, EventOp) u64,
+
+            const EventOp = enum {
+                wake,
+                nanotime,
+            };
+            
+            /// Wake up the waiter waiting on this WaitNode
+            fn wake(self: *WaitNode) void {
+                _ = (self.eventFn)(self, .wake);
+            }
+
+            /// Query the current nanosecond timestamp using the waiter for this WaitNode
+            fn nanotime(self: *WaitNode) u64 {
+                return (self.eventFn)(self, .nanotime);
+            }
+        };
+
         /// Suspend execution using the `Event` by waiting inn the WaitQueue associated with the `address`.
         /// Execution will be resumed when notified by an `unpark*` function or when the `deadline` is reached.
         /// The `context` contains captured state which implements some callbacks that hook into the parking routine:
@@ -445,7 +442,7 @@ pub fn ParkingLot(comptime config: anytype) type {
         /// The callback can then decide, using this context, what to do with the node.
         /// This type exposes info that could be useful for said decision.
         pub const UnparkContext = struct {
-            iter: *WaitNode.Iter,
+            iter: *WaitQueue.Iter,
             node: *WaitNode,
             queue: *WaitQueue,
 

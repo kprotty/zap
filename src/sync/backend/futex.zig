@@ -1,4 +1,4 @@
-const zap = @import(".../zap.zig");
+const zap = @import("../../zap.zig");
 const atomic = zap.sync.atomic;
 
 pub fn Lock(comptime Futex: type) type {
@@ -74,7 +74,7 @@ pub fn Lock(comptime Futex: type) type {
             }
         }
 
-        fn releaseSlow(self: *Mutex) void {
+        fn releaseSlow(self: *Self) void {
             @setCold(true);
 
             Futex.wake(&self.state);
@@ -83,7 +83,5 @@ pub fn Lock(comptime Futex: type) type {
 }
 
 pub fn Event(comptime Futex: type) type {
-    return extern struct {
-        
-    };
+    @compileError("TODO");
 }

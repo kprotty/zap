@@ -18,7 +18,8 @@ pub fn init(config: InitConfig) ThreadPool {
         .max_threads = std.math.min(
             std.math.maxInt(u14),
             std.math.max(1, config.max_threads orelse blk: {
-                break :blk @intCast(u16, std.Thread.cpuCount() catch 1);
+                const threads = std.Thread.cpuCount() catch 1;
+                break :blk @intCast(u14, threads);
             }),
         ),
     };
@@ -54,7 +55,7 @@ pub fn schedule(self: *ThreadPool, hints: ScheduleHints, batchable: anytype) voi
     }
 
     const priority = @enumToInt(hints.priority);
-    if (Worker.tls_current) |worker| {
+    if (Worker.getCurrent()) |worker| {
         worker.run_queues[priority].push(batch);
     } else {
         self.run_queues[priority].push(batch);
@@ -395,10 +396,83 @@ const Worker = struct {
         return true;
     }
 
-    threadlocal var tls_current: ?*Worker = null;
+    const is_apple_silicon = std.Target.current.isDarwin() and std.builtin.arch != .x86_64;
+    const TLS = if (is_apple_silicon) DarwinTLS else DefaultTLS;
+
+    const DefaultTLS = struct {
+        threadlocal var tls: ?*Worker = null;
+
+        fn get() ?*Worker {
+            return tls;
+        }
+
+        fn set(worker: ?*Worker) void {
+            tls = worker;
+        }
+    };
+
+    const DarwinTLS = struct {
+        fn get() ?*Worker {
+            const key = getKey();
+            const ptr = pthread_getspecific(key);
+            return @ptrCast(?*Worker, @alignCast(@alignOf(Worker), ptr));
+        }
+
+        fn set(worker: ?*Worker) void {
+            const key = getKey();
+            const rc = pthread_setspecific(key, @ptrCast(?*c_void, worker));
+            assert(rc == 0);
+        }
+
+        var tls_state: u8 = 0;
+        var tls_key: pthread_key_t = undefined;
+        const pthread_key_t = c_ulong;
+        extern "c" fn pthread_key_create(key: *pthread_key_t, destructor: ?fn (value: *c_void) callconv(.C) void) c_int;
+        extern "c" fn pthread_getspecific(key: pthread_key_t) ?*c_void;
+        extern "c" fn pthread_setspecific(key: pthread_key_t, value: ?*c_void) c_int;
+
+        fn getKey() pthread_key_t {
+            var state = @atomicLoad(u8, &tls_state, .Acquire);
+            while (true) {
+                switch (state) {
+                    0 => state = @cmpxchgWeak(
+                        u8,
+                        &tls_state,
+                        0,
+                        1,
+                        .Acquire,
+                        .Acquire,
+                    ) orelse break,
+                    1 => {
+                        std.os.sched_yield() catch {};
+                        state = @atomicLoad(u8, &tls_state, .Acquire);
+                    },
+                    2 => return tls_key,
+                    else => std.debug.panic("failed to get pthread_key_t", .{}),
+                }
+            }
+
+            const rc = pthread_key_create(&tls_key, null);
+            if (rc == 0) {
+                @atomicStore(u8, &tls_state, 2, .Release);
+                return tls_key;
+            }
+            
+            @atomicStore(u8, &tls_state, 3, .Monotonic);
+            std.debug.panic("failed to get pthread_key_t", .{});
+        }
+    };
+
+    fn getCurrent() ?*Worker {
+        return TLS.get();
+    }
+
+    fn setCurrent(worker: ?*Worker) void {
+        return TLS.set(worker);
+    }
 
     fn run(self: *Worker, pool: *ThreadPool, thread: *std.Thread) void {
-        tls_current = self;
+        setCurrent(self);
         self.* = .{
             .pool = pool,
             .thread = thread,
@@ -483,7 +557,7 @@ const Worker = struct {
         }
 
         var queue: usize = 0;
-        while (queue <= std.math.max(attempt, self.run_queues.len)) : (queue += 1) {
+        while (queue < std.math.min(attempt + 1, self.run_queues.len)) : (queue += 1) {
             const our_queue = &self.run_queues[queue];
             const target_queue = &target.run_queues[queue];
             if (our_queue.popAndSteal(target_queue)) |runnable| {
@@ -496,7 +570,7 @@ const Worker = struct {
 
     fn pollPool(self: *Worker, pool: *ThreadPool, attempt: usize) ?*Runnable {
         var queue: usize = 0;
-        while (queue <= std.math.max(attempt, pool.run_queues.len)) : (queue += 1) {
+        while (queue < std.math.min(attempt + 1, pool.run_queues.len)) : (queue += 1) {
             const our_queue = &self.run_queues[queue];
             const pool_queue = &pool.run_queues[queue];
             const first_runnable = pool_queue.pop() orelse continue;
@@ -510,7 +584,7 @@ const Worker = struct {
                 .head = head,
                 .tail = tail orelse undefined,
             });
-            
+
             return first_runnable;
         }
 
@@ -559,31 +633,126 @@ const GlobalQueue = struct {
 };
 
 const LocalQueue = struct {
+    head: u16 align(64) = 0,
+    tail: u16 = 0,
     state: u32 = 0,
     futex: Futex = .{},
     queue: Batch = .{},
     buffer: [64]*Runnable = undefined,
 
-    fn headPtr(self: *@This()) callconv(.Inline) *u8 {
-        return @intToPtr(*u8, @ptrToInt(&self.state) + 0);
-    }
-
-    fn tailPtr(self: *@This()) callconv(.Inline) *u8 {
-        return @intToPtr(*u8, @ptrToInt(&self.state) + 1);
-    }
-
-    const PRODUCER = 1 << 0;
-    const CONSUMER = 1 << 8;
-    const WAITING = 1 << 9;
-    const PENDING = 1 << 10;
-
-    fn statePtr(self: *@This()) callconv(.Inline) *u16 {
-        return @intToPtr(*u16, @ptrToInt(&self.state) + 2);
-    }
-
     pub fn deinit(self: *@This()) void {
         self.futex.deinit();
         self.* = undefined;
+    }
+    
+    const PRODUCER = 1 << 0; // the producer thread has/is requesting ownership of the queue
+    const CONSUMER = 1 << 8; // a consumer thread has ownership of the queue
+    const WAITING = 1 << 9; // the producer thread is blocked waiting for ownership of the queue
+    const PENDING = 1 << 10; // the queue is not empty
+
+    fn acquireProducer(self: *@This()) void {
+        // Mark that a producer either owns the queue or is requesting ownership.
+        @atomicStore(
+            u8,
+            @ptrCast(*u8, &self.state),
+            PRODUCER,
+            .Monotonic,
+        );
+        
+        // Then, load the state to ensure theres no consumer.
+        // Acquire barrier when loading as we need to see any changes the consumer made to the queue.
+        var state = @atomicLoad(u32, &self.state, .Acquire);
+        assert(state & PRODUCER != 0); // we set this bit earlier
+        assert(state & WAITING == 0); // there should only be one producer
+
+        // Wait for the consumer to complete finish up by polling the state.
+        var adaptive_spin: usize = 0;
+        while (true) {
+            if (state & CONSUMER == 0) {
+                return;
+            }
+
+            // Try to spin a little in the hopes that the consumer completes quickly.
+            if (adaptive_spin < 100) {
+                adaptive_spin += 1;
+                spinLoopHint();
+                state = @atomicLoad(u32, &self.state, .Acquire);
+                continue;
+            }
+
+            // We need to ensure that it knows we're waiting so it can wake us up when it does.
+            // Acquire on success as this needs to be stronger or equal to the failure ordering.
+            // Release on success to ensure the consumer sees the self.event we setup when waking it.
+            // Acquire on failure if the consumer completes and Releases changes to the queue while doing so.
+            if (@cmpxchgWeak(
+                u32,
+                &self.state,
+                state,
+                state | WAITING,
+                .AcqRel,
+                .Acquire,
+            )) |updated| {
+                state = updated;
+                spinLoopHint();
+                continue;
+            }
+
+            self.futex.wait(@ptrCast(*const i32, &self.state), @bitCast(i32, state | WAITING));
+            state = @atomicLoad(u32, &self.state, .Acquire);
+        }
+    }
+
+    fn releaseProducer(self: *@This()) void {
+        var new_state: u32 = undefined;
+        if (self.queue.isEmpty()) {
+            new_state = 0;
+        } else {
+            new_state = PENDING;
+        }
+
+        // Once we're done, release ownership and mark the queue as empty or not.
+        // Release barrier to ensure stealer threads see the self.queue changes we made via Acquire.
+        @atomicStore(u32, &self.state, new_state, .Release);
+    }
+
+    fn tryAcquireConsumer(self: *@This(), is_producer: bool) ?bool {
+        var state = @atomicLoad(u32, &self.state, .Monotonic);
+        while (true) {
+            if (state & (PENDING | CONSUMER | PRODUCER) != PENDING) {
+                return null;
+            }
+
+            state = @cmpxchgWeak(
+                u32,
+                &self.state,
+                state,
+                state | CONSUMER,
+                .Acquire,
+                .Monotonic,
+            ) orelse return true;
+
+            if (!is_producer) {
+                return false;
+            } else {
+                spinLoopHint();
+            }
+        }
+    }
+
+    fn releaseConsumer(self: *@This(), is_producer: bool) void {
+        if (is_producer) {
+            return self.releaseProducer();
+        }
+
+        var remove: u32 = CONSUMER;
+        if (self.queue.isEmpty()) {
+            remove |= PENDING;
+        }
+
+        const state = @atomicRmw(u32, &self.state, .Sub, remove, .AcqRel);
+        if (state & WAITING != 0) {
+            self.futex.wake(@ptrCast(*const i32, &self.state), 1);
+        }
     }
 
     pub fn push(self: *@This(), _batch: Batch) void {
@@ -592,40 +761,12 @@ const LocalQueue = struct {
             return;
         }
 
-        var raw_state = @atomicLoad(u32, &self.state, .Monotonic);
-        var raw_bytes = @bitCast([4]u8, raw_state);
-        var tail = raw_bytes[1];
-        var head = raw_bytes[0];
+        var tail = self.tail;
+        var head = @atomicLoad(u16, &self.head, .Monotonic);
         while (true) {
             if (batch.isEmpty()) {
                 return;
             }
-
-            if (tail -% head >= self.buffer.len) {
-                break;
-            }
-
-            while (tail -% head < self.buffer.len) {
-                const runnable = batch.popFront() orelse break;
-                @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
-                tail +%= 1;
-            }
-
-            @atomicStore(u8, self.tailPtr(), tail, .Release);
-            spinLoopHint();
-            head = @atomicLoad(u8, self.headPtr(), .Monotonic);
-        }
-
-        const ptr = self.statePtr();
-        @atomicStore(u8, @ptrCast(*u8, ptr), PRODUCER, .Monotonic);
-
-        var spin: usize = 0;
-        raw_state = @atomicLoad(u32, &self.state, .Acquire);
-        while (true) {
-            raw_bytes = @bitCast([4]u8, raw_state);
-            tail = raw_bytes[1];
-            head = raw_bytes[0];
-            var state = @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).*;
 
             if (tail -% head < self.buffer.len) {
                 while (tail -% head < self.buffer.len) {
@@ -634,232 +775,134 @@ const LocalQueue = struct {
                     tail +%= 1;
                 }
 
-                @atomicStore(u8, self.tailPtr(), tail, .Release);
-                if (!batch.isEmpty()) {
-                    spinLoopHint();
-                    raw_state = @atomicLoad(u32, &self.state, .Acquire);
-                    continue;
-                }
-
-                while (true) {
-                    if (state & CONSUMER == 0) {
-                        var new_state = if (self.queue.isEmpty()) @as(u16, 0) else PENDING;
-                        @atomicStore(u16, self.statePtr(), new_state, .Monotonic);
-                        return;
-                    }
-
-                    if (state & WAITING == 0) {
-                        @atomicStore(u8, @ptrCast(*u8, ptr), 0, .Monotonic);
-                        return;
-                    }
-
-                    state = @cmpxchgWeak(
-                        u16,
-                        self.statePtr(),
-                        state,
-                        CONSUMER | PENDING,
-                        .Acquire,
-                        .Acquire,
-                    ) orelse return;
-                }
-            }
-
-            if (state & CONSUMER == 0) {
-                break;
-            }
-
-            if (spin < 100) {
-                spin += 1;
-                spinLoopHint();
-                raw_state = @atomicLoad(u32, &self.state, .Acquire);
+                @atomicStore(u16, &self.tail, tail, .Release);
+                head = @atomicLoad(u16, &self.head, .Monotonic);
                 continue;
             }
 
-            if (state & WAITING == 0) {
-                if (@cmpxchgWeak(
-                    u16,
-                    self.statePtr(),
-                    state,
-                    state | WAITING,
-                    .Acquire,
-                    .Acquire,
-                )) |updated| {
-                    spinLoopHint();
-                    raw_state = @atomicLoad(u32, &self.state, .Acquire);
-                    continue;
-                }
-            }
+            _ = self.acquireProducer();
+            defer self.releaseProducer();
 
-            @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).* |= WAITING;
-            self.futex.wait(@ptrCast(*const i32, &self.state), @bitCast(i32, raw_bytes));
-            raw_state = @atomicLoad(u32, &self.state, .Acquire);
+            self.queue.pushBack(batch);
+            return;
         }
-
-        self.queue.pushBack(batch);
-
-        var new_state: u16 = 0;
-        if (!self.queue.isEmpty()) {
-            new_state = PENDING;
-        }
-
-        @atomicStore(u16, ptr, new_state, .Release);
     }
 
     pub fn pop(self: *@This()) ?*Runnable {
-        var tail = self.tailPtr().*;
-        var head = @atomicLoad(u8, self.headPtr(), .Monotonic);
-
+        var tail = self.tail;
+        var head = @atomicLoad(u16, &self.head, .Monotonic);
         while (tail != head) {
             head = @cmpxchgWeak(
-                u8,
-                self.headPtr(),
+                u16,
+                &self.head,
                 head,
                 head +% 1,
-                .Acquire,
+                .Monotonic,
                 .Monotonic,
             ) orelse return self.buffer[head % self.buffer.len];
-            spinLoopHint();
         }
 
-        const ptr = self.statePtr();
-        var state = @atomicLoad(u16, ptr, .Monotonic);
-        while (true) {
-            if (state != PENDING) return null;
-            state = @cmpxchgWeak(
-                u16,
-                ptr,
-                state,
-                state | CONSUMER,
-                .Acquire,
-                .Monotonic,
-            ) orelse break;
-            spinLoopHint();
+        var new_tail = tail;
+        defer if (new_tail != tail) {
+            @atomicStore(u16, &self.tail, new_tail, .Release);
+        };
+
+        const acquired = self.tryAcquireConsumer(true) orelse false;
+        if (!acquired) return null;
+        defer self.releaseConsumer(true);            
+
+        const runnable = self.queue.popFront();
+        while (new_tail -% head < self.buffer.len) {
+            const extra = self.queue.popFront() orelse break;
+            @atomicStore(*Runnable, &self.buffer[new_tail % self.buffer.len], extra, .Unordered);
+            new_tail +%= 1;
         }
 
-        const first_runnable = self.queue.popFront();
-        while (tail -% head < self.buffer.len) {
-            const runnable = self.queue.popFront() orelse break;
-            @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
-            tail +%= 1;
-        }
-
-        var new_state: u16 = 0;
-        if (!self.queue.isEmpty()) {
-            new_state = PENDING;
-        }
-
-        var raw_bytes: [4]u8 = undefined;
-        raw_bytes[0] = head;
-        raw_bytes[1] = tail;
-        @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).* = new_state;
-        @atomicStore(u32, &self.state, @bitCast(u32, raw_bytes), .Release);
-
-        return first_runnable;
+        return runnable;
     }
 
     pub fn popAndSteal(self: *@This(), target: *@This()) ?*Runnable {
+        // Make sure we only steal from queues that aren't ourselves.
         if (self == target) {
             return self.pop();
         }
 
-        var raw_state = @atomicLoad(u32, &self.state, .Monotonic);
-        var raw_bytes = @bitCast([4]u8, raw_state);
-
-        var head = raw_bytes[0];
-        var tail = raw_bytes[1];
-        if (tail != head) {
+        // Make sure that our queue is empty before stealing others.
+        var tail = self.tail;
+        var head = @atomicLoad(u16, &self.head, .Monotonic);
+        var state = @atomicLoad(u32, &self.state, .Unordered);
+        if ((tail != head) or (state & PENDING != 0)) {
             return self.pop();
         }
 
-        raw_state = @atomicLoad(u32, &target.state, .Acquire);
+        var target_head = @atomicLoad(u16, &target.head, .Monotonic);
         while (true) {
-            raw_bytes = @bitCast([4]u8, raw_state);
+            const target_tail = @atomicLoad(u16, &target.tail, .Acquire);
 
-            const target_head = raw_bytes[0];
-            const target_tail = raw_bytes[1];
-            const target_size = target_tail -% target_head;
-
-            if (target_size == 0) {
-                const state_ptr = @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2);
-                const state = state_ptr.*;
-                if (state != PENDING) {
-                    return null;
+            var take = target_tail -% target_head;
+            if (take == 0) {
+                const acquired = target.tryAcquireConsumer(false) orelse return null;
+                if (acquired) {
+                    break;
+                } else {
+                    target_head = @atomicLoad(u16, &target.head, .Monotonic);
+                    continue;
                 }
+            }
 
-                state_ptr.* |= CONSUMER;
-                raw_state = @cmpxchgWeak(
-                    u32,
-                    &target.state,
-                    raw_state,
-                    @bitCast(u32, raw_bytes),
-                    .Acquire,
-                    .Acquire,
-                ) orelse break;
+            take = take - (take / 2);
+            if (take > target.buffer.len / 2) {
                 spinLoopHint();
+                target_head = @atomicLoad(u16, &target.head, .Monotonic);
                 continue;
             }
 
-            var take = target_size - (target_size / 2);
-            if (take > (target.buffer.len / 2)) {
-                spinLoopHint();
-                raw_state = @atomicLoad(u32, &target.state, .Acquire);
-                continue;
-            }
-
-            const first_runnable = @atomicLoad(*Runnable, &target.buffer[target_head % self.buffer.len], .Unordered);
+            const runnable = @atomicLoad(*Runnable, &target.buffer[target_head % target.buffer.len], .Unordered);
             var new_target_head = target_head +% 1;
             var new_tail = tail;
             take -= 1;
 
             while (take > 0) : (take -= 1) {
-                const runnable = @atomicLoad(*Runnable, &target.buffer[target_head % self.buffer.len], .Unordered);
+                const stolen = @atomicLoad(*Runnable, &target.buffer[new_target_head % target.buffer.len], .Unordered);
                 new_target_head +%= 1;
-                @atomicStore(*Runnable, &self.buffer[new_tail % self.buffer.len], runnable, .Unordered);
+                @atomicStore(*Runnable, &self.buffer[new_tail % self.buffer.len], stolen, .Unordered);
                 new_tail +%= 1;
             }
 
             if (@cmpxchgWeak(
-                u8,
-                target.headPtr(),
+                u16,
+                &target.head,
                 target_head,
                 new_target_head,
                 .AcqRel,
                 .Monotonic,
-            )) |_| {
-                spinLoopHint();
-                raw_state = @atomicLoad(u32, &target.state, .Acquire);
+            )) |updated| {
+                target_head = updated;
                 continue;
             }
 
-            if (new_tail != tail) @atomicStore(u8, self.tailPtr(), new_tail, .Release);
-            return first_runnable;
+            if (new_tail != tail) {
+                @atomicStore(u16, &self.tail, new_tail, .Release);
+            }
+            return runnable;         
         }
 
-        const first_runnable = target.queue.popFront();
-        while (tail -% head < self.buffer.len) {
-            const runnable = target.queue.popFront() orelse break;
-            @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
-            tail +%= 1;
+        // Pop the first runnable as we'll be returning this one as stolen
+        const runnable = target.queue.popFront() orelse unreachable;
+
+        var new_tail = tail;
+        while (new_tail -% head < self.buffer.len) {
+            const stolen = target.queue.popFront() orelse break;
+            @atomicStore(*Runnable, &self.buffer[new_tail % self.buffer.len], stolen, .Unordered);
+            new_tail +%= 1;
         }
 
-        if (tail != head) {
-            raw_bytes[0] = head;
-            raw_bytes[1] = tail;
-            @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).* = 0;
-            @atomicStore(u32, &self.state, @bitCast(u32, raw_bytes), .Release);
+        if (new_tail != tail) {
+            @atomicStore(u16, &self.tail, new_tail, .Release);
         }
 
-        var remove: u16 = CONSUMER;
-        if (target.queue.isEmpty()) {
-            remove |= PENDING;
-        }
-
-        const state = @atomicRmw(u16, target.statePtr(), .Sub, remove, .Release);
-        if (state & WAITING != 0) {
-            self.futex.wake(@ptrCast(*const i32, &target.state), 1);
-        }
-
-        return first_runnable;
+        target.releaseConsumer(false);
+        return runnable;
     }
 };
 

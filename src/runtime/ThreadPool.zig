@@ -127,6 +127,10 @@ pub const Runnable = struct {
     next: ?*Runnable = null,
     runFn: fn (*Runnable) void,
 
+    pub fn init(callback: fn (*Runnable) void) Runnable {
+        return .{ .runFn = callback };
+    }
+
     pub fn run(self: *Runnable) void {
         return (self.runFn)(self);
     }
@@ -211,7 +215,7 @@ fn notifyWorkers(self: *ThreadPool, _is_waking: bool) void {
             spinLoopHint();
             attempts -= 1;
             is_waking = true;
-            Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
+            counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
             continue;
         }
 
@@ -245,24 +249,28 @@ fn suspendWorker(self: *ThreadPool, worker: *Worker) ?bool {
     while (true) {
         if (counter.shutdown) break;
 
-        var new_counter: ?Counter = counter;
+        var new_counter: ?Counter = null;
         if (counter.notified) {
-            new_counter.notified = false;
+            var new = counter;
+            new.notified = false;
+            new_counter = new;
         } else if (is_suspended and counter.ready) {
-            new_counter.ready = false;
+            var new = counter;
+            new.ready = false;
+            new_counter = new;
         } else if (!is_suspended) {
-            if (is_waking) new_counter.waking = false;
-            new_counter.idle += 1;
-        } else {
-            new_counter = null;
+            var new = counter;
+            if (is_waking) new.waking = false;
+            new.idle += 1;
+            new_counter = new;
         }
 
-        if (new_counter) |new_count| {
+        if (new_counter) |new| {
             if (@cmpxchgWeak(
                 u32,
                 &self.counter,
                 counter.pack(),
-                new_count.pack(),
+                new.pack(),
                 .Monotonic,
                 .Monotonic,
             )) |updated| {
@@ -274,7 +282,7 @@ fn suspendWorker(self: *ThreadPool, worker: *Worker) ?bool {
             } else if (is_suspended and counter.ready) {
                 return true;
             } else {
-                counter = new_counter;
+                counter = new;
                 is_suspended = true;
             }
         }
@@ -293,7 +301,7 @@ fn suspendWorker(self: *ThreadPool, worker: *Worker) ?bool {
     while (true) {
         const thread = @atomicLoad(?*std.Thread, &worker.thread, .Monotonic) orelse return null;
         const thread_int = @ptrCast(*const i32, &thread).*;
-        worker.futex.wait(@ptrCast(*const i32, &worker.thread), thread_int);
+        worker.run_queues[0].futex.wait(@ptrCast(*const i32, &worker.thread), thread_int);
     }
 }
 
@@ -336,7 +344,7 @@ fn joinWorkers(self: *ThreadPool) void {
     var workers = @atomicLoad(?*Worker, &self.spawned, .Acquire);
     while (workers) |worker| {
         workers = worker.spawned_next;
-        const thread = worker.thread;
+        const thread = worker.thread orelse unreachable;
         @atomicStore(?*std.Thread, &worker.thread, null, .Monotonic);
         worker.run_queues[0].futex.wake(@ptrCast(*const i32, &worker.thread), 1);
         thread.wait();
@@ -370,7 +378,7 @@ const Worker = struct {
 
                 const thread = self.thread;
                 const thread_pool = self.thread_pool;
-                @atomicStore(Stae, &self.state, .got, .Release);
+                @atomicStore(State, &self.state, .got, .Release);
 
                 var worker: Worker = undefined;
                 worker.run(thread_pool, thread);
@@ -394,11 +402,11 @@ const Worker = struct {
         self.* = .{
             .pool = pool,
             .thread = thread,
-            .xorshift = @ptrToInt(self) | 1,
+            .xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(usize)) | 1,
             .is_waking = true,
         };
 
-        var spawned_next = @atomicLoad(?*Worker, &pool.spawned);
+        var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Monotonic);
         while (true) {
             self.spawned_next = spawned_next;
             spawned_next = @cmpxchgWeak(
@@ -428,15 +436,15 @@ const Worker = struct {
 
         defer for (self.run_queues) |*queue| queue.deinit();
         while (true) {
-            const thread = @atomicLoad(?*std.Thread, &self.thread, .Monotonic) orelse break;
-            const current = @ptrCast(*const i32, &thread).*;
+            const thr = @atomicLoad(?*std.Thread, &self.thread, .Monotonic) orelse break;
+            const current = @ptrCast(*const i32, &thr).*;
             self.run_queues[0].futex.wait(@ptrCast(*const i32, &self.thread), current);
         }
     }
 
     fn poll(self: *Worker) ?*Runnable {
-        var attempts: usize = 0;
-        while (attempts < 5) : (attempts += 1) {
+        var attempt: usize = 0;
+        while (attempt < 5) : (attempt += 1) {
             if (self.pollWorker(self, attempt)) |runnable| {
                 return runnable;
             }
@@ -461,7 +469,7 @@ const Worker = struct {
                 }
             }
 
-            if (self.pollPool(&self.pool, attempt)) |runnable| {
+            if (self.pollPool(self.pool, attempt)) |runnable| {
                 return runnable;
             }
         }
@@ -478,7 +486,7 @@ const Worker = struct {
         while (queue <= std.math.max(attempt, self.run_queues.len)) : (queue += 1) {
             const our_queue = &self.run_queues[queue];
             const target_queue = &target.run_queues[queue];
-            if (our_queue.steal(target_queue)) |runnable| {
+            if (our_queue.popAndSteal(target_queue)) |runnable| {
                 return runnable;
             }
         }
@@ -486,19 +494,23 @@ const Worker = struct {
         return null;
     }
 
-    fn pollPool(self: *Worker, pool: *Pool, attempt: usize) ?*Runnable {
+    fn pollPool(self: *Worker, pool: *ThreadPool, attempt: usize) ?*Runnable {
         var queue: usize = 0;
         while (queue <= std.math.max(attempt, pool.run_queues.len)) : (queue += 1) {
             const our_queue = &self.run_queues[queue];
             const pool_queue = &pool.run_queues[queue];
             const first_runnable = pool_queue.pop() orelse continue;
 
-            const head = runnable.next;
+            const head = first_runnable.next;
             var tail = head;
-            while (tail.next) |runnable|
-                tail = runnable;
+            while (tail) |runnable|
+                tail = runnable.next orelse break;
 
-            our_queue.push(.{ .head = head, .tail = tail });
+            our_queue.push(.{
+                .head = head,
+                .tail = tail orelse undefined,
+            });
+            
             return first_runnable;
         }
 
@@ -580,8 +592,10 @@ const LocalQueue = struct {
             return;
         }
 
-        var tail = self.tailPtr().*;
-        var head = @atomicLoad(u8, self.headPtr(), .Monotonic);
+        var raw_state = @atomicLoad(u32, &self.state, .Monotonic);
+        var raw_bytes = @bitCast([4]u8, raw_state);
+        var tail = raw_bytes[1];
+        var head = raw_bytes[0];
         while (true) {
             if (batch.isEmpty()) {
                 return;
@@ -603,35 +617,82 @@ const LocalQueue = struct {
         }
 
         const ptr = self.statePtr();
-        @atomicStore(*u8, @ptrCast(*u8, ptr), PRODUCER, .Monotonic);
+        @atomicStore(u8, @ptrCast(*u8, ptr), PRODUCER, .Monotonic);
 
         var spin: usize = 0;
-        var state = @atomicLoad(u16, ptr, .Acquire);
+        raw_state = @atomicLoad(u32, &self.state, .Acquire);
+        while (true) {
+            raw_bytes = @bitCast([4]u8, raw_state);
+            tail = raw_bytes[1];
+            head = raw_bytes[0];
+            var state = @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).*;
 
-        while (state & CONSUMER != 0) {
+            if (tail -% head < self.buffer.len) {
+                while (tail -% head < self.buffer.len) {
+                    const runnable = batch.popFront() orelse break;
+                    @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
+                    tail +%= 1;
+                }
+
+                @atomicStore(u8, self.tailPtr(), tail, .Release);
+                if (!batch.isEmpty()) {
+                    spinLoopHint();
+                    raw_state = @atomicLoad(u32, &self.state, .Acquire);
+                    continue;
+                }
+
+                while (true) {
+                    if (state & CONSUMER == 0) {
+                        var new_state = if (self.queue.isEmpty()) @as(u16, 0) else PENDING;
+                        @atomicStore(u16, self.statePtr(), new_state, .Monotonic);
+                        return;
+                    }
+
+                    if (state & WAITING == 0) {
+                        @atomicStore(u8, @ptrCast(*u8, ptr), 0, .Monotonic);
+                        return;
+                    }
+
+                    state = @cmpxchgWeak(
+                        u16,
+                        self.statePtr(),
+                        state,
+                        CONSUMER | PENDING,
+                        .Acquire,
+                        .Acquire,
+                    ) orelse return;
+                }
+            }
+
+            if (state & CONSUMER == 0) {
+                break;
+            }
+
             if (spin < 100) {
                 spin += 1;
                 spinLoopHint();
-                state = @atomicLoad(u16, ptr, .Acquire);
+                raw_state = @atomicLoad(u32, &self.state, .Acquire);
                 continue;
             }
 
             if (state & WAITING == 0) {
                 if (@cmpxchgWeak(
                     u16,
-                    ptr,
+                    self.statePtr(),
                     state,
                     state | WAITING,
                     .Acquire,
                     .Acquire,
                 )) |updated| {
-                    state = updated;
+                    spinLoopHint();
+                    raw_state = @atomicLoad(u32, &self.state, .Acquire);
                     continue;
                 }
             }
 
-            self.futex.wait(@ptrCast(*const i32, ptr), @bitCast(i32, state | WAITING));
-            state = @atomicLoad(u16, ptr, .Acquire);
+            @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2).* |= WAITING;
+            self.futex.wait(@ptrCast(*const i32, &self.state), @bitCast(i32, raw_bytes));
+            raw_state = @atomicLoad(u32, &self.state, .Acquire);
         }
 
         self.queue.pushBack(batch);
@@ -716,7 +777,7 @@ const LocalQueue = struct {
 
             const target_head = raw_bytes[0];
             const target_tail = raw_bytes[1];
-            const target_size = target_tail -% target_size;
+            const target_size = target_tail -% target_head;
 
             if (target_size == 0) {
                 const state_ptr = @intToPtr(*u16, @ptrToInt(&raw_bytes) + 2);

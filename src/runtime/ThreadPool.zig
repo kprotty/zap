@@ -284,6 +284,7 @@ fn suspendWorker(self: *ThreadPool, worker: *Worker) ?bool {
                 return true;
             } else {
                 counter = new;
+                is_waking = false;
                 is_suspended = true;
             }
         }

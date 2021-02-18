@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub usingnamespace if (std.builtin.os.tag == .windows)
+pub const Futex = if (std.builtin.os.tag == .windows)
     WindowsFutex
 else if (std.builtin.os.tag == .linux)
     LinuxFutex
@@ -17,8 +17,8 @@ const LinuxFutex = struct {
         var ts_ptr: ?*std.os.timespec = null;
         if (timeout) |timeout_ns| {
             ts_ptr = &ts;
-            ts.tv_sec = timeout_ns / std.time.ns_per_s;
-            ts.tv_nsec = timeout_ns % std.time.ns_per_s;
+            ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), timeout_ns / std.time.ns_per_s) catch std.math.maxInt(@TypeOf(ts.tv_sec));
+            ts.tv_nsec = @intCast(@TypeOf(ts.tv_nsec), timeout_ns % std.time.ns_per_s);
         }
         
         switch (std.os.linux.getErrno(std.os.linux.futex_wait(
@@ -267,15 +267,26 @@ const WindowsFutex = struct {
 
     const WaitOnAddress = struct {
         var state: State = .uninit;
-        var wait_ptr: usize = undefined;
-        var wake_one_ptr: usize = undefined;
-        var wake_all_ptr: usize = undefined;
+        var wait_ptr: WaitOnAddressFn = undefined;
+        var wake_one_ptr: WakeByAddressFn = undefined;
+        var wake_all_ptr: WakeByAddressFn = undefined;
 
         const State = enum(u8) {
             uninit,
             supported,
             unsupported,
         };
+
+        const WakeByAddressFn = fn (
+            address: ?*const volatile c_void,
+        ) callconv(std.os.windows.WINAPI) void;
+
+        const WaitOnAddressFn = fn (
+            address: ?*const volatile c_void,
+            compare_address: ?*const c_void,
+            address_size: std.os.windows.SIZE_T,
+            timeout_ms: std.os.windows.DWORD,
+        ) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
 
         fn isSupported() bool {
             return switch (@atomicLoad(State, &state, .Acquire)) {
@@ -288,15 +299,77 @@ const WindowsFutex = struct {
         fn checkSupported() bool {
             @setCold(true);
 
-            @compileError("TODO");
+            const is_supported = tryLoad();
+            const new_state = if (is_supported) State.supported else .unsupported;
+            @atomicStore(State, &state, new_state, .Release);
+
+            return is_supported;
+        }
+
+        fn tryLoad() bool {
+            // MSDN says that the functions are in kernel32.dll, but apparently they aren't...
+            const synch_dll = std.os.windows.kernel32.GetModuleHandleW(blk: {
+                const dll = "api-ms-win-core-synch-l1-2-0.dll";
+                comptime var wdll = [_]std.os.windows.WCHAR{0} ** (dll.len + 1);
+                inline for (dll) |char, index|
+                    wdll[index] = @as(std.os.windows.WCHAR, char);
+                break :blk @ptrCast([*:0]const std.os.windows.WCHAR, &wdll);
+            }) orelse return false;
+
+            const _wait_ptr = std.os.windows.kernel32.GetProcAddress(
+                synch_dll,
+                "WaitOnAddress\x00",
+            ) orelse return false;
+
+            const _wake_one_ptr = std.os.windows.kernel32.GetProcAddress(
+                synch_dll,
+                "WakeByAddressSingle\x00",
+            ) orelse return false;
+
+            const _wake_all_ptr = std.os.windows.kernel32.GetProcAddress(
+                synch_dll,
+                "WakeByAddressAll\x00",
+            ) orelse return false;
+
+            // Unordered stores since this could be racing with other threads
+            @atomicStore(WaitOnAddressFn, &wait_ptr, @ptrCast(WaitOnAddressFn, _wait_ptr), .Unordered);
+            @atomicStore(WakeByAddressFn, &wake_one_ptr, @ptrCast(WakeByAddressFn, _wake_one_ptr), .Unordered);
+            @atomicStore(WakeByAddressFn, &wake_all_ptr, @ptrCast(WakeByAddressFn, _wake_all_ptr), .Unordered);
+
+            return true;
         }
 
         fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-            @compileError("TODO");
+            var timeout_ms: std.os.windows.DWORD = std.os.windows.INFINITE;
+            if (timeout) |timeout_ns| {
+                timeout_ms = std.math.cast(std.os.windows.DWORD, timeout_ns / std.time.ns_per_ms) catch timeout_ms;
+            }
+            
+            const status = (wait_ptr)(
+                @ptrCast(*const volatile c_void, ptr),
+                @ptrCast(*const c_void, &expected),
+                @sizeOf(u32),
+                timeout_ms,
+            );
+
+            if (status == std.os.windows.FALSE) {
+                switch (std.os.windows.kernel32.GetLastError()) {
+                    .TIMEOUT => {},
+                    else => |err| {
+                        const e = std.os.windows.unexpectedError(err);
+                        unreachable;
+                    },
+                }
+            }
         }
 
         fn wake(ptr: *const u32, waiters: u32) void {
-            @compileError("TODO");
+            const address = @ptrCast(*const volatile c_void, ptr);
+            return switch (waiters) {
+                0 => {},
+                1 => (wake_one_ptr)(address),
+                else => (wake_all_ptr)(address),
+            };
         }
     };
 

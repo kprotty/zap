@@ -1,11 +1,14 @@
 const std = @import("std");
-const Futex = @import("./Futex.zig");
-const Thread = @import("./Thread.zig"); 
+
+const Lock = @import("./Lock.zig").Lock;
+const Futex = @import("./Futex.zig").Futex;
+const Thread = @import("./Thread.zig").Thread;
 
 const Pool = @This();
 
-max_threads: u16,
 counter: u32 = 0,
+max_threads: u16,
+join_id: u32 = 0,
 spawned: ?*Worker = null,
 run_queues: [ScheduleHints.Priority.max]GlobalQueue = [_]GlobalQueue{.{}} ** ScheduleHints.Priority.max,
 
@@ -18,7 +21,7 @@ pub fn init(config: InitConfig) Pool {
         .max_threads = std.math.min(
             std.math.maxInt(u14),
             std.math.max(1, config.max_threads orelse blk: {
-                const threads = 2; // std.Thread.cpuCount() catch 1;
+                const threads = std.Thread.cpuCount() catch 1;
                 break :blk @intCast(u14, threads);
             }),
         ),
@@ -141,26 +144,30 @@ pub const Runnable = struct {
 const Counter = struct {
     idle: u16 = 0,
     spawned: u16 = 0,
-    wakeable: bool = false,
+    state: State = .pending,
     waking: bool = false,
-    notified: bool = false,
-    shutdown: bool = false,
+    polling: bool = false,
+
+    const State = enum(u2) {
+        pending = 0,
+        notified,
+        signalled,
+        shutdown,
+    };
 
     fn pack(self: Counter) u32 {
-        return ((@as(u32, @boolToInt(self.wakeable)) << 0) |
-            (@as(u32, @boolToInt(self.waking)) << 1) |
-            (@as(u32, @boolToInt(self.notified)) << 2) |
-            (@as(u32, @boolToInt(self.shutdown)) << 3) |
+        return ((@as(u32, @boolToInt(self.waking)) << 0) |
+            (@as(u32, @boolToInt(self.polling)) << 1) |
+            (@as(u32, @enumToInt(self.state)) << 2) |
             (@as(u32, @intCast(u14, self.idle)) << 4) |
             (@as(u32, @intCast(u14, self.spawned)) << 18));
     }
 
     fn unpack(value: u32) Counter {
         return .{
-            .wakeable = (value & (1 << 0)) != 0,
-            .waking = (value & (1 << 1)) != 0,
-            .notified = (value & (1 << 2)) != 0,
-            .shutdown = (value & (1 << 3)) != 0,
+            .waking = (value & (1 << 0)) != 0,
+            .polling = (value & (1 << 1)) != 0,
+            .state = @intToEnum(State, @truncate(u2, value >> 2)),
             .idle = @truncate(u14, value >> 4),
             .spawned = @truncate(u14, value >> 18),
         };
@@ -176,37 +183,45 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
     var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
 
     while (true) {
-        if (counter.shutdown)
+        if (counter.state == .shutdown) {
+            if (did_spawn)
+                self.markShutdown();
             return;
+        }
+
+        if (is_waking and !counter.waking)
+            std.debug.panic("is_waking when counter isnt", .{});
 
         var new_counter = counter;
         if (is_waking) {
-            new_counter.waking = attempts > 0 and (counter.idle > 0 or counter.spawned < max_threads or did_spawn);
-            if (new_counter.waking) {
-                new_counter.notified = counter.idle > 0;
-                if (new_counter.notified) {
-                    new_counter.idle -= 1;
-                    new_counter.wakeable = true;
-                    if (did_spawn) new_counter.spawned -= 1;
-                } else if (!did_spawn) {
-                    new_counter.spawned += 1;
-                }
+            if (attempts > 0 and did_spawn) {
+                new_counter.state = .notified;
+                new_counter.waking = true;
+            } else if (attempts > 0 and counter.idle > 0) {
+                new_counter.state = .signalled;
+                new_counter.waking = true;
+                new_counter.idle -= 1;
+            } else if (attempts > 0 and counter.spawned < max_threads) {
+                new_counter.state = .notified;
+                new_counter.waking = true;
+                new_counter.spawned += 1;
             } else {
-                new_counter.notified = true;
-                if (did_spawn) new_counter.spawned -= 1;
+                new_counter.state = .notified;
+                new_counter.waking = false;
+                if (did_spawn)
+                    new_counter.spawned -= 1;
             }
         } else {
             if (!counter.waking and counter.idle > 0) {
-                new_counter.notified = true;
+                new_counter.state = .signalled;
                 new_counter.waking = true;
-                new_counter.wakeable = true;
                 new_counter.idle -= 1;
             } else if (!counter.waking and counter.spawned < max_threads) {
-                new_counter.notified = false;
+                new_counter.state = .notified;
                 new_counter.waking = true;
                 new_counter.spawned += 1;
-            } else if (!counter.notified) {
-                new_counter.notified = true;
+            } else if (counter.state == .pending) {
+                new_counter.state = .notified;
             } else {
                 return;
             }
@@ -225,29 +240,23 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
             continue;
         }
 
-        std.debug.warn("resume({}) (waking={}, spawned={})\n  {}\n  {}\n\n", .{
-            std.Thread.getCurrentId(),
-            is_waking,
-            did_spawn,
-            counter,
-            new_counter,
-        });
-        
-        is_waking = new_counter.waking;
-        if (!is_waking)
-            return;
-
-        if (new_counter.idle < counter.idle) {
+        is_waking = true;
+        if (new_counter.state == .signalled) {
             Futex.wake(&self.counter, 1);
             return;
         }
 
-        did_spawn = true;
-        if (Thread.spawn(Worker.entry, @ptrToInt(self))) {
+        did_spawn = did_spawn or (new_counter.spawned > counter.spawned);
+        if (did_spawn) {
+            if (Thread.spawn(Worker.entry, @ptrToInt(self))) {
+                return;
+            }
+        } else {
             return;
         }
 
         attempts -= 1;
+        std.Thread.spinLoopHint();
         counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
     }
 }
@@ -258,19 +267,28 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
     var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
 
     while (true) {
-        if (counter.shutdown)
-            break;
+        if (counter.state == .shutdown) {
+            self.markShutdown();
+            return null;
+        }
 
-        if (counter.notified or !is_suspended) {
+        if (!is_suspended or counter.state == .signalled) {
             var new_counter = counter;
-            new_counter.notified = false;
-            new_counter.wakeable = false;
-            if (!counter.notified) {
+            if (counter.state == .signalled) {
+                if (is_waking)
+                    std.debug.panic("signalled when suspend(waking)", .{});
+                new_counter.state = .pending;
+                new_counter.waking = true;
+            } else if (counter.state == .notified) {
+                new_counter.state = .pending;
+                if (is_waking)
+                    new_counter.waking = true;
+            } else {
+                if (is_suspended)
+                    std.debug.panic("trying to suspend when already suspended", .{});
                 new_counter.idle += 1;
                 if (is_waking)
                     new_counter.waking = false;
-            } else if (is_waking) {
-                new_counter.waking = true;
             }
 
             if (@cmpxchgWeak(
@@ -286,17 +304,10 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
                 continue;
             }
 
-            std.debug.warn("suspend({}) (waking={}, suspended={})\n  {}\n  {}\n\n", .{
-                std.Thread.getCurrentId(),
-                is_waking,
-                is_suspended,
-                counter,
-                new_counter,
-            });
-
-            if (counter.notified) {
-                return counter.wakeable or is_waking;
-            }
+            if (counter.state == .signalled)
+                return true;
+            if (counter.state == .notified)
+                return is_waking;
 
             is_waking = false;
             is_suspended = true;
@@ -306,22 +317,22 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
         Futex.wait(&self.counter, counter.pack(), null) catch unreachable;
         counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
     }
+}
 
-    counter = Counter{ .spawned = 1 };
-    counter = Counter.unpack(@atomicRmw(u32, &self.counter, .Sub, counter.pack(), .Monotonic));
+fn markShutdown(self: *Pool) void {
+    var counter = Counter{ .spawned = 1 };
+    counter = Counter.unpack(@atomicRmw(u32, &self.counter, .Sub, counter.pack(), .Release));
     if (counter.spawned == 1) {
         Futex.wake(&self.counter, 1);
     }
-
-    return null;
 }
 
 fn shutdownWorkers(self: *Pool) void {
     var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
-    while (!counter.shutdown) {
+    while (counter.state != .shutdown) {
         var new_counter = counter;
         new_counter.idle = 0;
-        new_counter.shutdown = true;
+        new_counter.state = .shutdown;
 
         if (@cmpxchgWeak(
             u32,
@@ -336,24 +347,32 @@ fn shutdownWorkers(self: *Pool) void {
             continue;
         }
 
-        if (counter.idle > 0) {
-            Futex.wake(&self.counter, counter.idle);
-        }
-
+        Futex.wake(&self.counter, std.math.maxInt(u32));
         return;
     }
 }
 
 fn joinWorkers(self: *Pool) void {
     while (true) {
-        const counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
-        if (counter.spawned == 0) break;
+        const counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Acquire));
+        if (counter.spawned == 0)
+            break;
         Futex.wait(&self.counter, counter.pack(), null) catch unreachable;
+    }
+
+    var workers = @atomicLoad(?*Worker, &self.spawned, .Acquire);
+    while (workers) |worker| {
+        workers = worker.spawned_next;
+        const thread = worker.thread;
+        worker.shutdown();
+        thread.join();
     }
 }
 
 const Worker = struct {
+    id: u32,
     pool: *Pool,
+    thread: Thread,
     spawned_next: ?*Worker = null,
     run_queues: [ScheduleHints.Priority.max]LocalQueue = [_]LocalQueue{.{}} ** ScheduleHints.Priority.max,
     xorshift: u32,
@@ -434,30 +453,39 @@ const Worker = struct {
         return TLS.set(worker);
     }
 
-    fn entry(pool_ptr: usize) void {
+    fn entry(thread: Thread, pool_ptr: usize) void {
         const pool = @intToPtr(*Pool, pool_ptr);
         var worker: Worker = undefined;
-        worker.run(pool);
+        worker.run(pool, thread);
     }
 
-    fn run(self: *Worker, pool: *Pool) void {
+    fn run(self: *Worker, pool: *Pool, thread: Thread) void {
         setCurrent(self);
         self.* = .{
+            .id = 0,
             .pool = pool,
+            .thread = thread,
             .xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(usize)) | 1,
             .is_waking = true,
         };
 
-        var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Monotonic);
+        var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Acquire);
         while (true) {
             self.spawned_next = spawned_next;
+            if (spawned_next) |next_worker| {
+                if (@addWithOverflow(u32, next_worker.id, 1, &self.id))
+                    std.debug.panic("too many workers spawned", .{});
+            } else {
+                self.id = 1;
+            }
+
             spawned_next = @cmpxchgWeak(
                 ?*Worker,
                 &pool.spawned,
                 spawned_next,
                 self,
                 .Release,
-                .Monotonic,
+                .Acquire,
             ) orelse break;
         }
 
@@ -466,10 +494,28 @@ const Worker = struct {
                 if (self.is_waking) pool.notifyWorkers(true);
                 self.is_waking = false;
                 runnable.run();
+            } else if (pool.suspendWorker(self)) |is_waking| {
+                self.is_waking = is_waking;
             } else {
-                self.is_waking = pool.suspendWorker(self) orelse break;
+                return self.waitForShutdown();
             }
         }
+    }
+
+    fn waitForShutdown(self: *Worker) void {
+        while (true) {
+            const join_id = @atomicLoad(u32, &self.pool.join_id, .Acquire);
+            if (join_id == self.id) {
+                break;
+            } else {
+                Futex.wait(&self.pool.join_id, join_id, null) catch unreachable;
+            }
+        }
+    }
+
+    fn shutdown(self: *Worker) void {
+        @atomicStore(u32, &self.pool.join_id, self.id, .Release);
+        Futex.wake(&self.pool.join_id, std.math.maxInt(u32));
     }
 
     fn poll(self: *Worker) ?*Runnable {

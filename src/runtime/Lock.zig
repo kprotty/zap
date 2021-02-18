@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub usingnamespace if (std.builtin.os.tag == .windows)
+pub const Lock = if (std.builtin.os.tag == .windows)
     WindowsLock
 else if (std.Target.current.isDarwin())
     DarwinLock
@@ -9,7 +9,7 @@ else if (std.builtin.link_libc)
 else if (std.builtin.os.tag == .linux)
     LinuxLock
 else
-    SpinLock;
+    @compileError("Platform not supported");
 
 const WindowsLock = struct {
     lock: std.os.windows.SRWLOCK = std.os.windows.SRWLOCK_INIT,
@@ -27,7 +27,7 @@ const WindowsLock = struct {
     }
 
     pub fn release(self: *@This()) void {
-        std.os.windows.kernel32.AcquireSRWLockExclusive(&self.lock);
+        std.os.windows.kernel32.ReleaseSRWLockExclusive(&self.lock);
     }
 };
 
@@ -43,11 +43,11 @@ const PosixLock = struct {
     }
 
     pub fn acquire(self: *@This()) void {
-        assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+        std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
     }
 
     pub fn release(self: *@This()) void {
-        assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+        std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
     }
 };
 
@@ -75,23 +75,22 @@ const DarwinLock = struct {
     extern "c" fn os_unfair_lock_trylock(oul: *u32) callconv(.C) bool;
 };
 
-const SpinLock = struct {
-    locked: bool = false,
+const LinuxLock = struct {
+    
 
     pub fn deinit(self: *@This()) void {
-        self.* = undefined;
+        @compileError("TODO");
     }
 
     pub fn tryAcquire(self: *@This()) bool {
-        return @atomicRmw(bool, &self.locked, .Xchg, true, .Acquire) == false;
+        @compileError("TODO");
     }
 
     pub fn acquire(self: *@This()) void {
-        while (!self.tryAcquire())
-            std.Thread.spinLoopHint();
+        @compileError("TODO");
     }
 
     pub fn release(self: *@This()) void {
-        @atomicStore(bool, &self.locked, false, .Release);
+        @compileError("TODO");
     }
 };

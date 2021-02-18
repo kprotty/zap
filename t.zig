@@ -10,7 +10,7 @@ pub fn main() !void {
 
 const REPS = 10;
 const SPREAD = 64;
-const COUNT = 100;
+const COUNT = 10_000_000;
 
 var win_heap = std.heap.HeapAllocator.init();
 
@@ -197,7 +197,6 @@ const NewPool = struct {
     }
 
     fn shutdown() void {
-        current.?.shutdown();
         event.set();
     }
 };

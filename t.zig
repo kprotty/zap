@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(NewPool);
+    return benchPool(WindowsPool);
 }
 
 const REPS = 10;
@@ -758,6 +758,48 @@ const DistributedPool = struct {
             }
         }
     };
+};
+
+const WindowsPool = struct {
+    const Runnable = struct {
+        callback: fn (*Runnable) void,
+
+        fn init(callback: fn (*Runnable) void) Runnable {
+            return .{ .callback = callback };
+        }
+    };
+
+    var event = std.Thread.StaticResetEvent{};
+
+    fn run(runnable: *Runnable) !void {
+        schedule(runnable);
+        event.wait();
+    }
+
+    fn schedule(runnable: *Runnable) void {
+        const rc = TrySubmitThreadpoolCallback(
+            struct {
+                fn cb(ex: ?windows.PVOID, pt: ?windows.PVOID) callconv(.C) void {
+                    const r = @ptrCast(*Runnable, @alignCast(@alignOf(Runnable), pt.?));
+                    (r.callback)(r);
+                }
+            }.cb,
+            @ptrCast(windows.PVOID, runnable),
+            null,
+        );
+        if (rc == windows.FALSE) @panic("OOM");
+    }
+
+    fn shutdown() void {
+        event.set();
+    }
+
+    const windows = std.os.windows;
+    extern "kernel32" fn TrySubmitThreadpoolCallback(
+        cb: fn(?windows.PVOID, ?windows.PVOID) callconv(.C) void,
+        pv: ?windows.PVOID,
+        ce: ?windows.PVOID,
+    ) callconv(windows.WINAPI) windows.BOOL;
 };
 
 pub const Semaphore = struct {

@@ -1,4 +1,6 @@
-const Lock = if (std.builtin.os.tag == .windows)
+const std = @import("std");
+
+pub usingnamespace if (std.builtin.os.tag == .windows)
     WindowsLock
 else if (std.Target.current.isDarwin())
     DarwinLock
@@ -16,15 +18,15 @@ const WindowsLock = struct {
         self.* = undefined;
     }
 
-    pub fn tryLock(self: *@This()) bool {
+    pub fn tryAcquire(self: *@This()) bool {
         return std.os.windows.kernel32.TryAcquireSRWLockExclusive(&self.lock) != 0;
     }
 
-    pub fn lock(self: *@This()) void {
+    pub fn acquire(self: *@This()) void {
         std.os.windows.kernel32.AcquireSRWLockExclusive(&self.lock);
     }
 
-    pub fn unlock(self: *@This()) void {
+    pub fn release(self: *@This()) void {
         std.os.windows.kernel32.AcquireSRWLockExclusive(&self.lock);
     }
 };
@@ -36,15 +38,15 @@ const PosixLock = struct {
         _ = std.c.pthread_mutex_destroy(&self.mutex);
     }
 
-    pub fn tryLock(self: *@This()) bool {
+    pub fn tryAcquire(self: *@This()) bool {
         return std.c.pthread_mutex_trylock(&self.mutex) == 0;
     }
 
-    pub fn lock(self: *@This()) void {
+    pub fn acquire(self: *@This()) void {
         assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
     }
 
-    pub fn unlock(self: *@This()) void {
+    pub fn release(self: *@This()) void {
         assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
     }
 };
@@ -56,15 +58,15 @@ const DarwinLock = struct {
         self.* = undefined;
     }
 
-    pub fn tryLock(self: *@This()) bool {
+    pub fn tryAcquire(self: *@This()) bool {
         return os_unfair_lock_trylock(&self.oul);
     }
 
-    pub fn lock(self: *@This()) void {
+    pub fn acquire(self: *@This()) void {
         os_unfair_lock_lock(&self.oul);
     }
 
-    pub fn unlock(self: *@This()) void {
+    pub fn release(self: *@This()) void {
         os_unfair_lock_unlock(&self.oul);
     }
 
@@ -80,15 +82,16 @@ const SpinLock = struct {
         self.* = undefined;
     }
 
-    pub fn tryLock(self: *@This()) bool {
+    pub fn tryAcquire(self: *@This()) bool {
         return @atomicRmw(bool, &self.locked, .Xchg, true, .Acquire) == false;
     }
 
-    pub fn lock(self: *@This()) void {
-        while (!self.tryLock()) spinLoopHint();
+    pub fn acquire(self: *@This()) void {
+        while (!self.tryAcquire())
+            std.Thread.spinLoopHint();
     }
 
-    pub fn unlock(self: *@This()) void {
+    pub fn release(self: *@This()) void {
         @atomicStore(bool, &self.locked, false, .Release);
     }
 };

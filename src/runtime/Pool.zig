@@ -367,7 +367,6 @@ fn joinWorkers(self: *Pool) void {
 const Worker = struct {
     pool: *Pool,
     state: State,
-    thread: Thread,
     lock: Lock = .{},
     next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
@@ -455,18 +454,17 @@ const Worker = struct {
         return TLS.set(worker);
     }
 
-    fn entry(thread: Thread, pool_ptr: usize) void {
+    fn entry(pool_ptr: usize) void {
         const pool = @intToPtr(*Pool, pool_ptr);
         var worker: Worker = undefined;
-        worker.run(pool, thread);
+        worker.run(pool);
     }
 
-    fn run(self: *Worker, pool: *Pool, thread: Thread) void {
+    fn run(self: *Worker, pool: *Pool) void {
         setCurrent(self);
         self.* = .{
             .pool = pool,
             .state = .waking,
-            .thread = thread,
         };
 
         var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Monotonic);
@@ -519,9 +517,6 @@ const Worker = struct {
     }
 
     fn shutdown(self: *Worker) void {
-        const thread = self.thread;
-        defer thread.join();
-
         self.lock.acquire();
         defer self.lock.release();
 

@@ -8,7 +8,6 @@ const Pool = @This();
 
 counter: u32 = 0,
 max_threads: u16,
-join_id: u32 = 0,
 spawned: ?*Worker = null,
 run_queues: [ScheduleHints.Priority.max]GlobalQueue = [_]GlobalQueue{.{}} ** ScheduleHints.Priority.max,
 
@@ -263,7 +262,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
 
 fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
     var is_suspended = false;
-    var is_waking = worker.is_waking;
+    var is_waking = worker.state == .waking;
     var counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
 
     while (true) {
@@ -360,23 +359,26 @@ fn joinWorkers(self: *Pool) void {
         Futex.wait(&self.counter, counter.pack(), null) catch unreachable;
     }
 
-    var workers = @atomicLoad(?*Worker, &self.spawned, .Acquire);
-    while (workers) |worker| {
-        workers = worker.spawned_next;
-        const thread = worker.thread;
-        worker.shutdown();
-        thread.join();
+    if (@atomicLoad(?*Worker, &self.spawned, .Acquire)) |top_worker| {
+        top_worker.shutdown();
     }
 }
 
 const Worker = struct {
-    id: u32,
     pool: *Pool,
+    state: State,
     thread: Thread,
+    lock: Lock = .{},
+    next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
     run_queues: [ScheduleHints.Priority.max]LocalQueue = [_]LocalQueue{.{}} ** ScheduleHints.Priority.max,
-    xorshift: u32,
-    is_waking: bool,
+
+    const State = enum(u32) {
+        running,
+        waking,
+        waiting,
+        shutdown,
+    };
 
     const is_apple_silicon = std.Target.current.isDarwin() and std.builtin.arch != .x86_64;
     const TLS = if (is_apple_silicon) DarwinTLS else DefaultTLS;
@@ -462,40 +464,32 @@ const Worker = struct {
     fn run(self: *Worker, pool: *Pool, thread: Thread) void {
         setCurrent(self);
         self.* = .{
-            .id = 0,
             .pool = pool,
+            .state = .waking,
             .thread = thread,
-            .xorshift = @truncate(u32, @ptrToInt(self) >> @sizeOf(usize)) | 1,
-            .is_waking = true,
         };
 
-        var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Acquire);
+        var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Monotonic);
         while (true) {
             self.spawned_next = spawned_next;
-            if (spawned_next) |next_worker| {
-                if (@addWithOverflow(u32, next_worker.id, 1, &self.id))
-                    std.debug.panic("too many workers spawned", .{});
-            } else {
-                self.id = 1;
-            }
-
             spawned_next = @cmpxchgWeak(
                 ?*Worker,
                 &pool.spawned,
                 spawned_next,
                 self,
                 .Release,
-                .Acquire,
+                .Monotonic,
             ) orelse break;
         }
 
         while (true) {
             if (self.poll()) |runnable| {
-                if (self.is_waking) pool.notifyWorkers(true);
-                self.is_waking = false;
+                if (self.state == .waking)
+                    pool.notifyWorkers(true);
+                self.state = .running;
                 runnable.run();
             } else if (pool.suspendWorker(self)) |is_waking| {
-                self.is_waking = is_waking;
+                self.state = if (is_waking) .waking else .running;
             } else {
                 return self.waitForShutdown();
             }
@@ -504,18 +498,37 @@ const Worker = struct {
 
     fn waitForShutdown(self: *Worker) void {
         while (true) {
-            const join_id = @atomicLoad(u32, &self.pool.join_id, .Acquire);
-            if (join_id == self.id) {
+            self.lock.acquire();
+
+            if (self.state == .shutdown) {
+                self.lock.release();
                 break;
-            } else {
-                Futex.wait(&self.pool.join_id, join_id, null) catch unreachable;
             }
+
+            self.state = .waiting;
+            self.lock.release();
+            Futex.wait(
+                @ptrCast(*const u32, &self.state),
+                @enumToInt(State.waiting),
+                null,
+            ) catch unreachable;
         }
+
+        if (self.spawned_next) |next_worker|
+            next_worker.shutdown();
     }
 
     fn shutdown(self: *Worker) void {
-        @atomicStore(u32, &self.pool.join_id, self.id, .Release);
-        Futex.wake(&self.pool.join_id, std.math.maxInt(u32));
+        const thread = self.thread;
+        defer thread.join();
+
+        self.lock.acquire();
+        defer self.lock.release();
+
+        const state = self.state;
+        @atomicStore(State, &self.state, .shutdown, .Unordered);
+        if (state == .waiting)
+            Futex.wake(@ptrCast(*const u32, &self.state), 1);
     }
 
     fn poll(self: *Worker) ?*Runnable {
@@ -525,21 +538,10 @@ const Worker = struct {
                 return runnable;
             }
 
-            const counter = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic));
-            const num_threads = @as(@TypeOf(self.xorshift), counter.spawned);
-            const skip = blk: {
-                self.xorshift ^= self.xorshift << 13;
-                self.xorshift ^= self.xorshift >> 17;
-                self.xorshift ^= self.xorshift << 5;
-                break :blk (self.xorshift % std.math.max(1, num_threads / 2));
-            };
-
-            var iter = skip + num_threads;
-            var next_target: ?*Worker = null;
+            var iter = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
             while (iter > 0) : (iter -= 1) {
-                const target = next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
-                next_target = target.spawned_next;
-                if (iter > num_threads) continue;
+                const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
+                self.next_target = target.spawned_next;
                 if (target == self) continue;
                 if (self.pollWorker(target, attempt)) |runnable| {
                     return runnable;
@@ -560,7 +562,7 @@ const Worker = struct {
         }
 
         var queue: usize = 0;
-        while (queue < std.math.min(attempt + 1, self.run_queues.len)) : (queue += 1) {
+        while (queue < self.run_queues.len) : (queue += 1) {
             const our_queue = &self.run_queues[queue];
             const target_queue = &target.run_queues[queue];
             if (our_queue.popAndSteal(target_queue)) |runnable| {
@@ -573,7 +575,7 @@ const Worker = struct {
 
     fn pollPool(self: *Worker, pool: *Pool, attempt: usize) ?*Runnable {
         var queue: usize = 0;
-        while (queue < std.math.min(attempt + 1, self.run_queues.len)) : (queue += 1) {
+        while (queue < self.run_queues.len) : (queue += 1) {
             const pool_queue = &pool.run_queues[queue];
             const our_queue = &self.run_queues[queue];
             if (our_queue.popAndStealGlobal(pool_queue)) |runnable| {

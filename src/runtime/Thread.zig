@@ -10,7 +10,7 @@ else
     @compileError("Platform not supported");
 
 const WindowsThread = struct {
-    pub fn spawn(comptime entryFn: fn(@This(), usize) void, context: usize) bool {
+    pub fn spawn(comptime entryFn: fn(usize) void, context: usize) bool {
         const Wrapper = struct {
             fn entry(raw_arg: std.os.windows.LPVOID) callconv(.C) std.os.windows.DWORD {
                 entryFn(@ptrToInt(raw_arg));
@@ -22,7 +22,7 @@ const WindowsThread = struct {
             null,
             0, // use default stack size
             Wrapper.entry,
-            @intToPtr(std.os.windows.LPVOID, &spawner),
+            @intToPtr(std.os.windows.LPVOID, context),
             0,
             null,
         ) orelse return false;
@@ -55,7 +55,7 @@ const PosixThread = struct {
 };
 
 const LinuxThread = struct {
-    pub fn spawn(comptime entryFn: fn(@This(), usize) void, context: usize) bool {
+    pub fn spawn(comptime entryFn: fn(usize) void, context: usize) bool {
         @compileError("TODO");
     }
 

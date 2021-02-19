@@ -9,7 +9,7 @@ const Pool = @This();
 counter: u32 = 0,
 max_threads: u16,
 spawned: ?*Worker = null,
-run_queues: [ScheduleHints.Priority.max]GlobalQueue = [_]GlobalQueue{.{}} ** ScheduleHints.Priority.max,
+run_queue: UnboundedQueue = .{},
 
 pub const InitConfig = struct {
     max_threads: ?u16 = null,
@@ -37,17 +37,7 @@ pub fn shutdown(self: *Pool) void {
     return self.shutdownWorkers();
 }
 
-pub const ScheduleHints = struct {
-    priority: Priority = .Normal,
-
-    pub const Priority = enum {
-        High = 0,
-        Normal = 1,
-        Low = 2,
-
-        const max = 3;
-    };
-};
+pub const ScheduleHints = struct {};
 
 pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
     const batch = Batch.from(batchable);
@@ -55,11 +45,10 @@ pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
         return;
     }
 
-    const priority = @enumToInt(hints.priority);
     if (Worker.getCurrent()) |worker| {
-        worker.run_queues[priority].push(batch);
+        worker.push(hints, batch);
     } else {
-        self.run_queues[priority].push(batch);
+        self.run_queue.push(batch);
     }
 
     self.notifyWorkers(false);
@@ -231,7 +220,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
             &self.counter,
             counter.pack(),
             new_counter.pack(),
-            .Monotonic,
+            .Release,
             .Monotonic,
         )) |updated| {
             std.Thread.spinLoopHint();
@@ -295,7 +284,7 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
                 &self.counter,
                 counter.pack(),
                 new_counter.pack(),
-                .Monotonic,
+                .Acquire,
                 .Monotonic,
             )) |updated| {
                 std.Thread.spinLoopHint();
@@ -338,7 +327,7 @@ fn shutdownWorkers(self: *Pool) void {
             &self.counter,
             counter.pack(),
             new_counter.pack(),
-            .Monotonic,
+            .Release,
             .Monotonic,
         )) |updated| {
             counter = Counter.unpack(updated);
@@ -367,10 +356,11 @@ fn joinWorkers(self: *Pool) void {
 const Worker = struct {
     pool: *Pool,
     state: State,
-    lock: Lock = .{},
+    shutdown_lock: Lock = .{},
     next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
-    run_queues: [ScheduleHints.Priority.max]LocalQueue = [_]LocalQueue{.{}} ** ScheduleHints.Priority.max,
+    run_queue: BoundedQueue = .{},
+    run_queue_overflow: UnboundedQueue = .{},
 
     const State = enum(u32) {
         running,
@@ -481,30 +471,35 @@ const Worker = struct {
         }
 
         while (true) {
-            if (self.poll()) |runnable| {
+            if (self.pop()) |runnable| {
                 if (self.state == .waking)
                     pool.notifyWorkers(true);
                 self.state = .running;
                 runnable.run();
-            } else if (pool.suspendWorker(self)) |is_waking| {
-                self.state = if (is_waking) .waking else .running;
-            } else {
-                return self.waitForShutdown();
+                continue;
             }
+            
+            if (pool.suspendWorker(self)) |is_waking| {
+                self.state = if (is_waking) .waking else .running;
+                continue;
+            }
+
+            self.waitForShutdown();
+            return;
         }
     }
 
     fn waitForShutdown(self: *Worker) void {
         while (true) {
-            self.lock.acquire();
+            self.shutdown_lock.acquire();
 
             if (self.state == .shutdown) {
-                self.lock.release();
+                self.shutdown_lock.release();
                 break;
             }
 
             self.state = .waiting;
-            self.lock.release();
+            self.shutdown_lock.release();
             Futex.wait(
                 @ptrCast(*const u32, &self.state),
                 @enumToInt(State.waiting),
@@ -517,8 +512,8 @@ const Worker = struct {
     }
 
     fn shutdown(self: *Worker) void {
-        self.lock.acquire();
-        defer self.lock.release();
+        self.shutdown_lock.acquire();
+        defer self.shutdown_lock.release();
 
         const state = self.state;
         @atomicStore(State, &self.state, .shutdown, .Unordered);
@@ -526,91 +521,43 @@ const Worker = struct {
             Futex.wake(@ptrCast(*const u32, &self.state), 1);
     }
 
-    fn poll(self: *Worker) ?*Runnable {
-        var attempt: usize = 0;
-        while (attempt < 5) : (attempt += 1) {
-            if (self.pollWorker(self, attempt)) |runnable| {
-                return runnable;
-            }
+    fn push(self: *Worker, hints: ScheduleHints, batch: Batch) void {
+        if (self.run_queue.push(batch)) |overflowed|
+            self.run_queue_overflow.push(overflowed);
+    }
 
-            var iter = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
-            while (iter > 0) : (iter -= 1) {
+    fn pop(self: *Worker) ?*Runnable {
+        if (self.run_queue.pop()) |runnable|
+            return runnable;
+
+        if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
+            return runnable;
+
+        var steal_attempts: usize = 5;
+        while (steal_attempts > 0) : (steal_attempts -= 1) {
+
+            if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
+                return runnable;
+
+            var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
+            while (threads > 0) : (threads -= 1) {
                 const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
                 self.next_target = target.spawned_next;
-                if (target == self) continue;
-                if (self.pollWorker(target, attempt)) |runnable| {
+
+                if (target == self)
+                    continue;
+                if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
                     return runnable;
-                }
-            }
-
-            if (self.pollPool(self.pool, attempt)) |runnable| {
-                return runnable;
+                if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
+                    return runnable;
             }
         }
 
-        return null;
-    }
-
-    fn pollWorker(self: *Worker, target: *Worker, attempt: usize) ?*Runnable {
-        if (self == target and attempt > 0) {
-            return null;
-        }
-
-        var queue: usize = 0;
-        while (queue < self.run_queues.len) : (queue += 1) {
-            const our_queue = &self.run_queues[queue];
-            const target_queue = &target.run_queues[queue];
-            if (our_queue.popAndSteal(target_queue)) |runnable| {
-                return runnable;
-            }
-        }
-
-        return null;
-    }
-
-    fn pollPool(self: *Worker, pool: *Pool, attempt: usize) ?*Runnable {
-        var queue: usize = 0;
-        while (queue < self.run_queues.len) : (queue += 1) {
-            const pool_queue = &pool.run_queues[queue];
-            const our_queue = &self.run_queues[queue];
-            if (our_queue.popAndStealGlobal(pool_queue)) |runnable| {
-                return runnable;
-            }
-        }
-
-        return null;
-    }
-};
-
-const GlobalQueue = UnboundedQueue;
-const LocalQueue = struct {
-    buffer: BoundedQueue = .{},
-    overflow: UnboundedQueue = .{},
-
-    fn push(self: *LocalQueue, batch: Batch) void {
-        if (self.buffer.push(batch)) |overflowed|
-            self.overflow.push(overflowed);
-    }
-
-    fn pop(self: *LocalQueue) ?*Runnable {
-        if (self.buffer.pop()) |runnable|
+        if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
             return runnable;
-        if (self.buffer.stealUnbounded(&self.overflow)) |runnable|
-            return runnable;
-        return null;
-    }
 
-    fn popAndSteal(self: *LocalQueue, target: *LocalQueue) ?*Runnable {
-        if (self.buffer.stealBounded(&target.buffer)) |runnable|
-            return runnable;
-        if (self.buffer.stealUnbounded(&target.overflow)) |runnable|
-            return runnable;
         return null;
-    }
-
-    fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue) ?*Runnable {
-        return self.buffer.stealUnbounded(target);
-    }
+    }    
 };
 
 const UnboundedQueue = struct {
@@ -692,7 +639,7 @@ const BoundedQueue = struct {
     buffer: [capacity]*Runnable = undefined,
 
     const Pos = u8;
-    const capacity = 64;
+    const capacity = 128;
     comptime {
         std.debug.assert(capacity <= std.math.maxInt(Pos));
     }

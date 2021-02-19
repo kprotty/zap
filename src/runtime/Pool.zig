@@ -37,7 +37,15 @@ pub fn shutdown(self: *Pool) void {
     return self.shutdownWorkers();
 }
 
-pub const ScheduleHints = struct {};
+pub const ScheduleHints = struct {
+    priority: Priority = .Normal,
+
+    pub const Priority = enum {
+        High,
+        Normal,
+        Low,
+    };
+};
 
 pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
     const batch = Batch.from(batchable);
@@ -360,6 +368,7 @@ const Worker = struct {
     next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
     run_queue: BoundedQueue = .{},
+    run_queue_override: UnboundedQueue = .{},
     run_queue_overflow: UnboundedQueue = .{},
 
     const State = enum(u32) {
@@ -522,11 +531,20 @@ const Worker = struct {
     }
 
     fn push(self: *Worker, hints: ScheduleHints, batch: Batch) void {
-        if (self.run_queue.push(batch)) |overflowed|
-            self.run_queue_overflow.push(overflowed);
+        switch (hints.priority) {
+            .High => self.run_queue_override.push(batch),
+            .Low => self.run_queue_overflow.push(batch),
+            .Normal => {
+                if (self.run_queue.push(batch)) |overflowed|
+                    self.run_queue_overflow.push(overflowed);
+            },
+        }
     }
 
     fn pop(self: *Worker) ?*Runnable {
+        if (self.run_queue.stealUnbounded(&self.run_queue_override)) |runnable|
+            return runnable;
+
         if (self.run_queue.pop()) |runnable|
             return runnable;
 
@@ -549,6 +567,8 @@ const Worker = struct {
                 if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
                     return runnable;
                 if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
+                    return runnable;
+                if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
                     return runnable;
             }
         }
@@ -575,12 +595,13 @@ const UnboundedQueue = struct {
     fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
         var tail = @atomicLoad(usize, &self.tail, .Monotonic);
         while (true) : (std.Thread.spinLoopHint()) {
+
             const head = @atomicLoad(?*Runnable, &self.head, .Monotonic);
             if (head == null or head == &self.stub)
                 return null;
+
             if (tail & 1 != 0)
                 return null;
-
             tail = @cmpxchgWeak(
                 usize,
                 &self.tail,

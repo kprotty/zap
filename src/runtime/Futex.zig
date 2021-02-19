@@ -137,7 +137,7 @@ fn PosixFutex(comptime Config: type) type {
 
             pub fn set(self: *@This()) void {
                 std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
-                defer std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+                defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
 
                 const state = self.state;
                 self.state = .notified;
@@ -154,7 +154,7 @@ fn PosixFutex(comptime Config: type) type {
                     deadline = timestamp(std.os.CLOCK_MONOTONIC, timeout_ns);
 
                 std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
-                defer std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+                defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
 
                 switch (self.state) {
                     .empty => self.state = .waiting,
@@ -524,8 +524,12 @@ fn GenericFutex(comptime Config: type) type {
                 waiter.address = address;
                 waiter.prev = self.tail;
                 waiter.next = null;
-                if (self.tail) |tail| tail.next = waiter;
-                if (self.head == null) self.head = waiter;
+
+                if (self.head == null) 
+                    self.head = waiter;
+                if (self.tail) |tail| 
+                    tail.next = waiter;
+                self.tail = waiter;
             }
 
             fn pop(self: *Bucket, address: usize, max: usize) ?*Waiter {
@@ -554,11 +558,21 @@ fn GenericFutex(comptime Config: type) type {
             }
 
             fn remove(self: *Bucket, waiter: *Waiter) void {
+                std.debug.assert(waiter.waiting);
                 waiter.waiting = false;
-                if (waiter.prev) |prev| prev.next = waiter.next;
-                if (waiter.next) |next| next.prev = waiter.prev;
-                if (self.tail == waiter) self.tail = waiter.prev;
-                if (self.head == waiter) self.head = waiter.next;
+
+                if (waiter.prev) |prev| 
+                    prev.next = waiter.next;
+                if (waiter.next) |next|
+                    next.prev = waiter.prev;
+
+                if (self.head == waiter) {
+                    self.head = waiter.next;
+                    if (self.head == null)
+                        self.tail = null;
+                } else if (self.tail == waiter) {
+                    self.tail = waiter.prev;
+                }
             }
         };  
 

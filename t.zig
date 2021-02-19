@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(WindowsPool);
+    return benchPool(NewPool);
 }
 
 const REPS = 10;

@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(NewPool);
+    return benchPool(DispatchPool);
 }
 
 const REPS = 10;
@@ -169,10 +169,6 @@ const BasicPool = struct {
         return runnable;
     }
 };
-
-const DispatchPool = @import("./dispatch.zig");
-
-const QueuePool = @import("./d2.zig");
 
 const NewPool = struct {
     const Pool = @import("./src/runtime/Pool.zig");
@@ -800,6 +796,65 @@ const WindowsPool = struct {
         pv: ?windows.PVOID,
         ce: ?windows.PVOID,
     ) callconv(windows.WINAPI) windows.BOOL;
+};
+
+const DispatchPool = struct {
+    pub const Runnable = struct {
+        next: ?*Runnable = null,
+        callback: fn (*Runnable) void,
+
+        pub fn init(callback: fn (*Runnable) void) Runnable {
+            return .{ .callback = callback };
+        }
+    };
+
+    var sem: ?dispatch_semaphore_t = null;
+
+    pub fn run(runnable: *Runnable) !void {
+        sem = dispatch_semaphore_create(0) orelse return error.SemaphoreCreate;
+        defer dispatch_release(@ptrCast(*c_void, sem.?));
+        
+        const queue = dispatch_queue_create(null, @ptrCast(?*c_void, &_dispatch_queue_attr_concurrent)) orelse return error.QueueCreate;
+        defer dispatch_release(@ptrCast(*c_void, queue));
+
+        dispatch_async_f(queue, @ptrCast(*c_void, runnable), dispatchRun);
+        _ = dispatch_semaphore_wait(sem.?, DISPATCH_TIME_FOREVER);
+    }
+
+    pub fn schedule(runnable: *Runnable) void {
+        const queue = dispatch_get_current_queue() orelse unreachable;
+        dispatch_async_f(queue, @ptrCast(*c_void, runnable), dispatchRun);
+    }
+
+    fn dispatchRun(ptr: ?*c_void) callconv(.C) void {
+        const runnable_ptr = @ptrCast(?*Runnable, @alignCast(@alignOf(Runnable), ptr));
+        const runnable = runnable_ptr orelse unreachable;
+        return (runnable.callback)(runnable);
+    }
+
+    pub fn shutdown() void {
+        _ = dispatch_semaphore_signal(sem.?);
+    }
+
+    const dispatch_semaphore_t = *opaque {};
+    const dispatch_time_t = u64;
+    const DISPATCH_TIME_NOW = @as(dispatch_time_t, 0);
+    const DISPATCH_TIME_FOREVER = ~@as(dispatch_time_t, 0);
+
+    extern "c" fn dispatch_semaphore_create(value: isize) ?dispatch_semaphore_t;
+    extern "c" fn dispatch_semaphore_wait(dsema: dispatch_semaphore_t, timeout: dispatch_time_t) isize;
+    extern "c" fn dispatch_semaphore_signal(dsema: dispatch_semaphore_t) isize;
+    extern "c" fn dispatch_release(object: *c_void) void;
+
+    const dispatch_queue_t = *opaque {};
+    const DISPATCH_QUEUE_PRIORITY_DEFAULT = 0;
+    const dispatch_function_t = fn(?*c_void) callconv(.C) void;
+
+    extern "c" var _dispatch_queue_attr_concurrent: usize;
+    extern "c" fn dispatch_queue_create(label: ?[*:0]const u8, attr: ?*c_void) ?dispatch_queue_t;
+
+    extern "c" fn dispatch_get_current_queue() ?dispatch_queue_t;
+    extern "c" fn dispatch_async_f(queue: dispatch_queue_t, ctx: ?*c_void, work: dispatch_function_t) void;
 };
 
 pub const Semaphore = struct {

@@ -58,28 +58,64 @@ const LinuxFutex = struct {
     }
 };
 
-const DarwinFutex = PosixFutex(struct {
-    pub const Lock = struct {
-        oul: u32 = 0,
+const DarwinFutex = struct {
+    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
+        var timeout_us: u32 = 0;
+        if (timeout) |timeout_ns| {
+            timeout_us = std.math.cast(u32, timeout_ns / std.time.ns_per_us) catch 0;
+        }
+        
+        const ret = __ulock_wait(
+            UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
+            @ptrCast(*const c_void, ptr),
+            @as(u64, expected),
+            timeout_us,
+        );
 
-        pub fn acquire(self: *@This()) void {
-            os_unfair_lock_lock(&self.oul);
+        if (ret < 0) {
+            switch (-ret) {
+                std.os.EINTR => {},
+                std.os.EFAULT => unreachable,
+                std.os.ETIMEDOUT => return error.TimedOut,
+                else => |errno| {
+                    const err = std.os.unexpectedErrno(@intCast(usize, errno));
+                    unreachable;
+                },
+            }
+        }
+    }
+
+    pub fn wake(ptr: *const u32, waiters: u32) void {
+        var flags: u32 = UL_COMPARE_AND_WAIT | ULF_NO_ERRNO;
+        if (waiters > 1) {
+            flags |= ULF_WAKE_ALL;
         }
 
-        pub fn release(self: *@This()) void {
-            os_unfair_lock_unlock(&self.oul);
-        }
+        while (true) {
+            const ret = __ulock_wake(
+                flags,
+                @ptrCast(*const c_void, ptr),
+                @as(u64, 0),
+            );
 
-        extern "c" fn os_unfair_lock_lock(oul: *u32) void;
-        extern "c" fn os_unfair_lock_unlock(oul: *u32) void;
-    };
+            if (ret < 0) {
+                switch (-ret) {
+                    std.os.ENOENT => {},
+                    std.os.EINTR => continue,
+                    else => |errno| {
+                        const err = std.os.unexpectedErrno(@intCast(usize, errno));
+                        unreachable;
+                    },
+                }
+            }
+
+            return;
+        }
+    }
 
     pub fn yield(iteration: usize) bool {
-        if (std.builtin.os.tag != .macos)
-            return false;
-
         const max_spin = switch (std.builtin.arch) {
-            .x86_64 => 100,
+            .x86_64 => 1000,
             else => 10,
         };
 
@@ -89,159 +125,160 @@ const DarwinFutex = PosixFutex(struct {
         std.Thread.spinLoopHint();
         return true;
     }
-});
 
-fn PosixFutex(comptime Config: type) type {
-    return GenericFutex(struct {
-        pub const Lock = if (@hasDecl(Config, "Lock"))
-            Config.Lock
-        else
-            struct {
-                mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    const ULF_WAKE_ALL = 0x100;
+    const UL_COMPARE_AND_WAIT = 1;
+    const ULF_NO_ERRNO = 0x1000000;
+    extern "c" fn __ulock_wake(op: u32, addr: ?*const c_void, val: u64) c_int;
+    extern "c" fn __ulock_wait(op: u32, addr: ?*const c_void, val: u64, timeout_us: u32) c_int;
+};
 
-                pub fn acquire(self: *@This()) void {
-                    const rc = std.c.pthread_mutex_lock(&self.mutex);
-                    std.debug.assert(rc == 0);
-                }
+const PosixFutex = GenericFutex(struct {
+    pub const Lock = struct {
+        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
-                pub fn release(self: *@This()) void {
-                    const rc = std.c.pthread_mutex_unlock(&self.mutex);
-                    std.debug.assert(rc == 0);
-                }
-            };
+        pub fn acquire(self: *@This()) void {
+            const rc = std.c.pthread_mutex_lock(&self.mutex);
+            std.debug.assert(rc == 0);
+        }
 
-        pub const Event = struct {
-            state: State = .empty,
-            cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-            mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+        pub fn release(self: *@This()) void {
+            const rc = std.c.pthread_mutex_unlock(&self.mutex);
+            std.debug.assert(rc == 0);
+        }
+    };
 
-            const State = enum{
-                empty,
-                waiting,
-                notified,
-            };
+    pub const Event = struct {
+        state: State = .empty,
+        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
-            pub fn init(self: *@This()) void {
-                self.* = .{};
+        const State = enum{
+            empty,
+            waiting,
+            notified,
+        };
+
+        pub fn init(self: *@This()) void {
+            self.* = .{};
+        }
+
+        pub fn deinit(self: *@This()) void {
+            const rc = std.c.pthread_cond_destroy(&self.cond);
+            std.debug.assert(rc == 0 or rc == std.os.EINVAL);
+
+            const rm = std.c.pthread_mutex_destroy(&self.mutex);
+            std.debug.assert(rm == 0 or rm == std.os.EINVAL);
+
+            self.* = undefined;
+        }
+
+        pub fn set(self: *@This()) void {
+            std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+            defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+
+            const state = self.state;
+            self.state = .notified;
+            switch (state) {
+                .empty => {},
+                .waiting => std.debug.assert(std.c.pthread_cond_signal(&self.cond) == 0),
+                .notified => unreachable,
+            }
+        }
+
+        pub fn wait(self: *@This(), timeout: ?u64) error{TimedOut}!void {
+            var deadline: ?u64 = null;
+            if (timeout) |timeout_ns|
+                deadline = timestamp(std.os.CLOCK_MONOTONIC, timeout_ns);
+
+            std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
+            defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
+
+            switch (self.state) {
+                .empty => self.state = .waiting,
+                .waiting => unreachable,
+                .notified => return,
             }
 
-            pub fn deinit(self: *@This()) void {
-                const rc = std.c.pthread_cond_destroy(&self.cond);
-                std.debug.assert(rc == 0 or rc == std.os.EINVAL);
-
-                const rm = std.c.pthread_mutex_destroy(&self.mutex);
-                std.debug.assert(rm == 0 or rm == std.os.EINVAL);
-
-                self.* = undefined;
-            }
-
-            pub fn set(self: *@This()) void {
-                std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
-                defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
-
-                const state = self.state;
-                self.state = .notified;
-                switch (state) {
-                    .empty => {},
-                    .waiting => std.debug.assert(std.c.pthread_cond_signal(&self.cond) == 0),
-                    .notified => unreachable,
-                }
-            }
-
-            pub fn wait(self: *@This(), timeout: ?u64) error{TimedOut}!void {
-                var deadline: ?u64 = null;
-                if (timeout) |timeout_ns|
-                    deadline = timestamp(std.os.CLOCK_MONOTONIC, timeout_ns);
-
-                std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == 0);
-                defer std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == 0);
-
+            while (true) {
                 switch (self.state) {
-                    .empty => self.state = .waiting,
-                    .waiting => unreachable,
+                    .empty => unreachable,
+                    .waiting => {},
                     .notified => return,
                 }
 
-                while (true) {
-                    switch (self.state) {
-                        .empty => unreachable,
-                        .waiting => {},
-                        .notified => return,
-                    }
+                const deadline_ns = deadline orelse {
+                    std.debug.assert(std.c.pthread_cond_wait(&self.cond, &self.mutex) == 0);
+                    continue;
+                };
 
-                    const deadline_ns = deadline orelse {
-                        std.debug.assert(std.c.pthread_cond_wait(&self.cond, &self.mutex) == 0);
-                        continue;
-                    };
-
-                    var ns = timestamp(std.os.CLOCK_MONOTONIC, 0);
-                    if (ns > deadline_ns) {
-                        self.state = .empty;
-                        return error.TimedOut;
-                    } else {
-                        ns = timestamp(std.os.CLOCK_REALTIME, deadline_ns - ns);
-                    }
-
-                    var ts: std.os.timespec = undefined;
-                    ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), ns / std.time.ns_per_s) catch std.math.maxInt(@TypeOf(ts.tv_sec));
-                    ts.tv_nsec = std.math.cast(@TypeOf(ts.tv_nsec), ns % std.time.ns_per_s) catch std.time.ns_per_s;
-                    
-                    switch (std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts)) {
-                        0 => {},
-                        std.os.ETIMEDOUT => {},
-                        else => unreachable,
-                    }
-                }
-            }
-
-            pub fn yield(iteration: usize) bool {
-                if (@hasDecl(Config, "yield"))
-                    return Config.yield(iteration);
-                
-                if (iteration > 40)
-                    return false;
-
-                std.os.sched_yield() catch {};
-                return true;
-            }
-
-            fn timestamp(comptime clock: u32, offset: u64) u64{
-                var now: u64 = undefined;
-                if (std.Target.current.isDarwin()) {
-                    switch (clock) {
-                        std.os.CLOCK_REALTIME => {
-                            var tv: std.os.timeval = undefined;
-                            std.os.gettimeofday(&tv, null);
-                            now = @intCast(u64, tv.tv_sec) * std.time.ns_per_s;
-                            now += @intCast(u64, tv.tv_usec) * std.time.ns_per_us;
-                        },
-                        std.os.CLOCK_MONOTONIC => {
-                            var freq: std.os.darwin.mach_timebase_info_data = undefined;
-                            std.os.darwin.mach_timebase_info(&freq);
-                            now = std.os.darwin.mach_absolute_time();
-                            if (freq.numer > 1) now *= freq.numer;
-                            if (freq.denom > 1) now /= freq.denom;
-                        },
-                        else => unreachable,
-                    }
+                var ns = timestamp(std.os.CLOCK_MONOTONIC, 0);
+                if (ns > deadline_ns) {
+                    self.state = .empty;
+                    return error.TimedOut;
                 } else {
-                    var ts: std.os.timespec = undefined;
-                    std.os.clock_gettime(clock, &ts) catch {
-                        ts.tv_sec = std.math.maxInt(@TypeOf(ts.tv_sec));
-                        ts.tv_nsec = std.time.ns_per_s - 1;
-                    };
-                    now = @intCast(u64, ts.tv_sec) * std.time.ns_per_s;
-                    now += @intCast(u64, ts.tv_nsec);
+                    ns = timestamp(std.os.CLOCK_REALTIME, deadline_ns - ns);
                 }
+
+                var ts: std.os.timespec = undefined;
+                ts.tv_sec = std.math.cast(@TypeOf(ts.tv_sec), ns / std.time.ns_per_s) catch std.math.maxInt(@TypeOf(ts.tv_sec));
+                ts.tv_nsec = std.math.cast(@TypeOf(ts.tv_nsec), ns % std.time.ns_per_s) catch std.time.ns_per_s;
                 
-                var ns = now;
-                if (@addWithOverflow(u64, now, offset, &ns))
-                    ns = std.math.maxInt(u64);
-                return ns;
+                switch (std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts)) {
+                    0 => {},
+                    std.os.ETIMEDOUT => {},
+                    else => unreachable,
+                }
             }
-        };
-    });
-}
+        }
+
+        pub fn yield(iteration: usize) bool {
+            if (@hasDecl(Config, "yield"))
+                return Config.yield(iteration);
+            
+            if (iteration > 40)
+                return false;
+
+            std.os.sched_yield() catch {};
+            return true;
+        }
+
+        fn timestamp(comptime clock: u32, offset: u64) u64{
+            var now: u64 = undefined;
+            if (std.Target.current.isDarwin()) {
+                switch (clock) {
+                    std.os.CLOCK_REALTIME => {
+                        var tv: std.os.timeval = undefined;
+                        std.os.gettimeofday(&tv, null);
+                        now = @intCast(u64, tv.tv_sec) * std.time.ns_per_s;
+                        now += @intCast(u64, tv.tv_usec) * std.time.ns_per_us;
+                    },
+                    std.os.CLOCK_MONOTONIC => {
+                        var freq: std.os.darwin.mach_timebase_info_data = undefined;
+                        std.os.darwin.mach_timebase_info(&freq);
+                        now = std.os.darwin.mach_absolute_time();
+                        if (freq.numer > 1) now *= freq.numer;
+                        if (freq.denom > 1) now /= freq.denom;
+                    },
+                    else => unreachable,
+                }
+            } else {
+                var ts: std.os.timespec = undefined;
+                std.os.clock_gettime(clock, &ts) catch {
+                    ts.tv_sec = std.math.maxInt(@TypeOf(ts.tv_sec));
+                    ts.tv_nsec = std.time.ns_per_s - 1;
+                };
+                now = @intCast(u64, ts.tv_sec) * std.time.ns_per_s;
+                now += @intCast(u64, ts.tv_nsec);
+            }
+            
+            var ns = now;
+            if (@addWithOverflow(u64, now, offset, &ns))
+                ns = std.math.maxInt(u64);
+            return ns;
+        }
+    };
+});
 
 const WindowsFutex = struct {
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {

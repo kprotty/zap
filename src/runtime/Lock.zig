@@ -76,21 +76,88 @@ const DarwinLock = struct {
 };
 
 const LinuxLock = struct {
-    
+    state: State = .unlocked,
+
+    const Futex = @import("./Futex.zig").Futex;
+    const State = enum(u32) {
+        unlocked,
+        locked,
+        contended,
+    };
 
     pub fn deinit(self: *@This()) void {
-        @compileError("TODO");
+        self.* = undefined;
     }
 
     pub fn tryAcquire(self: *@This()) bool {
-        @compileError("TODO");
+        return @cmpxchgStrong(
+            State,
+            &self.state,
+            .unlocked,
+            .locked,
+            .Acquire,
+            .Monotonic,
+        ) == null;
     }
 
     pub fn acquire(self: *@This()) void {
-        @compileError("TODO");
+        const state = @atomicRmw(State, &self.state, .Xchg, .locked, .Acquire);
+        if (state != .unlocked) {
+            self.acquireSlow(state);
+        }
+    }
+
+    fn acquireSlow(self: *@This(), current_state: State) void {
+        @setCold(true);
+
+        var adaptive_spin: usize = 0;
+        var new_state = current_state;
+        while (true) {
+            var state = @atomicLoad(State, &self.state, .Monotonic);
+
+            if (state == .unlocked) {
+                state = @cmpxchgStrong(
+                    State,
+                    &self.state,
+                    .unlocked,
+                    new_state,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return;
+            }
+
+            if (state != .contended and Futex.yield(adaptive_spin)) {
+                adaptive_spin +%= 1;
+                continue;
+            }
+
+            new_state = .contended;
+            if (state != .contended) {
+                state = @atomicRmw(State, &self.state, .Xchg, .contended, .Acquire);
+                if (state == .unlocked) {
+                    return;
+                }
+            }
+
+            adaptive_spin = 0;
+            Futex.wait(
+                @ptrCast(*const u32, &self.state),
+                @enumToInt(State.contended),
+                null,
+            ) catch unreachable;
+        }
     }
 
     pub fn release(self: *@This()) void {
-        @compileError("TODO");
+        switch (@atomicRmw(State, &self.state, .Xchg, .unlocked, .Release)) {
+            .unlocked => unreachable,
+            .locked => {},
+            .contended => self.releaseSlow(),
+        } 
+    }
+
+    fn releaseSlow(self: *@This()) void {
+        @setCold(true);
+        Futex.wake(@ptrCast(*const u32, &self.state), 1);
     }
 };

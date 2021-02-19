@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(DispatchPool);
+    return benchPool(NewPool);
 }
 
 const REPS = 10;
@@ -813,7 +813,7 @@ const DispatchPool = struct {
     pub fn run(runnable: *Runnable) !void {
         sem = dispatch_semaphore_create(0) orelse return error.SemaphoreCreate;
         defer dispatch_release(@ptrCast(*c_void, sem.?));
-        
+
         const queue = dispatch_queue_create(null, @ptrCast(?*c_void, &_dispatch_queue_attr_concurrent)) orelse return error.QueueCreate;
         defer dispatch_release(@ptrCast(*c_void, queue));
 

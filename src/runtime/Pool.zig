@@ -41,9 +41,9 @@ pub const ScheduleHints = struct {
     priority: Priority = .Normal,
 
     pub const Priority = enum {
-        High,
-        Normal,
         Low,
+        Normal,
+        High,
     };
 };
 
@@ -367,6 +367,7 @@ const Worker = struct {
     shutdown_lock: Lock = .{},
     next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
+    run_tick: usize,
     run_queue: BoundedQueue = .{},
     run_queue_override: UnboundedQueue = .{},
     run_queue_overflow: UnboundedQueue = .{},
@@ -464,6 +465,7 @@ const Worker = struct {
         self.* = .{
             .pool = pool,
             .state = .waking,
+            .run_tick = @ptrToInt(self) *% 31,
         };
 
         var spawned_next = @atomicLoad(?*Worker, &pool.spawned, .Monotonic);
@@ -542,6 +544,28 @@ const Worker = struct {
     }
 
     fn pop(self: *Worker) ?*Runnable {
+        self.run_tick +%= 1;
+
+        if (self.run_tick % 257 == 0) {
+            if (self.steal()) |runnable|
+                return runnable;
+        }
+
+        if (self.run_tick % 127 == 0) {
+            if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
+                return runnable;
+        }
+
+        if (self.run_tick % 61 == 0) {
+            if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
+                return runnable;
+        }
+
+        if (self.run_tick % 31 == 0) {
+            if (self.run_queue.pop()) |runnable|
+                return runnable;
+        }
+
         if (self.run_queue.stealUnbounded(&self.run_queue_override)) |runnable|
             return runnable;
 
@@ -551,33 +575,41 @@ const Worker = struct {
         if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
             return runnable;
 
-        var steal_attempts: usize = 5;
+        var steal_attempts: usize = if (std.builtin.arch == .x86_64) 8 else 4;
         while (steal_attempts > 0) : (steal_attempts -= 1) {
-
             if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
                 return runnable;
 
-            var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
-            while (threads > 0) : (threads -= 1) {
-                const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
-                self.next_target = target.spawned_next;
-
-                if (target == self)
-                    continue;
-                if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
-                    return runnable;
-                if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
-                    return runnable;
-                if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
-                    return runnable;
-            }
+            if (self.steal()) |runnable|
+                return runnable;
         }
 
         if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
             return runnable;
 
         return null;
-    }    
+    }
+
+    fn steal(self: *Worker) ?*Runnable {
+        var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
+        while (threads > 0) : (threads -= 1) {
+            const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
+            self.next_target = target.spawned_next;
+            if (target == self)
+                continue;
+                
+            if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
+                return runnable;
+
+            if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
+                return runnable;
+
+            if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
+                return runnable;
+        }
+
+        return null;
+    }
 };
 
 const UnboundedQueue = struct {
@@ -659,8 +691,8 @@ const BoundedQueue = struct {
     tail: Pos = 0,
     buffer: [capacity]*Runnable = undefined,
 
-    const Pos = u8;
-    const capacity = 128;
+    const Pos = std.meta.Int(.unsigned, std.meta.bitCount(usize) / 2);
+    const capacity = 256;
     comptime {
         std.debug.assert(capacity <= std.math.maxInt(Pos));
     }

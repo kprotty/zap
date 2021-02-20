@@ -38,7 +38,7 @@ pub fn shutdown(self: *Pool) void {
 }
 
 pub const ScheduleHints = struct {
-    priority: Priority = .Normal,
+    priority: Priority = .High,
 
     pub const Priority = enum {
         Low,
@@ -548,22 +548,22 @@ const Worker = struct {
         }
 
         if (self.run_tick % 61 == 0) {
-            if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
+            if (self.run_queue.pop()) |runnable|
                 return runnable;
         }
 
         if (self.run_tick % 31 == 0) {
-            if (self.run_queue.pop()) |runnable|
+            if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
                 return runnable;
         }
 
         if (self.run_queue.stealUnbounded(&self.run_queue_override)) |runnable|
             return runnable;
 
-        if (self.run_queue.pop()) |runnable|
+        if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
             return runnable;
 
-        if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
+        if (self.run_queue.pop()) |runnable|
             return runnable;
 
         var steal_attempts: usize = if (std.builtin.arch == .x86_64) 8 else 4;
@@ -588,14 +588,14 @@ const Worker = struct {
             self.next_target = target.spawned_next;
             if (target == self)
                 continue;
+
+            if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
+                return runnable;
                 
             if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
                 return runnable;
 
             if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
-                return runnable;
-
-            if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
                 return runnable;
         }
 

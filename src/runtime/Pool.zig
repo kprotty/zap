@@ -9,7 +9,7 @@ const Pool = @This();
 counter: u32 = 0,
 max_threads: u16,
 spawned: ?*Worker = null,
-run_queue: UnboundedQueue = .{},
+run_queues: [Priority.Count]GlobalQueue = [_]GlobalQueue{.{}} ** Priority.Count,
 
 pub const InitConfig = struct {
     max_threads: ?u16 = null,
@@ -37,14 +37,21 @@ pub fn shutdown(self: *Pool) void {
     return self.shutdownWorkers();
 }
 
-pub const ScheduleHints = struct {
-    priority: Priority = .Normal,
+pub const Priority = enum {
+    Low = 0,
+    Normal = 1,
+    High = 2,
 
-    pub const Priority = enum {
-        Low,
-        Normal,
-        High,
-    };
+    pub const Max = Priority.High;
+    pub const Count = @enumToInt(Max) + 1;
+
+    fn toArrayIndex(self: Priority) usize {
+        return @enumToInt(Priority.Max) - @enumToInt(self);
+    }
+};
+
+pub const ScheduleHints = struct {
+    priority: Priority = .High,
 };
 
 pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
@@ -54,9 +61,9 @@ pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
     }
 
     if (Worker.getCurrent()) |worker| {
-        worker.push(hints, batch);
+        worker.run_queues[hints.priority.toArrayIndex()].push(batch);
     } else {
-        self.run_queue.push(batch);
+        self.run_queues[hints.priority.toArrayIndex()].push(batch);
     }
 
     self.notifyWorkers(false);
@@ -359,9 +366,7 @@ const Worker = struct {
     next_target: ?*Worker = null,
     spawned_next: ?*Worker = null,
     run_tick: usize,
-    run_queue: BoundedQueue = .{},
-    run_queue_override: UnboundedQueue = .{},
-    run_queue_overflow: UnboundedQueue = .{},
+    run_queues: [Priority.Count]LocalQueue = [_]LocalQueue{.{}} ** Priority.Count,
 
     const State = enum(u32) {
         running,
@@ -523,81 +528,141 @@ const Worker = struct {
             Futex.wake(@ptrCast(*const u32, &self.state), 1);
     }
 
-    fn push(self: *Worker, hints: ScheduleHints, batch: Batch) void {
-        switch (hints.priority) {
-            .High => self.run_queue_override.push(batch),
-            .Low => self.run_queue_overflow.push(batch),
-            .Normal => {
-                if (self.run_queue.push(batch)) |overflowed|
-                    self.run_queue_overflow.push(overflowed);
-            },
-        }
-    }
-
     fn pop(self: *Worker) ?*Runnable {
         self.run_tick +%= 1;
 
         if (self.run_tick % 257 == 0) {
-            if (self.steal()) |runnable|
+            if (self.pollWorkers(0)) |runnable|
                 return runnable;
         }
 
         if (self.run_tick % 127 == 0) {
-            if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
+            if (self.pollPool()) |runnable|
                 return runnable;
         }
 
+        var priorities: [Priority.Count]Priority = undefined;
         if (self.run_tick % 61 == 0) {
-            if (self.run_queue.pop()) |runnable|
+            priorities = [_]Priority{ .Low, .Normal, .High };
+        } else if (self.run_tick % 31 == 0) {
+            priorities = [_]Priority{ .Normal, .High, .Low };
+        } else {
+            priorities = [_]Priority{ .High, .Normal, .Low };
+        }
+
+        for (priorities) |priority| {
+            if (self.run_queues[priority.toArrayIndex()].pop(self.run_tick)) |runnable|
                 return runnable;
         }
 
-        if (self.run_tick % 31 == 0) {
-            if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
+        const max_attempts = switch (std.builtin.arch) {
+            .x86_64 => 32,
+            .aarch64 => 16,
+            else => 8,
+        };
+
+        var steal_attempt: usize = 0;
+        while (steal_attempt < max_attempts) : (steal_attempt += 1) {
+            if (self.pollPool()) |runnable|
+                return runnable;
+
+            if (self.pollWorkers(steal_attempt)) |runnable|
                 return runnable;
         }
 
-        if (self.run_queue.stealUnbounded(&self.run_queue_override)) |runnable|
-            return runnable;
-
-        if (self.run_queue.stealUnbounded(&self.run_queue_overflow)) |runnable|
-            return runnable;
-
-        if (self.run_queue.pop()) |runnable|
-            return runnable;
-
-        var steal_attempts: usize = if (std.builtin.arch == .x86_64) 8 else 4;
-        while (steal_attempts > 0) : (steal_attempts -= 1) {
-            if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
-                return runnable;
-
-            if (self.steal()) |runnable|
-                return runnable;
-        }
-
-        if (self.run_queue.stealUnbounded(&self.pool.run_queue)) |runnable|
+        if (self.pollPool()) |runnable|
             return runnable;
 
         return null;
     }
 
-    fn steal(self: *Worker) ?*Runnable {
+    fn pollPool(self: *Worker) ?*Runnable {
+        return self.pollWith(
+            std.math.maxInt(usize),
+            &self.pool.run_queues,
+            "popAndStealGlobal",
+        );
+    }
+
+    fn pollWorkers(self: *Worker, attempt: usize) ?*Runnable {
         var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
         while (threads > 0) : (threads -= 1) {
             const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
             self.next_target = target.spawned_next;
+
             if (target == self)
                 continue;
 
-            if (self.run_queue.stealUnbounded(&target.run_queue_override)) |runnable|
-                return runnable;
-                
-            if (self.run_queue.stealUnbounded(&target.run_queue_overflow)) |runnable|
-                return runnable;
-
-            if (self.run_queue.stealBounded(&target.run_queue)) |runnable|
+            if (self.pollWith(attempt, &target.run_queues, "popAndStealLocal")) |runnable|
                 return runnable;
         }
+
+        return null;
+    }
+
+    fn pollWith(
+        self: *Worker,
+        attempt: usize,
+        target_queues: anytype,
+        comptime pollFn: []const u8,
+    ) ?*Runnable {
+        const priorities: []const Priority = switch (attempt) {
+            0 => &[_]Priority{ .High },
+            1 => &[_]Priority{ .High, .Normal },
+            else => &[_]Priority{ .High, .Normal, .Low },
+        };
+
+        for (priorities) |priority| {
+            const index = priority.toArrayIndex();
+            const our_queue = &self.run_queues[index];
+            const target_queue = &target_queues[index];
+            if (@field(LocalQueue, pollFn)(our_queue, target_queue)) |runnable|
+                return runnable;
+        }
+
+        return null;
+    }
+};
+
+const GlobalQueue = UnboundedQueue;
+
+const LocalQueue = struct {
+    buffer: BoundedQueue = .{},
+    overflow: UnboundedQueue = .{},
+
+    fn push(self: *LocalQueue, batch: Batch) void {
+        if (self.buffer.push(batch)) |overflowed|
+            self.overflow.push(overflowed);
+    }
+
+    fn pop(self: *LocalQueue, tick: usize) ?*Runnable {
+        if (tick % 61 == 0) {
+            if (self.buffer.pop()) |runnable|
+                return runnable;
+        }
+        
+        if (self.buffer.stealUnbounded(&self.overflow)) |runnable|
+            return runnable;
+
+        if (self.buffer.pop()) |runnable|
+            return runnable;
+
+        return null;
+    }
+
+    fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue) ?*Runnable {
+        return self.buffer.stealUnbounded(target);
+    }
+
+    fn popAndStealLocal(self: *LocalQueue, target: *LocalQueue) ?*Runnable {
+        if (self == target)
+            return self.pop(1);
+
+        if (self.buffer.stealUnbounded(&target.overflow)) |runnable|
+            return runnable;
+
+        if (self.buffer.stealBounded(&target.buffer)) |runnable|
+            return runnable;
 
         return null;
     }
@@ -683,7 +748,7 @@ const BoundedQueue = struct {
     buffer: [capacity]*Runnable = undefined,
 
     const Pos = std.meta.Int(.unsigned, std.meta.bitCount(usize) / 2);
-    const capacity = 256;
+    const capacity = 64;
     comptime {
         std.debug.assert(capacity <= std.math.maxInt(Pos));
     }

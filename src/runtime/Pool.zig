@@ -38,7 +38,7 @@ pub fn shutdown(self: *Pool) void {
 }
 
 pub const ScheduleHints = struct {
-    priority: Priority = .High,
+    priority: Priority = .Normal,
 
     pub const Priority = enum {
         Low,

@@ -5,36 +5,39 @@
 // and substantial portions of the software.
 
 const std = @import("std");
-const atomic = @import("../sync/atomic.zig");
-
-counter: u32 = 0,
-max_threads: u16,
-spawned: ?*Worker = null,
-run_queues: [Priority.ARRAY_SIZE]GlobalQueue = [_]GlobalQueue{.{}} ** Priority.ARRAY_SIZE,
 
 const Self = @This();
 
-pub const Config = struct {
-    max_worker_threads: ?usize = null,
-    max_blocking_threads: ?usize = null,
-};
+fn ReturnTypeOf(comptime func: anytype) type {
+    return @typeInfo(@TypeOf(func)).Fn.return_type.?;
+}
 
-pub fn run(config: Config, task: *Task) void {
-    if (std.builtin.single_threaded)
-        return runSerial(task);
-
-    const max_worker_threads = blk: {
-        const num_threads = config.max_worker_threads orelse std.Thread.cpuCount() catch 1;
-        const max_threads = std.math.cast(u14, num_threads) catch std.math.maxInt(u14);
-        break :blk std.math.max(1, max_threads);
+pub fn run(
+    config: struct {
+        max_threads: ?usize = null,
+        stack_size: ?usize = null,
+    },
+    comptime entryFn: anytype,
+    entryArgs: anytype,
+) !ReturnTypeOf(entryFn) {
+    const Args = @TypeOf(entryArgs);
+    const Result = ReturnTypeOf(entryFn);
+    const Wrapper = struct {
+        fn entry(task: *Task, result: *?Result, args: Args) void {
+            suspend task.* = .{ .frame = @frame() };
+            const ret_val = @call(.{}, entryFn, args);
+            suspend result.* = ret_val;
+        }
     };
 
-    const max_blocking_threads = config.max_blocking_threads orelse+
+    var task: Task = undefined;
+    var result: ?Result = null;
+    var frame = async Wrapper.entry(&task, &result, entryArgs);
 }
 
 pub const Task = struct {
     next: ?*Task = null,
-    runFn: fn (*Worker, *Task) callconv(.C) void,
+    frame: anyframe,
 };
 
 pub const Batch = struct {
@@ -94,34 +97,10 @@ pub const Batch = struct {
     };
 };
 
-pub const Priority = enum {
-    Low = 0,
-    Normal = 1,
-    High = 2,
-    Handoff = 3,
-
-    const ARRAY_SIZE = 3;
-
-    fn toArrayIndex(self: Priority) usize {
-        return switch (self) {
-            .High, .Handoff => 0,
-            .Normal => 1,
-            .Low => 2,
-        };
-    }
-};
-
-pub const Worker = struct {
-    state: State,
-    run_tick: u8,
-    spawned_next: ?*Worker,
-    run_queues: [Priority.ARRAY_SIZE]LocalQueue = [_]LocalQueue{.{}} ** Priority.ARRAY_SIZE,
-};
-
 const GlobalQueue = UnboundedQueue;
 const LocalQueue = struct {
-    overflow: UnboundedQueue = .{},
     buffer: BoundedQueue = .{},
+    overflow: UnboundedQueue = .{},
 
     fn push(self: *LocalQueue, batch: Batch) void {
         if (self.buffer.push(batch)) |overflowed|
@@ -167,9 +146,7 @@ const UnboundedQueue = struct {
     stub: Task = Task.init(undefined),
 
     fn push(self: *UnboundedQueue, batch: Batch) void {
-        if (batch.isEmpty())
-            return;
-
+        if (batch.isEmpty()) return;
         const head = @atomicRmw(?*Task, &self.head, .Xchg, batch.tail, .AcqRel);
         const prev = head orelse &self.stub;
         @atomicStore(?*Task, &prev.next, batch.head, .Release);

@@ -3,3 +3,6 @@ name = "zap"
 edition = "2018"
 version = "0.0.0"
 authors = ["kprotty"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

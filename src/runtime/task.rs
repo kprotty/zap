@@ -1,26 +1,48 @@
-use super::Worker;
-use std::{marker::PhantomPinned, pin::Pin, ptr::NonNull, sync::atomic::AtomicPtr};
+use std::{
+    ptr::{NonNull, self},
+    pin::Pin,
+    marker::PhantomPinned,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
-pub(crate) struct Runnable(pub(crate) unsafe fn(Pin<&mut Task>, Pin<&Worker>));
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub(crate) enum Priority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Handoff = 3,
+}
 
-#[repr(align(2))]
+impl Priority {
+    pub(crate) const COUNT: usize = 3;
+
+    pub(crate) fn as_index(&self) -> usize {
+        match self {
+            Self::Handoff | Self::High => 0,
+            Self::Normal => 1,
+            Self::Low => 2,
+        }
+    }
+}
+
+pub(crate) type ExecuteFn = unsafe fn(Pin<&mut Task>);
+
 pub(crate) struct Task {
     pub(crate) next: AtomicPtr<Self>,
-    pub(crate) runnable: &'static Runnable,
+    callback: ExecuteFn,
     _pinned: PhantomPinned,
 }
 
-impl From<&'static Runnable> for Task {
-    fn from(runnable: &'static Runnable) -> Self {
+impl From<ExecuteFn> for Task {
+    fn from(callback: ExecuteFn) -> Self {
         Self {
-            next: AtomicPtr::default(),
-            runnable,
+            next: AtomicPtr::new(ptr::null_mut()),
+            callback,
             _pinned: PhantomPinned,
         }
     }
 }
 
-#[derive(Default)]
 pub(crate) struct Batch {
     pub(crate) head: Option<NonNull<Task>>,
     pub(crate) tail: Option<NonNull<Task>>,
@@ -28,13 +50,11 @@ pub(crate) struct Batch {
 
 impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
-        // SAFETY:
-        // We have ownership over the task (&mut Task)
-        // and it requires unsafe to create a Pin'd reference from it due to !Unpin.
-        let task = unsafe { task.get_unchecked_mut() };
-        *task.next.get_mut() = std::ptr::null_mut();
-
-        let task = Some(NonNull::from(task));
+        let task = unsafe {
+            let task = Pin::get_unchecked_mut(task);
+            *task.next.get_mut() = ptr::null_mut();
+            Some(NonNull::new_unchecked(task))
+        };
         Self {
             head: task,
             tail: task,
@@ -43,45 +63,40 @@ impl From<Pin<&mut Task>> for Batch {
 }
 
 impl Batch {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) const fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+        }
     }
 
-    pub(crate) fn empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
     }
 
-    pub(crate) fn push_front(&mut self, batch: impl Into<Self>) {
-        let batch: Self = batch.into();
-
-        if let (Some(head), Some(mut batch_tail)) = (self.head, batch.tail) {
-            // SAFETY: we have ownership of all tasks in both batches at this point.
-            unsafe { *batch_tail.as_mut().next.get_mut() = head.as_ptr() };
-            self.head = batch.head;
-        } else {
+    pub(crate) fn push(&mut self, batch: impl Into<Self>) {
+        if self.is_empty() {
             *self = batch;
-        }
-    }
-
-    pub(crate) fn push_back(&mut self, batch: impl Into<Self>) {
-        let batch: Self = batch.into();
-
-        if let (Some(mut tail), Some(batch_head)) = (self.tail, batch.head) {
-            // SAFETY: we have ownership of all tasks in both batches at this point.
-            unsafe { *tail.as_mut().next.get_mut() = batch_head.as_ptr() };
+        } else if let Some(batch_head) = batch.head {
+            let tail_ref = unsafe { self.tail.expect("is_empty() is false").as_mut() };
+            *tail_ref.next.get_mut() = batch_head.as_ptr();
             self.tail = batch.tail;
-        } else {
-            *self = batch;
         }
     }
 
-    pub(crate) fn pop_front(&mut self) -> Option<NonNull<Task>> {
-        self.head.map(|mut task| {
-            // SAFETY: we have ownership of all tasks in the batch.
-            self.head = NonNull::new(unsafe { *task.as_mut().next.get_mut() });
-            if self.head.is_none() {
-                self.tail = None;
-            }
+    pub(crate) fn push_front(&mut self, batch: impl Into<Self>) {
+        if self.is_empty() {
+            *self = batch;
+        } else if let Some(batch_head) = batch.head {
+            let tail_ref = unsafe { batch.tail.expect("is_empty() is false").as_mut() };
+            *tail_ref.next.get_mut() = self.head.expect("is_empty() is false").as_ptr();
+            self.head = batch_head;
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<NonNull<Task>> {
+        self.head.map(|mut task| unsafe {
+            self.head = NonNull::new(*task.as_mut().next.get_mut());
             task
         })
     }

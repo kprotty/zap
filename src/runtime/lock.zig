@@ -12,7 +12,7 @@ else if (std.builtin.link_libc)
     PosixLock
 else if (std.builtin.os.tag == .linux)
     LinuxLock
-else 
+else
     @compileError("Unimplemented Lock primitive for platform");
 
 const WindowsLock = struct {
@@ -122,7 +122,7 @@ const LinuxLock = struct {
         var spin: usize = 0;
         var lock_state = State.Locked;
         var state = atomic.load(&self.state, .Relaxed);
-        
+
         while (true) {
             if (state == .Unlocked) {
                 state = atomic.tryCompareAndSwap(
@@ -136,7 +136,13 @@ const LinuxLock = struct {
                 continue;
             }
 
-            if (state == .Locked and spin < 100) {
+            const max_spin = switch (std.builtin.arch) {
+                .i386, .x86_64 => 100,
+                .aarch64 => 20,
+                else => 0,
+            };
+
+            if (state == .Locked and spin < max_spin) {
                 spin += 1;
                 atomic.spinLoopHint();
                 state = atomic.load(&self.state, .Relaxed);

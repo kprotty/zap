@@ -46,6 +46,75 @@ pub const Batch = struct {
     }
 };
 
+pub const GlobalQueue = struct {
+    queue: UnboundedQueue = .{},
+
+    pub fn isEmpty(self: *const GlobalQueue) callconv(.Inline) bool {
+        return self.queue.isEmpty();
+    }
+
+    pub fn push(self: *GlobalQueue, batch: Batch) callconv(.Inline) void {
+        self.queue.push(batch);
+    }
+};
+
+pub const LocalQueue = struct {
+    buffer: BoundedQueue = .{},
+    overflow: UnboundedQueue = .{},
+
+    pub fn isEmpty(self: *const LocalQueue) bool {
+        return self.buffer.isEmpty() and self.overflow.isEmpty();
+    }
+
+    pub fn push(self: *LocalQueue, batch: Batch) void {
+        if (self.buffer.push(batch)) |overflowed|
+            self.overflow.push(overflowed);
+    }
+
+    pub fn pop(self: *LocalQueue, be_fair: bool) ?*Node {
+        if (be_fair) {
+            if (self.overflow.tryAcquireConsumer()) |*consumer| {
+                defer consumer.release();
+                if (consumer.pop()) |node|
+                    return node;
+            }
+        }
+
+        if (self.buffer.pop()) |node|
+            return node;
+
+        if (self.buffer.popAndSteal(&self.overflow)) |node|
+            return node;
+
+        return null;
+    }
+
+    pub fn popAndSteal(self: *LocalQueue, target: anytype, be_fair: bool) ?*Node {
+        const is_global = switch (@TypeOf(target)) {
+            *LocalQueue => false,
+            *GlobalQueue => true,
+            else => |ty| @compileError("Cannot popAndSteal() from " ++ @typeName(ty)),
+        };
+
+        if (is_global) {
+            return self.buffer.popAndSteal(&target.queue);
+        }
+
+        if (be_fair) {
+            if (self.buffer.popAndSteal(&target.overflow)) |node|
+                return node;
+        }
+
+        if (self.buffer.popAndSteal(&target.buffer)) |node|
+            return node;
+
+        if (self.buffer.popAndSteal(&target.overflow)) |node|
+            return node;
+
+        return null;
+    }
+};
+
 pub const UnboundedQueue = struct {
     head: ?*Node = null,
     tail: usize = 0,
@@ -137,6 +206,12 @@ pub const BoundedQueue = struct {
     tail: usize = 0,
     buffer: [128]*Node = undefined,
 
+    pub fn isEmpty(self: *const BoundedQueue) bool {
+        const tail = atomic.load(&self.tail, .Relaxed);
+        const head = atomic.load(&self.head, .Relaxed);
+        return tail == head;
+    }
+
     pub fn push(self: *BoundedQueue, _batch: Batch) ?Batch {
         var batch = _batch;
         if (batch.isEmpty())
@@ -147,7 +222,7 @@ pub const BoundedQueue = struct {
         while (true) {
             if (batch.isEmpty())
                 return null;
-            
+
             const size = tail -% head;
             if (size < self.buffer.len) {
                 var empty = self.buffer.len - size;
@@ -190,9 +265,7 @@ pub const BoundedQueue = struct {
         }
     }
 
-    pub fn pop(self: *BoundedQueue) ?*Node {
-
-    }
+    pub fn pop(self: *BoundedQueue) ?*Node {}
 
     pub fn popAndSteal(self: *BoundedQueue, target: anytype) ?*Node {
         const is_unbounded = switch (@TypeOf(target)) {

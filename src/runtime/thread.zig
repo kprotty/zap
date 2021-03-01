@@ -29,7 +29,7 @@ const WindowsThread = struct {
                 return 0;
             }
         };
-        
+
         const handle = std.os.windows.kernel32.CreateThread(
             null,
             stack_size,
@@ -155,7 +155,7 @@ const LinuxThread = struct {
             };
         }
 
-        const flags: u32 = 
+        const flags: u32 =
             std.os.CLONE_SIGHAND | std.os.CLONE_SYSVSEM |
             std.os.CLONE_VM | std.os.CLONE_FS | std.os.CLONE_FILES |
             std.os.CLONE_PARENT_SETTID | std.os.CLONE_CHILD_CLEARTID |
@@ -177,7 +177,7 @@ const LinuxThread = struct {
             @ptrToInt(info),
             &info.handle,
             tls_ptr,
-            &info.handle, 
+            &info.handle,
         );
 
         return switch (std.os.linux.getErrno(rc)) {

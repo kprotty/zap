@@ -13,7 +13,7 @@ else if (std.builtin.link_libc)
     PosixEvent
 else if (std.builtin.os.tag == .linux)
     LinuxEvent
-else 
+else
     @compileError("Unimplemented Event primitive for platform");
 
 const WindowsEvent = struct {
@@ -104,7 +104,7 @@ const PosixEvent = struct {
 
         const c = std.c.pthread_cond_destroy(&self.cond);
         std.debug.assert(c == 0 or c == std.os.EINVAL);
-        
+
         self.* = undefined;
     }
 
@@ -244,5 +244,5 @@ const LinuxEvent = struct {
                 else => unreachable,
             }
         }
-    }    
+    }
 };

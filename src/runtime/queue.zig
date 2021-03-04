@@ -100,6 +100,9 @@ pub const LocalQueue = struct {
             return self.buffer.popAndSteal(&target.queue);
         }
 
+        if (self == target)
+            return self.pop(be_fair);
+
         if (be_fair) {
             if (self.buffer.popAndSteal(&target.overflow)) |node|
                 return node;

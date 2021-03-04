@@ -231,7 +231,7 @@ pub const ThreadPool = struct {
 
     pub fn getSpawned(self: *const Self) usize {
         const counter = Counter.unpack(atomic.load(&self.counter, .Relaxed));
-        return counter.spawned;
+        return if (counter.state == .shutdown) 0 else counter.spawned;
     }
 
     pub fn isPollable(self: *const Self) bool {

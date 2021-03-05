@@ -16,7 +16,7 @@ else if (std.builtin.link_libc)
 else if (std.builtin.os.tag == .linux)
     LinuxOnce
 else
-    @compileError("Platform does not support Once implementation");
+    @compileError("Unimplemented Once primitive for platform");
 
 const WindowsOnce = struct {
     once: std.os.windows.INIT_ONCE = std.os.windows.INIT_ONCE_STATIC_INIT,

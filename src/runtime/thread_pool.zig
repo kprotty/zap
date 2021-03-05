@@ -97,7 +97,7 @@ pub const ThreadPool = struct {
             callFn: fn (*Impl, Action) void,
 
             pub const Action = union(enum) {
-                RunWorker: *Worker,
+                RunWorker: Instance,
                 NotifyWorker: *Worker,
                 SuspendWorker: *Worker,
                 PollEvents: *Worker,
@@ -146,11 +146,25 @@ pub const ThreadPool = struct {
             return true;
         }
 
-        fn run(pool: *Self, thread: ?Thread) void {
-            var self = Worker{
-                .pool = pool,
-                .state = .waking,
-                .thread = thread,
+        pub const Instance = struct {
+            pool: *Self,
+            thread: ?Thread,
+        };
+
+        fn run(pool: *Self, thread: ?Thread) callconv(.Inline) void {
+            pool.worker_impl.invoke(.{
+                .RunWorker = Instance{
+                    .pool = pool,
+                    .thread = thread,
+                },
+            });
+        }
+
+        pub fn init(self: *Worker, instance: Instance) void {
+            self.* = Worker{
+                .pool = instance.pool,
+                .state = .Waking,
+                .thread = instance.thread,
                 .idle_prev = undefined,
                 .idle_next = undefined,
                 .spawned_next = undefined,
@@ -167,15 +181,13 @@ pub const ThreadPool = struct {
                     .Relaxed,
                 ) orelse break;
             }
+        }
 
-            pool.worker_impl.invoke(.{
-                .RunWorker = &self,
-            });
-
-            if (thread == null) {
-                pool.join();
+        pub fn deinit(self: *Worker) void {
+            if (self.thread == null) {
+                self.pool.join();
             } else {
-                pool.worker_impl.invoke(.{ .SuspendWorker = &self });
+                self.pool.worker_impl.invoke(.{ .SuspendWorker = &self });
             }
         }
 

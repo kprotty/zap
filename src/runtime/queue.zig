@@ -62,7 +62,7 @@ pub const LocalQueue = struct {
     buffer: BoundedQueue = .{},
     overflow: UnboundedQueue = .{},
 
-    pub fn isEmpty(self: *const LocalQueue) bool {
+    pub fn isEmpty(self: *const LocalQueue) callconv(.Inline) bool {
         return self.buffer.isEmpty() and self.overflow.isEmpty();
     }
 
@@ -72,6 +72,15 @@ pub const LocalQueue = struct {
     }
 
     pub fn pop(self: *LocalQueue, be_fair: bool) ?*Node {
+        // Pop from the overflow queue first if we need to be fair.
+        // The overflow is otherwise normally starved by the buffer
+        // and contains tasks that used to be in the buffer but got unluckly migrated.
+        //
+        // Being fair in a hot-path such as this can have observable effects on throughput.
+        // While fairness is mean to disregard throughput, be_fair is only for eventual fairness.
+        //
+        // So instead of popAndSteal() which drains overflow to fill up the buffer for later,
+        // we only dequeue on node from overflow to amortize the cost of FIFO for future buffer pops.
         if (be_fair) {
             if (self.overflow.tryAcquireConsumer()) |*consumer| {
                 defer consumer.release();
@@ -100,9 +109,12 @@ pub const LocalQueue = struct {
             return self.buffer.popAndSteal(&target.queue);
         }
 
+        // TODO: should this be an assert?
         if (self == target)
             return self.pop(be_fair);
 
+        // Check the target's overflow queue first if we need to be fair.
+        // The target's overflow tasks are normally starved by its buffer.
         if (be_fair) {
             if (self.buffer.popAndSteal(&target.overflow)) |node|
                 return node;
@@ -137,6 +149,40 @@ pub const UnboundedQueue = struct {
         atomic.store(&prev.next, batch.head, .Release);
     }
 
+    fn pop(self: *UnboundedQueue, tail_ptr: **Node) callconv(.Inline) ?*Node {
+        var tail = tail_ptr.*;
+        var next = atomic.load(&tail.next, .Acquire);
+        if (tail == &self.stub) {
+            tail = next orelse return null;
+            tail_ptr.* = tail;
+            next = atomic.load(&tail.next, .Acquire);
+        }
+
+        if (next) |node| {
+            tail_ptr.* = node;
+            return tail;
+        }
+
+        const head = atomic.load(&self.head, .Acquire);
+        if (tail == head)
+            return null;
+
+        self.push(Batch.from(&self.stub));
+
+        if (atomic.load(&tail.next, .Acquire)) |node| {
+            tail_ptr.* = node;
+            return tail;
+        }
+
+        return null;
+    }
+
+    pub fn popAssumeOwner(self: *UnboundedQueue) ?*Node {
+        var tail = @intToPtr(?*Node, self.tail & ~@as(usize, 1)) orelse &self.stub;
+        defer self.tail = @ptrToInt(tail);
+        return self.pop(&tail, stub);
+    }
+
     pub fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
         while (true) : (atomic.spinLoopHint()) {
             if (self.isEmpty())
@@ -160,7 +206,6 @@ pub const UnboundedQueue = struct {
             ) orelse return Consumer{
                 .queue = self,
                 .tail = @intToPtr(?*Node, tail) orelse &self.stub,
-                .stub = &self.stub,
             };
         }
     }
@@ -168,38 +213,14 @@ pub const UnboundedQueue = struct {
     pub const Consumer = struct {
         queue: *UnboundedQueue,
         tail: *Node,
-        stub: *Node,
+
+        pub fn pop(self: *Consumer) ?*Node {
+            return self.queue.pop(&self.tail);
+        }
 
         pub fn release(self: Consumer) void {
             const new_tail = @ptrToInt(self.tail);
             atomic.store(&self.queue.tail, new_tail, .Release);
-        }
-
-        pub fn pop(self: *Consumer) ?*Node {
-            var tail = self.tail;
-            var next = atomic.load(&tail.next, .Acquire);
-            if (tail == self.stub) {
-                tail = next orelse return null;
-                self.tail = tail;
-                next = atomic.load(&tail.next, .Acquire);
-            }
-
-            if (next) |node| {
-                self.tail = node;
-                return tail;
-            }
-
-            const head = atomic.load(&self.queue.head, .Relaxed);
-            if (tail == head)
-                return null;
-
-            self.queue.push(Batch.from(self.stub));
-            if (atomic.load(&tail.next, .Acquire)) |node| {
-                self.tail = node;
-                return tail;
-            }
-
-            return null;
         }
     };
 };

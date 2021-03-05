@@ -6,12 +6,14 @@
 
 const std = @import("std");
 
-pub fn Treap(comptime Key: type) type {
+pub fn Treap(comptime KeyType: type) type {
     return struct {
         root: ?*Node = null,
         min: @TypeOf(min_init) = min_init,
 
         const Self = @This();
+
+        pub const Key = KeyType;
         const min_init = if (Key.use_min) @as(?*Node, null) else {};
 
         const Parent = struct {
@@ -221,12 +223,6 @@ pub fn Treap(comptime Key: type) type {
             if (!Key.use_min)
                 @compileError("Treap not configured for priority operations");
             return self.min;
-        }
-
-        pub fn popMin(self: *Self) ?*Node {
-            const node = self.peekMin() orelse return null;
-            self.remove(node);
-            return node;
         }
     };
 }

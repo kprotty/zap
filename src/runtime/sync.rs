@@ -1,7 +1,7 @@
 use std::{
+    cell::{Cell, UnsafeCell},
     pin::Pin,
     time::Instant,
-    cell::{Cell, UnsafeCell},
 };
 
 pub(crate) struct Lock<T> {
@@ -77,7 +77,7 @@ impl Event {
             self.sync().acquire();
 
             match self.state.replace(EventState::Notified) {
-                EventState::Empty => {},
+                EventState::Empty => {}
                 EventState::Waiting => self.sync().signal(),
                 EventState::Notified => unreachable!("Event::notify() called multiple times"),
             }
@@ -104,12 +104,14 @@ impl Event {
                 EventState::Waiting => unreachable!("Event::wait called by multiple threads"),
                 EventState::Notified => waiting = false,
             }
-            
+
             let mut timed_out = false;
             while waiting {
                 match self.state.get() {
-                    EventState::Empty => unreachable!("Event::wait() observed invalid internal state"),
-                    EventState::Waiting => {},
+                    EventState::Empty => {
+                        unreachable!("Event::wait() observed invalid internal state")
+                    }
+                    EventState::Waiting => {}
                     EventState::Notified => break,
                 }
 
@@ -141,12 +143,7 @@ impl Event {
 #[cfg(windows)]
 #[allow(non_camel_case_types)]
 mod os {
-    use std::{
-        pin::Pin,
-        cell::UnsafeCell,
-        time::Duration,
-        convert::TryInto,
-    };
+    use std::{cell::UnsafeCell, convert::TryInto, pin::Pin, time::Duration};
 
     type BOOL = i32;
     type BOOLEAN = u8;
@@ -228,7 +225,10 @@ mod os {
         }
 
         pub(crate) unsafe fn wait(self: Pin<&Self>) {
-            assert_ne!(FALSE, SleepConditionVariableSRW(self.cond.get(), self.lock.get(), INFINITE, 0));
+            assert_ne!(
+                FALSE,
+                SleepConditionVariableSRW(self.cond.get(), self.lock.get(), INFINITE, 0)
+            );
         }
 
         pub(crate) unsafe fn timed_wait(self: Pin<&Self>, duration: Duration) {
@@ -243,20 +243,13 @@ mod os {
 
 #[cfg(unix)]
 mod os {
-    use std::{
-        pin::Pin,
-        cell::UnsafeCell,
-        time::Duration,
-    };
+    use std::{cell::UnsafeCell, pin::Pin, time::Duration};
 
     pub(crate) use self::os_lock::OsLock;
 
     #[cfg(target_vendor = "apple")]
     mod os_lock {
-        use std::{
-            cell::UnsafeCell,
-            pin::Pin,
-        };
+        use std::{cell::UnsafeCell, pin::Pin};
 
         #[repr(C)]
         #[allow(non_camel_case_types)]
@@ -291,11 +284,7 @@ mod os {
 
     #[cfg(not(target_vendor = "apple"))]
     mod os_lock {
-        use std::{
-            cell::UnsafeCell,
-            pin::Pin,
-            marker::PhantomPinned,
-        };
+        use std::{cell::UnsafeCell, marker::PhantomPinned, pin::Pin};
 
         pub(crate) struct OsLock {
             mutex: UnsafeCell<libc::pthread_mutex_t>,
@@ -350,27 +339,32 @@ mod os {
         }
 
         pub(crate) unsafe fn signal(self: Pin<&Self>) {
-            assert_eq!(0, libc::pthread_cond_signal(self.cond.get()));    
+            assert_eq!(0, libc::pthread_cond_signal(self.cond.get()));
         }
 
         pub(crate) unsafe fn wait(self: Pin<&Self>) {
-            assert_eq!(0, libc::pthread_cond_wait(self.cond.get(), self.mutex.get()));
+            assert_eq!(
+                0,
+                libc::pthread_cond_wait(self.cond.get(), self.mutex.get())
+            );
         }
 
         pub(crate) unsafe fn timed_wait(self: Pin<&Self>, duration: Duration) {
             let mut timespec = Duration::from_nanos(Self::timestamp())
                 .checked_add(duration)
-                .and_then(|duration| duration
-                    .as_secs()
-                    .try_into::<libc::time_t>()
-                    .ok()
-                    .map(|seconds| libc::timespec {
-                        tv_sec: seconds,
-                        tv_nsec: duration.subsec_nanos()
-                            .try_into()
-                            .expect("typeof(tv_nsec) isn't posix compliant"),
-                    })
-                )
+                .and_then(|duration| {
+                    duration
+                        .as_secs()
+                        .try_into::<libc::time_t>()
+                        .ok()
+                        .map(|seconds| libc::timespec {
+                            tv_sec: seconds,
+                            tv_nsec: duration
+                                .subsec_nanos()
+                                .try_into()
+                                .expect("typeof(tv_nsec) isn't posix compliant"),
+                        })
+                })
                 .unwrap_or_else(|| libc::timespec {
                     tv_sec: libc::time_t::MAX,
                     tv_nsec: 1_000_000_000 - 1,

@@ -1,406 +1,290 @@
-use super::task::{Task, Batch, ExecuteFn};
+use super::task::{Batch, Task};
 use std::{
+    hint::spin_loop,
     pin::Pin,
     ptr::{self, NonNull},
-    cell::UnsafeCell,
-    marker::PhantomPinned,
-    convert::TryInto,
-    sync::atomic::{AtomicU32, AtomicPtr, AtomicUsize, Ordering, spin_loop_hint},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-pub(crate) struct GlobalQueue(UnboundedQueue);
+pub(crate) struct GlobalQueue {
+    stack: AtomicPtr<Task>,
+}
 
 impl GlobalQueue {
-    pub(crate) fn new() -> Self {
-        Self(UnboundedQueue::new())
-    }
-
-    #[inline(always)]
-    fn overflow(self: Pin<&Self>) -> Pin<&UnboundedQueue> {
-        unsafe { self.map_unchecked(|this| &this.0) }
-    }
-
-    pub(crate) fn push(self: Pin<&Self>, batch: impl Into<Batch>) {
-        self.overflow().push(batch)
-    }
-}
-
-pub(crate) struct LocalQueue {
-    buffer: BoundedQueue,
-    overflow: UnboundedQueue,
-}
-
-impl LocalQueue {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            buffer: BoundedQueue::new(),
-            overflow: UnboundedQueue::new(),
+            stack: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    #[inline]
-    fn overflow(self: Pin<&Self>) -> Pin<&UnboundedQueue> {
-        unsafe { self.map_unchecked(|this| &this.overflow) }
-    }
-
-    pub(crate) unsafe fn push(self: Pin<&Self>, batch: impl Into<Batch>) {
-        if let Some(overflowed) = self.buffer.push(batch) {
-            self.overflow().push(overflowed);
-        }
-    }
-
-    pub(crate) unsafe fn pop(self: Pin<&Self>, be_fair: bool) -> Option<NonNull<Task>> {
-        let mut fair_task = None;
-        if be_fair {
-            fair_task = self.buffer.pop();
-        }
-
-        fair_task
-            .or_else(|| self.buffer.pop_and_steal_unbounded(self.overflow()))
-            .or_else(|| self.buffer.pop())
-    }
-
-    pub(crate) unsafe fn pop_and_steal_global(self: Pin<&Self>, target: Pin<&GlobalQueue>) -> Option<NonNull<Task>> {
-        self.buffer.pop_and_steal_unbounded(target.overflow())   
-    }
-
-    pub(crate) unsafe fn pop_and_steal_local(self: Pin<&Self>, target: Pin<&Self>) -> Option<NonNull<Task>> {
-        if ptr::eq(&*self as *const Self, &*target as *const Self) {
-            return self.pop(false);
-        }
-
-        self.buffer
-            .pop_and_steal_unbounded(target.overflow())
-            .or_else(|| self.buffer.pop_and_steal_bounded(&target.buffer))
-    }
-}
-
-struct UnboundedQueue {
-    head: AtomicUsize,
-    tail: AtomicPtr<Task>,
-    stub: UnsafeCell<Task>,
-    _pinned: PhantomPinned,
-}
-
-unsafe impl Send for UnboundedQueue {}
-unsafe impl Sync for UnboundedQueue {}
-
-impl UnboundedQueue {
-    fn new() -> Self {
-        struct StubExecute;
-
-        impl StubExecute {
-            unsafe fn func(_: Pin<&mut Task>) {}
-        }
-
-        Self {
-            head: AtomicUsize::new(0),
-            tail: AtomicPtr::new(ptr::null_mut()),
-            stub: UnsafeCell::new(Task::from(StubExecute::func as ExecuteFn)),
-            _pinned: PhantomPinned,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        let tail = self.tail.load(Ordering::Relaxed);
-        tail.is_null() || ptr::eq(tail, self.stub.get())
-    }
-
-    fn push(self: Pin<&Self>, batch: impl Into<Batch>) {
+    pub(crate) fn push(&self, batch: impl Into<Batch>) {
         let batch = batch.into();
         if batch.is_empty() {
             return;
         }
 
-        let head = batch.head.expect("is_empty() returned false").as_ptr();
-        let tail = batch.tail.expect("is_empty() returned false").as_ptr();
+        let head = batch.head.expect("is_empty() check said this was safe");
+        let mut tail = batch.tail.expect("is_empty() check said this was safe");
 
-        let prev = self.tail.swap(tail, Ordering::AcqRel);
-        let prev = NonNull::new(prev)
-            .or(NonNull::new(self.stub.get()))
-            .expct("stub ptr is never null");
-
-        unsafe {
-            prev.as_ref().next.store(head, Ordering::Release);
-        }
-    }
-
-    #[inline]
-    fn try_drain<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
-        if self.is_empty() {
-            None
-        } else {
-            self.try_drain_slow()
-        }
-    }
-
-    #[cold]
-    fn try_drain_slow<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
-        let mut head = self.head.load(Ordering::Relaxed);
+        let mut stack = self.stack.load(Ordering::Relaxed);
         loop {
-            if (head & 1 != 0) || self.is_empty() {
-                return None;
-            }
-
-            match self.head.compare_exchange_weak(
-                head,
-                head | 1,
-                Ordering::Acquire,
+            unsafe { tail.as_mut().next.set(NonNull::new(stack)) };
+            match self.stack.compare_exchange_weak(
+                stack,
+                head.as_ptr(),
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Err(e) => head = e,
-                Ok(_) => break,
+                Ok(_) => return,
+                Err(e) => stack = e,
             }
         }
-
-        struct Drain<'b> {
-            queue: Pin<&'b UnboundedQueue>,
-            head: NonNull<Task>,
-        }
-
-        impl<'b> Drop for Drain<'b> {
-            fn drop(&mut self) {
-                let new_head = self.head.as_ptr() as usize;
-                self.queue.head.store(new_head, Ordering::Release);
-            }
-        }
-
-        impl<'b> Iterator for Drain<'b> {
-            type Item = NonNull<Task>;
-
-            fn next(&mut self) -> Option<NonNull<Task>> {
-                unsafe {
-                    let mut head = self.head;
-                    let mut next = head.as_ref().next.load(Ordering::Acquire);
-
-                    if ptr::eq(head.as_ptr(), self.queue.stub.get()) {
-                        head = NonNull::new(next)?;
-                        self.head = head;
-                        next = head.as_ref().next.load(Ordering::Acquire);
-                    }
-
-                    if let Some(task) = NonNull::new(next) {
-                        self.head = task;
-                        return Some(head);
-                    }
-
-                    let tail = self.queue.tail.load(Ordering::Relaxed);
-                    if head != NonNull::new_unchecked(tail) {
-                        return None;
-                    }
-
-                    self.queue.push({
-                        let stub = &mut *self.queue.stub.get();
-                        Pin::new_unchecked(stub)
-                    });
-                    
-                    next = head.as_ref().next.load(Ordering::Acquire);
-                    NonNull::new(next).map(|task| {
-                        self.head = task;
-                        head
-                    })
-                }
-            }
-        }
-
-        Some(Drain {
-            queue: self,
-            head: NonNull::new(head as *mut Task)
-                .or(NonNull::new(self.stub.get()))
-                .expect("stub ptr is never null"),
-        })
     }
 }
 
-struct BoundedQueue {
-    head: AtomicU32,
-    tail: AtomicU32,
+pub(crate) struct LocalQueue {
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    overflow: AtomicPtr<Task>,
     buffer: [AtomicPtr<Task>; Self::CAPACITY],
 }
 
-impl BoundedQueue {
-    const CAPACITY: usize = 64;
+impl LocalQueue {
+    const CAPACITY: usize = 128;
 
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         const SLOT: AtomicPtr<Task> = AtomicPtr::new(ptr::null_mut());
         Self {
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            overflow: AtomicPtr::new(ptr::null_mut()),
             buffer: [SLOT; Self::CAPACITY],
         }
     }
 
-    #[inline(always)]
-    fn read(&self, index: u32) -> NonNull<Task> {
-        let slot = &self.buffer[(index as usize) % Self::CAPACITY];
-        NonNull::new(slot.load(Ordering::Relaxed)).expect("reads must have been written to");
+    pub(crate) unsafe fn producer(&self) -> LocalQueueProducer<'_> {
+        LocalQueueProducer { queue: self }
     }
+}
 
-    #[inline(always)]
-    fn write(&self, index: u32, task: NonNull<Task>) {
-        let slot = &self.buffer[(index as usize) % Self::CAPACITY];
-        slot.store(task.as_ptr(), Ordering::Relaxed);
-    }
+pub(crate) struct LocalQueueProducer<'a> {
+    queue: &'a LocalQueue,
+}
 
-    unsafe fn push(&self, batch: impl Into<Batch>) -> Option<Batch> {
-        let mut batch = batch.into();
-        let mut tail = self.tail.load(Ordering::Relaxed);
-        let mut head = self.head.load(Ordering::Relaxed);
-
-        while !batch.is_empty() {
-            let capacity: u32 = Self::CAPACITY.try_into().unwrap();
-            if tail.wrapping_sub(head) < capacity {
-                while tail.wrapping_sub(head) < capacity {
-                    match batch.pop() {
-                        None => break,
-                        Some(task) => {
-                            self.write(tail, task);
-                            tail = tail.wrapping_add(1);
-                        },
-                    }
-                }
-
-                self.tail.store(tail, Ordering::Release);
-                if !batch.is_empty() {
-                    spin_loop_hint();
-                    head = self.head.load(Ordering::Relaxed);
-                }
-
-                continue;
-            }
-
-            let migrate = capacity / 2;
-            if let Err(e) = self.head.compare_exchange_weak(
-                head,
-                head.wrapping_add(migrate),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                head = e;
-                spin_loop_hint();
-                continue;
-            }
-
-            let mut overflowed = (0..migrate)
-                .map(|offset| self.read(head.wrapping_add(offset)))
-                .fold(Batch::new(), |mut batch, mut task| {
-                    batch.push(Pin::new_unchecked(task.as_mut()));
-                    batch
+impl<'a> LocalQueueProducer<'a> {
+    fn push_buffer(queue: &LocalQueue, mut batch: Batch) -> Option<Batch> {
+        let mut tail = queue.tail.load(Ordering::Relaxed);
+        let mut head = queue.head.load(Ordering::Relaxed);
+        loop {
+            let slots = queue.buffer.len() - tail.wrapping_sub(head);
+            if slots > 0 {
+                tail = (0..slots).zip(batch.drain()).fold(tail, |tail, (_, task)| {
+                    let index = tail % queue.buffer.len();
+                    queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
+                    tail.wrapping_add(1)
                 });
+
+                queue.tail.store(tail, Ordering::Release);
+                if batch.is_empty() {
+                    return None;
+                }
+
+                spin_loop();
+                head = queue.head.load(Ordering::Relaxed);
+                continue;
+            }
+
+            if let Err(e) =
+                queue
+                    .head
+                    .compare_exchange_weak(head, tail, Ordering::Acquire, Ordering::Relaxed)
+            {
+                spin_loop();
+                head = e;
+                continue;
+            }
+
+            let mut overflowed = (0..queue.buffer.len()).fold(Batch::new(), |mut batch, offset| {
+                let index = head.wrapping_add(offset) % queue.buffer.len();
+                let task = queue.buffer[index].load(Ordering::Relaxed);
+                batch.push(unsafe { Pin::new_unchecked(&mut *task) });
+                batch
+            });
 
             overflowed.push(batch);
             return Some(overflowed);
         }
-
-        None
     }
 
-    unsafe fn pop(&self) -> Option<NonNull<Task>> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let mut head = self.head.load(Ordering::Relaxed);
-
-        while tail != head {
-            match self.head.compare_exchange_weak(
-                head,
-                head.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(self.read(head)),
-                Err(e) => head = e,
-            }
+    fn pop_buffer(queue: &LocalQueue) -> Option<NonNull<Task>> {
+        let tail = queue.tail.load(Ordering::Relaxed);
+        let head = queue.head.load(Ordering::Relaxed);
+        if tail == head {
+            return None;
         }
 
-        None
-    }
+        queue.tail.swap(tail.wrapping_sub(1), Ordering::Acquire);
+        let head = queue.head.load(Ordering::Relaxed);
 
-    unsafe fn pop_and_steal_unbounded(&self, target: Pin<&UnboundedQueue>) -> Option<NonNull<Task>> {
-        target.try_drain().and_then(|mut consumer| {
-            let tail = self.tail.load(Ordering::Relaxed);
-            let mut new_tail = tail;
-            let mut popped = None;
-            
-            loop {
-                let head = self.head.load(Ordering::Relaxed);
-                let size = new_tail.wrapping_sub(head);
-                if !(popped.is_none() || size < Self::CAPACITY.try_into().unwrap()) {
-                    break;
-                }
-
-                let task = match consumer.next() {
-                    None => break,
-                    Some(task) => task,
-                };
-
-                if popped.is_none() {
-                    popped = Some(task);
-                    spin_loop_hint();
-                } else {
-                    self.write(new_tail, task);
-                    new_tail = new_tail.wrapping_add(1);
-                }
-            }
-
-            if tail != new_tail {
-                self.tail.store(new_tail, Ordering::Release);
-            }
-
-            popped
-        })
-    }
-
-    unsafe fn pop_and_steal_bounded(&self, target: &Self) -> Option<NonNull<Task>> {
-        if ptr::eq(self as *const Self, target as *const Self) {
-            return self.pop();
-        }
-
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
+        let mut task = None;
         if tail != head {
-            return self.pop();
+            let index = tail.wrapping_sub(1) % queue.buffer.len();
+            task = NonNull::new(queue.buffer[index].load(Ordering::Relaxed));
+
+            if head != tail.wrapping_sub(1) {
+                return task;
+            }
+
+            if let Err(_) =
+                queue
+                    .head
+                    .compare_exchange(head, tail, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                spin_loop();
+                task = None;
+            }
         }
 
-        let mut target_head = target.head.load(Ordering::Relaxed);
+        queue.tail.store(tail, Ordering::Release);
+        task
+    }
+
+    fn steal_buffer(queue: &LocalQueue) -> Option<NonNull<Task>> {
         loop {
-            let target_tail = target.tail.load(Ordering::Acquire);
-            let target_size = target_tail.wrapping_sub(target_head);
-            if target_size == 0 {
+            let head = queue.head.load(Ordering::Acquire);
+            let tail = queue.tail.load(Ordering::Acquire);
+            if head == tail && head != tail.wrapping_sub(1) {
                 return None;
             }
 
-            let mut target_steal = target_size - (target_size / 2);
-            let capacity: u32 = Self::CAPACITY.try_into().unwrap();
-            if target_steal > capacity / 2 {
-                spin_loop_hint();
-                target_head = target.head.load(Ordering::Relaxed);
-                continue;
-            }
-
-            let popped = target.read(target_head);
-            target_steal -= 1;
-
-            let new_tail = (0..target_steal).fold(tail, |new_tail, offset| {
-                let task = target.read(target_head.wrapping_add(offset));
-                self.write(new_tail, task);
-                new_tail.wrapping_add(1)
-            });
-            
-            if let Err(e) = target.head.compare_exchange_weak(
-                target_head,
-                target_head.wrapping_add(target_steal),
+            let index = head % queue.buffer.len();
+            let task = queue.buffer[index].load(Ordering::Relaxed);
+            match queue.head.compare_exchange_weak(
+                head,
+                head.wrapping_add(1),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                spin_loop_hint();
-                target_head = e;
-                continue;
+                Ok(_) => return NonNull::new(task),
+                Err(_) => spin_loop(),
             }
-
-            if tail != new_tail {
-                self.tail.store(new_tail, Ordering::Release);
-            }
-
-            return Some(popped);
         }
+    }
+
+    fn push_overflow(queue: &LocalQueue, batch: Batch) {
+        let Batch { head, tail } = batch;
+        let head = head.expect("this batch shouldn't be empty");
+        let mut tail = tail.expect("this batch shouldn't be empty");
+
+        let mut overflow = queue.overflow.load(Ordering::Relaxed);
+        loop {
+            unsafe { tail.as_mut().next.set(NonNull::new(overflow)) };
+
+            if overflow.is_null() {
+                queue.overflow.store(head.as_ptr(), Ordering::Release);
+                return;
+            }
+
+            match queue.overflow.compare_exchange_weak(
+                overflow,
+                head.as_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(e) => {
+                    spin_loop();
+                    overflow = e;
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn take_overflow(queue: &LocalQueue) -> Option<NonNull<Task>> {
+        let overflow = queue.overflow.load(Ordering::Relaxed);
+        if overflow.is_null() {
+            return None;
+        }
+
+        let overflow = queue.overflow.swap(ptr::null_mut(), Ordering::Acquire);
+        NonNull::new(overflow)
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    fn take_overflow(queue: &LocalQueue) -> Option<NonNull<Task>> {
+        let mut overflow = queue.overflow.load(Ordering::Relaxed);
+        loop {
+            if overflow.is_null() {
+                return None;
+            }
+
+            match queue.overflow.compare_exchange_weak(
+                overflow,
+                ptr::null_mut(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return NonNull::new(overflow),
+                Err(e) => {
+                    spin_loop();
+                    overflow = e;
+                }
+            }
+        }
+    }
+
+    fn pop_and_steal_overflow(
+        queue: &LocalQueue,
+        target: &LocalQueue,
+    ) -> Option<(NonNull<Task>, bool)> {
+        let mut first_task = Self::take_overflow(target)?;
+        let mut overflowed = unsafe { first_task.as_mut().next.get() };
+
+        let tail = queue.tail.load(Ordering::Relaxed);
+        let new_tail = (0..queue.buffer.len())
+            .zip(std::iter::from_fn(|| unsafe {
+                let mut task = overflowed?;
+                overflowed = task.as_mut().next.get();
+                Some(task)
+            }))
+            .fold(tail, |tail, (_, task)| {
+                let index = tail % queue.buffer.len();
+                queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
+                tail.wrapping_add(1)
+            });
+
+        if new_tail != tail {
+            queue.tail.store(new_tail, Ordering::Release);
+        }
+
+        if let Some(overflowed) = overflowed {
+            queue.overflow.store(overflowed.as_ptr(), Ordering::Release);
+        }
+
+        Some((first_task, overflowed.is_some()))
+    }
+
+    pub(crate) fn push(&mut self, batch: impl Into<Batch>) {
+        let batch = batch.into();
+        if batch.is_empty() {
+            return;
+        }
+
+        if let Some(overflowed) = Self::push_buffer(self.queue, batch) {
+            Self::push_overflow(self.queue, overflowed);
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<(NonNull<Task>, bool)> {
+        Self::pop_buffer(self.queue)
+            .map(|task| (task, false))
+            .or_else(|| Self::pop_and_steal_overflow(self.queue, self.queue))
+    }
+
+    pub(crate) fn pop_and_steal(&mut self, target: &LocalQueue) -> Option<(NonNull<Task>, bool)> {
+        Self::steal_buffer(target)
+            .map(|task| (task, false))
+            .or_else(|| Self::pop_and_steal_overflow(self.queue, target))
     }
 }

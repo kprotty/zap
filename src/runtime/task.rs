@@ -1,9 +1,4 @@
-use std::{
-    ptr::{NonNull, self},
-    pin::Pin,
-    marker::PhantomPinned,
-    sync::atomic::{AtomicPtr, Ordering},
-};
+use std::{cell::Cell, marker::PhantomPinned, pin::Pin, ptr::NonNull};
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub(crate) enum Priority {
@@ -28,7 +23,7 @@ impl Priority {
 pub(crate) type ExecuteFn = unsafe fn(Pin<&mut Task>);
 
 pub(crate) struct Task {
-    pub(crate) next: AtomicPtr<Self>,
+    pub(crate) next: Cell<Option<NonNull<Self>>>,
     callback: ExecuteFn,
     _pinned: PhantomPinned,
 }
@@ -36,7 +31,7 @@ pub(crate) struct Task {
 impl From<ExecuteFn> for Task {
     fn from(callback: ExecuteFn) -> Self {
         Self {
-            next: AtomicPtr::new(ptr::null_mut()),
+            next: Cell::new(None),
             callback,
             _pinned: PhantomPinned,
         }
@@ -52,7 +47,7 @@ impl From<Pin<&mut Task>> for Batch {
     fn from(task: Pin<&mut Task>) -> Self {
         let task = unsafe {
             let task = Pin::get_unchecked_mut(task);
-            *task.next.get_mut() = ptr::null_mut();
+            task.next.set(None);
             Some(NonNull::new_unchecked(task))
         };
         Self {
@@ -75,29 +70,53 @@ impl Batch {
     }
 
     pub(crate) fn push(&mut self, batch: impl Into<Self>) {
+        let batch = batch.into();
+        if batch.is_empty() {
+            return;
+        }
+
         if self.is_empty() {
             *self = batch;
-        } else if let Some(batch_head) = batch.head {
-            let tail_ref = unsafe { self.tail.expect("is_empty() is false").as_mut() };
-            *tail_ref.next.get_mut() = batch_head.as_ptr();
+        } else {
+            let mut tail_ptr = self.tail.expect("invalid batch state");
+            unsafe { tail_ptr.as_mut().next.set(batch.head) };
             self.tail = batch.tail;
         }
     }
 
     pub(crate) fn push_front(&mut self, batch: impl Into<Self>) {
+        let batch = batch.into();
+        if batch.is_empty() {
+            return;
+        }
+
         if self.is_empty() {
             *self = batch;
-        } else if let Some(batch_head) = batch.head {
-            let tail_ref = unsafe { batch.tail.expect("is_empty() is false").as_mut() };
-            *tail_ref.next.get_mut() = self.head.expect("is_empty() is false").as_ptr();
-            self.head = batch_head;
+        } else {
+            let mut tail_ptr = batch.tail.expect("invalid batch state");
+            unsafe { tail_ptr.as_mut().next.set(self.head) };
+            self.head = batch.head;
         }
     }
 
     pub(crate) fn pop(&mut self) -> Option<NonNull<Task>> {
         self.head.map(|mut task| unsafe {
-            self.head = NonNull::new(*task.as_mut().next.get_mut());
+            self.head = task.as_mut().next.get();
             task
         })
+    }
+
+    pub(crate) fn drain<'a>(&'a mut self) -> impl Iterator<Item = NonNull<Task>> + 'a {
+        struct Drain<'b>(&'b mut Batch);
+
+        impl<'b> Iterator for Drain<'b> {
+            type Item = NonNull<Task>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.pop()
+            }
+        }
+
+        Drain(self)
     }
 }

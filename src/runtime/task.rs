@@ -1,25 +1,5 @@
 use std::{cell::Cell, marker::PhantomPinned, pin::Pin, ptr::NonNull};
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub(crate) enum Priority {
-    Low = 0,
-    Normal = 1,
-    High = 2,
-    Handoff = 3,
-}
-
-impl Priority {
-    pub(crate) const COUNT: usize = 3;
-
-    pub(crate) fn as_index(&self) -> usize {
-        match self {
-            Self::Handoff | Self::High => 0,
-            Self::Normal => 1,
-            Self::Low => 2,
-        }
-    }
-}
-
 pub(crate) type ExecuteFn = unsafe fn(Pin<&mut Task>);
 
 pub(crate) struct Task {
@@ -41,6 +21,7 @@ impl From<ExecuteFn> for Task {
 pub(crate) struct Batch {
     pub(crate) head: Option<NonNull<Task>>,
     pub(crate) tail: Option<NonNull<Task>>,
+    pub(crate) size: usize,
 }
 
 impl From<Pin<&mut Task>> for Batch {
@@ -53,6 +34,7 @@ impl From<Pin<&mut Task>> for Batch {
         Self {
             head: task,
             tail: task,
+            size: 1,
         }
     }
 }
@@ -62,6 +44,7 @@ impl Batch {
         Self {
             head: None,
             tail: None,
+            size: 0,
         }
     }
 
@@ -81,6 +64,7 @@ impl Batch {
             let mut tail_ptr = self.tail.expect("invalid batch state");
             unsafe { tail_ptr.as_mut().next.set(batch.head) };
             self.tail = batch.tail;
+            self.size += batch.size;
         }
     }
 
@@ -96,12 +80,14 @@ impl Batch {
             let mut tail_ptr = batch.tail.expect("invalid batch state");
             unsafe { tail_ptr.as_mut().next.set(self.head) };
             self.head = batch.head;
+            self.size += batch.size;
         }
     }
 
     pub(crate) fn pop(&mut self) -> Option<NonNull<Task>> {
         self.head.map(|mut task| unsafe {
             self.head = task.as_mut().next.get();
+            self.size -= 1;
             task
         })
     }

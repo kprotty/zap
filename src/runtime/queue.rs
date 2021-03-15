@@ -23,12 +23,22 @@ impl GlobalQueue {
             return;
         }
 
-        let head = batch.head.expect("is_empty() check said this was safe");
-        let mut tail = batch.tail.expect("is_empty() check said this was safe");
+        self.push_batch(batch, false)
+    }
+
+    fn push_batch(&self, batch: Batch, is_owned: bool) {
+        let head = batch.head.expect("batch should not be empty");
+        let mut tail = batch.tail.expect("batch should not be empty");
 
         let mut stack = self.stack.load(Ordering::Relaxed);
         loop {
             unsafe { tail.as_mut().next.set(NonNull::new(stack)) };
+
+            if is_owned && stack.is_null() {
+                self.stack.store(head.as_ptr(), Ordering::Release);
+                return;
+            }
+
             match self.stack.compare_exchange_weak(
                 stack,
                 head.as_ptr(),
@@ -40,12 +50,51 @@ impl GlobalQueue {
             }
         }
     }
+
+    fn push_stack(&self, stack: NonNull<Task>) {
+        assert!(self.stack.load(Ordering::Relaxed).is_null());
+        self.stack.store(stack.as_ptr(), Ordering::Release);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub(crate) fn take_stack(&self) -> Option<NonNull<Task>> {
+        let stack = self.stack.load(Ordering::Relaxed);
+        if stack.is_null() {
+            return None;
+        }
+
+        let stack = self.stack.swap(ptr::null_mut(), Ordering::Acquire);
+        NonNull::new(stack)
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    pub(crate) fn take_stack(&self) -> Option<NonNull<Task>> {
+        let mut stack = self.stack.load(Ordering::Relaxed);
+        loop {
+            if stack.is_null() {
+                return None;
+            }
+
+            match self.stack.compare_exchange_weak(
+                stack,
+                ptr::null_mut(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return NonNull::new(stack),
+                Err(e) => {
+                    spin_loop();
+                    stack = e;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct LocalQueue {
     head: AtomicUsize,
     tail: AtomicUsize,
-    overflow: AtomicPtr<Task>,
+    overflow: GlobalQueue,
     buffer: [AtomicPtr<Task>; Self::CAPACITY],
 }
 
@@ -72,51 +121,38 @@ pub(crate) struct LocalQueueProducer<'a> {
 }
 
 impl<'a> LocalQueueProducer<'a> {
-    fn push_buffer(queue: &LocalQueue, mut batch: Batch) -> Option<Batch> {
-        let mut tail = queue.tail.load(Ordering::Relaxed);
-        let mut head = queue.head.load(Ordering::Relaxed);
-        loop {
-            let slots = queue.buffer.len() - tail.wrapping_sub(head);
-            if slots > 0 {
-                tail = (0..slots).zip(batch.drain()).fold(tail, |tail, (_, task)| {
-                    let index = tail % queue.buffer.len();
-                    queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
-                    tail.wrapping_add(1)
+    fn push_buffer(&self, mut batch: Batch) -> Option<Batch> {
+        let tail = self.queue.tail.load(Ordering::Relaxed);
+        let head = self.queue.head.load(Ordering::Relaxed);
+
+        let slots = self.queue.buffer.len() - tail.wrapping_sub(head);
+        if batch.size <= slots {
+            let new_tail = (0..slots)
+                .zip(batch.drain())
+                .fold(tail, |new_tail, (_, task)| {
+                    let index = new_tail % self.queue.buffer.len();
+                    self.queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
+                    new_tail.wrapping_add(1)
                 });
 
-                queue.tail.store(tail, Ordering::Release);
-                if batch.is_empty() {
-                    return None;
-                }
+            self.queue.tail.store(new_tail, Ordering::Release);
+            return None;
+        }
 
-                spin_loop();
-                head = queue.head.load(Ordering::Relaxed);
-                continue;
-            }
-
-            if let Err(e) =
-                queue
-                    .head
-                    .compare_exchange_weak(head, tail, Ordering::Acquire, Ordering::Relaxed)
-            {
-                spin_loop();
-                head = e;
-                continue;
-            }
-
-            let mut overflowed = (0..queue.buffer.len()).fold(Batch::new(), |mut batch, offset| {
-                let index = head.wrapping_add(offset) % queue.buffer.len();
-                let task = queue.buffer[index].load(Ordering::Relaxed);
-                batch.push(unsafe { Pin::new_unchecked(&mut *task) });
-                batch
+        let head = self.queue.head.swap(tail, Ordering::Acquire);
+        let mut overflowed =
+            (0..tail.wrapping_sub(head)).fold(Batch::new(), |mut overflow_batch, offset| {
+                let index = head.wrapping_add(offset) % self.queue.buffer.len();
+                let task = self.queue.buffer[index].load(Ordering::Relaxed);
+                overflow_batch.push(unsafe { Pin::new_unchecked(&mut *task) });
+                overflow_batch
             });
 
-            overflowed.push(batch);
-            return Some(overflowed);
-        }
+        overflowed.push(batch);
+        return Some(overflowed);
     }
 
-    fn pop_buffer(queue: &LocalQueue) -> Option<NonNull<Task>> {
+    fn pop_buffer(&self) -> Option<NonNull<Task>> {
         let tail = queue.tail.load(Ordering::Relaxed);
         let head = queue.head.load(Ordering::Relaxed);
         if tail == head {
@@ -130,15 +166,14 @@ impl<'a> LocalQueueProducer<'a> {
         if tail != head {
             let index = tail.wrapping_sub(1) % queue.buffer.len();
             task = NonNull::new(queue.buffer[index].load(Ordering::Relaxed));
-
             if head != tail.wrapping_sub(1) {
                 return task;
             }
 
-            if let Err(_) =
-                queue
-                    .head
-                    .compare_exchange(head, tail, Ordering::AcqRel, Ordering::Relaxed)
+            if queue
+                .head
+                .compare_exchange(head, tail, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
             {
                 spin_loop();
                 task = None;
@@ -149,11 +184,11 @@ impl<'a> LocalQueueProducer<'a> {
         task
     }
 
-    fn steal_buffer(queue: &LocalQueue) -> Option<NonNull<Task>> {
+    fn steal_buffer(&self) -> Option<NonNull<Task>> {
+        let mut head = queue.head.load(Ordering::Acquire);
         loop {
-            let head = queue.head.load(Ordering::Acquire);
             let tail = queue.tail.load(Ordering::Acquire);
-            if head == tail && head != tail.wrapping_sub(1) {
+            if head == tail || head == tail.wrapping_sub(1) {
                 return None;
             }
 
@@ -163,106 +198,40 @@ impl<'a> LocalQueueProducer<'a> {
                 head,
                 head.wrapping_add(1),
                 Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return NonNull::new(task),
-                Err(_) => spin_loop(),
-            }
-        }
-    }
-
-    fn push_overflow(queue: &LocalQueue, batch: Batch) {
-        let Batch { head, tail } = batch;
-        let head = head.expect("this batch shouldn't be empty");
-        let mut tail = tail.expect("this batch shouldn't be empty");
-
-        let mut overflow = queue.overflow.load(Ordering::Relaxed);
-        loop {
-            unsafe { tail.as_mut().next.set(NonNull::new(overflow)) };
-
-            if overflow.is_null() {
-                queue.overflow.store(head.as_ptr(), Ordering::Release);
-                return;
-            }
-
-            match queue.overflow.compare_exchange_weak(
-                overflow,
-                head.as_ptr(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
                 Err(e) => {
                     spin_loop();
-                    overflow = e;
+                    head = e;
                 }
             }
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    fn take_overflow(queue: &LocalQueue) -> Option<NonNull<Task>> {
-        let overflow = queue.overflow.load(Ordering::Relaxed);
-        if overflow.is_null() {
-            return None;
-        }
+    fn fill_buffer(&self, stack: NonNull<Task>) -> Option<NonNull<Task>> {
+        let mut stack = Some(stack);
+        let tail = self.queue.tail.load(Ordering::Relaxed);
+        let head = self.queue.head.load(Ordering::Relaxed);
 
-        let overflow = queue.overflow.swap(ptr::null_mut(), Ordering::Acquire);
-        NonNull::new(overflow)
-    }
-
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    fn take_overflow(queue: &LocalQueue) -> Option<NonNull<Task>> {
-        let mut overflow = queue.overflow.load(Ordering::Relaxed);
-        loop {
-            if overflow.is_null() {
-                return None;
-            }
-
-            match queue.overflow.compare_exchange_weak(
-                overflow,
-                ptr::null_mut(),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return NonNull::new(overflow),
-                Err(e) => {
-                    spin_loop();
-                    overflow = e;
-                }
-            }
-        }
-    }
-
-    fn pop_and_steal_overflow(
-        queue: &LocalQueue,
-        target: &LocalQueue,
-    ) -> Option<(NonNull<Task>, bool)> {
-        let mut first_task = Self::take_overflow(target)?;
-        let mut overflowed = unsafe { first_task.as_mut().next.get() };
-
-        let tail = queue.tail.load(Ordering::Relaxed);
-        let new_tail = (0..queue.buffer.len())
+        let slots = self.queue.buffer.len() - tail.wrapping_sub(head);
+        let new_tail = (0..slots)
             .zip(std::iter::from_fn(|| unsafe {
-                let mut task = overflowed?;
-                overflowed = task.as_mut().next.get();
+                let mut task = stack?;
+                stack = task.as_mut().next.get();
                 Some(task)
             }))
             .fold(tail, |tail, (_, task)| {
-                let index = tail % queue.buffer.len();
-                queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
+                let index = tail % self.queue.buffer.len();
+                self.queue.buffer[index].store(task.as_ptr(), Ordering::Relaxed);
                 tail.wrapping_add(1)
             });
 
         if new_tail != tail {
-            queue.tail.store(new_tail, Ordering::Release);
+            self.queue.tail.store(new_tail, Ordering::Release);
         }
 
-        if let Some(overflowed) = overflowed {
-            queue.overflow.store(overflowed.as_ptr(), Ordering::Release);
-        }
-
-        Some((first_task, overflowed.is_some()))
+        stack
     }
 
     pub(crate) fn push(&mut self, batch: impl Into<Batch>) {
@@ -271,20 +240,39 @@ impl<'a> LocalQueueProducer<'a> {
             return;
         }
 
-        if let Some(overflowed) = Self::push_buffer(self.queue, batch) {
-            Self::push_overflow(self.queue, overflowed);
+        if let Some(overflowed) = self.push_buffer(batch) {
+            self.overflow.push_batch(overflowed, true);
         }
     }
 
     pub(crate) fn pop(&mut self) -> Option<(NonNull<Task>, bool)> {
-        Self::pop_buffer(self.queue)
+        self.pop_buffer()
             .map(|task| (task, false))
-            .or_else(|| Self::pop_and_steal_overflow(self.queue, self.queue))
+            .or_else(|| self.pop_and_steal_global(&self.overflow))
     }
 
-    pub(crate) fn pop_and_steal(&mut self, target: &LocalQueue) -> Option<(NonNull<Task>, bool)> {
-        Self::steal_buffer(target)
+    pub(crate) fn pop_and_steal_local(
+        &mut self,
+        target: &LocalQueue,
+    ) -> Option<(NonNull<Task>, bool)> {
+        target
+            .steal_buffer()
             .map(|task| (task, false))
-            .or_else(|| Self::pop_and_steal_overflow(self.queue, target))
+            .or_else(|| self.pop_and_steal_global(&target.overflow))
+    }
+
+    pub(crate) fn pop_and_steal_global(
+        &self,
+        target: &GlobalQueue,
+    ) -> Option<(NonNull<Task>, bool)> {
+        let mut task = target.take_stack()?;
+        let mut stack = unsafe { task.as_mut().next.get() };
+
+        let did_push = stack.is_some();
+        if let Some(left_over) = stack.and_then(|s| self.fill_buffer(s)) {
+            self.overflow.push_stack(left_over);
+        }
+
+        Some((task, did_push))
     }
 }

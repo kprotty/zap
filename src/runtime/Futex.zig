@@ -11,6 +11,74 @@ else if (std.builtin.link_libc)
 else 
     @compileError("Platform not supported");
 
+const DarwinFutex = struct {
+    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) callconv(.Inline) error{TimedOut}!void {
+        return PosixFutex.wait(ptr, expected, timeout);
+    }
+
+    pub fn wake(ptr: *const u32, waiters: u32) callconv(.Inline) void {
+        return PosixFutex.wake(ptr, waiters);
+    }
+
+    pub fn yield(iteration: usize) bool {
+        if (std.builtin.arch != .x86_64) return false;
+        if (iteration > 100) return false;
+        std.Thread.spinLoopHint();
+        return true;
+    }
+};
+
+const WindowsFutex = struct {
+    extern "NtDll" fn RtlWakeAddressAll(
+        Address: ?*const c_void,
+    ) callconv(std.os.windows.WINAPI) void;
+
+    extern "NtDll" fn RtlWakeAddressSingle(
+        Address: ?*const c_void,
+    ) callconv(std.os.windows.WINAPI) void;
+
+    extern "NtDll" fn RtlWaitOnAddress(
+        Address: ?*const c_void,
+        CompareAddress: ?*const c_void,
+        AddressSize: std.os.windows.SIZE_T,
+        Timeout: ?*const std.os.windows.LARGE_INTEGER,
+    ) callconv(std.os.windows.WINAPI) std.os.windows.NTSTATUS;
+
+    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
+        var timeout_val: std.os.windows.LARGE_INTEGER = undefined;
+        var timeout_ptr: ?*const @TypeOf(timeout_val) = null;
+        if (timeout) |timeout_ns| {
+            timeout_ptr = &timeout_val;
+            timeout_val = -@intCast(@TypeOf(timeout_val), timeout_ns / 100);
+        }
+
+        const status = RtlWaitOnAddress(
+            @ptrCast(?*const c_void, ptr),
+            @ptrCast(?*const c_void, &expected),
+            @sizeOf(@TypeOf(expected)),
+            timeout_ptr,
+        );
+
+        if (status == .TIMEOUT)
+            return error.TimedOut;
+    }
+
+    pub fn wake(ptr: *const u32, waiters: u32) void {
+        const address = @ptrCast(?*const c_void, ptr);
+        switch (waiters) {
+            0 => {},
+            1 => RtlWakeAddressSingle(address),
+            else => RtlWakeAddressAll(address),
+        }
+    }
+
+    pub fn yield(iteration: usize) bool {
+        if (iteration >= 4000) return false;
+        std.Thread.spinLoopHint();
+        return true;
+    }
+};
+
 const LinuxFutex = struct {
     pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
         var ts: std.os.timespec = undefined;
@@ -50,31 +118,7 @@ const LinuxFutex = struct {
     }
 
     pub fn yield(iteration: usize) bool {
-        if (iteration > 100)
-            return false;
-
-        std.Thread.spinLoopHint();
-        return true;
-    }
-};
-
-const DarwinFutex = struct {
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) callconv(.Inline) error{TimedOut}!void {
-        return PosixFutex.wait(ptr, expected, timeout);
-    }
-
-    pub fn wake(ptr: *const u32, waiters: u32) callconv(.Inline) void {
-        return PosixFutex.wake(ptr, waiters);
-    }
-
-    pub fn yield(iteration: usize) bool {
-        if (std.builtin.os.tag != .macos) 
-            return false;
-
-        const max_spin = if (std.builtin.arch == .x86_64) 1000 else 100;
-        if (iteration > max_spin)
-            return false;
-
+        if (iteration > 10) return false;
         std.Thread.spinLoopHint();
         return true;
     }
@@ -208,238 +252,6 @@ const PosixFutex = GenericFutex(struct {
     }
 });
 
-const WindowsFutex = struct {
-    pub fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-        if (WaitOnAddress.isSupported())
-            return WaitOnAddress.wait(ptr, expected, timeout);
-        return Generic.wait(ptr, expected, timeout);
-    }
-
-    pub fn wake(ptr: *const u32, waiters: u32) void {
-        if (WaitOnAddress.isSupported())
-            return WaitOnAddress.wake(ptr, waiters);
-        return Generic.wake(ptr, waiters);
-    }
-
-    pub fn yield(iteration: usize) bool {
-        return Generic.Event.yield(iteration);
-    }
-
-    const WaitOnAddress = struct {
-        var state: State = .uninit;
-        var wait_ptr: WaitOnAddressFn = undefined;
-        var wake_one_ptr: WakeByAddressFn = undefined;
-        var wake_all_ptr: WakeByAddressFn = undefined;
-
-        const State = enum(u8) {
-            uninit,
-            supported,
-            unsupported,
-        };
-
-        const WakeByAddressFn = fn (
-            address: ?*const volatile c_void,
-        ) callconv(std.os.windows.WINAPI) void;
-
-        const WaitOnAddressFn = fn (
-            address: ?*const volatile c_void,
-            compare_address: ?*const c_void,
-            address_size: std.os.windows.SIZE_T,
-            timeout_ms: std.os.windows.DWORD,
-        ) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
-
-        fn isSupported() bool {
-            return switch (@atomicLoad(State, &state, .Acquire)) {
-                .uninit => checkSupported(),
-                .supported => true,
-                .unsupported => false,
-            };
-        }
-
-        fn checkSupported() bool {
-            @setCold(true);
-
-            const is_supported = tryLoad();
-            const new_state = if (is_supported) State.supported else .unsupported;
-            @atomicStore(State, &state, new_state, .Release);
-
-            return is_supported;
-        }
-
-        fn tryLoad() bool {
-            // MSDN says that the functions are in kernel32.dll, but apparently they aren't...
-            const synch_dll = std.os.windows.kernel32.GetModuleHandleW(blk: {
-                const dll = "api-ms-win-core-synch-l1-2-0.dll";
-                comptime var wdll = [_]std.os.windows.WCHAR{0} ** (dll.len + 1);
-                inline for (dll) |char, index|
-                    wdll[index] = @as(std.os.windows.WCHAR, char);
-                break :blk @ptrCast([*:0]const std.os.windows.WCHAR, &wdll);
-            }) orelse return false;
-
-            const _wait_ptr = std.os.windows.kernel32.GetProcAddress(
-                synch_dll,
-                "WaitOnAddress\x00",
-            ) orelse return false;
-
-            const _wake_one_ptr = std.os.windows.kernel32.GetProcAddress(
-                synch_dll,
-                "WakeByAddressSingle\x00",
-            ) orelse return false;
-
-            const _wake_all_ptr = std.os.windows.kernel32.GetProcAddress(
-                synch_dll,
-                "WakeByAddressAll\x00",
-            ) orelse return false;
-
-            // Unordered stores since this could be racing with other threads
-            @atomicStore(WaitOnAddressFn, &wait_ptr, @ptrCast(WaitOnAddressFn, _wait_ptr), .Unordered);
-            @atomicStore(WakeByAddressFn, &wake_one_ptr, @ptrCast(WakeByAddressFn, _wake_one_ptr), .Unordered);
-            @atomicStore(WakeByAddressFn, &wake_all_ptr, @ptrCast(WakeByAddressFn, _wake_all_ptr), .Unordered);
-
-            return true;
-        }
-
-        fn wait(ptr: *const u32, expected: u32, timeout: ?u64) error{TimedOut}!void {
-            var timeout_ms: std.os.windows.DWORD = std.os.windows.INFINITE;
-            if (timeout) |timeout_ns| {
-                timeout_ms = std.math.cast(std.os.windows.DWORD, timeout_ns / std.time.ns_per_ms) catch timeout_ms;
-            }
-            
-            const status = (wait_ptr)(
-                @ptrCast(*const volatile c_void, ptr),
-                @ptrCast(*const c_void, &expected),
-                @sizeOf(u32),
-                timeout_ms,
-            );
-
-            if (status == std.os.windows.FALSE) {
-                switch (std.os.windows.kernel32.GetLastError()) {
-                    .TIMEOUT => {},
-                    else => |err| {
-                        const e = std.os.windows.unexpectedError(err);
-                        unreachable;
-                    },
-                }
-            }
-        }
-
-        fn wake(ptr: *const u32, waiters: u32) void {
-            const address = @ptrCast(*const volatile c_void, ptr);
-            return switch (waiters) {
-                0 => {},
-                1 => (wake_one_ptr)(address),
-                else => (wake_all_ptr)(address),
-            };
-        }
-    };
-
-    const Generic = GenericFutex(struct {
-        state: State = .empty,
-        lock: std.os.windows.SRWLOCK = std.os.windows.SRWLOCK_INIT,
-        cond: std.os.windows.CONDITION_VARIABLE = std.os.windows.CONDITION_VARIABLE_INIT,
-
-        const State = enum {
-            empty,
-            waiting,
-            notified,
-        };
-
-        pub fn init(self: *@This()) void {
-            self.* = .{};
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self.* = undefined;
-        }
-
-        pub fn set(self: *@This()) void {
-            std.os.windows.kernel32.AcquireSRWLockExclusive(&self.lock);
-            defer std.os.windows.kernel32.ReleaseSRWLockExclusive(&self.lock);
-
-            const state = self.state;
-            self.state = .notified;
-            switch (state) {
-                .empty => {},
-                .waiting => std.os.windows.kernel32.WakeConditionVariable(&self.cond),
-                .notified => unreachable,
-            }
-        }
-
-        threadlocal var frequency: u64 = 0;
-
-        pub fn wait(self: *@This(), timeout: ?u64) error{TimedOut}!void {
-            var start: u64 = undefined;
-            if (timeout != null) {
-                if (frequency == 0) frequency = std.os.windows.QueryPerformanceFrequency();
-                start = std.os.windows.QueryPerformanceCounter();
-            }
-
-            std.os.windows.kernel32.AcquireSRWLockExclusive(&self.lock);
-            defer std.os.windows.kernel32.ReleaseSRWLockExclusive(&self.lock);
-
-            switch (self.state) {
-                .empty => self.state = .waiting,
-                .waiting => unreachable,
-                .notified => return,
-            }
-
-            while (true) {
-                switch (self.state) {
-                    .empty => unreachable,
-                    .waiting => {},
-                    .notified => return,
-                }
-
-                var timeout_ms: std.os.windows.DWORD = std.os.windows.INFINITE;
-                if (timeout) |timeout_ns| {
-                    const now = std.os.windows.QueryPerformanceCounter();
-                    const elapsed = if (now < start) 0 else blk: {
-                        const a = now - start;
-                        const b = std.time.ns_per_s;
-                        const c = frequency;
-                        const q = a / c;
-                        const r = a % c;
-                        break :blk (q * b) + (r * b) / c;
-                    };
-
-                    if (elapsed > timeout_ns) {
-                        self.state = .empty;
-                        return error.TimedOut;
-                    }
-
-                    const delay_ms = (timeout_ns - elapsed) / std.time.ns_per_ms;
-                    timeout_ms = std.math.cast(std.os.windows.DWORD, delay_ms) catch timeout_ms;
-                }
-
-                const status = std.os.windows.kernel32.SleepConditionVariableSRW(
-                    &self.cond,
-                    &self.lock,
-                    timeout_ms,
-                    0,
-                );
-
-                if (status == std.os.windows.FALSE) {
-                    switch (std.os.windows.kernel32.GetLastError()) {
-                        .TIMEOUT => {},
-                        else => |err| {
-                            const e = std.os.windows.unexpectedError(err);
-                            unreachable;
-                        },
-                    }
-                }
-            }
-        }
-
-        pub fn yield(iteration: usize) bool {
-            if (iteration > 4000)
-                return false;
-
-            std.Thread.spinLoopHint();
-            return true;
-        }
-    });
-};
-
 fn GenericFutex(comptime EventImpl: type) type {
     return struct {
         pub const Event = EventImpl;
@@ -462,7 +274,8 @@ fn GenericFutex(comptime EventImpl: type) type {
             var buckets = [_]Bucket{.{}} ** num_buckets;
 
             fn from(address: usize) *Bucket {
-                const index = (address >> @sizeOf(u32)) % num_buckets;
+                const seed = 0x9E3779B97F4A7C15 >> (64 - std.meta.bitCount(usize));
+                const index = (address *% seed) % num_buckets;
                 return &buckets[index];
             }
 

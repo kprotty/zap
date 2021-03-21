@@ -11,7 +11,7 @@ idle_lock: Lock = .{},
 idle_stack: ?*Worker = null,
 max_threads: u16,
 spawned: ?*Worker = null,
-run_queues: [Priority.Count]GlobalQueue = [_]GlobalQueue{.{}} ** Priority.Count,
+run_queues: Priority.Array(GlobalQueue) = Priority.arrayInit(GlobalQueue),
 
 pub const InitConfig = struct {
     max_threads: ?u16 = null,
@@ -45,15 +45,22 @@ pub const Priority = enum {
     High = 2,
 
     pub const Max = Priority.High;
-    pub const Count = @enumToInt(Max) + 1;
+    
+    fn Array(comptime T: type) type {
+        return [3]T;
+    }
+
+    fn arrayInit(comptime T: type) Array(T) {
+        return [_]T{.{}} ** 3;
+    }
 
     fn toArrayIndex(self: Priority) usize {
-        return @enumToInt(Priority.Max) - @enumToInt(self);
+        return @enumToInt(self);
     }
 };
 
 pub const ScheduleHints = struct {
-    priority: Priority = .High,
+    priority: Priority = .Normal,
 };
 
 pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
@@ -62,10 +69,11 @@ pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
         return;
     }
 
+    const priority_index = hints.priority.toArrayIndex();
     if (Worker.getCurrent()) |worker| {
-        worker.run_queues[hints.priority.toArrayIndex()].push(batch);
+        worker.run_queues[priority_index].push(batch);
     } else {
-        self.run_queues[hints.priority.toArrayIndex()].push(batch);
+        self.run_queues[priority_index].push(batch);
     }
 
     self.notifyWorkers(false);
@@ -423,7 +431,7 @@ const Worker = struct {
     idle_next: ?*Worker = null,
     spawned_next: ?*Worker = null,
     run_tick: usize,
-    run_queues: [Priority.Count]LocalQueue = [_]LocalQueue{.{}} ** Priority.Count,
+    run_queues: Priority.Array(LocalQueue) = Priority.arrayInit(LocalQueue),
 
     const State = enum(u32) {
         running,
@@ -590,47 +598,43 @@ const Worker = struct {
     }
 
     fn pop(self: *Worker, did_push: *bool) ?*Runnable {
+        const be_fair = self.run_tick % 61 == 0;
+        const max_attempts = 8;
         self.run_tick +%= 1;
 
-        const be_fair = self.run_tick % 61 == 0;
-        if (be_fair) {
-            if (self.pollPool(did_push)) |runnable|
-                return runnable;
+        var attempt: usize = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            const Scope = enum { local, global, remote };
+            const is_fair = be_fair and attempt == 0;
 
-            for ([_]Priority{ .Low, .Normal, .High }) |priority| {
-                if (self.run_queues[priority.toArrayIndex()].pop(true, did_push)) |runnable|
-                    return runnable;
-            }
-        }
-
-        const max_attempts = 8;
-
-        var steal_attempt: usize = 0;
-        while (steal_attempt < max_attempts) : (steal_attempt += 1) {
-            for ([_]Priority{ .High, .Normal, .Low }) |priority| {
-                if (self.run_queues[priority.toArrayIndex()].pop(false, did_push)) |runnable|
-                    return runnable;
+            var scope_order = [_]Scope{ .local, .global, .remote };
+            if (is_fair) {
+                scope_order = [_]Scope{ .global, .local, .remote };
             }
 
-            if (self.pollPool(did_push)) |runnable|
-                return runnable;
-
-            if (self.pollWorkers(did_push)) |runnable|
-                return runnable;
+            for (scope_order) |scope| {
+                if (switch (scope) {
+                    .local => self.pollLocal(is_fair, did_push),
+                    .global => self.pollPool(is_fair, did_push),
+                    .remote => self.pollSteal(is_fair, did_push),
+                }) |runnable| {
+                    return runnable;
+                }
+            }
         }
 
         return null;
     }
 
-    fn pollPool(self: *Worker, did_push: *bool) ?*Runnable {
-        return self.pollWith(
-            did_push,
-            &self.pool.run_queues,
-            "popAndStealGlobal",
-        );
+    fn pollLocal(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
+        return self.pollQueues(be_fair, did_push, {});
     }
 
-    fn pollWorkers(self: *Worker, did_push: *bool) ?*Runnable {
+    fn pollPool(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
+        return self.pollQueues(be_fair, did_push, self.pool);
+    }
+
+    fn pollSteal(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
         var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
         while (threads > 0) : (threads -= 1) {
             const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
@@ -639,25 +643,29 @@ const Worker = struct {
             if (target == self)
                 continue;
 
-            if (self.pollWith(did_push, &target.run_queues, "popAndStealLocal")) |runnable|
+            if (self.pollQueues(be_fair, did_push, target)) |runnable|
                 return runnable;
         }
 
         return null;
     }
 
-    fn pollWith(
-        self: *Worker,
-        did_push: *bool,
-        target_queues: anytype,
-        comptime pollFn: []const u8,
-    ) ?*Runnable {
-        for ([_]Priority{ .High, .Normal, .Low }) |priority| {
-            const index = priority.toArrayIndex();
-            const our_queue = &self.run_queues[index];
-            const target_queue = &target_queues[index];
-            if (@field(LocalQueue, pollFn)(our_queue, target_queue, did_push)) |runnable|
+    fn pollQueues(self: *Worker, be_fair: bool, did_push: *bool, target: anytype) ?*Runnable {
+        var priority_order = [_]Priority{ .High, .Normal, .Low };
+        if (be_fair) {
+            priority_order = [_]Priority{ .Low, .Normal, .High };
+        }
+
+        for (priority_order) |priority| {
+            const i = priority.toArrayIndex();
+            if (switch (@TypeOf(target)) {
+                *Worker => self.run_queues[i].popAndStealLocal(&target.run_queues[i], be_fair, did_push),
+                *Pool => self.run_queues[i].popAndStealGlobal(&target.run_queues[i], be_fair, did_push),
+                void => self.run_queues[i].pop(be_fair, did_push),
+                else => @compileError("invalid poll target"),
+            }) |runnable| {
                 return runnable;
+            }
         }
 
         return null;
@@ -690,13 +698,18 @@ const LocalQueue = struct {
         return null;
     }
 
-    fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue, did_push: *bool) ?*Runnable {
+    fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
         return self.buffer.stealUnbounded(target, did_push);
     }
 
-    fn popAndStealLocal(self: *LocalQueue, target: *LocalQueue, did_push: *bool) ?*Runnable {
+    fn popAndStealLocal(self: *LocalQueue, target: *LocalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
         if (self == target)
             return self.pop(false, did_push);
+
+        if (be_fair) {
+            if (self.buffer.stealUnbounded(&target.overflow, did_push)) |runnable|
+                return runnable;
+        }
 
         if (self.buffer.stealBounded(&target.buffer, did_push)) |runnable|
             return runnable;
@@ -713,24 +726,35 @@ const UnboundedQueue = struct {
     tail: usize = 0,
     stub: Runnable = Runnable.init(undefined),
 
+    fn isEmpty(self: *const UnboundedQueue) bool {
+        const head = @atomicLoad(?*Runnable, &self.head, .Monotonic);
+        return (head == null or head == &self.stub);
+    }
+
     fn push(self: *UnboundedQueue, batch: Batch) void {
-        if (batch.isEmpty()) return;
+        if (batch.isEmpty()) 
+            return;
+
         const head = @atomicRmw(?*Runnable, &self.head, .Xchg, batch.tail, .AcqRel);
         const prev = head orelse &self.stub;
         @atomicStore(?*Runnable, &prev.next, batch.head, .Release);
     }
 
     fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
-        var tail = @atomicLoad(usize, &self.tail, .Monotonic);
-        while (true) : (std.Thread.spinLoopHint()) {
+        if (self.isEmpty())
+            return null;
+        return self.tryAcquireConsumerSlow();
+    }
 
-            const head = @atomicLoad(?*Runnable, &self.head, .Monotonic);
-            if (head == null or head == &self.stub)
-                return null;
+    fn tryAcquireConsumerSlow(self: *UnboundedQueue) ?Consumer {
+        @setCold(true);
 
+        while (true) {
+            const tail = @atomicLoad(usize, &self.tail, .Monotonic);
             if (tail & 1 != 0)
                 return null;
-            tail = @cmpxchgWeak(
+
+            _ = @cmpxchgWeak(
                 usize,
                 &self.tail,
                 tail,
@@ -741,6 +765,10 @@ const UnboundedQueue = struct {
                 .queue = self,
                 .tail = @intToPtr(?*Runnable, tail) orelse &self.stub,
             };
+
+            std.Thread.spinLoopHint();
+            if (self.isEmpty())
+                return null;
         }
     }
 
@@ -899,7 +927,7 @@ const BoundedQueue = struct {
             return self.pop();
 
         var target_head = @atomicLoad(Pos, &target.head, .Acquire);
-        while (true) {
+        while (true) : (std.Thread.spinLoopHint()) {
             const target_tail = switch (std.builtin.arch) {
                 .i386, .x86_64 => @atomicLoad(Pos, &target.tail, .SeqCst),
                 else => blk: {

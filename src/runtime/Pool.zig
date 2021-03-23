@@ -684,13 +684,12 @@ const LocalQueue = struct {
     }
 
     fn pop(self: *LocalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
-        if (be_fair) {
-            if (self.buffer.stealUnbounded(&self.overflow, did_push)) |runnable|
-                return runnable;
-        }
-
-        if (self.buffer.pop()) |runnable|
+        if (switch (be_fair) {
+            true => self.buffer.popFair(),
+            false => self.buffer.pop(),
+        }) |runnable| {
             return runnable;
+        }
         
         if (self.buffer.stealUnbounded(&self.overflow, did_push)) |runnable|
             return runnable;
@@ -706,106 +705,106 @@ const LocalQueue = struct {
         if (self == target)
             return self.pop(false, did_push);
 
+        const Steal = enum { Bounded, Unbounded };
+        var steal_order = [_]Steal{ .Unbounded, .Bounded };
         if (be_fair) {
-            if (self.buffer.stealUnbounded(&target.overflow, did_push)) |runnable|
-                return runnable;
+            steal_order = [_]Steal{ .Bounded, .Unbounded };
         }
 
-        if (self.buffer.stealBounded(&target.buffer, did_push)) |runnable|
-            return runnable;
-
-        if (self.buffer.stealUnbounded(&target.overflow, did_push)) |runnable|
-            return runnable;
+        for (steal_order) |steal| {
+            if (switch (steal) {
+                .Bounded => target.buffer.stealBounded(),
+                .Unbounded => self.buffer.stealUnbounded(&target.overflow, did_push),
+            }) |runnable| {
+                return runnable;
+            }
+        }
 
         return null;
     }
 };
 
 const UnboundedQueue = struct {
-    head: ?*Runnable = null,
-    tail: usize = 0,
-    stub: Runnable = Runnable.init(undefined),
+    stack: usize = 0,
+    local: ?*Runnable = null,
 
-    fn isEmpty(self: *const UnboundedQueue) bool {
-        const head = @atomicLoad(?*Runnable, &self.head, .Monotonic);
-        return (head == null or head == &self.stub);
-    }
+    const MASK = ~(HAS_CONSUMER | HAS_LOCAL);
+    const HAS_CONSUMER: usize = 1 << 0;
+    const HAS_LOCAL: usize = 1 << 1;
 
     fn push(self: *UnboundedQueue, batch: Batch) void {
         if (batch.isEmpty()) 
             return;
 
-        const head = @atomicRmw(?*Runnable, &self.head, .Xchg, batch.tail, .AcqRel);
-        const prev = head orelse &self.stub;
-        @atomicStore(?*Runnable, &prev.next, batch.head, .Release);
+        var stack = @atomicLoad(usize, &self.stack, .Monotonic);
+        while (true) {
+            batch.tail.next = @intToPtr(?*Runnable, stack & MASK);
+            stack = @cmpxchgWeak(
+                usize,
+                &self.stack,
+                stack,
+                @ptrToInt(batch.head) | (stack & ~MASK),
+                .Release,
+                .Monotonic,
+            ) orelse break;
+        }
     }
 
     fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
-        if (self.isEmpty())
-            return null;
-        return self.tryAcquireConsumerSlow();
-    }
-
-    fn tryAcquireConsumerSlow(self: *UnboundedQueue) ?Consumer {
-        @setCold(true);
-
+        var stack = @atomicLoad(usize, &self.stack, .Monotonic);
         while (true) {
-            const tail = @atomicLoad(usize, &self.tail, .Monotonic);
-            if (tail & 1 != 0)
+            if (stack & ~HAS_CONSUMER == 0)
+                return null;
+            if (stack & HAS_CONSUMER != 0)
                 return null;
 
-            _ = @cmpxchgWeak(
+            var new_stack = stack | HAS_CONSUMER | HAS_LOCAL;
+            if (stack & HAS_LOCAL == 0) {
+                new_stack &= ~MASK;
+            }
+
+            stack = @cmpxchgWeak(
                 usize,
-                &self.tail,
-                tail,
-                tail | 1,
+                &self.stack,
+                stack,
+                new_stack,
                 .Acquire,
                 .Monotonic,
             ) orelse return Consumer{
                 .queue = self,
-                .tail = @intToPtr(?*Runnable, tail) orelse &self.stub,
+                .local = self.local orelse @intToPtr(?*Runnable, stack & MASK),
             };
-
-            std.Thread.spinLoopHint();
-            if (self.isEmpty())
-                return null;
         }
     }
 
     const Consumer = struct {
         queue: *UnboundedQueue,
-        tail: *Runnable,
+        local: ?*Runnable,
 
         fn release(self: Consumer) void {
-            @atomicStore(usize, &self.queue.tail, @ptrToInt(self.tail), .Release);
+            var remove: usize = HAS_CONSUMER;
+            if (self.local == null) {
+                remove |= HAS_LOCAL;
+            }
+
+            self.queue.local = self.local;
+            _ = @atomicRmw(usize, &self.queue.stack, .Sub, remove, .Release);
         }
 
         fn pop(self: *Consumer) ?*Runnable {
-            var tail = self.tail;
-            var next = @atomicLoad(?*Runnable, &tail.next, .Acquire);
-            if (tail == &self.queue.stub) {
-                tail = next orelse return null;
-                self.tail = tail;
-                next = @atomicLoad(?*Runnable, &tail.next, .Acquire);
+            if (self.local) |runnable| {
+                self.local = runnable.next;
+                return runnable;
             }
 
-            if (next) |runnable| {
-                self.tail = runnable;
-                return tail;
+            var stack = @atomicLoad(usize, &self.queue.stack, .Monotonic);
+            if (stack & MASK != 0) {
+                stack = @atomicRmw(usize, &self.queue.stack, .Xchg, HAS_LOCAL | HAS_CONSUMER, .Acquire);
             }
 
-            const head = @atomicLoad(?*Runnable, &self.queue.head, .Monotonic);
-            if (tail != head) {
-                return null;
-            }
-
-            self.queue.push(Batch.from(&self.queue.stub));
-            if (@atomicLoad(?*Runnable, &tail.next, .Acquire)) |runnable| {
-                self.tail = runnable;
-                return tail;
-            }
-
-            return null;
+            const runnable = @intToPtr(?*Runnable, stack & MASK) orelse return null;
+            self.local = runnable.next;
+            return runnable;
         }
     };
 };
@@ -827,76 +826,94 @@ const BoundedQueue = struct {
             return null;
         }
 
+        if (batch.size > self.buffer.len) {
+            return batch;
+        }
+
         var tail = self.tail;
         var head = @atomicLoad(Pos, &self.head, .Monotonic);
-        while (true) {
-            const unoccupied = self.buffer.len - (tail -% head);
-            if (unoccupied >= batch.size) {
-                while (tail -% head < self.buffer.len) {
-                    const runnable = batch.pop() orelse break;
-                    @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
-                    tail +%= 1;
-                }
-                @atomicStore(Pos, &self.tail, tail, .Release);
-                return null;
-            }
 
-            const half = @intCast(Pos, self.buffer.len / 2);
-            if (unoccupied < half) {
-                return batch;
-            }
-
-            const new_head = head +% half;
-            if (@cmpxchgWeak(
-                Pos,
-                &self.head,
-                head,
-                new_head,
-                .Acquire,
-                .Monotonic,
-            )) |updated| {
-                head = updated;
-                continue;
-            }
-
-            var overflowed = Batch{};
-            while (head != new_head) : (head +%= 1) {
-                const runnable = self.buffer[head % self.buffer.len];
-                overflowed.pushBack(Batch.from(runnable));
-            }
-
-            overflowed.pushBack(batch);
-            return overflowed;
+        const free_slots = self.buffer.len - (tail -% head);
+        if (batch.size > free_slots) {
+            return batch;
         }
+
+        while (batch.pop()) |runnable| {
+            @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
+            tail +%= 1;
+        }
+        
+        @atomicStore(Pos, &self.tail, tail, .Release);
+        return null;
     }
 
     fn pop(self: *BoundedQueue) ?*Runnable {
         const tail = self.tail;
-        if (@atomicLoad(Pos, &self.head, .Monotonic) == tail)
+        if (@atomicLoad(Pos, &self.head, .Unordered) == tail) {
             return null;
-
-        const new_tail = tail -% 1;
-        switch (std.builtin.arch) {
-            .i386, .x86_64 => _ = @atomicRmw(Pos, &self.tail, .Xchg, new_tail, .SeqCst),
-            else => {
-                @atomicStore(Pos, &self.tail, new_tail, .Monotonic);
-                @fence(.SeqCst);
-            },
         }
         
+        const new_tail = tail -% 1;
+        @atomicStore(Pos, &self.tail, new_tail, .SeqCst);
+        const head = @atomicLoad(Pos, &self.head, .SeqCst);
+
         var runnable: ?*Runnable = null;
-        const head = @atomicLoad(Pos, &self.head, .Monotonic);
         if (head != tail) {
             runnable = self.buffer[new_tail % self.buffer.len];
-            if (head != new_tail)
+            if (head != new_tail) {
                 return runnable;
+            }
 
-            if (@cmpxchgStrong(Pos, &self.head, head, tail, .SeqCst, .Monotonic) != null)
+            if (@cmpxchgStrong(Pos, &self.head, head, tail, .SeqCst, .Monotonic) != null) {
                 runnable = null;
+            }
         }
 
         @atomicStore(Pos, &self.tail, tail, .Monotonic);
         return runnable;
+    }
+
+    fn popFair(self: *BoundedQueue) ?*Runnable {
+        var tail = self.tail;
+        var head = @atomicLoad(Pos, &self.head, .Monotonic);
+        while (true) {
+            if (tail == head) {
+                return null;
+            }
+
+            head = @cmpxchgWeak(
+                Pos,
+                &self.head,
+                head,
+                head +% 1,
+                .Acquire,
+                .Monotonic,
+            ) orelse return self.buffer[head % self.buffer.len];
+        }
+    }
+
+    fn stealBounded(target: *BoundedQueue) ?*Runnable {
+        var target_head = @atomicLoad(Pos, &target.head, .SeqCst);
+        while (true) : (std.Thread.spinLoopHint()) {
+            const target_tail = @atomicLoad(Pos, &target.tail, .SeqCst);
+
+            if (target_tail == target_head)
+                return null;
+            if ((target_tail -% 1) == target_head)
+                return null;
+            if ((target_tail -% target_head) > target.buffer.len)
+                return null;
+
+            const task = @atomicLoad(*Runnable, &target.buffer[target_head % target.buffer.len], .Unordered);
+            target_head = @cmpxchgStrong(
+                Pos,
+                &target.head,
+                target_head,
+                target_head +% 1,
+                .SeqCst,
+                .SeqCst,
+            ) orelse return task;
+        }
     }
 
     fn stealUnbounded(self: *BoundedQueue, target: *UnboundedQueue, did_push: *bool) ?*Runnable {
@@ -920,38 +937,5 @@ const BoundedQueue = struct {
         }
 
         return first_runnable;
-    }
-
-    fn stealBounded(self: *BoundedQueue, target: *BoundedQueue, did_push: *bool) ?*Runnable {
-        if (self == target)
-            return self.pop();
-
-        var target_head = @atomicLoad(Pos, &target.head, .Acquire);
-        while (true) : (std.Thread.spinLoopHint()) {
-            const target_tail = switch (std.builtin.arch) {
-                .i386, .x86_64 => @atomicLoad(Pos, &target.tail, .SeqCst),
-                else => blk: {
-                    @fence(.SeqCst);
-                    break :blk @atomicLoad(Pos, &target.tail, .Acquire);
-                },
-            };
-
-            if (target_tail == target_head)
-                return null;
-            if ((target_tail -% 1) == target_head)
-                return null;
-            if ((target_tail -% target_head) > target.buffer.len)
-                return null;
-
-            const task = @atomicLoad(*Runnable, &target.buffer[target_head % target.buffer.len], .Unordered);
-            target_head = @cmpxchgStrong(
-                Pos,
-                &target.head,
-                target_head,
-                target_head +% 1,
-                .SeqCst,
-                .Monotonic,
-            ) orelse return task;
-        }
     }
 };

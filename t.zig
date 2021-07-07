@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(NewPool);
+    return benchPool(CustomPool);
 }
 
 const REPS = 10;
@@ -171,7 +171,7 @@ const BasicPool = struct {
 };
 
 const NewPool = struct {
-    const Pool = @import("./src/runtime/Pool.zig");
+    const Pool = @import("./src/runtime/Pool3.zig");
     const Runnable = Pool.Runnable;
 
     var current: ?*Pool = null;
@@ -194,6 +194,31 @@ const NewPool = struct {
 
     fn shutdown() void {
         event.set();
+    }
+};
+
+const CustomPool = struct {
+    const Pool = @import("./pool.zig");
+    const Runnable = Pool.Runnable;
+
+    var current: Pool = undefined;
+
+    fn run(runnable: *Runnable) !void {
+        const threads = try std.Thread.getCpuCount();
+        current = Pool.init(.{ .max_threads = @intCast(u14, threads) });
+        defer current.deinit();
+
+        schedule(runnable);
+    }
+
+    fn schedule(runnable: *Runnable) void {
+        var scheduler = current.getScheduler();
+        defer scheduler.schedule();
+        scheduler.submit(runnable);
+    }
+
+    fn shutdown() void {
+        current.shutdown();
     }
 };
 
@@ -776,6 +801,7 @@ const WindowsPool = struct {
         const rc = TrySubmitThreadpoolCallback(
             struct {
                 fn cb(ex: ?windows.PVOID, pt: ?windows.PVOID) callconv(.C) void {
+                    _ = ex;
                     const r = @ptrCast(*Runnable, @alignCast(@alignOf(Runnable), pt.?));
                     (r.callback)(r);
                 }

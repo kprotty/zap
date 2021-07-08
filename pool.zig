@@ -254,13 +254,6 @@ fn notifySlow(noalias self: *ThreadPool, is_waking: bool) void {
             continue;
         }
 
-        // std.debug.warn("{} notify({})\n  -> {}\n  -> {}\n", .{
-        //     std.Thread.getCurrentId(),
-        //     is_waking,
-        //     sync,
-        //     new_sync,
-        // });
-
         if (sync.idle > 0 and can_wake) {
             Futex.wake(&self.sync, 1);
         } else if (sync.spawned < max_spawn and can_wake) {
@@ -303,13 +296,6 @@ fn wait(noalias self: *ThreadPool, is_waking: bool) error{Shutdown}!bool {
                 sync = @bitCast(Sync, updated);
                 continue;
             }
-
-            // std.debug.warn("{} wait({})\n  -> {}\n  -> {}\n", .{
-            //     std.Thread.getCurrentId(),
-            //     is_waking,
-            //     sync,
-            //     new_sync,
-            // });
 
             if (sync.notified) {
                 return was_waking or sync.state == .signaled;
@@ -411,21 +397,20 @@ const Worker = struct {
 
             var num_workers: u16 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
             while (num_workers > 0) : (num_workers -= 1) {
-                const target_worker = steal_target_ptr.* orelse blk: {
-                    const new_target = thread_pool.workers.load(.Acquire) orelse unreachable;
-                    steal_target_ptr.* = new_target.next;
-                    break :blk new_target;
-                };
+                const target = steal_target_ptr.* orelse thread_pool.workers.load(.Acquire) orelse unreachable;
+                steal_target_ptr.* = target.next;
 
-                if (target_worker != self) {
-                    if (self.buffer.consume(&target_worker.runnable)) |popped| {
-                        return popped;
-                    }
-                    
-                    if (target_worker.buffer.steal()) |runnable| {
-                        return Buffer.Popped{ .runnable = runnable };
-                    } 
+                if (target == self) {
+                    continue;
                 }
+
+                if (self.buffer.consume(&target.runnable)) |popped| {
+                    return popped;
+                }
+                
+                if (target.buffer.steal()) |runnable| {
+                    return Buffer.Popped{ .runnable = runnable };
+                } 
             }
 
             if (self.buffer.consume(&thread_pool.runnable)) |popped| {

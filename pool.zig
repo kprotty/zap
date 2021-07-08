@@ -59,54 +59,27 @@ pub const Batch = struct {
             self.head = batch.head;
         }
     }
+
+    pub fn pop(noalias self: *Batch) ?*Runnable {
+        const runnable = self.head orelse return null;
+        self.head = runnable.next;
+        return runnable;
+    }
 };
 
-pub fn getScheduler(self: *ThreadPool) Scheduler {
-    return Scheduler {
-        .thread_pool = self,
-        .producer = blk: {
-            if (Worker.tls_current) |worker| {
-                break :blk .{ .local = worker.getProducer() };
-            }
+pub fn schedule(noalias self: *ThreadPool, batch: Batch) void {
+    if (batch.isEmpty()) {
+        return;
+    }
 
-            const is_single_producer = false;
-            break :blk .{ .remote = self.runnable.getProducer(is_single_producer) };
-        },
-    };
+    if (Worker.tls_current) |worker| {
+        worker.push(batch);
+    } else {
+        self.runnable.push(.shared, batch);
+    }
+
+    return self.notify();
 }
-
-pub const Scheduler = struct {
-    thread_pool: *ThreadPool,
-    producer: union(enum) {
-        local: Worker.Producer,
-        remote: List.Producer,
-    },
-
-    pub fn submit(
-        noalias self: *Scheduler, 
-        noalias runnable: *Runnable,
-    ) void {
-        return self.submitBatch(Batch.from(runnable));
-    }
-
-    pub fn submitBatch(noalias self: *Scheduler, batch: Batch) void {
-        if (batch.isEmpty()) return;
-        switch (self.producer) {
-            .local => |*producer| producer.push(batch),
-            .remote => |*producer| producer.push(batch),
-        }
-    }
-
-    pub fn schedule(self: Scheduler) void {
-        if (switch (self.producer) {
-            .local => |producer| producer.commit(),
-            .remote => |producer| producer.commit(),
-        }) {
-            const is_waking = false;
-            self.thread_pool.notify(is_waking);
-        }
-    }
-};
 
 const Spin = struct {
     count: u8 = if (arch.isX86()) 100 else 10,
@@ -135,7 +108,7 @@ const Sync = packed struct {
     } = .pending,
 };
 
-fn register(noalias self: *ThreadPool, noalias worker: *Worker) bool {
+fn register(noalias self: *ThreadPool, noalias worker: *Worker) void {
     var workers = self.workers.load(.Monotonic);
     while (true) {
         worker.next = workers;
@@ -146,37 +119,10 @@ fn register(noalias self: *ThreadPool, noalias worker: *Worker) bool {
             .Monotonic,
         ) orelse break;
     }
-    
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    while (true) {
-        if (sync.state == .shutdown) {
-            return false;
-        }
-
-        var new_sync = sync;
-        new_sync.notified = false;
-        if (sync.state == .signaled) {
-            new_sync.state = .waking;
-        } else if (!sync.notified) {
-            return false;
-        }
-
-        if (self.sync.tryCompareAndSwap(
-            @bitCast(u32, sync),
-            @bitCast(u32, new_sync),
-            .Acquire,
-            .Monotonic,
-        )) |updated| {
-            sync = @bitCast(Sync, updated);
-            continue;
-        }
-
-        const is_waking = sync.state == .signaled;
-        return is_waking;
-    }
 }
 
 fn unregister(noalias self: *ThreadPool, noalias maybe_worker: ?*Worker) void {
+    // Remove a spawned worker from the sync state
     const remove = @bitCast(u32, Sync{ .spawned = 1 });
     const updated = self.sync.fetchSub(remove, .AcqRel);
     const sync = @bitCast(Sync, updated);
@@ -184,14 +130,17 @@ fn unregister(noalias self: *ThreadPool, noalias maybe_worker: ?*Worker) void {
     assert(sync.state == .shutdown);
     assert(sync.spawned >= 1);
     
-    if (sync.spawned == 1 and sync.idle != 0) {
+    // Notify a join() thread waiting for all workers to be unregistered/joinable
+    if (sync.spawned == 1) {
         const notify_all = std.math.maxInt(u32);
         Futex.wake(&self.sync, notify_all);
     }
 
+    // If unregistering a worker, wait for a shutdown signal
     const worker = maybe_worker orelse return;
     worker.join();
 
+    // After receiving a shutdown signal, shutdown the next worker it's linked with
     const next_worker = worker.next orelse return;
     next_worker.shutdown();
 }
@@ -232,61 +181,48 @@ pub fn shutdown(self: *ThreadPool) void {
 
 fn join(noalias self: *ThreadPool) void {
     @setCold(true);
-    
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
 
-    while (true) {
-}
-
-fn terminate(noalias self: *ThreadPool) void {
-    @setCold(true);
+    // Wait for shutdown
     var spin = Spin{};
-    var is_waiting = false;
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-
     while (true) {
-        assert(sync.state == .shutdown);
-        if (sync.spawned == 0) {
+        const sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        if (sync.state == .shutdown) {
             break;
-        }
-
-        if (spin.yield()) {
-            sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        } else if (spin.yield()) {
             continue;
+        } else {
+            Futex.wait(&self.sync, @bitCast(u32, sync), null) catch unreachable;
         }
-
-        if (!is_waiting) {
-            var old_sync = sync;
-            sync.idle += 1;
-            if (self.sync.tryCompareAndSwap(
-                @bitCast(u32, old_sync),
-                @bitCast(u32, sync),
-                .Monotonic,
-                .Monotonic,
-            )) |updated| {
-                sync = @bitCast(Sync, updated);
-                continue;
-            }
-        }
-
-        Futex.wait(&self.sync, @bitCast(u32, sync), null) catch unreachable;
-        sync = @bitCast(Sync, self.sync.load(.Monotonic));
-        is_waiting = true;
     }
 
+    // Wait for all workers to enter a joinable state
+    spin = .{};
+    while (true) {
+        const sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        if (sync.spawned == 0) {
+            break;
+        } else if (spin.yield()) {
+            continue;
+        } else {
+            Futex.wait(&self.sync, @bitCast(u32, sync), null) catch unreachable;
+        }
+    }
+
+    // Shutdown the top-most worker, which will shutdown the next worker, and so on...
     const worker = self.workers.load(.Acquire) orelse return;
     worker.shutdown();
 }
 
-fn notify(noalias self: *ThreadPool, is_waking: bool) callconv(.Inline) void {
+fn notify(noalias self: *ThreadPool) callconv(.Inline) void {
     const sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    if (is_waking or !sync.notified) {
-        self.notifySlow(is_waking);
-    } 
+    if (!sync.notified) {
+        self.notifySlow(false);
+    }
 }
 
 fn notifySlow(noalias self: *ThreadPool, is_waking: bool) void {
     @setCold(true);
+
     const max_spawn = self.config.max_threads;
     var sync = @bitCast(Sync, self.sync.load(.Monotonic));
 
@@ -318,6 +254,13 @@ fn notifySlow(noalias self: *ThreadPool, is_waking: bool) void {
             continue;
         }
 
+        // std.debug.warn("{} notify({})\n  -> {}\n  -> {}\n", .{
+        //     std.Thread.getCurrentId(),
+        //     is_waking,
+        //     sync,
+        //     new_sync,
+        // });
+
         if (sync.idle > 0 and can_wake) {
             Futex.wake(&self.sync, 1);
         } else if (sync.spawned < max_spawn and can_wake) {
@@ -330,23 +273,24 @@ fn notifySlow(noalias self: *ThreadPool, is_waking: bool) void {
 
 fn wait(noalias self: *ThreadPool, is_waking: bool) error{Shutdown}!bool {
     @setCold(true);
+
     var spin = Spin{};
-    var is_waiting = false;
+    var was_idle = false;
+    var was_waking = is_waking;
     var sync = @bitCast(Sync, self.sync.load(.Monotonic));
 
     while (true) {
-        if (sync.state == .shutdown) {
-            return error.Shutdown;
-        }
+        if (sync.state == .shutdown) return error.Shutdown;
+        if (was_waking) assert(sync.state == .waking);
 
-        if (sync.notified or !is_waiting) {
+        if (sync.notified or !was_idle) {
             var new_sync = sync;
             new_sync.notified = false;
             if (sync.notified) {
-                if (sync.state == .signaled) new_sync.state = .waking;
-                if (is_waiting) new_sync.idle -= 1;
+                if (was_waking or sync.state == .signaled) new_sync.state = .waking;
+                if (was_idle) new_sync.idle -= 1;
             } else {
-                if (is_waking) new_sync.state = .pending;
+                if (was_waking) new_sync.state = .pending;
                 new_sync.idle += 1;
             }
 
@@ -360,13 +304,20 @@ fn wait(noalias self: *ThreadPool, is_waking: bool) error{Shutdown}!bool {
                 continue;
             }
 
+            // std.debug.warn("{} wait({})\n  -> {}\n  -> {}\n", .{
+            //     std.Thread.getCurrentId(),
+            //     is_waking,
+            //     sync,
+            //     new_sync,
+            // });
+
             if (sync.notified) {
-                if (sync.state == .signaled) return true;
-                if (is_waiting) return false;
-                return is_waking;
+                return was_waking or sync.state == .signaled;
             }
 
-            is_waiting = true;
+            sync = new_sync;
+            was_idle = true;
+            was_waking = false;
         }
 
         if (spin.yield()) {
@@ -406,57 +357,32 @@ const Worker = struct {
         var self = Worker{};
         tls_current = &self;
 
-        var is_waking = thread_pool.register(&self);
+        thread_pool.register(&self);
         defer thread_pool.unregister(&self);
         
+        var is_waking = false;
         var steal_target: ?*Worker = null;
+
         while (true) {
-            const popped = self.pop(thread_pool, &steal_target) orelse {
-                is_waking = thread_pool.wait(is_waking) catch break;
-                continue;
-            };
+            is_waking = thread_pool.wait(is_waking) catch break;
 
-            if (popped.pushed or is_waking) {
-                thread_pool.notify(is_waking);
+            while (self.pop(thread_pool, &steal_target)) |popped| {
+                if (popped.pushed or is_waking) {
+                    thread_pool.notifySlow(is_waking);
+                }
+
+                is_waking = false;
+                (popped.runnable.runFn)(popped.runnable);
             }
-
-            is_waking = false;
-            (popped.runnable.runFn)(popped.runnable);
         }
     }
 
-    fn getProducer(noalias self: *Worker) Producer {
-        const is_single_producer = true;
-        return Producer{
-            .buffer_producer = self.buffer.getProducer(),
-            .list_producer = self.runnable.getProducer(is_single_producer),
-        };
+    fn push(noalias self: *Worker, batch: Batch) void {
+        assert(!batch.isEmpty());
+        if (self.buffer.push(batch)) |overflowed| {
+            self.runnable.push(.exclusive, overflowed);
+        }
     }
-
-    const Producer = struct {
-        buffer_producer: Buffer.Producer,
-        list_producer: List.Producer,
-
-        fn push(noalias self: *Producer, batch: Batch) void {
-            const head = batch.head orelse unreachable;
-            if (batch.tail == head) {
-                self.pushRunnable(head);
-            } else {
-                self.list_producer.push(batch);
-            }
-        }
-
-        fn pushRunnable(noalias self: *Producer, noalias runnable: *Runnable) void {
-            const overflowed = self.buffer_producer.push(runnable) orelse return;
-            self.list_producer.push(overflowed);
-        }
-
-        fn commit(self: Producer) bool {
-            const buffer_committed = self.buffer_producer.commit();
-            const list_committed = self.list_producer.commit();
-            return buffer_committed or list_committed;
-        }
-    };
 
     fn pop(
         self: *Worker,
@@ -556,6 +482,11 @@ const Worker = struct {
     }
 };
 
+const Access = enum {
+    exclusive,
+    shared,
+};
+
 const List = struct {
     input: Atomic(?*Runnable) = Atomic(?*Runnable).init(null),
     output: Atomic(usize) = Atomic(usize).init(IS_EMPTY),
@@ -566,44 +497,31 @@ const List = struct {
         assert(@alignOf(Runnable) >= (IS_CONSUMING << 1));
     }
 
-    fn getProducer(noalias self: *List, is_single_producer: bool) Producer {
-        return Producer{
-            .list = self,
-            .is_single_producer = is_single_producer,
-        };
-    }
+    fn push(
+        noalias self: *List, 
+        comptime access: Access,
+        batch: Batch, 
+    ) void {
+        const head = batch.head orelse unreachable;
+        const tail = batch.tail;
 
-    const Producer = struct {
-        list: *List,
-        batch: Batch = .{},
-        is_single_producer: bool,
+        var input = self.input.load(.Monotonic);
+        while (true) {
+            tail.next = input;
 
-        fn push(noalias self: *Producer, batch: Batch) void {
-            self.batch.push(batch);
-        }
-        
-        fn commit(self: Producer) bool {
-            const head = self.batch.head orelse return false;
-            const tail = self.batch.tail;
-
-            var input = self.list.input.load(.Monotonic);
-            while (true) {
-                tail.next = input;
-
-                if (input == null and self.is_single_producer) {
-                    self.list.input.store(head, .Release);
-                    return true;
-                }
-
-                input = self.list.input.tryCompareAndSwap(
-                    input,
-                    head,
-                    .Release,
-                    .Monotonic,
-                ) orelse return true;
+            if (access == .exclusive and input == null) {
+                self.input.store(head, .Release);
+                return;
             }
+
+            input = self.input.tryCompareAndSwap(
+                input,
+                head,
+                .Release,
+                .Monotonic,
+            ) orelse return;
         }
-    };
+    }
 
     fn getConsumer(noalias self: *List) ?Consumer {
         var output = self.output.load(.Monotonic);
@@ -674,94 +592,79 @@ const Buffer = struct {
         assert(std.math.maxInt(Index) >= capacity);
     }
 
-    fn getProducer(self: *Buffer) Producer {
-        const tail = self.tail.loadUnchecked();
-        const head = self.head.load(.Monotonic);
-        
-        const size = tail -% head;
-        assert(size <= capacity);
-
-        return Producer {
-            .buffer = self,
-            .tail = tail,
-            .pushed = 0,
-            .remaining = capacity - size,
+    fn read(
+        noalias self: *Buffer,
+        comptime access: Access,
+        head: Index,
+    ) callconv(.Inline) *Runnable {
+        return switch (access) {
+            .exclusive => self.array[head % capacity].loadUnchecked(),
+            .shared => self.array[head % capacity].load(.Unordered),
         };
     }
 
-    const Producer = struct {
-        buffer: *Buffer,
+    fn write(
+        noalias self: *Buffer, 
+        noalias runnable: *Runnable, 
         tail: Index,
-        pushed: Index,
-        remaining: Index,
+    ) callconv(.Inline) void {
+        runnable.next = self.array[(tail -% 1) % capacity].loadUnchecked();
+        self.array[tail % capacity].store(runnable, .Unordered);
+    } 
 
-        fn push(noalias self: *Producer, noalias runnable: *Runnable) ?Batch {
-            return switch (self.remaining) {
-                0 => self.pushOverflow(runnable),
-                else => self.pushRunnable(runnable),
-            };
-        }
+    fn push(noalias self: *Buffer, batch: Batch) ?Batch {
+        var pushed = batch;
+        assert(!pushed.isEmpty());
 
-        fn pushRunnable(noalias self: *Producer, noalias runnable: *Runnable) ?Batch {
-            const index = self.tail +% self.pushed;
-            self.pushed += 1;
-
-            runnable.next = null;
-            if (self.pushed > 0) {
-                runnable.next = self.buffer.array[(index -% 1) % capacity].loadUnchecked();
-            }
-
-            self.buffer.array[index % capacity].store(runnable, .Unordered);
-            self.remaining -= 1;
-            return null;
-        } 
-
-        fn pushOverflow(noalias self: *Producer, noalias runnable: *Runnable) ?Batch {
-            @setCold(true);
-
-            const tail = self.tail +% self.pushed;
-            const head = self.buffer.head.load(.Monotonic);
+        var tail = self.tail.loadUnchecked();
+        var head = self.head.load(.Monotonic);
+        while (true) {
             const size = tail -% head;
             assert(size <= capacity);
 
-            self.remaining = capacity - size;
-            if (self.remaining != 0) {
-                return self.pushRunnable(runnable);
+            var remaining = capacity - size;
+            if (remaining > 0) {
+                while (remaining > 0) : (remaining -= 1) {
+                    const runnable = pushed.pop() orelse break;
+                    self.write(runnable, tail);
+                    tail +%= 1;
+                }
+
+                self.tail.store(tail, .Release);
+                if (pushed.isEmpty()) {
+                    return null;
+                }
+                
+                std.atomic.spinLoopHint();
+                head = self.head.load(.Monotonic);
+                continue;
             }
 
             const overflow = capacity / 2;
-            if (self.buffer.head.compareAndSwap(
+            if (self.head.tryCompareAndSwap(
                 head,
                 head +% overflow,
                 .Acquire,
                 .Monotonic,
             )) |updated| {
-                self.remaining = capacity - (tail -% updated);
-                return self.pushRunnable(runnable);
+                head = updated;
+                continue;
             }
 
-            const first = runnable;
-            first.next = self.buffer.array[(head +% (overflow - 1)) % capacity].loadUnchecked();
+            const front = self.read(.exclusive, head +% (overflow - 1));
+            const back = self.read(.exclusive, head);
+            back.next = null;
 
-            const last = self.buffer.array[head % capacity].loadUnchecked();
-            last.next = null;
+            pushed.push(Batch{
+                .head = front,
+                .tail = back,
+            });
 
-            return Batch{
-                .head = first,
-                .tail = last,
-            };
+            return pushed;
         }
 
-        fn commit(self: Producer) bool {
-            if (self.pushed == 0) {
-                return false;
-            }
-
-            const tail = self.tail +% self.pushed;
-            self.buffer.tail.store(tail, .Release);
-            return true;
-        }
-    };
+        return null;
+    }
 
     fn pop(noalias self: *Buffer) ?*Runnable {
         const tail = self.tail.loadUnchecked();
@@ -787,24 +690,21 @@ const Buffer = struct {
             },
         };
 
-        const size = tail -% head;
-        // assert(size <= capacity);
-        if (size > capacity) {
-            std.debug.panic("head={} tail={} size={}\n", .{head, tail, size});
-        }
+        var runnable: ?*Runnable = null;
+        if (head != tail) {
+            runnable = self.read(.exclusive, new_tail);
+            if (head != new_tail) {
+                return runnable;
+            }
 
-        var runnable: ?*Runnable = self.array[new_tail % capacity].loadUnchecked();
-        if (size > 1) {
-            return runnable;
-        }
-
-        if (self.head.compareAndSwap(
-            head,
-            head +% 1,
-            .Acquire,
-            .Monotonic,
-        )) |_| {
-            runnable = null;
+            if (self.head.compareAndSwap(
+                head,
+                tail,
+                .Acquire,
+                .Monotonic,
+            )) |_| {
+                runnable = null;
+            }
         }
 
         self.tail.store(tail, .Monotonic);
@@ -816,26 +716,31 @@ const Buffer = struct {
             .arm, .armeb, .thumb, .thumbeb => .Monotonic,
             else => .Acquire,
         };
-    
-        var head = self.head.load(load_ordering);
+        
         while (true) {
+            const head = self.head.load(load_ordering);
             if (load_ordering == .Monotonic) {
                 std.atomic.fence(.SeqCst);
             }
             
             const tail = self.tail.load(load_ordering);
-            if (head == tail or head == (tail -% 1)) {
+            const size = tail -% head;
+            if (size == 0 or size > capacity) {
                 return null;
             }
 
-            const runnable = self.array[head % capacity].load(.Unordered);
-            head = self.head.tryCompareAndSwap(
+            const runnable = self.read(.shared, head);
+            if (self.head.compareAndSwap(
                 head,
                 head +% 1,
                 .SeqCst,
-                load_ordering,
-            ) orelse return runnable;
-            std.atomic.spinLoopHint();
+                .Monotonic,
+            )) |_| {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+
+            return runnable;
         }
     }
 
@@ -845,29 +750,23 @@ const Buffer = struct {
     };
 
     fn consume(noalias self: *Buffer, noalias list: *List) ?Popped {
-        const tail = self.tail.loadUnchecked();
-        if (std.debug.runtime_safety) {
-            assert(tail == self.head.load(.Monotonic));
-        }
-
         var consumer = list.getConsumer() orelse return null;
         defer consumer.release();
+
+        const tail = self.tail.loadUnchecked();
+        const head = self.head.load(.Monotonic);
+        assert(head == tail);
 
         var pushed: Index = 0;
         while (pushed < capacity) : (pushed += 1) {
             const runnable = consumer.pop() orelse break;
-            self.array[(tail +% pushed) % capacity].store(runnable, .Unordered);
-
-            runnable.next = null;
-            if (pushed != 0) {
-                runnable.next = self.array[(tail +% (pushed - 1)) % capacity].loadUnchecked();
-            }
+            self.write(runnable, tail +% pushed);
         }
 
         const popped = consumer.pop() orelse blk: {
             if (pushed == 0) return null;
             pushed -= 1;
-            break :blk self.array[(tail +% pushed) % capacity].loadUnchecked();
+            break :blk self.read(.exclusive, tail +% pushed);
         };
 
         if (pushed > 0) self.tail.store(tail +% pushed, .Release);

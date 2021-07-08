@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(CustomPool);
+    return benchPool(NewPool);
 }
 
 const REPS = 10;
@@ -171,7 +171,7 @@ const BasicPool = struct {
 };
 
 const NewPool = struct {
-    const Pool = @import("./src/runtime/Pool3.zig");
+    const Pool = @import("./src/runtime/Pool.zig");
     const Runnable = Pool.Runnable;
 
     var current: ?*Pool = null;
@@ -212,9 +212,7 @@ const CustomPool = struct {
     }
 
     fn schedule(runnable: *Runnable) void {
-        var scheduler = current.getScheduler();
-        defer scheduler.schedule();
-        scheduler.submit(runnable);
+        current.schedule(Pool.Batch.from(runnable));
     }
 
     fn shutdown() void {

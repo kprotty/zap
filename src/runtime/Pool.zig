@@ -22,7 +22,7 @@ pub fn init(config: InitConfig) Pool {
         .max_threads = std.math.min(
             std.math.maxInt(u14),
             std.math.max(1, config.max_threads orelse blk: {
-                const threads = std.Thread.cpuCount() catch 1;
+                const threads = std.Thread.getCpuCount() catch 1;
                 break :blk @intCast(u14, threads);
             }),
         ),
@@ -39,7 +39,7 @@ pub fn shutdown(self: *Pool) void {
     return self.shutdownWorkers();
 }
 
-pub const Priority = enum {
+pub const Priority = enum(usize) {
     Low = 0,
     Normal = 1,
     High = 2,
@@ -247,7 +247,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
             .Release,
             .Monotonic,
         )) |updated| {
-            std.Thread.spinLoopHint();
+            std.atomic.spinLoopHint();
             counter = Counter.unpack(updated);
             continue;
         }
@@ -266,7 +266,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
         }
 
         attempts -= 1;
-        std.Thread.spinLoopHint();
+        std.atomic.spinLoopHint();
         counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
     }
 }
@@ -308,7 +308,7 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
                 .Acquire,
                 .Monotonic,
             )) |updated| {
-                std.Thread.spinLoopHint();
+                std.atomic.spinLoopHint();
                 counter = Counter.unpack(updated);
                 continue;
             }
@@ -352,7 +352,7 @@ fn shutdownWorkers(self: *Pool) void {
             .Monotonic,
         )) |updated| {
             counter = Counter.unpack(updated);
-            std.Thread.spinLoopHint();
+            std.atomic.spinLoopHint();
             continue;
         }
 
@@ -698,6 +698,7 @@ const LocalQueue = struct {
     }
 
     fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
+        _ = be_fair;
         return self.buffer.stealUnbounded(target, did_push);
     }
 
@@ -894,7 +895,7 @@ const BoundedQueue = struct {
 
     fn stealBounded(target: *BoundedQueue) ?*Runnable {
         var target_head = @atomicLoad(Pos, &target.head, .SeqCst);
-        while (true) : (std.Thread.spinLoopHint()) {
+        while (true) : (std.atomic.spinLoopHint()) {
             const target_tail = @atomicLoad(Pos, &target.tail, .SeqCst);
 
             if (target_tail == target_head)

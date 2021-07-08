@@ -119,7 +119,7 @@ const LinuxFutex = struct {
 
     pub fn yield(iteration: usize) bool {
         if (iteration > 10) return false;
-        std.Thread.spinLoopHint();
+        std.atomic.spinLoopHint();
         return true;
     }
 };

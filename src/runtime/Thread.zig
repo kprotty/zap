@@ -1,13 +1,21 @@
 const std = @import("std");
 
-pub const Thread = if (std.builtin.os.tag == .windows)
-    WindowsThread
-else if (std.builtin.link_libc)
-    PosixThread
-else if (std.builtin.os.tag == .linux)
-    LinuxThread
-else
-    @compileError("Platform not supported");
+// pub const Thread = if (std.builtin.os.tag == .windows)
+//     WindowsThread
+// else if (std.builtin.link_libc)
+//     PosixThread
+// else if (std.builtin.os.tag == .linux)
+//     LinuxThread
+// else
+//     @compileError("Platform not supported");
+
+pub const Thread = struct {
+    pub fn spawn(comptime entryFn: fn(usize) void, context: usize) bool {
+        const t = std.Thread.spawn(.{}, entryFn, .{context}) catch return false;
+        t.detach();
+        return true;
+    }
+};
 
 const WindowsThread = struct {
     pub fn spawn(comptime entryFn: fn(usize) void, context: usize) bool {
@@ -93,13 +101,13 @@ const LinuxThread = struct {
             .callback = entryFn,
         };
 
-        var user_desc: switch (std.builtin.arch) {
+        var user_desc: switch (std.Target.current.cpu.arch) {
             .i386 => std.os.linux.user_desc,
             else => void,
         } = undefined;
 
         var tls_ptr = std.os.linux.tls.prepareTLS(mmap_bytes[tls_begin..]);
-        if (std.builtin.arch == .i386) {
+        if (std.Target.current.cpu.arch == .i386) {
             defer tls_ptr = @ptrToInt(&user_desc);
             user_desc = .{
                 .entry_number = std.os.linux.tls.tls_image.gdt_entry_number,
@@ -153,7 +161,7 @@ const LinuxThread = struct {
 
     extern fn __unmap_and_exit(ptr: usize, len: usize) callconv(.C) noreturn;
     comptime {
-        asm(switch (std.builtin.arch) {
+        asm(switch (std.Target.current.cpu.arch) {
             .i386 => (
                 \\.text
                 \\.global __unmap_and_exit

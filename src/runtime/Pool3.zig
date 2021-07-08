@@ -11,7 +11,7 @@ idle_lock: Lock = .{},
 idle_stack: ?*Worker = null,
 max_threads: u16,
 spawned: ?*Worker = null,
-run_queue: GlobalQueue = .{},
+run_queues: Priority.Array(GlobalQueue) = Priority.arrayInit(GlobalQueue),
 
 pub const InitConfig = struct {
     max_threads: ?u16 = null,
@@ -22,7 +22,7 @@ pub fn init(config: InitConfig) Pool {
         .max_threads = std.math.min(
             std.math.maxInt(u14),
             std.math.max(1, config.max_threads orelse blk: {
-                const threads = std.Thread.cpuCount() catch 1;
+                const threads = std.Thread.getCpuCount() catch 1;
                 break :blk @intCast(u14, threads);
             }),
         ),
@@ -39,7 +39,7 @@ pub fn shutdown(self: *Pool) void {
     return self.shutdownWorkers();
 }
 
-pub const Priority = enum(u8) {
+pub const Priority = enum(usize) {
     Low = 0,
     Normal = 1,
     High = 2,
@@ -64,17 +64,16 @@ pub const ScheduleHints = struct {
 };
 
 pub fn schedule(self: *Pool, hints: ScheduleHints, batchable: anytype) void {
-    _ = hints;
-
     const batch = Batch.from(batchable);
     if (batch.isEmpty()) {
         return;
     }
 
+    const priority_index = hints.priority.toArrayIndex();
     if (Worker.getCurrent()) |worker| {
-        worker.run_queue.push(batch);
+        worker.run_queues[priority_index].push(batch);
     } else {
-        self.run_queue.push(batch);
+        self.run_queues[priority_index].push(batch);
     }
 
     self.notifyWorkers(false);
@@ -248,7 +247,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
             .Release,
             .Monotonic,
         )) |updated| {
-            std.Thread.spinLoopHint();
+            std.atomic.spinLoopHint();
             counter = Counter.unpack(updated);
             continue;
         }
@@ -267,7 +266,7 @@ fn notifyWorkers(self: *Pool, _is_waking: bool) void {
         }
 
         attempts -= 1;
-        std.Thread.spinLoopHint();
+        std.atomic.spinLoopHint();
         counter = Counter.unpack(@atomicLoad(u32, &self.counter, .Monotonic));
     }
 }
@@ -309,7 +308,7 @@ fn suspendWorker(self: *Pool, worker: *Worker) ?bool {
                 .Acquire,
                 .Monotonic,
             )) |updated| {
-                std.Thread.spinLoopHint();
+                std.atomic.spinLoopHint();
                 counter = Counter.unpack(updated);
                 continue;
             }
@@ -353,7 +352,7 @@ fn shutdownWorkers(self: *Pool) void {
             .Monotonic,
         )) |updated| {
             counter = Counter.unpack(updated);
-            std.Thread.spinLoopHint();
+            std.atomic.spinLoopHint();
             continue;
         }
 
@@ -432,7 +431,7 @@ const Worker = struct {
     idle_next: ?*Worker = null,
     spawned_next: ?*Worker = null,
     run_tick: usize,
-    run_queue: LocalQueue = .{},
+    run_queues: Priority.Array(LocalQueue) = Priority.arrayInit(LocalQueue),
 
     const State = enum(u32) {
         running,
@@ -546,6 +545,7 @@ const Worker = struct {
         while (true) {
             var did_push = false;
             if (self.pop(&did_push)) |runnable| {
+
                 const is_waking = self.state == .waking;
                 if (did_push or is_waking)
                     pool.notifyWorkers(is_waking);
@@ -592,45 +592,79 @@ const Worker = struct {
         defer self.shutdown_lock.release();
 
         const state = self.state;
-        @atomicStore(State, &self.state, .shutdown, .Unordered);
+        @atomicStore(State, &self.state, .shutdown, .Monotonic);
         if (state == .waiting)
             Futex.wake(@ptrCast(*const u32, &self.state), 1);
     }
 
     fn pop(self: *Worker, did_push: *bool) ?*Runnable {
-        var retries: usize = 8;
-        var attempts: usize = 32;
+        const be_fair = self.run_tick % 61 == 0;
+        const max_attempts = 8;
+        self.run_tick +%= 1;
 
-        while (attempts > 0 and retries > 0) : (attempts -= 1) {
-            if (self.run_queue.pop()) |runnable| {
+        var attempt: usize = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            const Scope = enum { local, global, remote };
+            const is_fair = be_fair and attempt == 0;
+
+            var scope_order = [_]Scope{ .local, .global, .remote };
+            if (is_fair) {
+                scope_order = [_]Scope{ .global, .local, .remote };
+            }
+
+            for (scope_order) |scope| {
+                if (switch (scope) {
+                    .local => self.pollLocal(is_fair, did_push),
+                    .global => self.pollPool(is_fair, did_push),
+                    .remote => self.pollSteal(is_fair, did_push),
+                }) |runnable| {
+                    return runnable;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    fn pollLocal(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
+        return self.pollQueues(be_fair, did_push, {});
+    }
+
+    fn pollPool(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
+        return self.pollQueues(be_fair, did_push, self.pool);
+    }
+
+    fn pollSteal(self: *Worker, be_fair: bool, did_push: *bool) ?*Runnable {
+        var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
+        while (threads > 0) : (threads -= 1) {
+            const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
+            self.next_target = target.spawned_next;
+
+            if (target == self)
+                continue;
+
+            if (self.pollQueues(be_fair, did_push, target)) |runnable|
                 return runnable;
-            }
+        }
 
-            switch (self.run_queue.steal(&self.pool.run_queue)) {
-                .Empty, .Contended => {},
-                .Dequeued => |result| {
-                    did_push.* = result.pushed;
-                    return result.runnable;
-                }
-            }
+        return null;
+    }
 
-            var was_contended = false;
-            var threads = Counter.unpack(@atomicLoad(u32, &self.pool.counter, .Monotonic)).spawned;
-            while (threads > 0) : (threads -= 1) {
-                const target = self.next_target orelse @atomicLoad(?*Worker, &self.pool.spawned, .Acquire).?;
-                self.next_target = target.spawned_next;
+    fn pollQueues(self: *Worker, be_fair: bool, did_push: *bool, target: anytype) ?*Runnable {
+        var priority_order = [_]Priority{ .High, .Normal, .Low };
+        if (be_fair) {
+            priority_order = [_]Priority{ .Low, .Normal, .High };
+        }
 
-                if (target != self) {
-                    switch (self.run_queue.steal(&target.run_queue)) {
-                        .Empty => {},
-                        .Contended => was_contended = true,
-                        .Dequeued => |result| return result.runnable,
-                    }
-                }
-            }
-
-            if (!was_contended) {
-                retries -= 1;
+        for (priority_order) |priority| {
+            const i = priority.toArrayIndex();
+            if (switch (@TypeOf(target)) {
+                *Worker => self.run_queues[i].popAndStealLocal(&target.run_queues[i], be_fair, did_push),
+                *Pool => self.run_queues[i].popAndStealGlobal(&target.run_queues[i], be_fair, did_push),
+                void => self.run_queues[i].pop(be_fair, did_push),
+                else => @compileError("invalid poll target"),
+            }) |runnable| {
+                return runnable;
             }
         }
 
@@ -638,198 +672,311 @@ const Worker = struct {
     }
 };
 
-const GlobalQueue = struct {
-    head: ?*Runnable = null,
+const GlobalQueue = UnboundedQueue;
 
-    pub fn push(self: *GlobalQueue, batch: Batch) void {
-        if (batch.isEmpty()) {
-            return;
+const LocalQueue = struct {
+    buffer: BoundedQueue = .{},
+    overflow: UnboundedQueue = .{},
+
+    fn push(self: *LocalQueue, batch: Batch) void {
+        if (self.buffer.push(batch)) |overflowed|
+            self.overflow.push(overflowed);
+    }
+
+    fn pop(self: *LocalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
+        if (switch (be_fair) {
+            true => self.buffer.popFair(),
+            false => self.buffer.pop(),
+        }) |runnable| {
+            return runnable;
+        }
+        
+        if (self.buffer.stealUnbounded(&self.overflow, did_push)) |runnable|
+            return runnable;
+
+        return null;
+    }
+
+    fn popAndStealGlobal(self: *LocalQueue, target: *GlobalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
+        _ = be_fair;
+        return self.buffer.stealUnbounded(target, did_push);
+    }
+
+    fn popAndStealLocal(self: *LocalQueue, target: *LocalQueue, be_fair: bool, did_push: *bool) ?*Runnable {
+        if (self == target)
+            return self.pop(false, did_push);
+
+        const Steal = enum { Bounded, Unbounded };
+        var steal_order = [_]Steal{ .Unbounded, .Bounded };
+        if (be_fair) {
+            steal_order = [_]Steal{ .Bounded, .Unbounded };
         }
 
-        var head = @atomicLoad(?*Runnable, &self.head, .Monotonic);
+        for (steal_order) |steal| {
+            if (switch (steal) {
+                .Bounded => target.buffer.stealBounded(),
+                .Unbounded => self.buffer.stealUnbounded(&target.overflow, did_push),
+            }) |runnable| {
+                return runnable;
+            }
+        }
+
+        return null;
+    }
+};
+
+const UnboundedQueue = struct {
+    stack: usize = 0,
+    local: ?*Runnable = null,
+
+    const MASK = ~(HAS_CONSUMER | HAS_LOCAL);
+    const HAS_CONSUMER: usize = 1 << 0;
+    const HAS_LOCAL: usize = 1 << 1;
+
+    fn push(self: *UnboundedQueue, batch: Batch) void {
+        if (batch.isEmpty()) 
+            return;
+
+        var stack = @atomicLoad(usize, &self.stack, .Monotonic);
         while (true) {
-            batch.tail.next = head;
-            head = @cmpxchgWeak(
-                ?*Runnable,
-                &self.head,
-                batch.tail.next,
-                batch.head,
+            batch.tail.next = @intToPtr(?*Runnable, stack & MASK);
+            stack = @cmpxchgWeak(
+                usize,
+                &self.stack,
+                stack,
+                @ptrToInt(batch.head) | (stack & ~MASK),
                 .Release,
                 .Monotonic,
             ) orelse break;
         }
     }
-};
 
-const LocalQueue = struct {
-    head: isize = 0,
-    tail: isize = 0,
-    buffer: ?*Buffer = null,
+    fn tryAcquireConsumer(self: *UnboundedQueue) ?Consumer {
+        var stack = @atomicLoad(usize, &self.stack, .Monotonic);
+        while (true) {
+            if (stack & ~HAS_CONSUMER == 0)
+                return null;
+            if (stack & HAS_CONSUMER != 0)
+                return null;
 
-    const Buffer = struct {
-        mask: usize,
-        data: [*]*Runnable,
-
-        var heap = std.heap.HeapAllocator.init();
-
-        fn getAllocator() *std.mem.Allocator {
-            const target = std.Target.current;
-            if (target.os.tag == .windows) return &heap.allocator;
-            if (std.builtin.link_libc) return std.heap.c_allocator;
-            return std.heap.page_allocator;
-        }
-
-        fn alloc(capacity: usize) *Buffer {
-            @setCold(true);
-            const allocator = getAllocator();
-
-            const self = allocator.create(Buffer) catch @panic("Buffer alloc");
-            self.mask = capacity - 1;
-
-            const runnables = allocator.alloc(*Runnable, capacity) catch @panic("Buffer data");
-            self.data = runnables.ptr;
-            return self;
-        }
-
-        fn at(self: Buffer, index: isize) callconv(.Inline) **Runnable {
-            const raw_index = std.math.cast(usize, index) catch @panic("Buffer.at");
-            std.debug.warn("{} at {} -> {}\n", .{std.Thread.getCurrentId(), index, raw_index});
-            return &self.data[raw_index & (self.mask - 1)];
-        }
-
-        fn read(self: Buffer, index: isize) callconv(.Inline) *Runnable {
-            return self.at(index).*;
-        }
-
-        fn write(self: Buffer, index: isize, runnable: *Runnable) callconv(.Inline) void {
-            self.at(index).* = runnable;
-        }
-    };
-
-    pub fn push(self: *LocalQueue, batch: Batch) void {
-        if (batch.isEmpty()) {
-            return;
-        }
-
-        var tail = self.tail;
-        var head = @atomicLoad(isize, &self.head, .Monotonic);
-        const size = std.math.cast(usize, tail -% head) catch @panic("LocalQueue.push()");
-
-        const buffer = blk: {
-            const buf = self.buffer orelse {
-                const min_capacity = std.math.ceilPowerOfTwo(usize, std.math.max(1, size)) catch @panic("bad size");
-                const buf = Buffer.alloc(std.math.max(1024 * 1024, min_capacity));
-                @atomicStore(?*Buffer, &self.buffer, buf, .Release);
-                break :blk buf;
-            };
-
-            const capacity = buf.mask + 1;
-            const remaining = capacity - size;
-            if (remaining >= size) {
-                break :blk buf;
+            var new_stack = stack | HAS_CONSUMER | HAS_LOCAL;
+            if (stack & HAS_LOCAL == 0) {
+                new_stack &= ~MASK;
             }
 
-            const new_buf = Buffer.alloc(capacity * 2);
-            @memcpy(@ptrCast([*]u8, new_buf.data), @ptrCast([*]const u8, buf.data), capacity * @sizeOf(*Runnable));
-            @atomicStore(?*Buffer, &self.buffer, new_buf, .Release);
-            break :blk new_buf;
-        };
-
-        var runnables = batch;
-        while (runnables.pop()) |runnable| {
-            buffer.write(tail, runnable);
-            tail +%= 1;
+            stack = @cmpxchgWeak(
+                usize,
+                &self.stack,
+                stack,
+                new_stack,
+                .Acquire,
+                .Monotonic,
+            ) orelse return Consumer{
+                .queue = self,
+                .local = self.local orelse @intToPtr(?*Runnable, stack & MASK),
+            };
         }
-
-        @atomicStore(isize, &self.tail, tail, .Release);
-        return;
     }
 
-    pub fn pop(self: *LocalQueue) ?*Runnable {
-        const tail = self.tail;
-        var head = @atomicLoad(isize, &self.head, .Monotonic);
-        if (tail == head) {
-            return null;
+    const Consumer = struct {
+        queue: *UnboundedQueue,
+        local: ?*Runnable,
+
+        fn release(self: Consumer) void {
+            var remove: usize = HAS_CONSUMER;
+            if (self.local == null) {
+                remove |= HAS_LOCAL;
+            }
+
+            self.queue.local = self.local;
+            _ = @atomicRmw(usize, &self.queue.stack, .Sub, remove, .Release);
         }
 
+        fn pop(self: *Consumer) ?*Runnable {
+            if (self.local) |runnable| {
+                self.local = runnable.next;
+                return runnable;
+            }
+
+            var stack = @atomicLoad(usize, &self.queue.stack, .Monotonic);
+            if (stack & MASK != 0) {
+                stack = @atomicRmw(usize, &self.queue.stack, .Xchg, HAS_LOCAL | HAS_CONSUMER, .Acquire);
+            }
+
+            const runnable = @intToPtr(?*Runnable, stack & MASK) orelse return null;
+            self.local = runnable.next;
+            return runnable;
+        }
+    };
+};
+
+const BoundedQueue = struct {
+    head: Pos = 0,
+    tail: Pos = 0,
+    buffer: [capacity]*Runnable = undefined,
+
+    const Pos = std.meta.Int(.unsigned, std.meta.bitCount(usize) / 2);
+    const capacity = 128;
+    comptime {
+        std.debug.assert(capacity <= std.math.maxInt(Pos));
+    }
+
+    fn write(self: *BoundedQueue, runnable: *Runnable, tail: Pos, is_first: bool) void {
+        _ = is_first;
+        runnable.next = self.buffer[(tail -% 1) % capacity];
+        @atomicStore(*Runnable, &self.buffer[tail % self.buffer.len], runnable, .Unordered);
+    }
+
+    fn push(self: *BoundedQueue, _batch: Batch) ?Batch {
+        var batch = _batch;
+        var tail = self.tail;
+        var head = @atomicLoad(Pos, &self.head, .Monotonic);
+
+        while (!batch.isEmpty()) {
+            const size = tail -% head;
+
+            var remaining = capacity - size;
+            if (remaining > 0) {
+                while (remaining > 0) {
+                    const runnable = batch.pop() orelse break;
+                    self.write(runnable, tail, remaining == capacity);
+                    tail +%= 1;
+                }
+
+                @atomicStore(Pos, &self.tail, tail, .Release);
+                std.atomic.spinLoopHint();
+                head = @atomicLoad(Pos, &self.head, .Monotonic);
+                continue;
+            }
+
+            var migrate: Pos = capacity / 2;
+            if (@cmpxchgWeak(
+                Pos,
+                &self.head,
+                head,
+                head +% migrate,
+                .Acquire,
+                .Monotonic,
+            )) |updated| {
+                head = updated;
+                continue;
+            }
+
+            // if (false) {
+            //     var i = migrate;
+            //     while (i > 0) : (i -= 1) {
+            //         const index = (head +% (i - 1));
+            //         const runnable = self.buffer[index % capacity];
+            //         const next = self.buffer[(index -% 1) % capacity];
+            //         if (i > 1 and runnable.next != next) {
+            //             std.debug.warn("invalid from top: {}", .{migrate - i});
+            //         }
+            //     }
+            // }
+
+            batch.pushFront(Batch{
+                .head = self.buffer[(head +% (migrate -% 1)) % capacity],
+                .tail = self.buffer[head % capacity],
+                .size = migrate,
+            });
+
+            return batch;
+        }
+
+        return null;
+    }
+
+    fn pop(self: *BoundedQueue) ?*Runnable {
+        const tail = self.tail;
+        if (@atomicLoad(Pos, &self.head, .Unordered) == tail) {
+            return null;
+        }
+        
         const new_tail = tail -% 1;
-        @atomicStore(isize, &self.tail, new_tail, .SeqCst);
-        head = @atomicLoad(isize, &self.head, .SeqCst);
+        @atomicStore(Pos, &self.tail, new_tail, .SeqCst);
+        const head = @atomicLoad(Pos, &self.head, .SeqCst);
 
         var runnable: ?*Runnable = null;
         if (head != tail) {
-            runnable = self.buffer.?.read(new_tail);
+            runnable = self.buffer[new_tail % self.buffer.len];
             if (head != new_tail) {
                 return runnable;
             }
-            if (@cmpxchgStrong(isize, &self.head, head, tail, .SeqCst, .Monotonic) != null) {
+
+            if (@cmpxchgStrong(Pos, &self.head, head, tail, .SeqCst, .Monotonic) != null) {
                 runnable = null;
             }
         }
 
-        @atomicStore(isize, &self.tail, tail, .Monotonic);
+        @atomicStore(Pos, &self.tail, tail, .Monotonic);
         return runnable;
     }
 
-    pub const Steal = union(enum) {
-        Empty,
-        Contended,
-        Dequeued: struct {
-            runnable: *Runnable,
-            pushed: bool,
-        },
-    };
-
-    pub fn steal(self: *LocalQueue, target: anytype) Steal {
-        const is_local = switch (@TypeOf(target)) {
-            *LocalQueue => true,
-            *GlobalQueue => false,
-            else => |t| @compileError(@typeName(t) ++ " isnt stealable"),
-        };
-
-        if (is_local) {
-            const head = @atomicLoad(isize, &target.head, .Acquire);
-            const tail = @atomicLoad(isize, &target.tail, .Acquire);
-            if (tail -% head <= 0) {
-                return .Empty;
+    fn popFair(self: *BoundedQueue) ?*Runnable {
+        var tail = self.tail;
+        var head = @atomicLoad(Pos, &self.head, .Monotonic);
+        while (true) {
+            if (tail == head) {
+                return null;
             }
 
-            const buffer = @atomicLoad(?*Buffer, &target.buffer, .Acquire) orelse return .Empty;
-            const runnable = buffer.read(head);
-            _ = @cmpxchgStrong(
-                isize,
-                &target.head,
+            head = @cmpxchgWeak(
+                Pos,
+                &self.head,
                 head,
                 head +% 1,
-                .AcqRel,
+                .Acquire,
                 .Monotonic,
-            ) orelse return .{ 
-                .Dequeued = .{
-                    .runnable = runnable,
-                    .pushed = false,
-                },
-            };
+            ) orelse return self.buffer[head % self.buffer.len];
+        }
+    }
 
-            return .Contended;
-        } 
-        
-        var head = @atomicLoad(?*Runnable, &target.head, .Monotonic) orelse return .Empty;
-        head = @atomicRmw(?*Runnable, &target.head, .Xchg, null, .Acquire) orelse return .Empty;
-        
-        var pushed = head.next != null;
-        if (head.next) |remaining| {
-            self.push(Batch{
-                .size = std.math.maxInt(usize),
-                .head = remaining,
-                .tail = undefined,
-            });
+    fn stealBounded(target: *BoundedQueue) ?*Runnable {
+        var target_head = @atomicLoad(Pos, &target.head, .SeqCst);
+        while (true) : (std.atomic.spinLoopHint()) {
+            const target_tail = @atomicLoad(Pos, &target.tail, .SeqCst);
+
+            if (target_tail == target_head)
+                return null;
+            if (target_tail == (target_head -% 1))
+                return null;
+            // if ((target_tail -% 1) == target_head)
+            //     return null;
+            // if ((target_tail -% target_head) > target.buffer.len)
+            //     return null;
+
+            const task = @atomicLoad(*Runnable, &target.buffer[target_head % target.buffer.len], .Unordered);
+            target_head = @cmpxchgStrong(
+                Pos,
+                &target.head,
+                target_head,
+                target_head +% 1,
+                .SeqCst,
+                .SeqCst,
+            ) orelse return task;
+        }
+    }
+
+    fn stealUnbounded(self: *BoundedQueue, target: *UnboundedQueue, did_push: *bool) ?*Runnable {
+        var consumer = target.tryAcquireConsumer() orelse return null;
+        defer consumer.release();
+
+        const first_runnable = consumer.pop();
+        const head = @atomicLoad(Pos, &self.head, .Monotonic);
+        const tail = self.tail;
+
+        var new_tail = tail;
+        while (new_tail -% head < self.buffer.len) {
+            const runnable = consumer.pop() orelse break;
+            self.write(runnable, new_tail, new_tail == head);
+            new_tail +%= 1;
         }
 
-        return .{
-            .Dequeued = .{
-                .runnable = head,
-                .pushed = pushed,
-            },
-        };
+        if (new_tail != tail) {
+            did_push.* = true;
+            @atomicStore(Pos, &self.tail, new_tail, .Release);
+        }
+
+        return first_runnable;
     }
 };

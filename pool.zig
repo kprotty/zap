@@ -22,6 +22,7 @@ pub fn init(config: Config) ThreadPool {
 
 pub fn deinit(self: *ThreadPool) void {
     self.join();
+    self.terminate();
     self.* = undefined;
 }
 
@@ -232,10 +233,18 @@ pub fn shutdown(self: *ThreadPool) void {
 
 fn join(noalias self: *ThreadPool) void {
     @setCold(true);
-    
-    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
 
+    var spin = Spin{};
     while (true) {
+        const sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        if (sync.state == .shutdown) {
+            break;
+        } else if (spin.yield()) {
+            continue;
+        } else {
+            Futex.wait(&self.sync, @bitCast(u32, sync), null) catch unreachable;
+        }
+    }
 }
 
 fn terminate(noalias self: *ThreadPool) void {
@@ -746,6 +755,7 @@ const Buffer = struct {
             const last = self.buffer.array[head % capacity].loadUnchecked();
             last.next = null;
 
+            self.remaining = capacity - overflow;
             return Batch{
                 .head = first,
                 .tail = last,
@@ -766,7 +776,10 @@ const Buffer = struct {
     fn pop(noalias self: *Buffer) ?*Runnable {
         const tail = self.tail.loadUnchecked();
         var head = self.head.load(.Monotonic);
-        if (head == tail) {
+
+        var size = tail -% head;
+        assert(size <= capacity);
+        if (size == 0) {
             return null;
         }
 
@@ -787,24 +800,25 @@ const Buffer = struct {
             },
         };
 
-        const size = tail -% head;
-        // assert(size <= capacity);
-        if (size > capacity) {
-            std.debug.panic("head={} tail={} size={}\n", .{head, tail, size});
-        }
+        size = tail -% head;
+        assert(size <= capacity);
 
-        var runnable: ?*Runnable = self.array[new_tail % capacity].loadUnchecked();
-        if (size > 1) {
-            return runnable;
-        }
+        var runnable: ?*Runnable = null;
+        if (size > 0) {
+            runnable = self.array[new_tail % capacity].loadUnchecked();
+            if (size > 1) {
+                return runnable;
+            }
 
-        if (self.head.compareAndSwap(
-            head,
-            head +% 1,
-            .Acquire,
-            .Monotonic,
-        )) |_| {
-            runnable = null;
+            assert(size == 1);
+            if (self.head.compareAndSwap(
+                head,
+                tail,
+                .SeqCst,
+                .Monotonic,
+            )) |_| {
+                runnable = null;
+            }
         }
 
         self.tail.store(tail, .Monotonic);
@@ -817,25 +831,29 @@ const Buffer = struct {
             else => .Acquire,
         };
     
-        var head = self.head.load(load_ordering);
         while (true) {
+            const head = self.head.load(load_ordering);
             if (load_ordering == .Monotonic) {
                 std.atomic.fence(.SeqCst);
             }
             
             const tail = self.tail.load(load_ordering);
-            if (head == tail or head == (tail -% 1)) {
+            if (tail == head or tail == (head -% 1)) {
                 return null;
             }
 
             const runnable = self.array[head % capacity].load(.Unordered);
-            head = self.head.tryCompareAndSwap(
+            if (self.head.compareAndSwap(
                 head,
                 head +% 1,
                 .SeqCst,
-                load_ordering,
-            ) orelse return runnable;
-            std.atomic.spinLoopHint();
+                .Monotonic,
+            )) |_| {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            
+            return runnable;
         }
     }
 

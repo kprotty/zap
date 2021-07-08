@@ -7,9 +7,9 @@ const arch = std.Target.current.cpu.arch;
 const ThreadPool = @This();
 
 config: Config,
-runnable: List = .{},
 workers: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-sync: Atomic(u32) = Atomic(u32).init(@bitCast(u32, Sync{})),
+sync: Atomic(u32) align(cache_line_padding) = Atomic(u32).init(@bitCast(u32, Sync{})),
+runnable: List = .{},
 
 pub const Config = struct {
     max_threads: u14,
@@ -374,12 +374,22 @@ const Worker = struct {
         self: *Worker,
         noalias thread_pool: *ThreadPool,
         noalias steal_target_ptr: *?*Worker,
-    ) callconv(.Inline) ?Buffer.Popped {
+    ) ?Buffer.Popped {
         if (self.buffer.pop()) |runnable| {
             return Buffer.Popped{ .runnable = runnable };
         }
 
+        if (self.consume(&self.runnable)) |popped| {
+            return popped;
+        }
+
         return self.steal(thread_pool, steal_target_ptr);
+    }
+
+    fn consume(self: *Worker, list: *List) ?Buffer.Popped {
+        var consumer = self.runnable.steal(list) orelse return null;
+        defer consumer.release();
+        return self.buffer.consume(&consumer);
     }
 
     fn steal(
@@ -391,10 +401,6 @@ const Worker = struct {
         
         var attempts: u8 = if (arch.isX86()) 32 else 8;
         while (attempts > 0) : (attempts -= 1) {
-            if (self.buffer.consume(&self.runnable)) |popped| {
-                return popped;
-            }
-
             var num_workers: u16 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
             while (num_workers > 0) : (num_workers -= 1) {
                 const target = steal_target_ptr.* orelse thread_pool.workers.load(.Acquire) orelse unreachable;
@@ -404,7 +410,7 @@ const Worker = struct {
                     continue;
                 }
 
-                if (self.buffer.consume(&target.runnable)) |popped| {
+                if (self.consume(&target.runnable)) |popped| {
                     return popped;
                 }
                 
@@ -413,7 +419,7 @@ const Worker = struct {
                 } 
             }
 
-            if (self.buffer.consume(&thread_pool.runnable)) |popped| {
+            if (self.consume(&thread_pool.runnable)) |popped| {
                 return popped;
             }
 
@@ -472,15 +478,15 @@ const Access = enum {
     shared,
 };
 
-const List = struct {
-    input: Atomic(?*Runnable) = Atomic(?*Runnable).init(null),
-    output: Atomic(usize) = Atomic(usize).init(IS_EMPTY),
+const cache_line_padding = switch (arch) {
+    .riscv64, .arm, .armeb, .thumb, .thumbeb, .mips, .mipsel, .mips64, .mips64el => 32,
+    .x86_64, .powerpc64, .powerpc64le => 128,
+    .s390x => 256,
+    else => 64,
+};
 
-    const IS_EMPTY: usize = 0b0;
-    const IS_CONSUMING: usize = 0b1;
-    comptime {
-        assert(@alignOf(Runnable) >= (IS_CONSUMING << 1));
-    }
+const List = struct {
+    stack: Atomic(?*Runnable) align(cache_line_padding) = Atomic(?*Runnable).init(null),
 
     fn push(
         noalias self: *List, 
@@ -490,17 +496,17 @@ const List = struct {
         const head = batch.head orelse unreachable;
         const tail = batch.tail;
 
-        var input = self.input.load(.Monotonic);
+        var stack = self.stack.load(.Monotonic);
         while (true) {
-            tail.next = input;
+            tail.next = stack;
 
-            if (access == .exclusive and input == null) {
-                self.input.store(head, .Release);
+            if (access == .exclusive and stack == null) {
+                self.stack.store(head, .Release);
                 return;
             }
 
-            input = self.input.tryCompareAndSwap(
-                input,
+            stack = self.stack.tryCompareAndSwap(
+                stack,
                 head,
                 .Release,
                 .Monotonic,
@@ -508,67 +514,59 @@ const List = struct {
         }
     }
 
-    fn getConsumer(noalias self: *List) ?Consumer {
-        var output = self.output.load(.Monotonic);
-        if (output == IS_CONSUMING) return null;
-        if (output == 0 and self.input.load(.Monotonic) == null) {
+    fn take(noalias self: *List) ?*Runnable {
+        var stack = self.stack.load(.Monotonic);
+        if (stack == null) {
             return null;
         }
 
-        acquired: {
-            if (comptime arch.isX86()) {
-                output = self.output.swap(IS_CONSUMING, .Acquire);
-                if (output == IS_CONSUMING) return null;
-                break :acquired;       
-            }
-
-            while (true) {
-                output = self.output.tryCompareAndSwap(
-                    output,
-                    IS_CONSUMING,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse break :acquired;
-                if (output == IS_CONSUMING) return null;
-                if (output == 0 and self.input.load(.Monotonic) == null) {
-                    return null;
-                }
-            }
+        if (comptime arch.isX86()) {
+            return self.stack.swap(null, .Acquire);
         }
 
-        return Consumer{
+        while (true) {
+            stack = self.stack.tryCompareAndSwap(
+                stack,
+                null,
+                .Acquire,
+                .Monotonic,
+            ) orelse return stack;
+            if (stack == null) {
+                return null;
+            }
+        }
+    }
+
+    fn steal(self: *List, target: *List) ?Consumer {
+        return Consumer {
             .list = self,
-            .output = @intToPtr(?*Runnable, output),
+            .target = target,
+            .stack = target.take() orelse return null,
         };
     }
 
     const Consumer = struct {
         list: *List,
-        output: ?*Runnable,
+        target: *List,
+        stack: ?*Runnable,
 
-        fn pop(self: *Consumer) ?*Runnable {
-            if (self.output) |runnable| {
-                self.output = runnable.next;
-                return runnable;
-            }
-
-            var input = self.list.input.load(.Monotonic) orelse return null;
-            input = self.list.input.swap(null, .Acquire) orelse unreachable;
-
-            self.output = input.next;
-            return input;
+        pub fn pop(noalias self: *Consumer) ?*Runnable {
+            const runnable = self.stack orelse self.target.take() orelse return null;
+            self.stack = runnable.next;
+            return runnable;
         }
 
-        fn release(self: Consumer) void {
-            const output = @ptrToInt(self.output);
-            self.list.output.store(output, .Release);
+        pub fn release(self: Consumer) void {
+            const stack = self.stack orelse return;
+            assert(self.list.stack.loadUnchecked() == null);
+            self.list.stack.store(stack, .Release);
         }
     };
 };
 
 const Buffer = struct {
-    head: Atomic(Index) = Atomic(Index).init(0),
-    tail: Atomic(Index) = Atomic(Index).init(0),
+    head: Atomic(Index) align(cache_line_padding) = Atomic(Index).init(0),
+    tail: Atomic(Index) align(cache_line_padding) = Atomic(Index).init(0),
     array: [capacity]Atomic(*Runnable) = undefined,
 
     const Index = u32;
@@ -734,10 +732,7 @@ const Buffer = struct {
         pushed: bool = false,
     };
 
-    fn consume(noalias self: *Buffer, noalias list: *List) ?Popped {
-        var consumer = list.getConsumer() orelse return null;
-        defer consumer.release();
-
+    fn consume(noalias self: *Buffer, noalias consumer: *List.Consumer) ?Popped {
         const tail = self.tail.loadUnchecked();
         const head = self.head.load(.Monotonic);
         assert(head == tail);

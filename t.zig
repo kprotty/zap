@@ -5,11 +5,11 @@ const assert = std.debug.assert;
 // https://vorbrodt.blog/2019/02/27/advanced-thread-pool/
 
 pub fn main() !void {
-    return benchPool(NewPool);
+    return benchPool(CustomPool);
 }
 
 const REPS = 10;
-const SPREAD = 64;
+const SPREAD = 12;
 const COUNT = 10_000_000;
 
 var win_heap = std.heap.HeapAllocator.init();
@@ -45,17 +45,17 @@ fn benchPool(comptime Pool: type) !void {
                 
                 //std.os.sched_yield() catch {};
                 // std.time.sleep(1 * std.time.ns_per_us);
-                // var prng = std.rand.DefaultPrng.init(self.index);
-                // const rng = &prng.random;
+                var prng = std.rand.DefaultPrng.init(self.index);
+                const rng = &prng.random;
 
-                // var x: usize = undefined;
-                // var reps: usize = REPS + (REPS * rng.uintLessThan(usize, 5));
-                // while (reps > 0) : (reps -= 1) {
-                //     x = self.index + rng.int(usize);
-                // }
+                var x: usize = undefined;
+                var reps: usize = REPS + (REPS * rng.uintLessThan(usize, 5));
+                while (reps > 0) : (reps -= 1) {
+                    x = self.index + rng.int(usize);
+                }
 
-                // var keep: usize = undefined;
-                // @atomicStore(usize, &keep, x, .SeqCst);
+                var keep: usize = undefined;
+                @atomicStore(usize, &keep, x, .SeqCst);
             }
         };
 
@@ -199,7 +199,7 @@ const NewPool = struct {
 };
 
 const CustomPool = struct {
-    const Pool = @import("./pool.zig");
+    const Pool = @import("./pool2.zig");
     const Runnable = Pool.Runnable;
 
     var current: Pool = undefined;

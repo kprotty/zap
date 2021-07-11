@@ -43,19 +43,19 @@ fn benchPool(comptime Pool: type) !void {
                     }
                 }
                 
-                //std.os.sched_yield() catch {};
+                std.os.sched_yield() catch {};
                 // std.time.sleep(1 * std.time.ns_per_us);
-                var prng = std.rand.DefaultPrng.init(self.index);
-                const rng = &prng.random;
+                // var prng = std.rand.DefaultPrng.init(self.index);
+                // const rng = &prng.random;
 
-                var x: usize = undefined;
-                var reps: usize = REPS + (REPS * rng.uintLessThan(usize, 5));
-                while (reps > 0) : (reps -= 1) {
-                    x = self.index + rng.int(usize);
-                }
+                // var x: usize = undefined;
+                // var reps: usize = REPS + (REPS * rng.uintLessThan(usize, 5));
+                // while (reps > 0) : (reps -= 1) {
+                //     x = self.index + rng.int(usize);
+                // }
 
-                var keep: usize = undefined;
-                @atomicStore(usize, &keep, x, .SeqCst);
+                // var keep: usize = undefined;
+                // @atomicStore(usize, &keep, x, .SeqCst);
             }
         };
 

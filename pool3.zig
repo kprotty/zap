@@ -11,17 +11,18 @@ const cache_line_padding = switch (std.Target.current.cpu.arch) {
     else => 64,
 };
 
+pub const ThreadCount = Sync.Count;
+pub const Config = struct {
+    max_threads: ThreadCount,
+    stack_size: usize = (std.Thread.SpawnConfig{}).stack_size,
+};
+
 config: Config,
 join_event: Event = .{},
 workers: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-injected: List align(cache_line_padding) = .{},
+runnable: List align(cache_line_padding) = .{},
 idle_event: Event align(cache_line_padding) = .{},
-sync: Atomic(u32) align(cache_line_padding) = Atomic(u32).init(@bitCast(u32, Sync{})),
-
-pub const Config = struct {
-    max_threads: u14,
-    stack_size: usize = (std.Thread.SpawnConfig{}).stack_size,
-};
+sync: Atomic(usize) align(cache_line_padding) = Atomic(usize).init(@bitCast(usize, Sync{})),
 
 pub fn init(config: Config) ThreadPool {
     return .{ .config = config };
@@ -43,7 +44,7 @@ pub const Runnable = struct {
 
 pub const Batch = struct {
     head: ?*Runnable = null,
-    tail: *Runnable = undefined,
+    tail: ?*Runnable = null,
 
     pub fn from(runnable: *Runnable) Batch {
         runnable.next = null;
@@ -57,29 +58,29 @@ pub const Batch = struct {
         return self.head == null;
     }
 
-    pub fn push(noalias self: *Batch, batch: Batch) void {
+    pub fn push(self: *Batch, batch: Batch) void {
         if (batch.head == null) return;
-        if (self.head == null) self.tail = batch.tail;
-        batch.tail.next = self.head;
+        if (self.isEmpty()) self.tail = batch.tail;
+        batch.tail.?.next = self.head;
         self.head = batch.head;
     }
 
-    pub fn pop(noalias self: *Batch) ?*Runnable {
+    pub fn pop(self: *Batch) ?*Runnable {
         const runnable = self.head orelse return null;
         self.head = runnable.next;
         return runnable;
     }
 };
 
-pub fn schedule(noalias self: *ThreadPool, batch: Batch) void {
+pub fn schedule(self: *ThreadPool, batch: Batch) void {
     if (batch.isEmpty()) {
         return;
     }
 
-    if (Worker.tls_current) |worker| {
+    if (Worker.current) |worker| {
         worker.push(batch);
     } else {
-        self.injected.push(batch);
+        self.runnable.push(batch);
     }
 
     const sync = @bitCast(Sync, self.sync.load(.Monotonic));
@@ -92,11 +93,24 @@ pub fn schedule(noalias self: *ThreadPool, batch: Batch) void {
 }
 
 const Sync = packed struct {
-    idle: u14 = 0,
-    spawned: u14 = 0,
-    u32_padding: u1 = 0,
+    const Count = std.meta.Int(
+        .unsigned,
+        (std.meta.bitCount(usize) - 3) / 2,
+    );
+
+    const StateTag = std.meta.Int(
+        .unsigned,
+        std.meta.bitCount(usize) - 1 - (std.meta.bitCount(Count) * 2),
+    );
+
+    comptime {
+        assert(@bitSizeOf(Sync) == @bitSizeOf(usize));
+    }
+
+    idle: Count = 0,
+    spawned: Count = 0,
     notified: bool = false,
-    state: enum(u2) {
+    state: enum(StateTag) {
         pending = 0,
         waking,
         signaled,
@@ -104,7 +118,7 @@ const Sync = packed struct {
     } = .pending,
 };
 
-fn notify(noalias self: *ThreadPool, is_waking: bool) void {
+fn notify(self: *ThreadPool, is_waking: bool) void {
     @setCold(true);
 
     const max_spawn = self.config.max_threads;
@@ -129,8 +143,8 @@ fn notify(noalias self: *ThreadPool, is_waking: bool) void {
         }
 
         if (self.sync.tryCompareAndSwap(
-            @bitCast(u32, sync),
-            @bitCast(u32, new_sync),
+            @bitCast(usize, sync),
+            @bitCast(usize, new_sync),
             .Release,
             .Monotonic,
         )) |updated| {
@@ -148,7 +162,7 @@ fn notify(noalias self: *ThreadPool, is_waking: bool) void {
     }
 }
 
-fn wait(noalias self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
+fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
     @setCold(true);
 
     var is_idle = false;
@@ -166,8 +180,8 @@ fn wait(noalias self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
             if (sync.state == .signaled) new_sync.state = .waking;
 
             if (self.sync.tryCompareAndSwap(
-                @bitCast(u32, sync),
-                @bitCast(u32, new_sync),
+                @bitCast(usize, sync),
+                @bitCast(usize, new_sync),
                 .Acquire,
                 .Monotonic,
             )) |updated| {
@@ -185,8 +199,8 @@ fn wait(noalias self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
             if (is_waking) new_sync.state = .pending;
 
             if (self.sync.tryCompareAndSwap(
-                @bitCast(u32, sync),
-                @bitCast(u32, new_sync),
+                @bitCast(usize, sync),
+                @bitCast(usize, new_sync),
                 .Monotonic,
                 .Monotonic,
             )) |updated| {
@@ -214,8 +228,8 @@ pub fn shutdown(self: *ThreadPool) void {
         new_sync.state = .shutdown;
 
         if (self.sync.tryCompareAndSwap(
-            @bitCast(u32, sync),
-            @bitCast(u32, new_sync),
+            @bitCast(usize, sync),
+            @bitCast(usize, new_sync),
             .AcqRel,
             .Monotonic,
         )) |updated| {
@@ -232,6 +246,8 @@ pub fn shutdown(self: *ThreadPool) void {
 }
 
 fn register(noalias self: *ThreadPool, noalias worker: *Worker) void {
+    @setCold(true);
+
     var workers = self.workers.load(.Monotonic);
     while (true) {
         worker.next = workers;
@@ -248,7 +264,7 @@ fn unregister(noalias self: *ThreadPool, noalias maybe_worker: ?*Worker) void {
     @setCold(true);
     
     // Remove a spawned worker from the sync state
-    const remove = @bitCast(u32, Sync{ .spawned = 1 });
+    const remove = @bitCast(usize, Sync{ .spawned = 1 });
     const updated = self.sync.fetchSub(remove, .AcqRel);
     const sync = @bitCast(Sync, updated);
 
@@ -269,7 +285,7 @@ fn unregister(noalias self: *ThreadPool, noalias maybe_worker: ?*Worker) void {
     next_worker.join_event.notify();
 }
 
-fn join(noalias self: *ThreadPool) void {
+fn join(self: *ThreadPool) void {
     @setCold(true);
 
     // Wait for the thread pool to be shutdown and for all workers to be unregistered.
@@ -286,20 +302,12 @@ fn join(noalias self: *ThreadPool) void {
 const Worker = struct {
     next: ?*Worker = undefined,
     join_event: Event = .{},
-    buffer: [buffer_capacity]Atomic(*Runnable) = undefined,
-    tail: Atomic(BufferIndex) = Atomic(BufferIndex).init(0),
-    head: Atomic(BufferIndex) align(cache_line_padding) = Atomic(BufferIndex).init(0),
-    overflowed: List align(cache_line_padding) = .{},
+    runnable: List align(cache_line_padding) = .{},
+    buffer: Buffer align(cache_line_padding) = .{},
 
-    const BufferIndex = usize;
-    const buffer_capacity = 256;
-    comptime {
-        assert(std.math.maxInt(BufferIndex) >= buffer_capacity);
-    }
-    
-    threadlocal var tls_current: ?*Worker = null;
+    threadlocal var current: ?*Worker = null;
 
-    fn spawn(noalias thread_pool: *ThreadPool) !void {
+    fn spawn(thread_pool: *ThreadPool) !void {
         const thread = try std.Thread.spawn(
             .{ .stack_size = thread_pool.config.stack_size },
             Worker.run,
@@ -308,9 +316,9 @@ const Worker = struct {
         thread.detach();
     }
 
-    fn run(noalias thread_pool: *ThreadPool) void {
+    fn run(thread_pool: *ThreadPool) void {
         var self = Worker{};
-        tls_current = &self;
+        current = &self;
 
         thread_pool.register(&self);
         defer thread_pool.unregister(&self);
@@ -332,109 +340,93 @@ const Worker = struct {
         }
     }
 
-    fn push(noalias self: *Worker, batch: Batch) void {
-        if (self.pushBuffer(batch)) |overflowed_batch| {
-            self.overflowed.push(overflowed_batch);
+    fn push(self: *Worker, batch: Batch) void {
+        if (self.buffer.push(batch)) |overflowed| {
+            self.runnable.push(overflowed);
         }
     }
-
-    const Popped = struct {
-        runnable: *Runnable,
-        pushed: bool = false,
-    };
 
     fn pop(
-        self: *Worker,
+        noalias self: *Worker,
         noalias thread_pool: *ThreadPool,
         noalias steal_target_ptr: *?*Worker,
-    ) ?Popped {
-        if (self.popBuffer()) |popped| {
+    ) callconv(.Inline) ?Buffer.Popped {
+        if (self.buffer.pop()) |popped| {
             return popped;
         }
 
-        return self.steal(thread_pool, steal_target_ptr);
+        return self.popAndSteal(thread_pool, steal_target_ptr);
     }
 
-    fn steal(
-        self: *Worker,
+    fn popAndSteal(
+        noalias self: *Worker, 
         noalias thread_pool: *ThreadPool,
         noalias steal_target_ptr: *?*Worker,
-    ) ?Popped {
+    ) ?Buffer.Popped {
         @setCold(true);
 
-        if (self.popAndFillBuffer(&self.overflowed)) |popped| {
+        if (self.buffer.popAndSteal(&self.runnable)) |popped| {
             return popped;
         }
 
-        if (self.popAndFillBuffer(&thread_pool.injected)) |popped| {
+        if (self.buffer.popAndSteal(&thread_pool.runnable)) |popped| {
             return popped;
         }
 
-        var num_workers: u16 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
+        var num_workers: usize = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
         while (num_workers > 0) : (num_workers -= 1) {
-            const target = steal_target_ptr.* orelse thread_pool.workers.load(.Acquire) orelse unreachable;
-            steal_target_ptr.* = target.next;
+            const target_worker = steal_target_ptr.* orelse thread_pool.workers.load(.Acquire) orelse unreachable;
+            steal_target_ptr.* = target_worker.next;
 
-            if (target == self) {
+            if (target_worker == self) {
                 continue;
             }
 
-            if (self.popAndFillBuffer(&target.overflowed)) |popped| {
+            if (self.buffer.popAndSteal(&target_worker.runnable)) |popped| {
                 return popped;
             }
             
-            if (self.popAndStealBuffer(target)) |popped| {
+            if (self.buffer.popAndSteal(&target_worker.buffer)) |popped| {
                 return popped;
             } 
         }
 
         return null;
     }
+};
 
-    const BufferAccess = enum {
-        single_writer,
-        shared_access,
-    };
+const Buffer = struct {
+    head: Atomic(Index) align(cache_line_padding) = Atomic(Index).init(0),
+    tail: Atomic(Index) align(cache_line_padding) = Atomic(Index).init(0),
+    array: [capacity]Atomic(*Runnable) = undefined,
 
-    fn readBuffer(
-        noalias self: *Worker,
-        comptime access: BufferAccess,
-        head: BufferIndex,
-    ) callconv(.Inline) *Runnable {
-        const slot = &self.buffer[head % buffer_capacity];
-        _ = access;
-        return slot.load(.Unordered);
+    const Index = std.meta.Int(.unsigned, std.meta.bitCount(usize) / 2);
+    const capacity = 256;
+    comptime {
+        assert(std.math.maxInt(Index) >= capacity);
     }
 
-    fn writeBuffer(
-        noalias self: *Worker, 
-        noalias runnable: *Runnable,
-        tail: BufferIndex,
-    ) callconv(.Inline) void {
-        const slot = &self.buffer[tail % buffer_capacity];
-        slot.store(runnable, .Unordered);
-    } 
+    fn push(self: *Buffer, batch: Batch) ?Batch {
+        assert(!batch.isEmpty());
 
-    fn pushBuffer(noalias self: *Worker, tasks: Batch) ?Batch {
-        var batch = tasks;
+        var runnables = batch;
         var tail = self.tail.loadUnchecked();
         var head = self.head.load(.Monotonic);
 
         while (true) {
-            assert(!batch.isEmpty());
             const size = tail -% head;
-            assert(size <= buffer_capacity);
+            assert(size <= capacity);
 
-            var free_slots = buffer_capacity - size;
+            var free_slots = capacity - size;
             if (free_slots > 0) {
                 while (free_slots > 0) : (free_slots -= 1) {
-                    const runnable = batch.pop() orelse break;
-                    self.writeBuffer(runnable, tail);
+                    const runnable = runnables.pop() orelse break;
+                    self.array[tail % capacity].store(runnable, .Unordered);
                     tail +%= 1;
                 }
 
                 self.tail.store(tail, .Release);
-                if (batch.isEmpty()) {
+                if (runnables.isEmpty()) {
                     return null;
                 }
                 
@@ -443,7 +435,7 @@ const Worker = struct {
                 continue;
             }
 
-            var overflow: usize = buffer_capacity / 2;
+            var overflow: Index = capacity / 2;
             if (self.head.tryCompareAndSwap(
                 head,
                 head +% overflow,
@@ -453,57 +445,106 @@ const Worker = struct {
                 head = updated;
                 continue;
             }
-
+            
+            var overflowed = runnables;
             while (overflow > 0) : (overflow -= 1) {
-                const runnable = self.readBuffer(.single_writer, head);
-                batch.push(Batch.from(runnable));
+                const runnable = self.array[head % capacity].loadUnchecked();
+                overflowed.push(Batch.from(runnable));
                 head +%= 1;
             }
 
-            return batch;
+            return overflowed;
         }
     }
 
-    fn popBuffer(self: *Worker) ?Popped {
+    const Popped = struct {
+        runnable: *Runnable,
+        pushed: bool = false,
+    };
+
+    fn pop(self: *Buffer) ?Popped {
         const tail = self.tail.loadUnchecked();
         var head = self.head.load(.Monotonic);
 
         while (true) {
-            assert(tail -% head <= buffer_capacity);
-            if (tail == head) {
+            const size = tail -% head;
+            assert(size <= capacity);
+
+            if (size == 0) {
                 return null;
             }
 
-            head = self.head.tryCompareAndSwap(
+            if (self.head.tryCompareAndSwap(
                 head,
                 head +% 1,
                 .Acquire,
                 .Monotonic,
-            ) orelse {
-                const runnable = self.readBuffer(.single_writer, head);
-                return Popped{ .runnable = runnable };
-            };
+            )) |updated| {
+                head = updated;
+                continue;
+            }
+
+            const runnable = self.array[head % capacity].loadUnchecked();
+            return Popped{ .runnable = runnable };
         }
     }
 
-    fn popAndStealBuffer(
-        noalias self: *Worker, 
-        noalias target: *Worker,
-    ) ?Popped {
+    fn popAndSteal(noalias self: *Buffer, noalias target: anytype) ?Popped {
+        @setCold(true);
+
+        return switch (@TypeOf(target)) {
+            *List => self.popAndStealList(target),
+            *Buffer => self.popAndStealBuffer(target),
+            else => |T| @compileError(@typeName(T) ++ " cannot be stolen from"),
+        };
+    }
+
+    fn popAndStealList(noalias self: *Buffer, noalias target: *List) ?Popped {
+        var consumer = target.tryAcquireConsumer() orelse return null;
+        defer consumer.release(); 
+
         const tail = self.tail.loadUnchecked();
-        if (std.debug.runtime_safety) {
-            assert(tail == self.head.load(.Monotonic));
+        const head = self.head.load(.Monotonic);
+
+        const size = tail -% head;
+        assert(size == 0);
+
+        var pushed: Index = 0;
+        while (pushed < capacity) : (pushed += 1) {
+            const runnable = consumer.pop() orelse break;
+            self.array[(tail +% pushed) % capacity].store(runnable, .Unordered);
         }
+
+        const popped = consumer.pop() orelse blk: {
+            if (pushed == 0) return null;
+            pushed -= 1;
+            break :blk self.array[(tail +% pushed) % capacity].loadUnchecked();
+        };
+
+        if (pushed > 0) self.tail.store(tail +% pushed, .Release);
+        return Popped {
+            .runnable = popped,
+            .pushed = pushed > 0,
+        };
+    }
+
+    fn popAndStealBuffer(noalias self: *Buffer, noalias target: *Buffer) ?Popped {
+        const tail = self.tail.loadUnchecked();
+        const head = self.head.load(.Monotonic);
+        
+        var size = tail -% head;
+        assert(size == 0);
 
         var target_head = target.head.load(.Acquire);
         while (true) {
             const target_tail = target.tail.load(.Acquire);
-            if (target_head == target_tail) {
+
+            size = target_tail -% target_head;
+            if (size == 0) {
                 return null;
             }
 
-            var size = target_tail -% target_head;
-            if (size > buffer_capacity) {
+            if (size > capacity) {
                 std.atomic.spinLoopHint();
                 target_head = target.head.load(.Acquire);
                 continue;
@@ -511,13 +552,13 @@ const Worker = struct {
 
             var new_tail = tail;
             var new_target_head = target_head +% 1;
-            const stolen = target.readBuffer(.shared_access, target_head);
+            const stolen = target.array[target_head % capacity].load(.Unordered);
 
             size = (size - (size / 2)) - 1;
             while (size > 0) : (size -= 1) {
-                const runnable = target.readBuffer(.shared_access, new_target_head);
+                const runnable = target.array[new_target_head % capacity].load(.Unordered);
                 new_target_head +%= 1;
-                self.writeBuffer(runnable, new_tail);
+                self.array[new_tail % capacity].store(runnable, .Unordered);
                 new_tail +%= 1;
             }
 
@@ -538,35 +579,6 @@ const Worker = struct {
             };
         }
     }
-
-    fn popAndFillBuffer(self: *Worker, list: *List) ?Popped {
-        @setCold(true);
-
-        var consumer = list.consume() orelse return null;
-        defer consumer.release(); 
-
-        const tail = self.tail.loadUnchecked();
-        const head = self.head.load(.Monotonic);
-        assert(head == tail);
-
-        var pushed: BufferIndex = 0;
-        while (pushed < buffer_capacity) : (pushed += 1) {
-            const runnable = consumer.pop() orelse break;
-            self.writeBuffer(runnable, tail +% pushed);
-        }
-
-        const popped = consumer.pop() orelse blk: {
-            if (pushed == 0) return null;
-            pushed -= 1;
-            break :blk self.readBuffer(.single_writer, tail +% pushed);
-        };
-
-        if (pushed > 0) self.tail.store(tail +% pushed, .Release);
-        return Popped {
-            .runnable = popped,
-            .pushed = pushed > 0,
-        };
-    }
 };
 
 const List = struct {
@@ -582,8 +594,10 @@ const List = struct {
     }
 
     fn push(self: *List, batch: Batch) void {
+        assert(!batch.isEmpty());
+
         const head = batch.head orelse unreachable;
-        const tail = batch.tail;
+        const tail = batch.tail orelse unreachable;
 
         var stack = self.stack.load(.Monotonic);
         while (true) {
@@ -598,7 +612,7 @@ const List = struct {
         }
     }
 
-    fn consume(self: *List) ?Consumer {
+    fn tryAcquireConsumer(self: *List) ?Consumer {
         var stack = self.stack.load(.Monotonic);
         while (true) {
             // Return if there's no pushed pointer or HAS_LOCAL

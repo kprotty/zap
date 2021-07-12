@@ -9,7 +9,7 @@ pub fn main() !void {
 }
 
 const REPS = 10;
-const SPREAD = 12;
+const SPREAD = 100;
 const COUNT = 10_000_000;
 
 var win_heap = std.heap.HeapAllocator.init();
@@ -43,7 +43,11 @@ fn benchPool(comptime Pool: type) !void {
                     }
                 }
                 
-                std.os.sched_yield() catch {};
+                const fd = (std.math.cast(i32, self.index) catch std.math.maxInt(i32)) + 3;
+                for (@as([5]void, undefined)) |_|
+                    _ = std.os.read(fd, &[_]u8{}) catch {};
+
+                //std.os.sched_yield() catch {};
                 // std.time.sleep(1 * std.time.ns_per_us);
                 // var prng = std.rand.DefaultPrng.init(self.index);
                 // const rng = &prng.random;
@@ -199,7 +203,7 @@ const NewPool = struct {
 };
 
 const CustomPool = struct {
-    const Pool = @import("./pool2.zig");
+    const Pool = @import("./pool3.zig");
     const Runnable = Pool.Runnable;
 
     var current: Pool = undefined;

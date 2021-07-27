@@ -1,11 +1,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
+const Futex = std.Thread.Futex;
 
 const ThreadPool = @This();
 
-const arch = std.Target.current.cpu.arch;
-const cache_line_padding = switch (arch) {
+const cache_line_padding = switch (std.Target.current.cpu.arch) {
     .riscv64, .arm, .armeb, .thumb, .thumbeb, .mips, .mipsel, .mips64, .mips64el => 32,
     .x86_64, .powerpc64, .powerpc64le => 128,
     .s390x => 256,
@@ -19,10 +19,10 @@ pub const Config = struct {
 };
 
 config: Config,
-join_event: Event = .{},
+join_event: EventCount = .{},
 workers: Atomic(?*Worker) = Atomic(?*Worker).init(null),
 runnable: List align(cache_line_padding) = .{},
-idle_event: Event align(cache_line_padding) = .{},
+idle_event: EventCount align(cache_line_padding) = .{},
 sync: Atomic(usize) align(cache_line_padding) = Atomic(usize).init(@bitCast(usize, Sync{})),
 
 pub fn init(config: Config) ThreadPool {
@@ -154,7 +154,7 @@ fn notify(self: *ThreadPool, is_waking: bool) void {
         }
 
         if (sync.idle > 0 and can_wake) {
-            self.idle_event.notify();
+            self.idle_event.notifyOne();
         } else if (sync.spawned < max_spawn and can_wake) {
             Worker.spawn(self) catch self.unregister(null);
         }
@@ -213,7 +213,15 @@ fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
             is_waking = false;
         }
 
-        self.idle_event.wait();
+        const epoch = self.idle_event.prepare();
+        sync = @bitCast(Sync, self.sync.load(.Monotonic));
+
+        if (sync.notified) {
+            self.idle_event.cancel(epoch);
+        } else {
+            self.idle_event.wait(epoch);
+        }
+        
         sync = @bitCast(Sync, self.sync.load(.Monotonic));
     }
 }
@@ -239,7 +247,7 @@ pub fn shutdown(self: *ThreadPool) void {
         }
 
         if (sync.idle > 0) {
-            self.idle_event.shutdown();
+            self.idle_event.notifyAll();
         }
 
         return;
@@ -274,35 +282,38 @@ fn unregister(noalias self: *ThreadPool, noalias maybe_worker: ?*Worker) void {
     
     // Notify the join() threads waiting for all workers to be unregistered/joinable
     if (sync.spawned == 1) {
-        self.join_event.notify();
+        self.join_event.notifyAll();
     }
 
     // If unregistering a worker, wait for a shutdown signal
     const worker = maybe_worker orelse return;
-    worker.join_event.wait();
+    worker.waitForShutdown();
 
     // After receiving a shutdown signal, shutdown the next worker it's linked with
     const next_worker = worker.next orelse return;
-    next_worker.join_event.notify();
+    next_worker.notifyShutdown();
 }
 
 fn join(self: *ThreadPool) void {
     @setCold(true);
 
     // Wait for the thread pool to be shutdown and for all workers to be unregistered.
+    const epoch = self.join_event.prepare();
     const sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    if (!(sync.state == .shutdown and sync.spawned == 0)) {
-        self.join_event.wait();
+    if (sync.state == .shutdown and sync.spawned == 0) {
+        self.join_event.cancel(epoch);
+    } else {
+        self.join_event.wait(epoch);
     }
 
     // Shutdown the top-most worker, which will shutdown the next worker, and so on...
     const worker = self.workers.load(.Acquire) orelse return;
-    worker.join_event.notify();
+    worker.notifyShutdown();
 }
 
 const Worker = struct {
     next: ?*Worker = undefined,
-    join_event: Event = .{},
+    shutdown_futex: Atomic(u32) = Atomic(u32).init(0),
     runnable: List align(cache_line_padding) = .{},
     buffer: Buffer align(cache_line_padding) = .{},
 
@@ -325,12 +336,12 @@ const Worker = struct {
         defer thread_pool.unregister(&self);
         
         var is_waking = false;
-        var xorshift = @truncate(u32, @ptrToInt(&self) *% 31) | 1;
+        var steal_target: ?*Worker = null;
 
         while (true) {
             is_waking = thread_pool.wait(is_waking) catch break;
 
-            while (self.pop(thread_pool, &xorshift)) |popped| {
+            while (self.pop(thread_pool, &steal_target)) |popped| {
                 if (popped.pushed or is_waking) {
                     thread_pool.notify(is_waking);
                 }
@@ -339,6 +350,17 @@ const Worker = struct {
                 (popped.runnable.runFn)(popped.runnable);
             }
         }
+    }
+
+    fn waitForShutdown(self: *Worker) void {
+        while (self.shutdown_futex.load(.Acquire) == 0) {
+            Futex.wait(&self.shutdown_futex, 0, null) catch unreachable;
+        }
+    }
+
+    fn notifyShutdown(self: *Worker) void {
+        self.shutdown_futex.store(1, .Release);
+        Futex.wake(&self.shutdown_futex, 1);
     }
 
     fn push(self: *Worker, batch: Batch) void {
@@ -350,108 +372,49 @@ const Worker = struct {
     fn pop(
         noalias self: *Worker,
         noalias thread_pool: *ThreadPool,
-        noalias xorshift: *u32,
+        noalias steal_target_ptr: *?*Worker,
     ) callconv(.Inline) ?Buffer.Popped {
         if (self.buffer.pop()) |popped| {
             return popped;
         }
 
-        return self.popAndSteal(thread_pool, xorshift);
+        return self.popAndSteal(thread_pool, steal_target_ptr);
     }
 
     fn popAndSteal(
         noalias self: *Worker, 
         noalias thread_pool: *ThreadPool,
-        noalias xorshift: *u32,
+        noalias steal_target_ptr: *?*Worker,
     ) ?Buffer.Popped {
         @setCold(true);
 
         if (self.buffer.popAndSteal(&self.runnable)) |popped| {
             return popped;
-        } else |_| {}
-
-        if (self.buffer.popAndSteal(&thread_pool.runnable)) |popped| {
-            return popped;
-        } else |_| {}
-
-        var attempts: u8 = 4;
-        while (attempts > 0) : (attempts -= 1) {
-            return self.tryPopAndSteal(thread_pool, xorshift) catch {
-                std.atomic.spinLoopHint();
-                continue;
-            };
         }
 
         if (self.buffer.popAndSteal(&thread_pool.runnable)) |popped| {
             return popped;
-        } else |_| {}
+        }
 
-        return null;
-    }
-
-    fn tryPopAndSteal(
-        noalias self: *Worker,
-        noalias thread_pool: *ThreadPool,
-        noalias xorshift: *u32,
-    ) error{Empty, Contended}!Buffer.Popped {
-        var rng = xorshift.*;
-        rng ^= rng >> 13;
-        rng ^= rng << 17;
-        rng ^= rng >> 5;
-        xorshift.* = rng;
-
-        var index: u8 = 0;
-        var was_contended = false;
-        var buffer = std.mem.zeroes([8]?*Worker);
-        var workers = thread_pool.workers.load(.Acquire);
-
-        while (true) {
-            const target: ?*Worker = blk: {
-                while (true) {
-                    while (index < buffer.len) {
-                        const worker = buffer[index];
-                        index += 1;
-                        break :blk (worker orelse continue);
-                    }
-
-                    if (workers == null) {
-                        break :blk null;
-                    }
-
-                    index = 0;
-                    for (buffer) |*slot| {
-                        slot.* = workers;
-                        const worker = slot.* orelse continue;
-                        workers = worker.next;
-                    }
-
-                    var i = buffer.len - 1;
-                    while (i > 0) : (i -= 1) {
-                        const j = rng % (i + 1);
-                        std.mem.swap(?*Worker, &buffer[i], &buffer[j]);
-                    }
-                }
-            };
-            
-            const target_worker = target orelse break;
-            if (self.buffer.popAndSteal(&target_worker.runnable)) |popped| {
-                return popped;
-            } else |err| {
-                was_contended = was_contended or err == error.Contended;
-            }
+        var num_workers: usize = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
+        while (num_workers > 0) : (num_workers -= 1) {
+            const target_worker = steal_target_ptr.* orelse thread_pool.workers.load(.Acquire) orelse unreachable;
+            steal_target_ptr.* = target_worker.next;
 
             if (target_worker == self) {
                 continue;
             }
 
-            return target_worker.buffer.steal() catch |err| {
-                was_contended = was_contended or err == error.Contended;
-                continue;
-            };
+            if (self.buffer.popAndSteal(&target_worker.runnable)) |popped| {
+                return popped;
+            }
+            
+            if (self.buffer.popAndSteal(&target_worker.buffer)) |popped| {
+                return popped;
+            } 
         }
 
-        if (was_contended) return error.Contended;
-        return error.Empty;
+        return null;
     }
 };
 
@@ -481,7 +444,6 @@ const Buffer = struct {
             if (free_slots > 0) {
                 while (free_slots > 0) : (free_slots -= 1) {
                     const runnable = runnables.pop() orelse break;
-                    runnable.next = self.array[(tail -% 1) % capacity].loadUnchecked();
                     self.array[tail % capacity].store(runnable, .Unordered);
                     tail +%= 1;
                 }
@@ -506,17 +468,15 @@ const Buffer = struct {
                 head = updated;
                 continue;
             }
-
-            const front = self.array[(head +% (overflow - 1)) % capacity].loadUnchecked();
-            const back = self.array[head % capacity].loadUnchecked();
-            back.next = null;
             
-            runnables.push(Batch {
-                .head = front,
-                .tail = back,
-            });
+            var overflowed = runnables;
+            while (overflow > 0) : (overflow -= 1) {
+                const runnable = self.array[head % capacity].loadUnchecked();
+                overflowed.push(Batch.from(runnable));
+                head +%= 1;
+            }
 
-            return runnables;
+            return overflowed;
         }
     }
 
@@ -528,59 +488,42 @@ const Buffer = struct {
     fn pop(self: *Buffer) ?Popped {
         const tail = self.tail.loadUnchecked();
         var head = self.head.load(.Monotonic);
-        
-        assert(tail -% head <= capacity);
-        if (tail == head) {
-            return null;
-        }
 
-        const new_tail = tail -% 1;
-        self.tail.store(new_tail, .SeqCst);
-        head = self.head.load(.SeqCst);
+        while (true) {
+            const size = tail -% head;
+            assert(size <= capacity);
 
-        const size = tail -% head;
-        assert(size <= capacity);
+            if (size == 0) {
+                return null;
+            }
 
-        const runnable = self.array[new_tail % capacity].loadUnchecked();
-        if (size > 1) {
-            return Popped{ .runnable = runnable };
-        }
-
-        self.tail.store(tail, .Monotonic);
-        if (size == 1) {
-            _ = self.head.compareAndSwap(
+            if (self.head.tryCompareAndSwap(
                 head,
-                tail,
+                head +% 1,
                 .Acquire,
                 .Monotonic,
-            ) orelse return Popped{ .runnable = runnable };
-        }
+            )) |updated| {
+                head = updated;
+                continue;
+            }
 
-        return null;
+            const runnable = self.array[head % capacity].loadUnchecked();
+            return Popped{ .runnable = runnable };
+        }
     }
 
-    fn steal(self: *Buffer) error{Empty, Contended}!Popped {
-        const head = self.head.load(.Acquire);
-        const tail = self.tail.load(.Acquire);
+    fn popAndSteal(noalias self: *Buffer, noalias target: anytype) ?Popped {
+        @setCold(true);
 
-        const size = tail -% head;
-        if (size == 0 or size > capacity) {
-            return error.Empty;
-        }
-        
-        const runnable = self.array[head % capacity].load(.Unordered);
-        _ = self.head.compareAndSwap(
-            head,
-            head +% 1,
-            .SeqCst,
-            .Monotonic,
-        ) orelse return Popped{ .runnable = runnable };
-
-        return error.Contended;
+        return switch (@TypeOf(target)) {
+            *List => self.popAndStealList(target),
+            *Buffer => self.popAndStealBuffer(target),
+            else => |T| @compileError(@typeName(T) ++ " cannot be stolen from"),
+        };
     }
 
-    fn popAndSteal(noalias self: *Buffer, noalias target: *List) error{Empty, Contended}!Popped {
-        var consumer = target.tryAcquireConsumer() catch return error.Empty;
+    fn popAndStealList(noalias self: *Buffer, noalias target: *List) ?Popped {
+        var consumer = target.tryAcquireConsumer() orelse return null;
         defer consumer.release(); 
 
         const tail = self.tail.loadUnchecked();
@@ -589,16 +532,14 @@ const Buffer = struct {
         const size = tail -% head;
         assert(size == 0);
 
-        const first = consumer.pop();
         var pushed: Index = 0;
         while (pushed < capacity) : (pushed += 1) {
             const runnable = consumer.pop() orelse break;
-            runnable.next = self.array[((tail +% pushed) -% 1) % capacity].loadUnchecked();
             self.array[(tail +% pushed) % capacity].store(runnable, .Unordered);
         }
 
-        const popped = first orelse consumer.pop() orelse blk: {
-            if (pushed == 0) return error.Empty;
+        const popped = consumer.pop() orelse blk: {
+            if (pushed == 0) return null;
             pushed -= 1;
             break :blk self.array[(tail +% pushed) % capacity].loadUnchecked();
         };
@@ -608,6 +549,58 @@ const Buffer = struct {
             .runnable = popped,
             .pushed = pushed > 0,
         };
+    }
+
+    fn popAndStealBuffer(noalias self: *Buffer, noalias target: *Buffer) ?Popped {
+        const tail = self.tail.loadUnchecked();
+        const head = self.head.load(.Monotonic);
+        
+        var size = tail -% head;
+        assert(size == 0);
+
+        var target_head = target.head.load(.Acquire);
+        while (true) {
+            const target_tail = target.tail.load(.Acquire);
+
+            size = target_tail -% target_head;
+            if (size == 0) {
+                return null;
+            }
+
+            if (size > capacity) {
+                std.atomic.spinLoopHint();
+                target_head = target.head.load(.Acquire);
+                continue;
+            }
+
+            var new_tail = tail;
+            var new_target_head = target_head +% 1;
+            const stolen = target.array[target_head % capacity].load(.Unordered);
+
+            size = (size - (size / 2)) - 1;
+            while (size > 0) : (size -= 1) {
+                const runnable = target.array[new_target_head % capacity].load(.Unordered);
+                new_target_head +%= 1;
+                self.array[new_tail % capacity].store(runnable, .Unordered);
+                new_tail +%= 1;
+            }
+
+            if (target.head.tryCompareAndSwap(
+                target_head,
+                new_target_head,
+                .AcqRel,
+                .Acquire,
+            )) |updated| {
+                target_head = updated;
+                continue;
+            }
+
+            if (new_tail != tail) self.tail.store(new_tail, .Release);
+            return Popped{
+                .runnable = stolen,
+                .pushed = new_tail != tail,
+            };
+        }
     }
 };
 
@@ -642,16 +635,16 @@ const List = struct {
         }
     }
 
-    fn tryAcquireConsumer(self: *List) error{Empty, Contended}!Consumer {
+    fn tryAcquireConsumer(self: *List) ?Consumer {
         var stack = self.stack.load(.Monotonic);
         while (true) {
             // Return if there's no pushed pointer or HAS_LOCAL
             if (stack & ~HAS_CONSUMER == 0)
-                return error.Empty;
+                return null;
 
             // Return if there's already a consumer
             if (stack & HAS_CONSUMER != 0)
-                return error.Contended;
+                return null;
 
             // Mark that the stack is being consumed and will have a local stack
             // Also claim the stack of Runnables if there is no self.local
@@ -707,87 +700,41 @@ const List = struct {
     };
 };
 
-const Event = struct {
-    state: Atomic(State) = Atomic(State).init(.empty),
+const EventCount = struct {
+    epoch: Atomic(u32) = Atomic(u32).init(0),
+    waiting: Atomic(u32) = Atomic(u32).init(0),
 
-    const Futex = std.Thread.Futex;
-    const State = enum(u32) {
-        empty = 0,
-        waiting,
-        notified,
-        shutdown,
-    };
+    fn prepare(self: *EventCount) u32 {
+        _ = self.waiting.fetchAdd(1, .SeqCst);
+        return self.epoch.load(.Monotonic);
+    }
 
-    fn wait(self: *Event) void {
-        @setCold(true);
+    fn cancel(self: *EventCount, epoch: u32) void {
+        _ = epoch;
+        _ = self.waiting.fetchSub(1, .SeqCst);
+    }
 
-        var wake_state = State.empty;
-        var state = self.state.load(.Monotonic);
-        while (true) {
-            switch (state) {
-                .empty => {
-                    state = self.state.tryCompareAndSwap(
-                        state,
-                        .waiting,
-                        .Monotonic,
-                        .Monotonic,
-                    ) orelse .waiting;
-                },
-                .waiting => {
-                    Futex.wait(
-                        @ptrCast(*const Atomic(u32), &self.state),
-                        @enumToInt(State.waiting),
-                        null,
-                    ) catch unreachable;
-                    wake_state = .waiting;
-                    state = self.state.load(.Monotonic);
-                },
-                .notified => {
-                    state = self.state.tryCompareAndSwap(
-                        state,
-                        wake_state,
-                        .Acquire,
-                        .Monotonic,
-                    ) orelse return;
-                },
-                .shutdown => {
-                    return;
-                },
-            }
+    fn wait(self: *EventCount, epoch: u32) void {
+        defer self.cancel(epoch);
+        while (self.epoch.load(.Acquire) == epoch) {
+            Futex.wait(&self.epoch, epoch, null) catch unreachable;
         }
     }
 
-    fn notify(self: *Event) void {
-        @setCold(true);
-
-        var state = self.state.load(.Monotonic);
-        while (true) {
-            switch (state) {
-                .empty => {},
-                .waiting => {},
-                .notified => return,
-                .shutdown => return,
-            }
-
-            state = self.state.tryCompareAndSwap(
-                state,
-                .notified,
-                .Release,
-                .Monotonic,
-            ) orelse return Futex.wake(
-                @ptrCast(*const Atomic(u32), &self.state),
-                @as(u32, 1),
-            );
-        }
+    fn notifyOne(self: *EventCount) void {
+        return self.notify(1);
     }
 
-    fn shutdown(self: *Event) void {
-        @setCold(true);
+    fn notifyAll(self: *EventCount) void {
+        return self.notify(std.math.maxInt(u32));
+    }
 
-        self.state.store(.shutdown, .Release);
-        Futex.wake(
-            @ptrCast(*const Atomic(u32), &self.state),
-            std.math.maxInt(u32),
-        );
+    fn notify(self: *EventCount, max_waiters: u32) void {
+        if (self.waiting.load(.SeqCst) == 0) {
+            return;
+        }
+
+        _ = self.epoch.fetchAdd(1, .Release);
+        Futex.wake(&self.epoch, max_waiters);
     }
 };

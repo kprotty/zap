@@ -3,6 +3,7 @@
 .history/
 
 # build directories
+zig-out/
 zig-cache/
 target/
 gobuild/

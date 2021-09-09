@@ -1,19 +1,20 @@
 const std = @import("std");
 const Async = @import("async.zig");
 
-const num_tasks = 100_000; // zig can handle more, but we need to be nice to Golang ;^)
+const num_tasks = 5_000_000; // zig can handle more, but we need to be nice to Golang ;^)
 const num_samples = 10; // amount of times to run each benchmark
-const num_concurrency = 10; // 
+const num_concurrency = 10; // number of producers for the multi-producer benchmarks
+const num_buffer_slots = 100; // channel buffer capacity for chan benchmarks
 
 pub fn main() !void {
     try (try Async.run(asyncMain, .{}));
 }
 
 fn asyncMain() !void {
-    try benchmark("single-producer", runSingleProducer);
-    try benchmark("multi-producer", runMultiProducer);
-    try benchmark("single-chain", runSingleChain);
-    try benchmark("multi-chain", runMultiChain);
+    try benchmark("spawn-spmc", runSpawnSingleProducer);
+    try benchmark("spawn-mpmc", runSpawnMultiProducer);
+    try benchmark("chan-spsc", runChanSingleProducer);
+    try benchmark("chan-mpsc", runChanMultiProducer);
 }
 
 fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
@@ -67,7 +68,7 @@ fn runSpawner(frames: []@Frame(runWork)) void {
     for (frames) |*f| await f;
 }
 
-fn runSingleProducer() !void {
+fn runSpawnSingleProducer() !void {
     // All the coroutines (Frames) can be allocated in batch given zig's async semantics
     const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
     defer Async.allocator.free(frames);
@@ -75,7 +76,7 @@ fn runSingleProducer() !void {
     runSpawner(frames);
 } 
 
-fn runMultiProducer() !void {
+fn runSpawnMultiProducer() !void {
     const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
     defer Async.allocator.free(frames);
 
@@ -89,10 +90,10 @@ fn runMultiProducer() !void {
 
 // ===================================================================
 
-fn runSingleChain() !void {
+fn runChanSingleProducer() !void {
     
 } 
 
-fn runMultiChain() !void {
+fn runChanMultiProducer() !void {
         
 } 

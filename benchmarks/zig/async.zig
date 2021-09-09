@@ -98,6 +98,19 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     return result orelse error.AsyncFnDeadLocked;
 }
 
+pub fn Channel(comptime T: type) type {
+    return struct {
+        buffer: []T,
+        readers: Port = .{},
+        writers: Port = .{},
+
+        const Port = struct {
+            pos: usize,
+            lock: std.Mutex = .{},
+        };
+    };
+}
+
 /// An efficient OneShot channel implementation.
 pub fn Oneshot(comptime T: type) type {
     return struct {

@@ -13,23 +13,37 @@ run_queue: Node.Queue = .{},
 threads: Atomic(?*Thread) = Atomic(?*Thread).init(null),
 
 const Sync = packed struct {
+    /// Tracks the number of threads not searching for Tasks
     idle: u14 = 0,
+    /// Tracks the number of threads spawned
     spawned: u14 = 0,
+    /// What you see is what you get
     unused: bool = false,
+    /// Used to not miss notifications while state = waking
     notified: bool = false,
+    /// The current state of the thread pool
     state: enum(u2) {
+        /// A notification can be issued to wake up a sleeping as the "waking thread".
         pending = 0,
-        waking,
+        /// The state was notifiied with a signal. A thread is woken up.
+        /// The first thread to transition to `waking` becomes the "waking thread".
         signaled,
+        /// There is a "waking thread" among us.
+        /// No other thread should be woken up until the waking thread transitions the state.
+        waking,
+        /// The thread pool was terminated. Start decremented `spawned` so that it can be joined.
         shutdown,
     } = .pending,
 };
 
+/// Configuration options for the thread pool.
+/// TODO: add CPU core affinity?
 pub const Config = struct {
     stack_size: u32 = (std.Thread.SpawnConfig{}).stack_size,
     max_threads: u32,
 };
 
+/// Statically initialize the thread pool using the configuration.
 pub fn init(config: Config) ThreadPool {
     return .{
         .stack_size = std.math.max(1, config.stack_size),
@@ -37,11 +51,14 @@ pub fn init(config: Config) ThreadPool {
     };
 }
 
+/// Wait for a thread to call shutdown() on the thread pool and kill the worker threads.
 pub fn deinit(self: *ThreadPool) void {
     self.join();
     self.* = undefined;
 }
 
+/// A Task represents the unit of Work / Job / Execution that the ThreadPool schedules.
+/// The user provides a `callback` which is invoked when the *Task can run on a thread.
 pub const Task = struct {
     node: Node = .{},
     callback: fn (*Task) void,

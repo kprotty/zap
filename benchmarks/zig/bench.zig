@@ -1,8 +1,9 @@
 const std = @import("std");
 const Async = @import("async.zig");
 
-const num_tasks = 100_000;
-const num_iters = 10;
+const num_tasks = 100_000; // zig can handle more, but we need to be nice to Golang ;^)
+const num_samples = 10; // amount of times to run each benchmark
+const num_concurrency = 10; // 
 
 pub fn main() !void {
     try (try Async.run(asyncMain, .{}));
@@ -17,19 +18,22 @@ fn asyncMain() !void {
 
 fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
     var timer = try std.time.Timer.start();
-    var results: [num_iters]u64 = undefined;
+    var results: [num_samples]u64 = undefined;
 
+    // Run the benchmark and collect elapsed times
     for (results) |*result| {
         const start = timer.read();
         try benchFn();
         const end = timer.lap();
-        result.* = std.math.sub(u64, end, start) catch 0;
+        result.* = std.math.sub(u64, end, start) catch 0; // account for timer going backwards
     }
 
+    // Average the elapsed times
     var sum: u64 = 0;
     for (results) |r| sum += r;
     var elapsed = @intToFloat(f64, sum) / @intToFloat(f64, results.len);
 
+    // Convert them to nicer units
     var units: []const u8 = "ns";
     if (elapsed >= std.time.ns_per_s) {
         elapsed /= std.time.ns_per_s;
@@ -45,32 +49,48 @@ fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
     std.debug.warn("{s}\t... {d:.2}{s}\n", .{name, elapsed, units});
 }
 
-fn runSingleProducer() !void {
-    const Worker = struct {
-        fn run() void {
-            Async.Task.fork();
-            
-            
-            var i: usize = 10;
-            while (i > 0) : (i -= 1) {
-                std.os.sched_yield() catch unreachable;
-            }
-        }
-    };
+// ===================================================================
 
-    const frames = try Async.allocator.alloc(@Frame(Worker.run), num_tasks);
+fn runWork() void {
+    // Make this task run concurrently to the caller
+    Async.Task.reschedule();
+
+    // Takes a few micro seconds to complete.
+    // Simulates a relatively average asynchronous task.
+    _ = std.os.sched_yield() catch {};
+}
+
+fn runSpawner(frames: []@Frame(runWork)) void {
+    // spawn all the frames given to this function (fork)
+    for (frames) |*f| f.* = async runWork();
+    // wait for all the frames to complete (join)
+    for (frames) |*f| await f;
+}
+
+fn runSingleProducer() !void {
+    // All the coroutines (Frames) can be allocated in batch given zig's async semantics
+    const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
     defer Async.allocator.free(frames);
 
-    for (frames) |*f| f.* = async Worker.run();
-    for (frames) |*f| await f;
+    runSpawner(frames);
 } 
 
 fn runMultiProducer() !void {
-        
+    const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
+    defer Async.allocator.free(frames);
+
+    const spawners = try Async.allocator.alloc(@Frame(runSpawner), num_concurrency);
+    defer Async.allocator.free(spawners);
+
+    const chunk_size = num_concurrency / num_tasks;
+    for (spawners) |*s, i| s.* = async runSpawner(frames[(i * chunk_size)..][0..chunk_size]);
+    for (spawners) |*s| await s;
 } 
 
+// ===================================================================
+
 fn runSingleChain() !void {
-        
+    
 } 
 
 fn runMultiChain() !void {

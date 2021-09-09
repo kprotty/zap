@@ -3,6 +3,7 @@ const ThreadPool = @import("thread_pool");
 
 var thread_pool: ThreadPool = undefined;
 
+/// A zig async version of ThreadPool.Task
 pub const Task = struct {
     tp_task: ThreadPool.Task = .{ .callback = resumeFrame },
     frame: anyframe,
@@ -16,7 +17,7 @@ pub const Task = struct {
         thread_pool.schedule(&self.tp_task) catch {};
     }
 
-    pub fn fork() void {
+    pub fn reschedule() void {
         var task = Task{ .frame = @frame() };
         suspend {
             task.schedule();
@@ -26,6 +27,8 @@ pub const Task = struct {
 
 pub var allocator: *std.mem.Allocator = undefined;
 
+/// Use HeapAllocator on windows with the Process Heap.
+/// Use a Mutex protected ArenaAllocator on Linux when no libc is available.
 var heap_allocator: std.heap.HeapAllocator = undefined;
 var arena_lock = std.Thread.Mutex{};
 var arena_allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -50,6 +53,8 @@ fn ReturnTypeOf(comptime asyncFn: anytype) type {
     return @typeInfo(@TypeOf(asyncFn)).Fn.return_type orelse unreachable; // function is generic
 }
 
+/// Starts the global thread pool and executes the asyncFn with args as the entry point.
+/// The thread pool is shut down once asyncFn() completes.
 pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     const Args = @TypeOf(args);
     const Result = ReturnTypeOf(asyncFn);
@@ -66,6 +71,7 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
         }
     };
 
+    // Decide on the allocator. See above
     if (std.builtin.link_libc) {
         allocator = std.heap.c_allocator;
     } else if (std.builtin.target.os.tag == .windows) {
@@ -76,19 +82,23 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
         allocator = &arena_thread_safe_allocator;
     }
 
+    // Prepare a Task for the asyncFn
     var task: Task = undefined;
     var result: ?Result = null;
     var frame = async Wrapper.entry(&task, &result, args);
 
+    // Initialize and run the thread pool
     const num_threads = if (std.builtin.single_threaded) 1 else try std.Thread.getCpuCount();
     thread_pool = ThreadPool.init(.{ .max_threads = @intCast(u32, num_threads) });
     thread_pool.schedule(&task.tp_task) catch unreachable;
     thread_pool.deinit();
 
+    // Return the asyncFn result which should be completed
     _ = frame;
     return result orelse error.AsyncFnDeadLocked;
 }
 
+/// An efficient OneShot channel implementation.
 pub fn Oneshot(comptime T: type) type {
     return struct {
         state: Atomic(usize) = Atomic(usize).init(0),

@@ -1,4 +1,6 @@
 const std = @import("std");
+const Atomic = std.atomic.Atomic;
+const target = std.builtin.target;
 const ThreadPool = @import("thread_pool");
 
 var thread_pool: ThreadPool = undefined;
@@ -74,7 +76,7 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     // Decide on the allocator. See above
     if (std.builtin.link_libc) {
         allocator = std.heap.c_allocator;
-    } else if (std.builtin.target.os.tag == .windows) {
+    } else if (target.os.tag == .windows) {
         heap_allocator = @TypeOf(heap_allocator).init();
         heap_allocator.heap_handle = std.os.windows.kernel32.GetProcessHeap() orelse unreachable;
         allocator = &heap_allocator.allocator;
@@ -98,62 +100,229 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     return result orelse error.AsyncFnDeadLocked;
 }
 
-pub fn Channel(comptime T: type) type {
-    return struct {
-        buffer: []T,
-        readers: Port = .{},
-        writers: Port = .{},
+const Lock = switch (target.os.tag) {
+    .macos, .ios, .tvos, .watchos => DarwinLock,
+    .windows => WindowsLock,
+    else => switch (target.cpu.arch) {
+        .i386, .x86_64 => FutexLockx86,
+        else => FutexLock,
+    },
+};
 
-        const Port = struct {
-            pos: usize,
-            lock: std.Mutex = .{},
-        };
-    };
-}
+const WindowsLock = struct {
+    srwlock: std.os.windows.SRWLOCK = std.os.windows.SRWLOCK_INIT,
 
-/// An efficient OneShot channel implementation.
-pub fn Oneshot(comptime T: type) type {
+    pub fn acquire(self: *Lock) void {
+        std.os.windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+    }
+
+    pub fn release(self: *Lock) void {
+        std.os.windows.kernel32.ReleaseSRWLockExclusive(&self.srwlock);
+    }
+};
+
+const DarwinLock = struct {
+    oul: std.os.darwin.os_unfair_lock = .{},
+
+    pub fn acquire(self: *Lock) void {
+        std.os.darwin.os_unfair_lock_lock(&self.oul);
+    }
+
+    pub fn release(self: *Lock) void {
+        std.os.darwin.os_unfair_lock_unlock(&self.oul);
+    }
+};
+
+const FutexLockx86 = struct {
+    state: Atomic(u32) = Atomic(u32).init(0),
+
+    pub fn acquire(self: *Lock) void {
+        if (self.state.bitSet(0, .Acquire) == 0) |_|
+            self.acquireSlow();
+    }
+
+    noinline fn acquireSlow(self: *Lock) void {
+        var spin: u8 = 100;
+        while (spin > 0) : (spin -= 1) {
+            std.atomic.spinLoopHint();
+            switch (self.state.load(.Monotonic)) {
+                0 => if (self.state.tryCompareAndSwap(0, 1, .Acquire, .Monotonic) == 0) return,
+                1 => continue,
+                else => break,
+            }
+        }
+
+        while (self.state.swap(2, .Acquire) != 0)
+            std.Thread.Futex.wait(&self.state, 2, null) catch unreachable;
+    }
+
+    pub fn release(self: *Lock) void {
+        if (self.state.swap(0, .Release) == 2)
+            std.Thread.Futex.wake(&self.state, 1);
+    }
+};
+
+const FutexLock = struct {
+    state: Atomic(u32) = Atomic(u32).init(0),
+
+    pub fn acquire(self: *Lock) void {
+        if (self.state.tryCompareAndSwap(0, 1, .Acquire, .Monotonic)) |_|
+            self.acquireSlow();
+    }
+
+    noinline fn acquireSlow(self: *Lock) void {
+        while (true) : (std.Thread.Futex.wait(&self.state, 2, null) catch unreachable) {
+            var state = self.state.load(.Monotonic);
+            while (state != 2) {
+                state = switch (state) {
+                    0 => self.state.tryCompareAndSwap(0, 2, .Acquire, .Monotonic) orelse return,
+                    1 => self.state.tryCompareAndSwap(1, 2, .Monotonic, .Monotonic) orelse break,
+                    else => unreachable,
+                };
+            }
+        }
+    }
+
+    pub fn release(self: *Lock) void {
+        if (self.state.swap(0, .Release) == 2)
+            std.Thread.Futex.wake(&self.state, 1);
+    }
+};
+
+pub fn Channel(
+    comptime T: type,
+    comptime buffer_type: std.fifo.LinearFifoBufferType,
+) type {
     return struct {
-        state: Atomic(usize) = Atomic(usize).init(0),
+        queue: VecDeque,
+        lock: Lock = .{},
+        closed: bool = false,
+        readers: ?*Waiter = null,
+        writers: ?*Waiter = null,
 
         const Self = @This();
+        const VecDeque = std.fifo.LinearFifo(T, buffer_type);
         const Waiter = struct {
+            next: ?*Waiter = null,
+            tail: ?*Waiter = null,
+            item: error{Closed}!?T,
             task: Task,
-            item: ?T,
         };
 
-        pub fn send(self: *Self, item: T) void {
-            var waiter = Waiter{
-                .item = item,
-                .task = .{ .frame = @frame() },
-            };
+        pub usingnamespace switch (buffer_type) {
+            .Static => struct {
+                pub fn init() Self {
+                    return .{ .queue = VecDeque.init() };
+                }
+            },
+            .Slice => struct {
+                pub fn init(_buffer: []T) Self {
+                    return .{ .queue = VecDeque.init(_buffer) };
+                }
+            },
+            .Dynamic => struct {
+                pub fn init(_allocator: *std.mem.Allocator) Self {
+                    return .{ .queue = VecDeque.init(_allocator) };
+                }
+            },
+        };
 
-            suspend {
-                const state = self.state.swap(@ptrToInt(&waiter), .AcqRel);
-                if (@intToPtr(?*Waiter, state)) |receiver| {
-                    receiver.item = item;
-                    receiver.task.schedule();
-                    resume @frame();
+        pub fn deinit(self: *Self) void {
+            self.queue.deinit();
+            self.* = undefined;
+        }
+
+        pub fn close(self: *Self) void {
+            self.lock.acquire();
+            if (self.closed) {
+                return self.lock.release();
+            }
+
+            const readers = self.readers;
+            self.readers = null;
+            
+            const writers = self.writers;
+            self.writers = null;
+
+            self.closed = true;
+            self.lock.release();
+
+            for (&[_]?*Waiter{ readers, writers }) |*waiters| {
+                while (waiters.*) |waiter| {
+                    waiters.* = waiter.next;
+                    waiter.item = error.Closed;
+                    waiter.task.schedule();
                 }
             }
         }
 
-        pub fn recv(self: *@This()) T {
-            var waiter = Waiter{
-                .item = null,
-                .task = .{ .frame = @frame() },
-            };
+        pub fn send(self: *Self, item: T) error{Closed}!void {
+            self.lock.acquire();
 
-            suspend {
-                const state = self.state.swap(@ptrToInt(&waiter), .AcqRel);
-                if (@intToPtr(?*Waiter, state)) |sender| {
-                    waiter.item = sender.item;
-                    sender.task.schedule();
-                    resume @frame();
-                }
+            if (self.closed) {
+                self.lock.release();
+                return error.Closed;
             }
 
-            return waiter.item orelse unreachable;
+            if (self.notify(&self.readers, item)) |_| {
+                return;
+            }
+
+            if (self.queue.writeItem(item)) |_| {
+                self.lock.release();
+            } else |_| {
+                _ = try self.wait(&self.writers, item);
+            }
+        }
+
+        pub fn recv(self: *Self) error{Closed}!T {
+            self.lock.acquire();
+
+            if (self.closed) {
+                self.lock.release();
+                return error.Closed;
+            }
+
+            if (self.notify(&self.writers, null)) |item| {
+                return item;
+            }
+
+            if (self.queue.readItem()) |item| {
+                self.lock.release();
+                return item;
+            } else {
+                const item = try self.wait(&self.readers, null);
+                return item orelse unreachable; // sender didn't set item
+            }
+        }
+
+        fn wait(self: *Self, queue: *?*Waiter, item: ?T) error{Closed}!?T {
+            var waiter = Waiter{ .item = item, .task = .{ .frame = @frame() } };
+            if (queue.*) |head| {
+                head.tail.?.next = &waiter;
+                head.tail = &waiter;
+            } else {
+                queue.* = &waiter;
+                waiter.tail = &waiter;
+            }
+
+            suspend { self.lock.release(); }
+            return waiter.item;
+        }
+
+        fn notify(self: *Self, queue: *?*Waiter, item: ?T) ?T {
+            const waiter = queue.* orelse return null;
+            queue.* = waiter.next;
+            if (queue.*) |head|
+                head.tail = waiter.tail;
+            self.lock.release();
+
+            const waiter_item = waiter.item catch unreachable;
+            waiter.item = item;
+            waiter.task.schedule();
+
+            return @as(T, waiter_item orelse undefined);
         }
     };
 }
+

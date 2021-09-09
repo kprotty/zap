@@ -40,7 +40,7 @@ fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
         units = "us";
     }
 
-    std.debug.warn("{s}\t... {d:.2}{s}\n", .{name, elapsed, units});
+    std.debug.warn("{s}\t... {d}{s}\n", .{name, elapsed, units});
 }
 
 fn blackBox(value: anytype) @TypeOf(value) {

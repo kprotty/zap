@@ -1,10 +1,9 @@
 const std = @import("std");
 const Async = @import("async.zig");
 
-const num_tasks = 50_000_000; // zig can handle more, but we need to be nice to Golang ;^)
-const num_samples = 1; // amount of times to run each benchmark
-const num_concurrency = 10; // number of producers for the multi-producer benchmarks
-const num_buffer_slots = 100; // channel buffer capacity for chan benchmarks
+const num_tasks = 200_000; // zig can handle more, but we need to be nice to Golang ;^)
+const num_producers = 10; // number of producers for the multi-producer benchmarks
+const num_slots = 100; // channel buffer capacity for chan benchmarks
 
 pub fn main() !void {
     try (try Async.run(asyncMain, .{}));
@@ -19,23 +18,17 @@ fn asyncMain() !void {
 
 fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
     var timer = try std.time.Timer.start();
-    var results: [num_samples]u64 = undefined;
 
-    // Run the benchmark and collect elapsed times
-    for (results) |*result| {
-        const start = timer.read();
-        try benchFn();
-        const end = timer.lap();
-        result.* = std.math.sub(u64, end, start) catch 0; // account for timer going backwards
-    }
+    // Measure the benchmark function
+    const start = timer.read();
+    try benchFn();
+    const end = timer.lap();
 
-    // Average the elapsed times
-    var sum: u64 = 0;
-    for (results) |r| sum += r;
-    var elapsed = @intToFloat(f64, sum) / @intToFloat(f64, results.len);
+    // Compute the amount of time taken
+    var elapsed = try std.math.sub(u64, end, start);
+    var units: []const u8 = "ns";
 
     // Convert them to nicer units
-    var units: []const u8 = "ns";
     if (elapsed >= std.time.ns_per_s) {
         elapsed /= std.time.ns_per_s;
         units = "s";
@@ -52,57 +45,76 @@ fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
 
 // ===================================================================
 
-fn runWork() void {
-    // Make this task run concurrently to the caller
-    Async.Task.reschedule();
+fn runSpawnWork(batch: *Async.Batch) void {
+    var task = Async.Task{ .frame = @frame() };
+    suspend {
+        batch.push(&task);
+    }
 
     // Takes a few micro seconds to complete.
     // Simulates a relatively average asynchronous task.
-    std.os.sched_yield() catch {};
+    
 }
 
-fn runSpawner(frames: []@Frame(runWork)) void {
-    // spawn all the frames given to this function (fork)
-    for (frames) |*f| f.* = async runWork();
-    // wait for all the frames to complete (join)
-    for (frames) |*f| await f;
+fn runSpawnProducer(workers: []@Frame(runSpawnWork)) void {
+    var batch = Async.Batch{};
+    for (workers) |*worker| {
+        worker.* = async runSpawnWork(&batch);
+    }
+
+    batch.schedule();
+    for (workers) |*worker| {
+        await worker;
+    }
 }
 
 fn runSpawnSingleProducer() !void {
-    // All the coroutines (Frames) can be allocated in batch given zig's async semantics
-    const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
-    defer Async.allocator.free(frames);
+    const workers = try Async.allocator.alloc(@Frame(runSpawnWork), num_tasks);
+    defer Async.allocator.free(workers);
 
-    runSpawner(frames);
+    runSpawnProducer(workers);
 } 
 
 fn runSpawnMultiProducer() !void {
-    const frames = try Async.allocator.alloc(@Frame(runWork), num_tasks);
-    defer Async.allocator.free(frames);
+    const workers = try Async.allocator.alloc(@Frame(runSpawnWork), num_tasks);
+    defer Async.allocator.free(workers);
 
-    const spawners = try Async.allocator.alloc(@Frame(runSpawner), num_concurrency);
-    defer Async.allocator.free(spawners);
+    const producers = try Async.allocator.alloc(@Frame(runSpawnProducer), num_producers);
+    defer Async.allocator.free(producers);
 
-    const chunk_size = num_tasks / num_concurrency;
-    for (spawners) |*s, i| s.* = async runSpawner(frames[(i * chunk_size)..][0..chunk_size]);
-    for (spawners) |*s| await s;
+    const chunk_size = @divFloor(num_tasks, num_producers);
+    for (producers) |*producer, i| {
+        const worker_chunk = workers[(i * chunk_size)..][0..chunk_size];
+        producer.* = async runSpawnProducer(worker_chunk);
+    }
+
+    for (producers) |*producer| {
+        await producer;
+    }
 } 
 
 // ===================================================================
 
 const Chan = Async.Channel(u8, .Slice);
 
-fn runProducer(chan: *Chan, count: usize) void {
-    Async.Task.reschedule();
-
-    var i = count;
-    while (i > 0) : (i -= 1) {
-        chan.send(0) catch break;
+fn runChanAsync() void {
+    var task = Async.Task{ .frame = @frame() };
+    suspend {
+        task.schedule();
     }
 }
 
-fn runConsumer(chan: *Chan) void {
-    Async.Task.reschedule();
+fn runChanProducer(chan: *Chan, count: usize) void {
+    runChanAsync();
+
+    var i = count;
+    while (i > 0) : (i -= 1) {
+        chan.send(0) catch unreachable;
+    }
+}
+
+fn runChanConsumer(chan: *Chan) void {
+    runChanAsync();
 
     while (true) {
         const x = chan.recv() catch break;
@@ -111,39 +123,44 @@ fn runConsumer(chan: *Chan) void {
 }
 
 fn runChanSingleProducer() !void {
-    const buffer = try Async.allocator.alloc(u8, num_buffer_slots);
+    const buffer = try Async.allocator.alloc(u8, num_slots);
     defer Async.allocator.free(buffer);
 
     var chan = Chan.init(buffer);
     defer chan.deinit();
 
-    var consumer = async runConsumer(&chan);
+    var consumer = async runChanConsumer(&chan);
     defer {
         chan.close();
         await consumer;
     }
 
-    runProducer(&chan, num_tasks);
-    chan.close();
+    runChanProducer(&chan, num_tasks);
 } 
 
 fn runChanMultiProducer() !void {
-    const buffer = try Async.allocator.alloc(u8, num_buffer_slots);
+    const buffer = try Async.allocator.alloc(u8, num_slots);
     defer Async.allocator.free(buffer);
 
     var chan = Chan.init(buffer);
     defer chan.deinit();
 
-    var consumer = async runConsumer(&chan);
+    var consumer = async runChanConsumer(&chan);
     defer {
         chan.close();
         await consumer;
     }
 
-    const producers = try Async.allocator.alloc(@Frame(runProducer), num_concurrency);
+    const producers = try Async.allocator.alloc(@Frame(runChanProducer), num_producers);
     defer Async.allocator.free(producers);
 
-    const chunk_size = num_tasks / num_concurrency;
-    for (producers) |*p, i| p.* = async runProducer(&chan, std.math.min(num_tasks - (i * chunk_size), chunk_size));
-    for (producers) |*p| await p;
+    const chunk_size = num_tasks / num_producers;
+    for (producers) |*producer, i| {
+        const count = std.math.min(num_tasks - (i * chunk_size), chunk_size);
+        producer.* = async runChanProducer(&chan, count);
+    }
+
+    for (producers) |*producer| {
+        await producer;
+    }
 } 

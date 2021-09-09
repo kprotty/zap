@@ -18,10 +18,29 @@ pub const Task = struct {
     }
 
     pub fn schedule(self: *Task) void {
-        // We don't take advantage of batch scheduling in our benchmarks
-        // to keep it fair with other async runtimes ;^)
-        const batch = ThreadPool.Batch.from(&self.tp_task);
-        thread_pool.schedule(batch);
+        return Batch.from(self).schedule();
+    }
+};
+
+/// Batch of async tasks that can be scheduled
+pub const Batch = struct {
+    tp_batch: ThreadPool.Batch = .{},
+
+    pub fn from(batchable: anytype) Batch {
+        return switch (@TypeOf(batchable)) {
+            *Task => .{ .tp_batch = ThreadPool.Batch.from(&batchable.tp_task) },
+            Batch => batchable,
+            else => |T| @compileError(@typeName(T) ++ " isn't batchable"),
+        };
+    }
+
+    pub fn push(self: *Batch, batchable: anytype) void {
+        const batch = from(batchable);
+        return self.tp_batch.push(batch.tp_batch);
+    }
+
+    pub fn schedule(self: Batch) void {
+        thread_pool.schedule(self.tp_batch);
     }
 };
 
@@ -99,128 +118,6 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !ReturnTypeOf(asyncFn) {
     return result orelse error.AsyncFnDeadLocked;
 }
 
-/// Internal handle state to coordinate the result from an async spawned function and its JoinHandle.
-fn SpawnHandle(comptime T: type) type {
-    return struct {
-        state: Atomic(usize) = Atomic(usize).init(0),
-
-        const Self = @This();
-        const Waiter = struct {
-            value: ?T,
-            task: Task,
-        };
-
-        /// Called by the thread to mark the handle as completed with the result and possibly wait for join().
-        pub fn complete(self: *Self, value: T) void {
-            var waiter = Waiter{ .value = value, .task = .{ .task = @frame() } };
-            suspend {
-                // Acquire barrier ensures we see valid joiner *Waiter if it's waiting.
-                // Release barrier ensures detach() and join() see our valid *Waiter we're publishing.
-                const state = self.state.swap(@ptrToInt(&waiter), .AcqRel);
-
-                // Non-Zero implies detach() or join() must have been called before, so we don't have to wait.
-                // One impmlies detach() was called instead of join() so we don't have to give it our value.
-                if (state != 0) {
-                    if (state != 1) {
-                        const joiner = @intToPtr(*Waiter, state);
-                        joiner.value = waiter.value;
-                        joiner.task.schedule();
-                    }
-                    resume @frame();
-                }
-            }
-        }
-
-        pub fn detach(self: *Self) void {
-            // Acquire barrier to synchornize with complete() to see valid *Waiter.
-            const state = self.state.swap(1, .Acquire);
-
-            // If it's set, the complete() thread is waiting with it's value set
-            if (@intToPtr(?*Waiter, state)) |completer| {
-                completer.task.schedule();
-            }
-        }
-
-        pub fn join(self: *Self) T {
-            var waiter = Waiter{ .value = null, .task = .{ .task = @frame() } };
-            suspend {
-                // Acquire barrier ensures we see valid completer *Waiter if it's waiting.
-                // Release barrier ensures complete() see our valid *Waiter we're publishing.
-                const state = self.state.swap(@ptrToInt(&waiter), .AcqRel);
-
-                // If the completer was already waiting, we just consume it's value.
-                // If not, we suspend normally and the future complete() will set our waiter's value.
-                if (@intToPtr(?*Waiter, state)) |completer| {
-                    waiter.value = completer.value orelse unreachable;
-                    completer.task.schedule();
-                    resume @frame();
-                }
-            }
-            return waiter.value orelse unreachable;
-        }
-    };
-}
-
-/// A type-safe interface to wait for or detach from an async spawned fn.
-pub fn JoinHandle(comptime T: type) type {
-    return struct {
-        spawn_handle_ref: *SpawnHandle(T),
-
-        pub fn detach(self: @This()) void {
-            return self.spawn_handle_ref.detach();
-        }
-
-        pub fn join(self: @This()) T {
-            return self.spawn_handle_ref.join();
-        }
-    };
-}
-
-/// Runs the async function concurrently to the caller.
-/// This can be done without heap allocation at the call-site using Zig async/await, 
-/// but we're intentionally heap allocating to make it fair for other langs ;^)
-pub fn spawn(comptime asyncFn: anytype, args: anytype) error{OutOfMemory}!JoinHandle(ReturnTypeOf(asyncFn)) {
-    const Args = @TypeOf(args);
-    const Result = ReturnTypeOf(asyncFn);
-    const Wrapper = struct {
-        fn entry(spawn_handle_ref: **SpawnHandle(Result), fn_args: Args) void {
-            // Create a spawn handle in this frame's memory
-            var spawn_handle = SpawnHandle(Result){};
-            spawn_handle_ref.* = &spawn_handle;
-
-            // Reschedule the caller to make it concurrent
-            var reschedule_task = Task{ .frame = @frame() };
-            suspend {
-                reschedule_task.schedule();
-            }
-
-            // Run the async function and mark the handle as completed (schedules the JoinHandle if joining).
-            const result = @call(.{}, asyncFn, fn_args);
-            spawn_handle.complete(result);
-            
-            // Free the current frame with the assumption that it was allocated.
-            // This must be done inside a suspend block because the Zig compiler inserts some hidden code
-            // at the end of an async function to resume it's `await`er if it has one.
-            // This extra code touches the frame memory again so that's a no-no after it's been free'd.
-            suspend {
-                allocator.destroy(@frame());
-            }
-        }
-    };
-    
-    // Heap allocate the frame given it has an unbounded lifetime
-    const frame = try allocator.create(@Frame(Wrapper.entry));
-
-    // Kick off the async function concurrently and get a reference to it's SpawnHandle
-    var spawn_handle_ref: *SpawnHandle(Result) = undefined;
-    frame.* = async Wrapper.entry(&spawn_handle_ref, args);
-
-    // Return a join handle which exposes the spawn handle reference.
-    return JoinHandle(Result){
-        .spawn_handle = spawn_handle_ref,
-    };
-}
-
 /// MPMC channel capable of bounded/unbounded send()/recv().
 pub fn Channel(
     comptime T: type,
@@ -293,7 +190,7 @@ pub fn Channel(
 
         /// Pushes the item to the channel, blocking the caller asynchronously until it can.
         /// Returns error.Shutdown if shutdown() was ever called on the Channel.
-        pub fn send(self: *Self, item: T) error{Shutdown}!void {
+        pub fn send(self: *Self, item: T) !void {
             self.lock.acquire();
 
             if (self.is_shutdown) {
@@ -314,7 +211,7 @@ pub fn Channel(
 
         /// Pops an item from the channel, blocking the caller asynchronously until it can.
         /// Returns error.Shutdown if shutdown() was ever called on the Channel.
-        pub fn recv(self: *Self) error{Shutdown}!T {
+        pub fn recv(self: *Self) !T {
             self.lock.acquire();
 
             if (self.is_shutdown) {

@@ -110,7 +110,7 @@ noinline fn notify(self: *ThreadPool, is_waking: bool) error{Shutdown}!void {
         sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
             @bitCast(u32, sync),
             @bitCast(u32, new_sync),
-            .AcqRel,
+            .Release,
             .Monotonic,
         ) orelse {
             // We signaled to notify an idle thread
@@ -144,38 +144,42 @@ noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
         if (sync.state == .shutdown) return error.Shutdown;
         if (is_waking) assert(sync.state == .waking);
 
-        if (sync.notified or !is_idle) {
+        if (sync.notified) {
             var new_sync = sync;
             new_sync.notified = false;
-
+            if (is_idle) 
+                new_sync.idle -= 1;
             if (sync.state == .signaled)
                 new_sync.state = .waking;
-            if (sync.notified and is_idle)
-                new_sync.idle -= 1;
-            if (!sync.notified and !is_idle)
-                new_sync.idle += 1;
-            if (!sync.notified and is_waking)
-                new_sync.state = .pending;
 
-            if (self.sync.tryCompareAndSwap(
+            sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
                 @bitCast(u32, sync),
                 @bitCast(u32, new_sync),
-                .AcqRel,
+                .Acquire,
                 .Monotonic,
-            )) |updated| {
-                sync = @bitCast(Sync, updated);
-                continue;
-            }
-
-            if (sync.notified) {
+            ) orelse {
                 return is_waking or (sync.state == .signaled);
-            }
-        }
+            });
+        } else if (!is_idle) {
+            var new_sync = sync;
+            new_sync.idle += 1;
+            if (is_waking) 
+                new_sync.state = .pending;
 
-        is_idle = true;
-        is_waking = false;
-        self.idle_event.wait();
-        sync = @bitCast(Sync, self.sync.load(.Monotonic));
+            sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+                @bitCast(u32, sync),
+                @bitCast(u32, new_sync),
+                .Monotonic,
+                .Monotonic,
+            ) orelse {
+                is_waking = false;
+                is_idle = true;
+                continue;
+            });
+        } else {
+            self.idle_event.wait();
+            sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        }
     }
 }
 
@@ -277,11 +281,11 @@ const Thread = struct {
 
         var is_waking = false;
         while (true) {
-            is_waking = thread_pool.wait(is_waking) catch break;
+            is_waking = thread_pool.wait(is_waking) catch return;
 
             while (self.pop(thread_pool)) |result| {
                 if (result.pushed or is_waking) 
-                    thread_pool.notify(is_waking) catch break;
+                    thread_pool.notify(is_waking) catch return;
                 is_waking = false;
 
                 const task = @fieldParentPtr(Task, "node", result.node);

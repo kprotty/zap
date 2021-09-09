@@ -1,7 +1,6 @@
 const std = @import("std");
 const Atomic = std.atomic.Atomic;
 const target = std.builtin.target;
-const Lock = @import("lock.zig").Lock;
 const ThreadPool = @import("thread_pool");
 
 // Global thread pool instance used for async stuff
@@ -125,10 +124,13 @@ pub fn Channel(
 ) type {
     return struct {
         queue: VecDeque,
-        lock: Lock = .{},
+        mutex: Mutex = .{},
         readers: ?*Waiter = null,
         writers: ?*Waiter = null,
         is_shutdown: bool = false,
+
+        const Mutex = std.Thread.Mutex;
+        const Held = @TypeOf(@as(Mutex, undefined).impl).Held;
 
         const Self = @This();
         const VecDeque = std.fifo.LinearFifo(T, buffer_type);
@@ -165,9 +167,10 @@ pub fn Channel(
         /// Closes both the read and write ends of the channel
         /// making future send() and recv() calls return `error.Shutdown`. 
         pub fn close(self: *Self) void {
-            self.lock.acquire();
+            const held = self.mutex.acquire();
+
             if (self.is_shutdown) {
-                return self.lock.release();
+                return held.release();
             }
 
             const readers = self.readers;
@@ -177,7 +180,7 @@ pub fn Channel(
             self.writers = null;
 
             self.is_shutdown = true;
-            self.lock.release();
+            held.release();
 
             for (&[_]?*Waiter{ readers, writers }) |*waiters| {
                 while (waiters.*) |waiter| {
@@ -191,50 +194,50 @@ pub fn Channel(
         /// Pushes the item to the channel, blocking the caller asynchronously until it can.
         /// Returns error.Shutdown if shutdown() was ever called on the Channel.
         pub fn send(self: *Self, item: T) !void {
-            self.lock.acquire();
+            const held = self.mutex.acquire();
 
             if (self.is_shutdown) {
-                self.lock.release();
+                held.release();
                 return error.Shutdown;
             }
 
-            if (self.notify(&self.readers, item)) |_| {
+            if (notify(&self.readers, item, held)) |_| {
                 return;
             }
 
             if (self.queue.writeItem(item)) |_| {
-                self.lock.release();
+                held.release();
             } else |_| {
-                _ = try self.wait(&self.writers, item);
+                _ = try wait(&self.writers, item, held);
             }
         }
 
         /// Pops an item from the channel, blocking the caller asynchronously until it can.
         /// Returns error.Shutdown if shutdown() was ever called on the Channel.
         pub fn recv(self: *Self) !T {
-            self.lock.acquire();
+            const held = self.mutex.acquire();
 
             if (self.is_shutdown) {
-                self.lock.release();
+                held.release();
                 return error.Shutdown;
             }
 
-            if (self.notify(&self.writers, null)) |item| {
+            if (notify(&self.writers, null, held)) |item| {
                 return item;
             }
 
             if (self.queue.readItem()) |item| {
-                self.lock.release();
+                held.release();
                 return item;
             } else {
-                const item = try self.wait(&self.readers, null);
+                const item = try wait(&self.readers, null, held);
                 return item orelse unreachable; // sender didn't set item
             }
         }
         
         /// Block asynchronously on either `readers` or `writers` queue until notified with an item.
         /// Stores the given item in our waiter if the caller is from send().
-        fn wait(self: *Self, queue: *?*Waiter, item: ?T) error{Shutdown}!?T {
+        fn wait(queue: *?*Waiter, item: ?T, held: Held) error{Shutdown}!?T {
             var waiter = Waiter{ .item = item, .task = .{ .frame = @frame() } };
             if (queue.*) |head| {
                 head.tail.?.next = &waiter;
@@ -244,17 +247,17 @@ pub fn Channel(
                 waiter.tail = &waiter;
             }
 
-            suspend { self.lock.release(); }
+            suspend { held.release(); }
             return waiter.item;
         }
 
         /// Try to unblock an asynchronous task waiting on either `readers` or `writers` queue with an item.
-        fn notify(self: *Self, queue: *?*Waiter, item: ?T) ?T {
+        fn notify(queue: *?*Waiter, item: ?T, held: Held) ?T {
             const waiter = queue.* orelse return null;
             queue.* = waiter.next;
             if (queue.*) |head|
                 head.tail = waiter.tail;
-            self.lock.release();
+            held.release();
 
             const waiter_item = waiter.item catch unreachable;
             waiter.item = item;

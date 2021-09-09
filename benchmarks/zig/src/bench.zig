@@ -43,6 +43,12 @@ fn benchmark(comptime name: []const u8, comptime benchFn: anytype) !void {
     std.debug.warn("{s}\t... {d:.2}{s}\n", .{name, elapsed, units});
 }
 
+fn blackBox(value: anytype) @TypeOf(value) {
+    var stub: @TypeOf(value) = undefined;
+    @ptrCast(*volatile @TypeOf(value), &stub).* = value;
+    return @ptrCast(*volatile @TypeOf(value), &stub).*;
+}
+
 // ===================================================================
 
 fn runSpawnWork(batch: *Async.Batch) void {
@@ -51,9 +57,18 @@ fn runSpawnWork(batch: *Async.Batch) void {
         batch.push(&task);
     }
 
-    // Takes a few micro seconds to complete.
+    // Compute all divisors of 1000
+    // Takes a micro second or two to complete.
     // Simulates a relatively average asynchronous task.
+    const divisor = blackBox(@as(usize, 1000));
     
+    var count: usize = 0;
+    var i: usize = 2;
+    while (i <= divisor / 2) : (i += 1) {
+        count += @boolToInt(divisor % i == 0);
+    }
+
+    _ = blackBox(count);
 }
 
 fn runSpawnProducer(workers: []@Frame(runSpawnWork)) void {

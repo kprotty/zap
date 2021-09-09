@@ -351,7 +351,6 @@ const Thread = struct {
     }
 };
 
-
 /// An event which stores 1 semaphore token and is multi-threaded safe.
 /// The event can be shutdown(), waking up all wait()ing threads and 
 /// making subsequent wait()'s return immediately.
@@ -439,6 +438,7 @@ const Event = struct {
     }
 };
 
+/// Linked list intrusive memory node and lock-free data structures to operate with it
 const Node = struct {
     next: ?*Node = null,
 
@@ -617,10 +617,26 @@ const Node = struct {
             var tail = self.tail.loadUnchecked(); // we're the only thread that can change this
 
             while (true) {
-                const size = tail -% head;
+                // Quick sanity check and return null when not empty
+                var size = tail -% head;
                 assert(size <= capacity);
                 if (size == 0) {
                     return null;
+                }
+
+                // On x86, a fetchAdd ("lock xadd") can be faster than a tryCompareAndSwap ("lock cmpxchg").
+                // If the increment makes the head go past the tail, it means the queue was emptied before we incremented so revert.
+                // Acquire barrier to ensure that any writes we do to the popped Node only happen after the head increment.
+                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                    head = self.head.fetchAdd(1, .Acquire);
+                    if (head == tail) {
+                        self.head.store(head, .Monotonic);
+                        return null;
+                    }
+
+                    size = tail -% head;
+                    assert(size <= capacity);
+                    return self.array[head % capacity].loadUnchecked();
                 }
 
                 // Dequeue with an acquire barrier to ensure any writes done to the Node
@@ -686,6 +702,14 @@ const Node = struct {
             while (true) : (std.atomic.spinLoopHint()) {
                 const buffer_head = buffer.head.load(.Acquire);
                 const buffer_tail = buffer.tail.load(.Acquire);
+
+                // On x86, the target buffer thread uses fetchAdd to increment the head which can go over if it's zero.
+                // Account for that here by understanding that it's empty here.
+                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                    if (buffer_head == buffer_tail +% 1) {
+                        return null;
+                    }
+                }
 
                 // Overly large size indicates the the tail was updated a lot after the head was loaded.
                 // Reload both and try again.

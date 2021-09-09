@@ -1,8 +1,8 @@
 # Building an efficient thread pool with Zig
 
-I'd like to share what I've been working on for the past 2 years give or take. It's a thread pool that checks a bunch of boxes: lock-free, allocation-free\*, supports batch scheduling, and dynamically spawns threads while handling failure. 
+I'd like to share what I've been working on for the past 2 years give or take. It's a thread pool that checks a bunch of boxes: lock-free, allocation-free\* (excluding spawning threads), supports batch scheduling, and dynamically spawns threads while handling thread spawn failure. 
 
-To preface, this assumes you're familiar with thread synchronization patterns and manual memory management. It's also more of a letter to other people implementing schedulers than it is to benefit most programmers. So if you don't understand what's going on sometimes, that's perfectly fine. I try to explain what led to each thought and if you're just interested in how the claims above materialized, go [read the source]()
+To preface, this assumes you're familiar with thread synchronization patterns and manual memory management. It's also more of a letter to other people implementing schedulers than it is to benefit most programmers. So if you don't understand what's going on sometimes, that's perfectly fine. I try to explain what led to each thought and if you're just interested in how the claims above materialized, go [read the source](https://github.com/kprotty/zap/blob/blog/src/thread_pool.zig)
 
 ## Thread Pools?
 
@@ -135,11 +135,11 @@ run_on_each_thread():
             threads.wait()
 ```
 
-Here is the algorithm that we will implement for our thread pool. I will refer back to this here and there and also reiterative over it later. For now, keep this as a reminder for where we're working.
+Here is the algorithm that we will implement for our thread pool. I will refer back to this here and there and also reiterate over it later. For now, keep this as a reminder for where we're working on.
 
 ## Run Queues
 
-Let's focus on the run queue first. Having a shared run queue for all threads increases how much they fight over it when going to dequeue. This fighting is known as contention in synchronization terms and is the primary slowdown of any sync mechanism from Locks down to atomic intructions. The less threads are stomping over each other, the better the throughput in most cases.
+Let's focus on the run queue first. Having a shared run queue for all threads increases how much they fight over it when going to dequeue. This fighting is known as **contention** in synchronization terms and is the primary slowdown of any sync mechanism from Locks down to atomic intructions. The less threads are stomping over each other, the better the throughput in most cases.
 
 To help decrease contention on the shared run queue, we just give each thread its own run queue! When threads schedule(), they push to their own run queue. When they pop(), they first dequeue from their own, then try to dequeue() from others as a last resort. **This is what people call a work-stealing scheduler**. 
 
@@ -151,7 +151,7 @@ If the total work on the system is being pushed in by differrent threads, then t
 
 The first thing we can do is to get rid of the locks on the run queues. When there's a lot of contention a lock, the thread has to be put to sleep. This is a relatively expensive operation compared the actual dequeue as it's a syscall for the losing thread to sleep and often a syscall for the winning thread to wake up a losing thread. We can avoid this with a few realizations.
 
-One realization is that there's only one producer to our thread local queues while there's multiple consumers in the form of "the other threads". This means we don't need to synchronize the producer side and can use lock-free SPMC (single-producer-multi-consumer) algorithms. Golang uses a good one (which I believed is borrowed from Cilk?) which has a really efficient push/pop and can steal in batches, all without locks:
+One realization is that there's only one producer to our thread local queues while there's multiple consumers in the form of "the other threads". This means we don't need to synchronize the producer side and can use lock-free SPMC (single-producer-multi-consumer) algorithms. Golang uses a good one (which I believed is borrowed from Cilk?) that has a really efficient push() and can steal in batches, all without locks:
 
 ```rs
 head = 0
@@ -175,6 +175,7 @@ pop():
     while h != tail:
         h = ATOMIC_CMPXCHG(&head, h, h +% 1, Acquire) orelse:
             return buffer[head % N]
+    return null
 
 steal(into):
     while True:
@@ -197,7 +198,7 @@ steal(into):
             return into.buffer[new_tail % N]
 ```
 
-You can ignore the details but just know that this algorithm is nice because it allows stealing to happen concurrently to producing. Stealing can also happen concurrently to other steal()s and pop()s without ever having to block the thread by issuing a syscall. Basically, we've made the serialization points (places where mutual exclusion is needed) to be atomic operations which happen in hardware while locks serialize entire OS threads with syscalls.
+You can ignore the details but just know that this algorithm is nice because it allows stealing to happen concurrently to producing. Stealing can also happen concurrently to other steal()s and pop()s without ever having to block the thread by issuing a syscall. Basically, we've made the serialization points (places where mutual exclusion is needed) to be the atomic operations which happen in hardware instead of locks which serialize entire OS threads using syscalls.
 
 Unfortunately, this algorithm is only for a bounded array. `N` could be pretty small relative to the overall Tasks that may be queued on a given thread so we need a way to hold tasks which overflow, but without re-introducing locks. This is where other implementations stop but we can keep going with more realizations.
 
@@ -238,7 +239,7 @@ This might have been a lot to process, but hopefully the code shows what's going
 
 ### Going Lock-Free: Unbounded; Season 1 pt. 2
 
-You may have noticed that the `try_lock()` on `pop` for our thread queues is just there to enforce serialization. There's still also only one producer. Using these assumptions, we can reduce the queues down to non-blocking-lock protected lock-free SPSC queues. This would allow the producer to operate lock-free to the consumer and remove the final blocking serialization point that is `lock_and_push()`.
+You also may have noticed that the "try_lock()" in `try_lock_and_pop` for our thread queues is just there to enforce serialization. There's still also only one producer. Using these assumptions, we can reduce the queues down to non-blocking-lock protected lock-free SPSC queues. This would allow the producer to operate lock-free to the consumer and remove the final blocking serialization point that is `lock_and_push()`.
 
 Unfortunately, there don't seem to be any unbounded lock-free SPSC queues out there which are fully intrusive *and* don't use atomic read-modify-write instructions (that's what's generally assumed of SPSC). But thats fine! We can just use an intrusive unbounded MPSC instead. Dmitry Vyukov discovered a [fast algorithm](https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue) for such a while back which has been we'll known and used everywhere from [Rust stdlib](https://doc.rust-lang.org/src/std/sync/mpsc/mpsc_queue.rs.html) to [Apple GCD](https://github.com/apple/swift-corelibs-libdispatch/blob/34f383d34450d47dd5bdfdf675fcdaa0d0ec8031/src/inline_internal.h#L1510) to [Ponylang](https://github.com/ponylang/ponyc/blob/7d38ffa91cf5f89f94daf6f195dfae3bd3395355/src/libponyrt/actor/messageq.c#L31).
 
@@ -295,7 +296,7 @@ unlock(locked_head: *Task):
 
 ```
 
-**SIDENOTE**: This didn't end up in the final thread pool, but I actually discovered a "mostly-LIFO" version of this which doesn't really perform any better in practice. It's a treiber stack MPSC which swaps entire stack with null for consumer. It's used fairly often in the wild ([mimalloc: 2.4 The Thread Free List](https://www.microsoft.com/en-us/research/uploads/prod/2019/06/mimalloc-tr-v1.pdf)), and I used added the try-lock scheme to it, but it's cool and I wanted to show it off here since I got the chance.
+**SIDENOTE**: A different algorithm ended up in the final thread pool as I discovered a "mostly-LIFO" version of this which performs about the same in practice. It's a treiber stack MPSC which swaps entire stack with null for consumer. It's used fairly often in the wild ([mimalloc: 2.4 The Thread Free List](https://www.microsoft.com/en-us/research/uploads/prod/2019/06/mimalloc-tr-v1.pdf)), and I just added the try-lock scheme to it.
 
 ```rs
 stack: usize = 0
@@ -359,7 +360,7 @@ unlock(locked_stack: ?*Task):
 
 ### Going Lock-Free: Unbounded; Season 1 pt. 3
 
-Now that the entire run queue is lock-free, we've actually introduced a situation where one thread can grab the queue lock of another and the other thread would see empty and sleep on `threads.wait`. This is expected, but the sad part is that the queue lock holder may leave some remaining Tasks after refilling it's buffer while there's sleeping threads that could process those Tasks. As a general rule, **anytime we push to the buffer in any way, follow it up with a `threads.notify`**. This prevents under-utilization of threads in the pool and we must change the algorithm to reflect this:
+Now that the entire run queue is lock-free, we've actually introduced a situation where one thread can grab the queue lock of another and the other thread would see empty and sleep on `threads.wait`. This is expected, but the sad part is that the queue lock holder may leave some remaining Tasks after refilling it's buffer even while there's sleeping threads that could process those Tasks. As a general rule, **anytime we push to the buffer in any way, follow it up with a `threads.notify`**. This prevents under-utilization of threads in the pool and we must change the algorithm to reflect this:
 
 ```rs
 run_on_each_thread():
@@ -385,15 +386,15 @@ run_queue.pop(): ?(task: *Task, pushed: bool)
 
 ## Notification Throttling
 
-The run queue is optimized and, by this point, it has improved throughput the most so far. The next thing to do is to optimize how threads are put to sleep and woken up through `threads.wait` and `threads.notify`. The run queue relies on `wait()` to handle spurious reports of being empty and `notify()` is now called on every steal so they have to be efficient.
+The run queue is optimized and, by this point, it has improved throughput the most so far. The next thing to do is to optimize how threads are put to sleep and woken up through `threads.wait` and `threads.notify`. The run queue relies on `wait()` to handle spurious reports of being empty, and `notify()` is now called on every steal, so both functions have to be efficient.
 
 I mentioned before that putting a thread to sleep and waking it up are both "expensive" syscalls. We should also not try to wake up all threads for each `notify()` as that would increase contention on the run queues (even if we're tried hard to avoid it). The best solution that myself and others have found in practice is to throttle thread wake ups.
 
-Throttling in this case means that when we do wake up a thread, we don't wake up another until that thread has actually been scheduled by the OS. We can take this even further by requiring that the woken up thread actually find work before waking another. This is what Golang and Rust async executors do to great avail and is what we will do as well, but in a *different* way.
+Throttling in this case means that when we do wake up a thread, we don't wake up another until that thread has actually been scheduled by the OS. We can take this even further by requiring that the woken up thread to actually find Tasks before waking another. This is what Golang and Rust async executors do to great results and is what we will do as well, but in a *different* way.
 
-For context, Golang and Rust use a counter of all the threads who are stealing. They only wake up a thread if there's no threads currently stealing so `notify()` tries to `ATOMIC_CMPXCHG()` it from 0 to 1 before waking. When entering the work stealing portion, it's incremented if some heuristics deem OK. When exiting the work stealing portion, it's decremented. If the last thread to exit stealing found a Task, it will try to `notify()` again [AFAIK](https://www.macmillandictionary.com/us/dictionary/american/afaik#:~:text=AFAIK%20%E2%80%8BDefinitions%20and%20Synonyms,you%20are%20not%20completely%20sure). This works for them, but is a bit awkward for us. 
+For context, Golang and Rust use a counter of all the threads who are stealing. They only wake up a thread if there's no threads currently stealing so `notify()` tries to `ATOMIC_CMPXCHG()` the stealing count from 0 to 1 before waking. When entering the work stealing portion, the count is incremented if some heuristics deem OK. When leaving, the stealing count is decremented and if the last thread to exit stealing found a Task, it will try to `notify()` again [AFAIK](https://www.macmillandictionary.com/us/dictionary/american/afaik#:~:text=AFAIK%20%E2%80%8BDefinitions%20and%20Synonyms,you%20are%20not%20completely%20sure). This works for them, but is a bit awkward for us for a few reasons.
 
-We want to have a similar throttling but have some requirements. Unlike Rust, we spawn threads lazily to support static initialization for our thread pool. Unlike Go, we don't use locks for mutual exclusion to know whether to wake up or spawn a new thread on `notify()`. We also want to allow thread spawning to fail without bringing the entire program down like both Go and Rust. Threads are a resource which, like memory, can be constrainted at runtime and we should be explicit about handle it as per Zig zen.
+We want to have a similar throttling but have different requirements. Unlike Rust, we spawn threads lazily to support static initialization for our thread pool. Unlike Go, we don't use locks for mutual exclusion to know whether to wake up or spawn a new thread on `notify()`. We also want to allow thread spawning to fail without bringing the entire program down from a `panic()` like both Go and Rust. Threads are a resource which, like memory, can be constrainted at runtime and we should be explicit about handle it as per Zig zen.
 
 I came up with a different solution which I believe is a bit easier to reason about and solves the problems listed above. I originally called it `Counter` but have started calling it `Sync` out of simplicity. All thread coordination state is stored in a single machine word which packs the bits full of meaning (yay memory efficiency!) and is atomically transitioned through `ATOMIC_CMPXCHG`.
 
@@ -414,21 +415,21 @@ struct Sync(u32):
     spawned_threads: u14
 ```
 
-The `Sync` state tracks the "pool state" which is used to control thread signaling, shutdown, and throttling. It's followed by a boolean called `notified` which helps in thread notification, `unused` which you can ignore (it's just there to pad it to `u32`), and counters for the amount of threads sleeping and the amount of threads spawned. You could extend `Sync`'s size from `u32` to `u64` on 64bit platforms and grow the counters, but if you need more than 16K (`1 << 14`) threads in your thread pool, you have bigger issues...
+The thicc-but-not-really `Sync` struct tracks the "pool state" which is used to control thread signaling, shutdown, and throttling. That's followed by a boolean called `notified` which helps in thread notification, `unused` which you can ignore (it's just there to pad it to `u32`), and counters for the amount of threads sleeping and the amount of threads created. You could extend `Sync`'s size from `u32` to `u64` on 64bit platforms and grow the counters, but if you need more than 16K (`1 << 14`) threads in your thread pool, you have bigger issues...
 
-In order to implement thread wakeup throttling, we introduce something called "the waking thread". To wake up a thread, the `state` is transitioned from `pending` to `signaled`. Once a thread wakes up, it consumes this signal by transitioning the state from `signaled` to `waking`. The thread to consume the signal now becomes the "waking thread".
+In order to implement thread wakeup throttling, we introduce something called "the waking thread". To wake up a thread, the `state` is transitioned from `pending` to `signaled`. Once a thread wakes up, it consumes this signal by transitioning the state from `signaled` to `waking`. The winning thread to consume the signal now becomes the "waking thread".
 
-While there is a "waking thread", no other thread can be woken up. The waking thread will either dequeue a Task or go back to sleep. If it finds a Task, it must transfer its "waking" status by transitioning from `waking` to `signaled` and wake up another thread. If it doesn't find Tasks, it must transition back from `waking` to `pending`.
+While there is a "waking thread", no other thread can be woken up. The waking thread will either dequeue a Task or go back to sleep. If it finds a Task, it must transfer its "waking" status to someone else by transitioning from `waking` to `signaled` and wake up another thread. If it doesn't find Tasks, it must transition from `waking` to `pending` before going back to sleep.
 
-This results in the same throttling mechanisms found in Go and Rust by avoiding a [thundering herd](https://en.wikipedia.org/wiki/Thundering_herd_problem) of threads on `threads.notify`, decreases contention on stealing, and amortizes the syscall cost of actually waking up a thread:
+This results in the same throttling mechanisms found in Go and Rust by avoiding a [thundering herd](https://en.wikipedia.org/wiki/Thundering_herd_problem) of threads on `notify()`, decreases contention on stealing, and amortizes the syscall cost of actually waking up a thread:
 
-* T1 pushes Tasks to its run queue and calls `threads.notify`
+* T1 pushes Tasks to its run queue and calls `notify()`
 * T2 is woken up and designated as the "waking thread"
 * T1 pushses Tasks again but can't wake up other threads since T2 is still "waking"
 * T2 steals Tasks from T1 and wakes up T3 as the new "waking" thread
 * T3 steals from from either T2 or T1 and wakes T4 as the new "waking" thread.
 * By the time T4 wakes up, all Tasks have been processed
-* T4 fails to steal Tasks, gives up the "waking thread" status, and goes back to sleep
+* T4 fails to steal Tasks, gives up the "waking thread" status, and goes back to sleep on `wait()`
 
 ### Thread Counters and Races
 
@@ -436,17 +437,17 @@ So far, we've only talked about the `state`, but theres still `notified`, `idle_
 
 First, let's check out `spawned_threads`. Since it's handled atomically with `idle_threads`, this gives us a choice on how we want to "wake" up a thread. If theres idle/sleeping threads, we should of course prefer waking up those instead of spawning new ones. But if there aren't any, we can accurately spawn more until we reach a user-set "max threads" capacity. **If spawning a thread fails, we just decrement this count**. `spawned_threads` is also used to synchronize shutdown which is explained later.
 
-Then theres `notified`. Even when theres a "waking" thread, we still don't want `thread.notify`s to be lost as then that's missed wake ups which lead to CPU under-utilization. So every time we notify(), we also set the `notified` bit if it's not already. Threads going to sleep can observe the `notified` bit and try to consume it. Consuming it acts like a pseudo wake up so the thread should recheck run queues again. This applies to the "waking" thread as well.
+Then theres `notified`. Even when theres a "waking" thread, we still don't want `notify()`s to be lost as then that's missed wake ups which lead to CPU under-utilization. So every time we `notify()`, we also set the `notified` bit if it's not already. Threads going to sleep can observe the `notified` bit and try to consume it. Consuming it acts like a pseudo wake up so the thread should recheck run queues again. This applies to the "waking" thread as well. This keeps at least one other non-waking thread searching for work. For `u64`, we could probably extend this to a counter to have more active searching threads.
 
-Finally there's `idle_threads`. When a thread goes to sleep, it increments `idle_threads` by one then sleeps on a semaphore or something. A non-zero idle count allows `threads.notify` to know to transition to `signaled` and post to the theoretical semaphore. It's the "waking" threads responsibility to decrement the `idle_threads` count when it transitions the state from `signaled` to `waking`. Idle threads might also wake up and decrement the idle count if they consume `notified` too.
+Finally there's `idle_threads`. When a thread goes to sleep, it increments `idle_threads` by one then sleeps on a semaphore or something. A non-zero idle count allows `notify()` to know to transition to `signaled` and post to the theoretical semaphore. It's the notification-consuming threads responsibility to decrement the `idle_threads` count when it transitions the state from `signaled` to `waking` or muches up the `notified` bit. Those familiar with [semaphore internals](https://code.woboq.org/userspace/glibc/nptl/sem_waitcommon.c.html#__new_sem_wait_slow) or [event counts](https://github.com/r10a/Event-Counts) will recognize this `idle_threads` algorithm.
 
 ### Shutdown Synchronization
 
-When the book of revelations comes to pass, and the thread pool is ready to die and ascend to reclaimed memory, it must first make peace with its children to join gracefully. The scripture recites a particular mantra to perform the process:
+When the book of revelations comes to pass, and the thread pool is ready to die and ascend to reclaimed memory, it must first make peace with its children to join gracefully. For one must not be eager to return, else they risk the memory corruption of others. The scripture recites a particular mantra to perform the process:
 
-Transiton the `state` from whatever it is to `shutdown`, then post to the semaphore if there were any `idle_threads`. This notifies the threads that the end is *among us*. `threads.notify` bails if it observes the state to be `shutdown`. `threads.wait` decrements `spawned_threads` and bails when it observes `shutdown`. The thread to zero-out the spawned count must notify the pool that *it is time*.
+Transiton the `state` from whatever it is to `shutdown`, then post to the semaphore if there were any `idle_threads`. This notifies the threads that the end is *among us*. `notify()` bails if it observes the state to be `shutdown`. `wait()` decrements `spawned_threads` and bails when it observes `shutdown`. The thread to decrement the spawned count to zero must notify the pool that *it is time*.
 
-The thread pool can iterate it's children threads and sacrifice them to the kernel... but wait, we never explained how the thread pool keeps track of threads? Well to keep with intrusive memory, a spawned thread pushes itself to a lock-free stack on the thread pool. Threads find each other by following that stack and restarting/reobserving from the top when the first-born is reached. We just follow this stack as well when `spawned_threads` reaches 0 to join them.
+The thread pool can iterate it's children threads and sacrifice them to the kernel... but wait, we never explained how the thread pool keeps track of threads? Well to keep with the idea of intrusive memory, a thread pushes itself to a lock-free stack on the thread pool when it's first spawned. Threads find each other by following that stack and restarting/reobserving from the top when the first-born is reached. We just follow this stack as well when `spawned_threads` reaches 0 to join them.
 
 The final algorithm is as follows. Thank you for coming to my TED Talk.
 
@@ -551,4 +552,4 @@ dequeue(): ?(task: *Task, pushed: bool)
 
 ## Conclusions
 
-I probably missed something in my explanations. If so, I urge you to read the actual source code since that works. I've provided benchmarks for competing thread pools in the repository so feel free to also add your own or modify this one. Learned a lot by doing this so here's some links to articles about other schedulers as well as [my own curated tips](). *And as always, hope you learned somethin'*
+I probably missed something in my explanations. If so, I urge you to read the [source](https://github.com/kprotty/zap/blob/blog/src/thread_pool.zig) since i've verified that to work. I've provided [benchmarks]() for competing thread pools in the repository so feel free to also add your own or modify this one. Learned a lot by doing this so here's some links to articles about other schedulers as well as [my own curated tips](). *And as always, hope you learned somethin'*

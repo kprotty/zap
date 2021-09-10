@@ -5,7 +5,7 @@ pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const link_c = b.option(bool, "c", "link libc") orelse false;
 
-    const exe = b.addExecutable("bench", "src/bench.zig");
+    const exe = b.addExecutable("qsort", "qsort.zig");
     if (link_c) {
         exe.linkLibC();
     }

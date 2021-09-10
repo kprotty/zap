@@ -112,18 +112,25 @@ pub noinline fn schedule(self: *ThreadPool, batch: Batch) void {
         self.run_queue.push(list);
     }
     
-    // Fast path to check the Sync state to avoid calling into notify()
-    const sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    if (sync.notified) {
-        return;
-    }
-    
     // Try to notify a thread
     const is_waking = false;
     return self.notify(is_waking);
 }
 
-noinline fn notify(self: *ThreadPool, is_waking: bool) void {
+inline fn notify(self: *ThreadPool, is_waking: bool) void {
+    // Fast path to check the Sync state to avoid calling into notifySlow().
+    // If we're waking, then we need to update the state regardless
+    if (!is_waking) {
+        const sync = @bitCast(Sync, self.sync.load(.Monotonic));
+        if (sync.notified) {
+            return;
+        }
+    }
+    
+    return self.notifySlow(is_waking);
+}
+
+noinline fn notifySlow(self: *ThreadPool, is_waking: bool) void {
     var sync = @bitCast(Sync, self.sync.load(.Monotonic));
     while (sync.state != .shutdown) {
 
@@ -329,7 +336,6 @@ const Thread = struct {
             while (self.pop(thread_pool)) |result| {
                 if (result.pushed or is_waking) 
                     thread_pool.notify(is_waking);
-                is_waking = false;
 
                 const task = @fieldParentPtr(Task, "node", result.node);
                 (task.callback)(task);

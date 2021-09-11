@@ -80,7 +80,7 @@ async fn quick_sort(arr: &'static mut [i32]) {
 
 fn selection_sort(arr: &mut [i32]) {
     for i in 0..arr.len() {
-        let min = (i..arr.len()).fold(i, |min, j| {
+        let min = ((i+1)..arr.len()).fold(i, |min, j| {
             if arr[j] < arr[min] {
                 j
             } else {

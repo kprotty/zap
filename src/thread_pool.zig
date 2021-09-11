@@ -336,6 +336,7 @@ const Thread = struct {
             while (self.pop(thread_pool)) |result| {
                 if (result.pushed or is_waking) 
                     thread_pool.notify(is_waking);
+                is_waking = false;
 
                 const task = @fieldParentPtr(Task, "node", result.node);
                 (task.callback)(task);

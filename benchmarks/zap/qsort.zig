@@ -65,10 +65,7 @@ fn quickSort(arr: []i32) void {
     if (arr.len <= 32) {
         insertionSort(arr);
     } else {
-        var mid = partition(arr);
-        if (mid < arr.len / 2) {
-            mid += 1;
-        }
+        const mid = partition(arr);
 
         var left = Async.spawn(quickSort, .{arr[0..mid]});
         var right = Async.spawn(quickSort, .{arr[mid..]});
@@ -79,16 +76,16 @@ fn quickSort(arr: []i32) void {
 }
 
 fn partition(arr: []i32) usize {
-    std.mem.swap(i32, &arr[0], &arr[arr.len / 2]);
-    var mid: usize = 0;
-    for (arr[1..]) |value, i| {
-        if (value < arr[0]) {
-            mid += 1;
-            std.mem.swap(i32, &arr[mid], &arr[i+1]);
+    const pivot = arr.len - 1;
+    var i: usize = 0;
+    for (arr[0..pivot]) |_, j| {
+        if (arr[j] <= arr[pivot]) {
+            std.mem.swap(i32, &arr[j], &arr[i]);
+            i += 1;
         }
     }
-    std.mem.swap(i32, &arr[0], &arr[mid]);
-    return mid;
+    std.mem.swap(i32, &arr[i], &arr[pivot]);
+    return i;
 }
 
 fn insertionSort(arr: []i32) void {

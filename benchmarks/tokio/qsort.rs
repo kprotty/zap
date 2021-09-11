@@ -43,10 +43,8 @@ async fn quick_sort(arr: &'static mut [i32]) {
     if arr.len() <= 32 {
         insertion_sort(arr);
     } else {
-        let mut mid = partition(arr);
-        if mid < arr.len() / 2 {
-            mid += 1;
-        }
+        let mid = partition(arr);
+        let (low, high) = arr.split_at_mut(mid);
 
         fn spawn_quick_sort(array: &'static mut [i32]) -> tokio::task::JoinHandle<()> {
             tokio::spawn(async move { 
@@ -54,7 +52,6 @@ async fn quick_sort(arr: &'static mut [i32]) {
             })
         }
 
-        let (low, high) = arr.split_at_mut(mid);
         let left = spawn_quick_sort(low);
         let right = spawn_quick_sort(high);
 
@@ -64,16 +61,16 @@ async fn quick_sort(arr: &'static mut [i32]) {
 }
 
 fn partition(arr: &mut [i32]) -> usize {
-    arr.swap(0, arr.len() / 2);
-    let mut mid = 0;
-    for i in 1..arr.len() {
-        if arr[i] < arr[0] {
-            mid += 1;
-            arr.swap(mid, i);
+    let pivot = arr.len() - 1;
+    let mut i = 0;
+    for j in 0..pivot {
+        if arr[j] <= arr[pivot] {
+            arr.swap(i, j);
+            i += 1;
         }
     }
-    arr.swap(0, mid);
-    mid
+    arr.swap(i, pivot);
+    i
 }
 
 fn insertion_sort(arr: &mut [i32]) {

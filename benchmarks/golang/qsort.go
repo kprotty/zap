@@ -52,14 +52,10 @@ func quickSort(arr []int) {
 	if len(arr) <= 32 {
 		insertionSort(arr)
 	} else {
-		mid := partition(arr)
-		if mid < len(arr) / 2 {
-			mid++
-		}
-		
 		var wg sync.WaitGroup
+		mid := partition(arr)
+		
 		wg.Add(2)
-
 		go func() {
 			quickSort(arr[:mid])
 			wg.Done()
@@ -74,16 +70,16 @@ func quickSort(arr []int) {
 }
 
 func partition(arr []int) int {
-	arr[0], arr[len(arr) / 2] = arr[len(arr) / 2], arr[0]
-	mid := 0
-	for i := 1; i < len(arr); i++ {
-		if arr[i] < arr[0] {
-			mid++
-			arr[mid], arr[i] = arr[i], arr[mid]
+	pivot := len(arr) - 1
+	i := 0;
+	for j := 0; j < pivot; j++ {
+		if arr[j] <= arr[pivot] {
+			arr[i], arr[j] = arr[j], arr[i]
+			i++
 		}
 	}
-	arr[0], arr[mid] = arr[mid], arr[0]
-	return mid
+	arr[i], arr[pivot] = arr[pivot], arr[i]
+	return i
 }
 
 func insertionSort(arr [] int) {

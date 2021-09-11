@@ -7,16 +7,34 @@ import (
 )
 
 func main() {
-	arr := make([]int, 128 * 1000)
+	arr := make([]int, 10 * 1000 * 1000)
+
+	fmt.Println("filling")
+	for i := 0; i < len(arr); i++ {
+		arr[i] = i
+	}
+
 	fmt.Println("shuffling")
 	shuffle(arr)
 
 	fmt.Println("running")
 	start := time.Now()
 	quickSort(arr)
-	elapsed := time.Since(start)
 
-	fmt.Println("took", elapsed)
+	fmt.Println("took", time.Since(start))
+	if !verify(arr) {
+		panic("array not sorted")
+	}
+}
+
+func verify(arr []int) bool {
+	for i := 0;; i++ {
+		if i == len(arr) - 1 {
+			return true
+		} else if arr[i] > arr[i + 1] {
+			return false
+		}
+	}
 }
 
 func shuffle(arr []int) {
@@ -30,58 +48,48 @@ func shuffle(arr []int) {
 	}
 }
 
-func partition(arr []int) int {
-	i := 0
-	p := len(arr) - 1
-	pivot := arr[p]
-	for j := 0; j < len(arr); j++ {
-		if arr[j] < pivot {
-			arr[i], arr[j] = arr[j], arr[i]
-			i++
-		}
-	}
-	arr[i], arr[p]= arr[p], arr[i]
-	return i
-}
-
 func quickSort(arr []int) {
 	if len(arr) <= 32 {
-		selectionSort(arr);
+		insertionSort(arr)
 	} else {
-		p := partition(arr)
+		mid := partition(arr)
+		if mid < len(arr) / 2 {
+			mid++
+		}
 		
 		var wg sync.WaitGroup
-		if p != 0 {
-			wg.Add(1)
-			go func() {
-				quickSort(arr[:p])
-				wg.Done()
-			}()
-		}
+		wg.Add(2)
 
-		if p < len(arr) - 1 {
-			wg.Add(1)
-			go func() {
-				quickSort(arr[p + 1:])
-				wg.Done()
-			}()
-		}
+		go func() {
+			quickSort(arr[:mid])
+			wg.Done()
+		}()
+		go func() {
+			quickSort(arr[mid:])
+			wg.Done()
+		}()
 
 		wg.Wait()
 	}
 }
 
-func selectionSort(arr [] int) {
-	n := len(arr)
-	for i := 0; i < n; i++ {
-		min := i;
-		for j := i + 1; j < n; j++ {
-			if arr[j] < arr[min] {
-				min = j;
-			}
+func partition(arr []int) int {
+	arr[0], arr[len(arr) / 2] = arr[len(arr) / 2], arr[0]
+	mid := 0
+	for i := 1; i < len(arr); i++ {
+		if arr[i] < arr[0] {
+			mid++
+			arr[mid], arr[i] = arr[i], arr[mid]
 		}
-		if min != i {
-			arr[min], arr[i] = arr[i], arr[min]
+	}
+	arr[0], arr[mid] = arr[mid], arr[0]
+	return mid
+}
+
+func insertionSort(arr [] int) {
+	for i := 1; i < len(arr); i++ {
+		for n := i; n > 0 && arr[n] < arr[n - 1]; n-- {
+			arr[n], arr[n - 1] = arr[n - 1], arr[n]
 		}
 	}
 }

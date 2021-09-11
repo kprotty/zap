@@ -1,8 +1,16 @@
-const SIZE: usize = 128_000;
+const SIZE: usize = 10_000_000;
 
 #[tokio::main]
 pub async fn main() {
-    let mut arr = Box::leak(vec![0; SIZE].into_boxed_slice());
+    use std::convert::TryInto;
+
+    println!("filling");
+    let arr = (0..SIZE)
+        .map(|i| i.try_into().unwrap())
+        .collect::<Vec<i32>>()
+        .into_boxed_slice();
+
+    let mut arr = Box::leak(arr);
     let arr_ptr = arr.as_ptr();
 
     println!("shuffling");
@@ -31,64 +39,49 @@ fn shuffle(arr: &mut [i32]) {
     }
 }
 
-fn partition(arr: &mut [i32]) -> usize {
-    let mut i = 0;
-    let p = arr.len() - 1;
-    let pivot = arr[p];
-    for j in 0..arr.len() {
-        if arr[j] < pivot {
-            arr.swap(i, j);
-            i += 1;
-        }
-    }
-    arr.swap(i, p);
-    i
-}
-
-fn spawn_quick_sort(arr: &'static mut [i32]) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { 
-        quick_sort(arr).await
-    })
-}
-
 async fn quick_sort(arr: &'static mut [i32]) {    
     if arr.len() <= 32 {
-        selection_sort(arr);
+        insertion_sort(arr);
     } else {
-        let p = partition(arr);
-        let (mut low, high) = arr.split_at_mut(p + 1);
-
-        let mut left = None;
-        if low.len() > 0 {
-            low = low.split_at_mut(low.len() - 1).0;
-            left = Some(spawn_quick_sort(low));
+        let mut mid = partition(arr);
+        if mid < arr.len() / 2 {
+            mid += 1;
         }
 
-        let mut right = None;
-        if high.len() > 0 {
-            right = Some(spawn_quick_sort(high));
+        fn spawn_quick_sort(array: &'static mut [i32]) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move { 
+                quick_sort(array).await
+            })
         }
 
-        if let Some(handle) = left {
-            handle.await.unwrap();
-        }
-        if let Some(handle) = right {
-            handle.await.unwrap();
-        }
+        let (low, high) = arr.split_at_mut(mid);
+        let left = spawn_quick_sort(low);
+        let right = spawn_quick_sort(high);
+
+        left.await.unwrap();
+        right.await.unwrap();
     }
 }
 
-fn selection_sort(arr: &mut [i32]) {
-    for i in 0..arr.len() {
-        let min = ((i+1)..arr.len()).fold(i, |min, j| {
-            if arr[j] < arr[min] {
-                j
-            } else {
-                min
-            }
-        });
-        if min != i {
-            arr.swap(i, min);
+fn partition(arr: &mut [i32]) -> usize {
+    arr.swap(0, arr.len() / 2);
+    let mut mid = 0;
+    for i in 1..arr.len() {
+        if arr[i] < arr[0] {
+            mid += 1;
+            arr.swap(mid, i);
+        }
+    }
+    arr.swap(0, mid);
+    mid
+}
+
+fn insertion_sort(arr: &mut [i32]) {
+    for i in 1..arr.len() {
+        let mut n = i;
+        while n > 0 && arr[n] < arr[n - 1] {
+            arr.swap(n, n - 1);
+            n -= 1;
         }
     }
 }

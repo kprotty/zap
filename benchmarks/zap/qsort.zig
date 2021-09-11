@@ -1,7 +1,7 @@
 const std = @import("std");
 const Async = @import("async.zig");
 
-const SIZE = 128_000;
+const SIZE = 10_000_000;
 
 pub fn main() void {
     return Async.run(asyncMain, .{});

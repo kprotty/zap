@@ -14,3 +14,4 @@ NUL
 
 # testing
 main.zig
+perf.*

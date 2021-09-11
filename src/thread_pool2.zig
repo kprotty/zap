@@ -1,26 +1,39 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
+const ThreadPool = @This();
 
+stack_size: u32,
 max_threads: u16,
 queue: Node.Queue = .{},
 join_event: Event = .{},
+idle_event: Event = .{},
 sync: Atomic(u32) = Atomic(u32).init(0),
-spinning: Atomic(usize) = Atomic(usize).init(0),
 threads: Atomic(?*Thread) = Atomic(?*Thread).init(null),
 
 const Sync = packed struct {
-    idle: u15 = 0,
-    spawned: u15 = 0,
-    unused: u1 = 0,
+    idle: u10 = 0,
+    spawned: u10 = 0,
+    stealing: u10 = 0,
+    padding: u1 = 0,
     shutdown: bool = false,
 };
 
-pub fn init(config: Config) ThreadPool {
+pub const Config = struct {
+    max_threads: u16,
+    stack_size: u32 = (std.Thread.SpawnConfig{}).stack_size,
+};
 
+pub fn init(config: Config) ThreadPool {
+    return .{
+        .max_threads = std.math.max(1, config.max_threads),
+        .stack_size = std.math.max(std.mem.page_size, config.stack_size),
+    };
 }
 
 pub fn deinit(self: *ThreadPool) void {
-
+    self.join();
+    self.* = undefined;
 }
 
 /// A Task represents the unit of Work / Job / Execution that the ThreadPool schedules.
@@ -79,64 +92,232 @@ pub noinline fn schedule(self: *ThreadPool, batch: Batch) void {
     }
     
     const sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    if (sync.shutdown or (sync.idle == 0 and sync.spawned == self.max_threads)) {
-        return;
-    }
-
-    if (self.spinning.load(.Monotonic) == 0) return;
-    if (self.spinning.compareAndSwap(0, 1, .SeqCst, .Monotonic) == null) {
-        self.notify();
-    }
+    if (sync.shutdown) return;
+    if (sync.stealing > 0) return;
+    if (sync.idle == 0 and sync.spawned == self.max_threads) return;
+    return self.notify();
 }
 
 noinline fn notify(self: *ThreadPool) void {
     var sync = @bitCast(Sync, self.sync.load(.Monotonic));
-    while (!sync.shutdown) {
+    while (true) {
+        if (sync.shutdown) return;
+        if (sync.stealing != 0) return;
+
         var new_sync = sync;
+        new_sync.stealing = 1;
         if (sync.idle > 0) {
-            new_sync.idle -= 1;
+            // the thread will decrement idle on its own
         } else if (sync.spawned < self.max_threads) {
             new_sync.spawned += 1;
         } else {
-            _ = 
+            return;
         }
+
+        sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+            @bitCast(u32, sync),
+            @bitCast(u32, new_sync),
+            .SeqCst,
+            .Monotonic,
+        ) orelse {
+            if (sync.idle > 0)
+                return self.idle_event.notify();
+            
+            assert(sync.spawned < self.max_threads);
+            const spawn_config = std.Thread.SpawnConfig{ .stack_size = self.stack_size };
+            const thread = std.Thread.spawn(spawn_config, Thread.run, .{self}) catch @panic("failed to spawn a thread");
+            thread.detach();
+            return;
+        });
     }
 }
 
 /// Marks the thread pool as shutdown
 pub noinline fn shutdown(self: *ThreadPool) void {
+    var sync = @bitCast(Sync, self.sync.load(.Monotonic));
+    while (!sync.shutdown) {
+        var new_sync = sync;
+        new_sync.shutdown = true;
+        
+        sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
+            @bitCast(u32, sync),
+            @bitCast(u32, new_sync),
+            .SeqCst,
+            .Monotonic,
+        ) orelse {
+            self.idle_event.shutdown();
+            return;
+        });
+    }
+}
 
+noinline fn register(self: *ThreadPool, thread: *Thread) void {
+    var threads = self.threads.load(.Monotonic);
+    while (true) {
+        thread.next = threads;
+        threads = self.threads.tryCompareAndSwap(
+            threads,
+            thread,
+            .Release,
+            .Monotonic,
+        ) orelse break;
+    }
+}
+
+noinline fn unregister(self: *ThreadPool, thread: *Thread) void {
+    const one_spawned = @bitCast(u32, Sync{ .spawned = 1 });
+    const sync = @bitCast(Sync, self.sync.fetchSub(one_spawned, .SeqCst));
+
+    assert(sync.spawned > 0);
+    if (sync.spawned == 1) {
+        self.join_event.notify();
+    }
+
+    thread.join_event.wait();
+    if (thread.next) |next| {
+        next.join_event.notify();
+    }
+}
+
+noinline fn join(self: *ThreadPool) void {
+    self.join_event.wait();
+    if (self.threads.load(.Acquire)) |thread| {
+        thread.join_event.notify();
+    }
 }
 
 const Thread = struct {
+    pool: *ThreadPool,
     next: ?*Thread = null,
+    stealing: bool = true,
+    target: ?*Thread = null,
     join_event: Event = .{},
     buffer: Node.Buffer = .{},
     queue: Node.Queue = .{},
 
+    threadlocal var current: ?*Thread = null;
+
     fn run(thread_pool: *ThreadPool) void {
-        var self = Thread{};
+        var self = Thread{ .pool = thread_pool };
         current = &self;
 
-        var threads = thread_pool.threads.load(.Monotonic);
+        self.pool.register(&self);
+        defer self.pool.unregister(&self);
+
         while (true) {
-            threads = thread_pool.threads.tryCompareAndSwap(
-                threads,
-                &self,
-                .Release,
-                .Monotonic,
-            ) orelse break;
+            const node = self.poll() catch break;
+            const task = @fieldParentPtr(Task, "node", node);
+            (task.callback)(task);
+        }
+    }
+
+    fn poll(self: *Thread) error{Shutdown}!*Node {
+        defer if (self.stealing) {
+            const one_stealing = @bitCast(u32, Sync{ .stealing = 1 });
+            const sync = @bitCast(Sync, self.pool.sync.fetchSub(one_stealing, .SeqCst));
+
+            // assert(sync.stealing > 0);
+            if (sync.stealing == 0) {
+                std.debug.warn("{} resetspinning(): {}\n", .{std.Thread.getCurrentId(), sync});
+                unreachable;
+            }
+
+            self.stealing = false;
+            self.pool.notify();
+        };
+
+        if (self.buffer.pop()) |node|
+            return node;
+
+        while (true) {
+            if (self.buffer.consume(&self.queue)) |result|
+                return result.node;
+
+            if (self.buffer.consume(&self.pool.queue)) |result|
+                return result.node;
+
+            if (!self.stealing) blk: {
+                var sync = @bitCast(Sync, self.pool.sync.load(.Monotonic));
+                if ((@as(u32, sync.stealing) * 2) >= (sync.spawned - sync.idle))
+                    break :blk;
+
+                const one_stealing = @bitCast(u32, Sync{ .stealing = 1 });
+                sync = @bitCast(Sync, self.pool.sync.fetchAdd(one_stealing, .SeqCst));
+                assert(sync.stealing < sync.spawned);
+                self.stealing = true;
+            }
+
+            if (self.stealing) {
+                var attempts: u8 = 4;
+                while (attempts > 0) : (attempts -= 1) {
+                    var num_threads: u16 = @bitCast(Sync, self.pool.sync.load(.Monotonic)).spawned;
+                    while (num_threads > 0) : (num_threads -= 1) {
+                        const thread = self.target orelse self.pool.threads.load(.Acquire) orelse unreachable;
+                        self.target = thread.next;
+
+                        if (self.buffer.consume(&thread.queue)) |result|
+                            return result.node;
+
+                        if (self.buffer.steal(&thread.buffer)) |result|
+                            return result.node;
+                    }
+                }
+            }
+
+            if (self.buffer.consume(&self.pool.queue)) |result|
+                return result.node;
+
+            var update = @bitCast(u32, Sync{ .idle = 1 });
+            if (self.stealing) {
+                update -%= @bitCast(u32, Sync{ .stealing = 1 });
+            }
+
+            var sync = @bitCast(Sync, self.pool.sync.fetchAdd(update, .SeqCst));
+            //std.debug.print("\nwait {}({}):{}\n\t\t{}\n", .{std.Thread.getCurrentId(), self.stealing, sync, @bitCast(Sync, @bitCast(u32, sync) +% update)});
+            assert(sync.idle < sync.spawned);
+            if (self.stealing) assert(sync.stealing <= sync.spawned);
+            self.stealing = false;
+
+            update = @bitCast(u32, Sync{ .idle = 1 });
+            if (self.canSteal()) {
+                update -%= @bitCast(u32, Sync{ .stealing = 1 });
+                self.stealing = true;
+            } else {
+                self.pool.idle_event.wait();
+            }
+
+            sync = @bitCast(Sync, self.pool.sync.fetchSub(update, .SeqCst));
+            //std.debug.print("\nwake {}({}):{}\n\t\t{}\n", .{std.Thread.getCurrentId(), self.stealing, sync, @bitCast(Sync, @bitCast(u32, sync) -% update)});
+            assert(sync.idle <= sync.spawned);
+            if (self.stealing) assert(sync.stealing < sync.spawned);
+
+            self.stealing = !sync.shutdown;
+            if (!self.stealing) return error.Shutdown;
+            continue;
+        }
+    }
+
+    fn canSteal(self: *const Thread) bool {
+        if (self.queue.canSteal()) 
+            return true;
+
+        if (self.pool.queue.canSteal())
+            return true;
+
+        var num_threads: u16 = @bitCast(Sync, self.pool.sync.load(.Monotonic)).spawned;
+        var threads: ?*Thread = null;
+        while (num_threads > 0) : (num_threads -= 1) {
+            const thread = threads orelse self.pool.threads.load(.Acquire) orelse unreachable;
+            threads = thread.next;
+
+            if (thread.queue.canSteal())
+                return true;
+
+            if (thread.buffer.canSteal())
+                return true;
         }
 
-        defer {
-            const counter = thread_pool.fetchSub(1, .SeqCst);
-            if (counter & 0xffff == 1)
-                thread_pool.join_event.notify();
-
-            self.join_event.wait();
-            if (self.next) |next|
-                next.join_event.notify();
-        }
+        return false;
     }
 };
 
@@ -183,6 +364,13 @@ const Node = struct {
                     .Monotonic,
                 ) orelse break;
             }
+        }
+
+        fn canSteal(self: *const Queue) bool {
+            const stack = self.stack.load(.Monotonic);
+            if (stack & IS_CONSUMING != 0) return false;
+            if (stack & (HAS_CACHE | PTR_MASK) == 0) return false;
+            return true;
         }
 
         fn tryAcquireConsumer(self: *Queue) error{Empty, Contended}!?*Node {
@@ -365,6 +553,29 @@ const Node = struct {
             node: *Node,
             pushed: bool,
         };
+
+        fn canSteal(self: *const Buffer) bool {
+            while (true) : (std.atomic.spinLoopHint()) {
+                const head = self.head.load(.Acquire);
+                const tail = self.tail.load(.Acquire);
+
+                // On x86, the target buffer thread uses fetchAdd to increment the head which can go over if it's zero.
+                // Account for that here by understanding that it's empty here.
+                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                    if (head == tail +% 1) {
+                        return false;
+                    }
+                }
+
+                const size = tail -% head;
+                if (size > capacity) {
+                    continue;
+                }
+
+                assert(size <= capacity);
+                return size != 0;
+            }
+        }
 
         fn consume(noalias self: *Buffer, noalias queue: *Queue) ?Stole {
             var consumer = queue.tryAcquireConsumer() catch return null;

@@ -1,12 +1,14 @@
 const std = @import("std");
 const Async = @import("async.zig");
 
+const SIZE = 128_000;
+
 pub fn main() void {
     return Async.run(asyncMain, .{});
 }
 
 fn asyncMain() void {
-    const arr = Async.allocator.alloc(i32, 200_000) catch @panic("failed to allocate array");
+    const arr = Async.allocator.alloc(i32, SIZE) catch @panic("failed to allocate array");
     defer Async.allocator.free(arr);
 
     std.debug.warn("shuffling\n", .{});
@@ -30,6 +32,17 @@ fn asyncMain() void {
     }
 
     std.debug.warn("took {d:.2}{s}\n", .{ elapsed, units });
+    if (!verify(arr)) {
+        std.debug.panic("array not sorted", .{});
+    }
+}
+
+fn verify(arr: []const i32) bool {
+    for (arr[1..]) |item, i| {
+        if (item < arr[i])
+            return false;
+    }
+    return true;
 }
 
 fn shuffle(arr: []i32) void {
@@ -62,15 +75,17 @@ fn quickSort(arr: []i32) void {
         selectionSort(arr);
     } else {
         const p = partition(arr);
+        const low = arr[0..p];
+        const high = arr[p+1..];
 
         var left: ?Async.JoinHandle(void) = null;
-        if (p != 0) {
-            left = Async.spawn(quickSort, .{arr[0..p]});
+        if (low.len > 0) {
+            left = Async.spawn(quickSort, .{low});
         }
 
         var right: ?Async.JoinHandle(void) = null;
-        if (p != arr.len - 1) {
-            right = Async.spawn(quickSort, .{arr[p+1..]});
+        if (high.len > 0) {
+            right = Async.spawn(quickSort, .{high});
         }
 
         if (left) |l| l.join();

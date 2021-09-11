@@ -1,8 +1,9 @@
-
+const SIZE: usize = 128_000;
 
 #[tokio::main]
 pub async fn main() {
-    let mut arr = Box::leak(vec![0; 200_000].into_boxed_slice());
+    let mut arr = Box::leak(vec![0; SIZE].into_boxed_slice());
+    let arr_ptr = arr.as_ptr();
 
     println!("shuffling");
     shuffle(&mut arr);
@@ -12,6 +13,11 @@ pub async fn main() {
     quick_sort(arr).await;
 
     println!("took {:?}", start.elapsed());
+    assert!(verify(unsafe { std::slice::from_raw_parts(arr_ptr, SIZE) }));
+}
+
+fn verify(arr: &[i32]) -> bool {
+    arr.windows(2).all(|i| i[0] <= i[1])
 }
 
 fn shuffle(arr: &mut [i32]) {
@@ -45,15 +51,16 @@ fn spawn_quick_sort(arr: &'static mut [i32]) -> tokio::task::JoinHandle<()> {
     })
 }
 
-async fn quick_sort(arr: &'static mut [i32]) {
+async fn quick_sort(arr: &'static mut [i32]) {    
     if arr.len() <= 32 {
         selection_sort(arr);
     } else {
         let p = partition(arr);
-        let (low, high) = arr.split_at_mut(p + 1);
+        let (mut low, high) = arr.split_at_mut(p + 1);
 
         let mut left = None;
         if low.len() > 0 {
+            low = low.split_at_mut(low.len() - 1).0;
             left = Some(spawn_quick_sort(low));
         }
 

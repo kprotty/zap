@@ -93,7 +93,7 @@ pub const Batch = struct {
 };
 
 /// Schedule a batch of tasks to be executed by some thread on the thread pool.
-pub noinline fn schedule(self: *ThreadPool, batch: Batch) void {
+pub fn schedule(self: *ThreadPool, batch: Batch) void {
     // Sanity check
     if (batch.len == 0) {
         return;
@@ -353,11 +353,7 @@ const Thread = struct {
                 .pushed = false,
             };
         }
-
-        return self.popSlow(thread_pool);
-    }
-
-    noinline fn popSlow(noalias self: *Thread, noalias thread_pool: *ThreadPool) ?Node.Buffer.Stole {
+        
         // Then check our local queue
         if (self.run_buffer.consume(&self.run_queue)) |stole| {
             return stole;
@@ -472,7 +468,7 @@ const Event = struct {
         return self.wake(SHUTDOWN, std.math.maxInt(u32));
     }
 
-    noinline fn wake(self: *Event, release_with: u32, wake_threads: u32) void {
+    fn wake(self: *Event, release_with: u32, wake_threads: u32) void {
         // Update the Event to notifty it with the new `release_with` state (either NOTIFIED or SHUTDOWN).
         // Release barrier to ensure any operations before this are this to happen before the wait() in the other threads.
         const state = self.state.swap(release_with, .Release);

@@ -10,6 +10,13 @@ authors = ["kprotty"]
 name = "qsort"
 path = "qsort.rs"
 
+[[bin]]
+name = "rsort"
+path = "rayon_qsort.rs"
+
+[dependencies.rayon]
+version = "1.5"
+
 [dependencies.tokio]
 version = "1"
 features = ["rt-multi-thread", "sync", "macros"]

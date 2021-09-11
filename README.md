@@ -1,28 +1,11 @@
-zap [![License](https://img.shields.io/badge/license-MIT-8FBD08.svg)](https://shields.io/) [![Zig](https://img.shields.io/badge/Made_with-Zig-F7A41D.svg)](https://shields.io/)
+zap [![License](https://img.shields.io/badge/license-MIT-8FBD08.svg)](https://shields.io/)
 ====
-A collection of resource efficient tools for writing scalable software.
+Designing efficient task scheduling for Ziglang.
 
-## Design Goals
-This project explicitly makes an effort to optimize for resource efficiency and customizability when possible as opposed to the more standard goal of performance and ease of use. This has two simultaneous, but sometimes conflicting, meanings:
+## Goals
+So I originally started this project around 2019 in order to develop memory, threads, io, and synchronization primitives for Zig given they were lacking at the time. Over the months, it shifted more on developing a runtime (or thread pool rather) that was both resource efficient (one of Zig's, and my personal, implicit Zen's) and competitive in performance with existing implementations.
 
-* In order to achieve resource efficiency, maximum performance or ease of use may be sacrificed when reasonable.
-* Optimizing for resource efficiency should not completely neglect performance and ease of use as these are practically important.
+Here lies the result of that effort for now. There's still more experimenting to do like how to dispatch I/O efficiently and the like, but I'm happy with what has come and wanted to share. You can find a copy of the blogpost [in this repo](blog.md), the reference implementation in [src](src/thread_pool.zig), and some of my [previous attempts](zap/tree/old_branches) in their own branch.
 
-The term "resource efficiency" here refers to using the least amount of system resources (i.e. Compute, Memory, IO, etc.) to achieve similar functionality. This often includes tricks such as caching computed values, using special CPU instructions, favoring intrusively provided memory and amortizing synchronization or syscalls.
-
-Aligning with the [Zen of Ziglang](https://ziglang.org/documentation/master/#Zen), this should aid in easing the ability to program software which utilizes the hardware better on average than before.
-
-## License
-
-<sup>
-Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
-2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
-</sup>
-
-<br/>
-
-<sub>
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
-</sub>
+## Benchmarks
+To benchmark the implementation, I wrote some quicksort implementations for similar APIs in other languages. The reasoning behind quicksort is that it's fairly practical and can also be heavy with concurrency. Try running them locally!

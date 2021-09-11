@@ -10,6 +10,11 @@ pub fn main() void {
 fn asyncMain() void {
     const arr = Async.allocator.alloc(i32, SIZE) catch @panic("failed to allocate array");
     defer Async.allocator.free(arr);
+    
+    std.debug.warn("filling\n", .{});
+    for (arr) |*item, i| {
+        item.* = @intCast(i32, i);
+    }
 
     std.debug.warn("shuffling\n", .{});
     shuffle(arr);
@@ -38,11 +43,11 @@ fn asyncMain() void {
 }
 
 fn verify(arr: []const i32) bool {
-    for (arr[1..]) |item, i| {
-        if (item < arr[i])
-            return false;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        if (i == arr.len - 1) return true;
+        if (arr[i] > arr[i + 1]) return false;
     }
-    return true;
 }
 
 fn shuffle(arr: []i32) void {
@@ -56,53 +61,42 @@ fn shuffle(arr: []i32) void {
     }
 }
 
-fn partition(arr: []i32) usize {
-    var i: usize = 0;
-    const p = arr.len - 1;
-    const pivot = arr[p];
-    for (arr) |x, j| {
-        if (x < pivot) {
-            std.mem.swap(i32, &arr[j], &arr[i]);
-            i += 1;
-        }
-    }
-    std.mem.swap(i32, &arr[i], &arr[p]);
-    return i;
-}
-
 fn quickSort(arr: []i32) void {
     if (arr.len <= 32) {
-        selectionSort(arr);
+        insertionSort(arr);
     } else {
-        const p = partition(arr);
-        const low = arr[0..p];
-        const high = arr[p+1..];
-
-        var left: ?Async.JoinHandle(void) = null;
-        if (low.len > 0) {
-            left = Async.spawn(quickSort, .{low});
+        var mid = partition(arr);
+        if (mid < arr.len / 2) {
+            mid += 1;
         }
 
-        var right: ?Async.JoinHandle(void) = null;
-        if (high.len > 0) {
-            right = Async.spawn(quickSort, .{high});
-        }
+        var left = Async.spawn(quickSort, .{arr[0..mid]});
+        var right = Async.spawn(quickSort, .{arr[mid..]});
 
-        if (left) |l| l.join();
-        if (right) |r| r.join();
+        left.join();
+        right.join();
     }
 }
 
-fn selectionSort(arr: []i32) void {
-    for (arr) |_, i| {
-        var min = i;
-        for (arr[i..]) |_, j| {
-            if (arr[j] < arr[min]) {
-                min = j;
-            }
+fn partition(arr: []i32) usize {
+    std.mem.swap(i32, &arr[0], &arr[arr.len / 2]);
+    var mid: usize = 0;
+    for (arr[1..]) |value, i| {
+        if (value < arr[0]) {
+            mid += 1;
+            std.mem.swap(i32, &arr[mid], &arr[i+1]);
         }
-        if (min != i) {
-            std.mem.swap(i32, &arr[i], &arr[min]);
+    }
+    std.mem.swap(i32, &arr[0], &arr[mid]);
+    return mid;
+}
+
+fn insertionSort(arr: []i32) void {
+    for (arr[1..]) |_, i| {
+        var n = i + 1;
+        while (n > 0 and arr[n] < arr[n - 1]) {
+            std.mem.swap(i32, &arr[n], &arr[n - 1]);
+            n -= 1;
         }
     }
 }

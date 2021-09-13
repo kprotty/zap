@@ -1,4 +1,4 @@
-# Go implementations
+# Zig implementations
 
 ```
 zig build run -Drelease-fast // -Dc if on posix systems

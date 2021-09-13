@@ -2,23 +2,20 @@ const SIZE: usize = 10_000_000;
 
 fn main() {
     println!("filling");
-    let arr = (0..SIZE)
+    let mut arr = (0..SIZE)
         .map(|i| i.try_into().unwrap())
         .collect::<Vec<i32>>()
         .into_boxed_slice();
-
-    let mut arr = Box::leak(arr);
-    let arr_ptr = arr.as_ptr();
 
     println!("shuffling");
     shuffle(&mut arr);
 
     println!("running");
     let start = std::time::Instant::now();
-    quick_sort(arr);
+    quick_sort(&mut arr);
 
     println!("took {:?}", start.elapsed());
-    assert!(verify(unsafe { std::slice::from_raw_parts(arr_ptr, SIZE) }));
+    assert!(verify(&arr));
 }
 
 fn verify(arr: &[i32]) -> bool {
@@ -36,7 +33,7 @@ fn shuffle(arr: &mut [i32]) {
     }
 }
 
-fn quick_sort(arr: &'static mut [i32]) {    
+fn quick_sort(arr: &mut [i32]) {
     if arr.len() <= 32 {
         insertion_sort(arr);
     } else {

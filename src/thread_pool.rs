@@ -18,6 +18,29 @@ where
 
 }
 
+struct Scheduler {
+    sync: AtomicU32,
+    injected: Queue,
+}
+
+impl Scheduler {
+    fn notify(&self, is_waking: bool) {
+
+    }
+
+    fn wait(&self, mut is_waking: bool) -> Option<bool> {
+
+    }
+
+    fn register(&self, worker: Pin<&Worker>) {
+
+    }
+
+    fn unregister(&self, worker: Pin<&Worker>) {
+
+    }
+}
+
 
 thread_local!(static ref CURRENT_WORKER: Option<NonNull<Worker>> = None);
 
@@ -43,12 +66,28 @@ impl Worker {
         };
         
         let this = unsafe { Pin::new_unchecked(&this) };
-        CURRENT_WORKER.with(|w| *w = NonNull::from(&*this));
+        scheduler.register(this.clone());
 
-        
-        while let Some(is_waking) =  {
+        let mut old_current = None;
+        CURRENT_WORKER.with(|w| {
+            old_current = *w;
+            *w = NonNull::from(&*this);
+        });
 
+        while let Some(mut is_waking) = scheduler.wait(false) {
+            while let Some((task, pushed)) = this.pop() {
+                if pushed || is_waking {
+                    scheduler.notify(is_waking);
+                }
+
+                is_waking = false;
+                let task = unsafe { Pin::new_unchecked(task.as_ref()) };
+                (task.vtable.poll_fn)(task)
+            }
         }
+
+        CURRENT_WORKER.with(|w| *w = old_current);
+        scheduler.unregister(this);
     }
 
     fn push(task_ptr: NonNull<Task>) {

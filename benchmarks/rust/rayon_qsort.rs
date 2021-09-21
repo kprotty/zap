@@ -26,8 +26,8 @@ fn shuffle(arr: &mut [i32]) {
     let mut xs: u32 = 0xdeadbeef;
     for i in 0..arr.len() {
         xs ^= xs << 13;
-		xs ^= xs >> 17;
-		xs ^= xs << 5;
+        xs ^= xs >> 17;
+        xs ^= xs << 5;
         let j = (xs as usize) % (i + 1);
         arr.swap(i, j);
     }
@@ -44,7 +44,7 @@ fn quick_sort(arr: &mut [i32]) {
             s.spawn(|_| quick_sort(low));
             s.spawn(|_| quick_sort(high));
         });
-        
+
         // Optimized version (hooks directly into the scheduler)
         // rayon::join(
         //     || quick_sort(low),

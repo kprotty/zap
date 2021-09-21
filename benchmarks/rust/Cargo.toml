@@ -1,23 +1,29 @@
 [package]
-name = "bench"
+name = "zap"
 version = "0.0.0"
 edition = "2021"
 authors = ["kprotty"]
 
+[lib]
+name = "zap"
+path = "src/lib.rs"
+
 [[bin]]
 name = "qsort"
-path = "qsort.rs"
+path = "tokio_qsort.rs"
 
 [[bin]]
 name = "rsort"
 path = "rayon_qsort.rs"
 
-[dependencies.rayon]
-version = "1.5"
+[[bin]]
+name = "zsort"
+path = "zap_qsort.rs"
 
-[dependencies.tokio]
-version = "1"
-features = ["rt-multi-thread", "sync", "macros"]
+[dependencies]
+rayon = "1.5"
+num_cpus = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
 [profile.release]
 codegen-units = 1

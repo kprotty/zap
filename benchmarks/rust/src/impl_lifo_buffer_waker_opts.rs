@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicPtr, AtomicUsize, AtomicU8, Ordering},
+        atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -135,16 +135,17 @@ impl Into<usize> for SyncState {
         let mut value = 0;
         value |= self.idle << (Self::COUNT_BITS + 4);
         value |= self.spawned << 4;
-        
+
         if self.notified {
             value |= 0b100;
         }
 
-        value | match self.status {
-            SyncStatus::Pending => 0b00,
-            SyncStatus::Waking => 0b01,
-            SyncStatus::Signaled => 0b10,
-        }
+        value
+            | match self.status {
+                SyncStatus::Pending => 0b00,
+                SyncStatus::Waking => 0b01,
+                SyncStatus::Signaled => 0b10,
+            }
     }
 }
 
@@ -193,7 +194,7 @@ impl Pool {
         assert!(pending != !0usize);
     }
 
-    fn drop_ref(self: &Arc<Pool>) {
+    fn on_drop(self: &Arc<Pool>) {
         let pending = self.pending.fetch_sub(1, Ordering::SeqCst);
         assert!(pending > 0);
 
@@ -216,28 +217,30 @@ impl Pool {
 
     #[cold]
     fn notify_slow(self: &Arc<Self>, is_waking: bool) {
-        let result = self.sync.fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
-            let mut state: SyncState = state.into();
-            assert!(state.idle <= state.spawned);
-            if is_waking {
-                assert_eq!(state.status, SyncStatus::Waking);
-            }
+        let result = self
+            .sync
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+                let mut state: SyncState = state.into();
+                assert!(state.idle <= state.spawned);
+                if is_waking {
+                    assert_eq!(state.status, SyncStatus::Waking);
+                }
 
-            let can_wake = is_waking || state.status == SyncStatus::Pending;
-            if can_wake && state.idle > 0 {
-                state.status = SyncStatus::Signaled;
-            } else if can_wake && state.spawned < self.workers.len() {
-                state.status = SyncStatus::Signaled;
-                state.spawned += 1;
-            } else if is_waking {
-                state.status = SyncStatus::Pending;
-            } else if state.notified {
-                return None;
-            }
-            
-            state.notified = true;
-            Some(state.into())
-        });
+                let can_wake = is_waking || state.status == SyncStatus::Pending;
+                if can_wake && state.idle > 0 {
+                    state.status = SyncStatus::Signaled;
+                } else if can_wake && state.spawned < self.workers.len() {
+                    state.status = SyncStatus::Signaled;
+                    state.spawned += 1;
+                } else if is_waking {
+                    state.status = SyncStatus::Pending;
+                } else if state.notified {
+                    return None;
+                }
+
+                state.notified = true;
+                Some(state.into())
+            });
 
         if let Ok(sync) = result.map(SyncState::from) {
             if is_waking || sync.status == SyncStatus::Pending {
@@ -308,14 +311,19 @@ impl Pool {
     }
 
     #[inline]
-    fn poll(&self, index: usize, tick: usize, xorshift: &mut usize) -> Option<(NonNull<Task>, bool)> {
+    fn poll(
+        &self,
+        index: usize,
+        tick: usize,
+        xorshift: &mut usize,
+    ) -> Option<(NonNull<Task>, bool)> {
         let _ = tick;
         // if tick % 64 == 0 {
         //     if let Ok(task) = self.workers[index].buffer.consume(&self.workers[index].queue) {
         //         return Some((task, true));
         //     }
         // }
-        
+
         if let Some(task) = self.workers[index].buffer.pop() {
             return Some((task, false));
         }
@@ -339,17 +347,22 @@ impl Pool {
             rng ^= rng << shifts.2;
             *xorshift = rng;
 
-            let mut buffer_contended = false; 
-            let mut queue_contended = match self.workers[index].buffer.consume(&self.workers[index].queue) {
+            let mut buffer_contended = false;
+            let mut queue_contended = match self.workers[index]
+                .buffer
+                .consume(&self.workers[index].queue)
+            {
                 Ok(task) => return Some(task),
                 Err(contended) => contended,
             };
 
             let num_workers = self.workers.len();
             let start_index = rng % num_workers;
-            for steal_index in (0..num_workers).cycle().skip(start_index).take(num_workers)
-            {
-                queue_contended = match self.workers[index].buffer.consume(&self.workers[steal_index].queue) {
+            for steal_index in (0..num_workers).cycle().skip(start_index).take(num_workers) {
+                queue_contended = match self.workers[index]
+                    .buffer
+                    .consume(&self.workers[steal_index].queue)
+                {
                     Ok(task) => return Some(task),
                     Err(contended) => queue_contended || contended,
                 };
@@ -383,37 +396,39 @@ impl Pool {
     fn wait(self: &Arc<Self>, index: usize, mut is_waking: bool) -> Result<bool, ()> {
         let mut is_idle = false;
         loop {
-            let result = self.sync.fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
-                let mut state: SyncState = state.into();
-                if is_waking {
-                    assert_eq!(state.status, SyncStatus::Waking);
-                }
-
-                if is_idle {
-                    assert!(state.idle <= state.spawned);
-                } else {
-                    assert!(state.idle < state.spawned);
-                }
-
-                if state.notified {
-                    if state.status == SyncStatus::Signaled {
-                        state.status = SyncStatus::Waking;
-                    }
-                    if is_idle {
-                        state.idle -= 1;
-                    }
-                } else if !is_idle {
-                    state.idle += 1;
+            let result = self
+                .sync
+                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                    let mut state: SyncState = state.into();
                     if is_waking {
-                        state.status = SyncStatus::Pending;
+                        assert_eq!(state.status, SyncStatus::Waking);
                     }
-                } else {
-                    return None;
-                }
 
-                state.notified = false;
-                Some(state.into())
-            });
+                    if is_idle {
+                        assert!(state.idle <= state.spawned);
+                    } else {
+                        assert!(state.idle < state.spawned);
+                    }
+
+                    if state.notified {
+                        if state.status == SyncStatus::Signaled {
+                            state.status = SyncStatus::Waking;
+                        }
+                        if is_idle {
+                            state.idle -= 1;
+                        }
+                    } else if !is_idle {
+                        state.idle += 1;
+                        if is_waking {
+                            state.status = SyncStatus::Pending;
+                        }
+                    } else {
+                        return None;
+                    }
+
+                    state.notified = false;
+                    Some(state.into())
+                });
 
             if let Ok(state) = result.map(SyncState::from) {
                 if state.notified {
@@ -600,11 +615,16 @@ impl Queue {
     const IS_CONSUMING: NonNull<Task> = NonNull::<Task>::dangling();
 
     unsafe fn push(&self, list: List) {
-        list.tail.as_ref().next.store(ptr::null_mut(), Ordering::Relaxed);
+        list.tail
+            .as_ref()
+            .next
+            .store(ptr::null_mut(), Ordering::Relaxed);
         let tail = self.tail.swap(list.tail.as_ptr(), Ordering::AcqRel);
 
         let prev = NonNull::new(tail).unwrap_or(NonNull::from(&self.stub));
-        prev.as_ref().next.store(list.head.as_ptr(), Ordering::Release);
+        prev.as_ref()
+            .next
+            .store(list.head.as_ptr(), Ordering::Release);
     }
 
     #[inline]
@@ -619,7 +639,9 @@ impl Queue {
 
     #[cold]
     fn consume_slow<'a>(&'a self) -> Result<impl Iterator<Item = NonNull<Task>> + 'a, bool> {
-        let head = self.head.swap(Self::IS_CONSUMING.as_ptr(), Ordering::Acquire);
+        let head = self
+            .head
+            .swap(Self::IS_CONSUMING.as_ptr(), Ordering::Acquire);
         if head == Self::IS_CONSUMING.as_ptr() {
             return Err(true);
         }
@@ -645,11 +667,11 @@ impl Queue {
                     if self.head == stub {
                         let next = self.head.as_ref().next.load(Ordering::Acquire);
                         self.head = NonNull::new(next)?;
-                    } 
+                    }
 
                     let next = self.head.as_ref().next.load(Ordering::Acquire);
                     if let Some(next) = NonNull::new(next) {
-                        return Some(mem::replace(&mut self.head, next));    
+                        return Some(mem::replace(&mut self.head, next));
                     }
 
                     let tail = self.queue.tail.load(Ordering::Acquire);
@@ -713,7 +735,7 @@ impl Buffer {
     unsafe fn push(&self, task: NonNull<Task>) -> Result<(), List> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        
+
         let size = tail.wrapping_sub(head);
         assert!(size <= self.array.len());
 
@@ -730,7 +752,7 @@ impl Buffer {
     fn push_overflow(&self, head: usize, tail: usize, task: NonNull<Task>) -> Result<(), List> {
         let size = tail.wrapping_sub(head);
         assert_eq!(size, self.array.len());
-        
+
         let migrate = size / 2;
         if let Err(head) = self.head.compare_exchange(
             head,
@@ -788,14 +810,12 @@ impl Buffer {
 
         self.tail.store(tail, Ordering::Relaxed);
         if size == 1 {
-            match self.head.compare_exchange(
-                head,
-                tail,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .head
+                .compare_exchange(head, tail, Ordering::SeqCst, Ordering::Relaxed)
+            {
                 Ok(_) => return Some(task),
-                Err(_) => {},
+                Err(_) => {}
             }
         }
 
@@ -805,7 +825,7 @@ impl Buffer {
     fn steal(&self) -> Result<NonNull<Task>, bool> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        
+
         let size = tail.wrapping_sub(head);
         if size == 0 || size > self.array.len() {
             return Err(false);
@@ -833,12 +853,13 @@ impl Buffer {
                 let size = tail.wrapping_sub(head);
                 assert!(size <= self.array.len());
 
-                let new_tail = consumer
-                    .take(self.array.len() - size)
-                    .fold(tail, |new_tail, task| {
-                        self.write(new_tail, task);
-                        new_tail.wrapping_add(1)
-                    });
+                let new_tail =
+                    consumer
+                        .take(self.array.len() - size)
+                        .fold(tail, |new_tail, task| {
+                            self.write(new_tail, task);
+                            new_tail.wrapping_add(1)
+                        });
 
                 if new_tail != tail {
                     self.tail.store(new_tail, Ordering::Release);
@@ -927,7 +948,7 @@ impl<F: Future> TaskFuture<F> {
 
             pool.clone_ref();
             Self::schedule_with(task_ptr, pool, worker_index, false);
-            
+
             JoinHandle {
                 task: Some(task_ptr),
                 _phantom: PhantomData,
@@ -949,14 +970,19 @@ impl<F: Future> TaskFuture<F> {
     ) {
         Self::with(task, |this| {
             assert_ne!(this.ref_count.load(Ordering::Relaxed), 0);
-            match this.data_state.load(Ordering::Relaxed) {
-                Self::DATA_NOTIFIED => {},
+
+            let data_state = this.data_state.load(Ordering::Relaxed);
+            assert_eq!(data_state & Self::DATA_READY, 0);
+            match data_state {
+                Self::DATA_NOTIFIED => {}
                 Self::DATA_SCHEDULED => {}
-                Self::DATA_IDLE => unreachable!("scheduled task without transitioning to scheduled"),
+                Self::DATA_IDLE => {
+                    unreachable!("scheduled task without transitioning to scheduled")
+                }
                 Self::DATA_RUNNING => unreachable!("scheduled task when already running"),
                 data_state => unreachable!("invalid data_state {:?}", data_state),
             }
-        })
+        });
 
         if be_fair {
             pool.workers[worker_index].queue.push(List {
@@ -1029,14 +1055,17 @@ impl<F: Future> TaskFuture<F> {
     unsafe fn on_poll(task: NonNull<Task>, pool: &Arc<Pool>, worker_index: usize) {
         let poll_result = Self::with(task, |this| {
             assert_ne!(this.ref_count.load(Ordering::Relaxed), 0);
-            match this.data_state.load(Ordering::Relaxed) {
+
+            let data_state = this.data_state.load(Ordering::Relaxed);
+            assert_eq!(data_state & Self::DATA_READY, 0);
+            match data_state {
                 Self::DATA_SCHEDULED => {}
                 Self::DATA_NOTIFIED => {}
                 Self::DATA_IDLE => unreachable!("polling task without transitioning to scheduled"),
                 Self::DATA_RUNNING => unreachable!("polling task when already running"),
                 data_state => unreachable!("invalid data_state {:b}", data_state),
             }
-            
+
             this.data_state.store(Self::DATA_RUNNING, Ordering::Relaxed);
             match this.poll() {
                 Poll::Ready(output) => Ok(output),
@@ -1069,12 +1098,25 @@ impl<F: Future> TaskFuture<F> {
                 TaskData::Consumed => unreachable!("future marked ready when already joined"),
             }
 
-            let data_state = this.data_state.fetch_add(Self::DATA_READY, Ordering::AcqRel);
+            let data_state = this.data_state.load(Ordering::Relaxed);
             assert_eq!(data_state & Self::DATA_READY, 0);
-            assert_ne!(data_state, Self::DATA_IDLE);
-            assert_ne!(data_state, Self::DATA_SCHEDULED);
+            match data_state {
+                Self::DATA_RUNNING => {}
+                Self::DATA_NOTIFIED => {}
+                Self::DATA_IDLE => unreachable!("completing task while not running"),
+                Self::DATA_SCHEDULED => unreachable!("completing task that is scheduled"),
+                data_state => unreachable!("invalid data_state {:b}", data_state),
+            }
 
-            if let Some(waker) = match this.waker_state.swap(Self::WAKER_NOTIFIED, Ordering::Acquire) {
+            this.data_state.store(
+                Self::DATA_READY | Self::DATA_NOTIFIED,
+                Ordering::Release,
+            );
+
+            if let Some(waker) = match this
+                .waker_state
+                .swap(Self::WAKER_NOTIFIED, Ordering::AcqRel)
+            {
                 Self::WAKER_EMPTY => None,
                 Self::WAKER_UPDATING => None,
                 Self::WAKER_READY => mem::replace(&mut *this.waker.get(), None),
@@ -1085,31 +1127,40 @@ impl<F: Future> TaskFuture<F> {
             }
         });
 
-        pool.drop_ref();
-        Self::drop_ref(task)
+        pool.on_drop();
+        Self::on_drop(task)
     }
 
     unsafe fn on_wake(task: NonNull<Task>, also_drop: bool) {
         match Self::with(task, |this| {
             assert_ne!(this.ref_count.load(Ordering::Relaxed), 0);
-            this.data_state.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |data_state| {
-                match data_state {
-                    Self::DATA_IDLE => Some(Self::DATA_SCHEDULED),
-                    Self::DATA_RUNNING => Some(Self::DATA_NOTIFIED),
-                    Self::DATA_SCHEDULED => None,
-                    Self::DATA_NOTIFIED => None,
-                    _ => unreachable!("invalid data_state {:b}", data_state)
-                }
-            })
+            this.data_state
+                .fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                    |data_state| {
+                        if data_state & Self::DATA_READY != 0 {
+                            return None;
+                        }
+
+                        match data_state {
+                            Self::DATA_IDLE => Some(Self::DATA_SCHEDULED),
+                            Self::DATA_RUNNING => Some(Self::DATA_NOTIFIED),
+                            Self::DATA_SCHEDULED => None,
+                            Self::DATA_NOTIFIED => None,
+                            _ => unreachable!("invalid data_state {:b}", data_state),
+                        }
+                    },
+                )
         }) {
             Ok(Self::DATA_IDLE) => Self::schedule(task, false),
-            Ok(Self::DATA_NOTIFIED) => {},
+            Ok(Self::DATA_RUNNING) => {}
             Ok(_) => unreachable!(),
-            Err(_) => {},
+            Err(_) => {}
         }
 
         if also_drop {
-            Self::drop_ref(task);
+            Self::on_drop(task);
         }
     }
 
@@ -1122,10 +1173,6 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_drop(task: NonNull<Task>) {
-        Self::drop_ref(task)
-    }
-
-    unsafe fn drop_ref(task: NonNull<Task>) {
         if Self::with(task, |this| {
             let ref_count = this.ref_count.fetch_sub(1, Ordering::AcqRel);
             assert_ne!(ref_count, 0);
@@ -1150,7 +1197,7 @@ impl<F: Future> TaskFuture<F> {
 
     unsafe fn on_detach(task: NonNull<Task>) {
         let _ = Self::update_waker(task, None);
-        Self::drop_ref(task)
+        Self::on_drop(task)
     }
 
     unsafe fn on_join(task: NonNull<Task>, waker_ref: &Waker, output_ptr: *mut ()) -> bool {
@@ -1160,7 +1207,9 @@ impl<F: Future> TaskFuture<F> {
 
         Self::with(task, |this| {
             assert_ne!(this.ref_count.load(Ordering::Relaxed), 0);
-            assert_ne!(this.data_state.load(Ordering::Relaxed) & Self::DATA_READY, 0);
+
+            let data_state = this.data_state.load(Ordering::Acquire);
+            assert_ne!(data_state & Self::DATA_READY, 0);
 
             match mem::replace(&mut *this.data.get(), TaskData::Consumed) {
                 TaskData::Consumed => unreachable!("data consumed when already consumed"),
@@ -1169,8 +1218,8 @@ impl<F: Future> TaskFuture<F> {
             }
         });
 
-        Self::drop_ref(task);
-        true    
+        Self::on_drop(task);
+        true
     }
 
     unsafe fn update_waker(task: NonNull<Task>, waker_ref: Option<&Waker>) -> bool {
@@ -1183,10 +1232,47 @@ impl<F: Future> TaskFuture<F> {
             }
 
             let waker_state = this.waker_state.load(Ordering::Relaxed);
-            assert_ne!(waker_state, Self::WAKER_UPDATING);
-            if waker_state == Self::WAKER_EMPTY && waker_ref.is_none() {
-                
+            match waker_state {
+                Self::WAKER_NOTIFIED => return false,
+                Self::WAKER_EMPTY if waker_ref.is_none() => return false,
+                Self::WAKER_UPDATING => unreachable!("multiple threads trying to update waker"),
+                Self::WAKER_EMPTY => {}
+                Self::WAKER_READY => {}
+                _ => unreachable!("invalid waker_state {:b}", waker_state),
             }
+
+            match this.waker_state.compare_exchange(
+                waker_state,
+                Self::WAKER_UPDATING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {}
+                Err(Self::WAKER_NOTIFIED) => return false,
+                Err(waker_state) => unreachable!("invalid waker_state {:b}", waker_state),
+            }
+
+            match mem::replace(&mut *this.waker.get(), waker_ref.map(|waker| waker.clone())) {
+                Some(_dropped_waker) => assert_eq!(waker_state, Self::WAKER_READY),
+                None => assert_eq!(waker_state, Self::WAKER_EMPTY),
+            }
+
+            match this.waker_state.compare_exchange(
+                Self::WAKER_UPDATING,
+                match waker_ref {
+                    Some(_) => Self::WAKER_READY,
+                    None => Self::WAKER_EMPTY,
+                },
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(Self::WAKER_NOTIFIED) => {}
+                Err(waker_state) => unreachable!("invalid waker_state {:b}", waker_state),
+            }
+
+            *this.waker.get() = None;
+            false
         })
     }
 }

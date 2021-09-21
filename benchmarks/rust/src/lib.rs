@@ -575,11 +575,18 @@ impl Queue {
         prev.as_ref().next.store(task.as_ptr(), Ordering::Release);
     }
 
+    #[inline]
     fn pop(&self) -> Result<NonNull<Task>, bool> {
-        if self.tail.load(Ordering::Acquire).is_null() {
-            return Err(false);
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail.is_null() || tail == NonNull::from(&self.stub).as_ptr() {
+            Err(false)
+        } else {
+            self.pop_slow()
         }
+    }
 
+    #[cold]
+    fn pop_slow(&self) -> Result<NonNull<Task>, bool> {
         let head = self.head.swap(Self::IS_POPPING.as_ptr(), Ordering::Acquire);
         if head == Self::IS_POPPING.as_ptr() {
             return Err(true);

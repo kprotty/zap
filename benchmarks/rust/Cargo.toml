@@ -23,7 +23,7 @@ path = "zap_qsort.rs"
 [dependencies]
 rayon = "1.5"
 num_cpus = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [profile.release]
 codegen-units = 1

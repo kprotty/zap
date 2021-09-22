@@ -1,27 +1,29 @@
 const SIZE: usize = 10_000_000;
 
-#[tokio::main]
-pub async fn main() {
-    use std::convert::TryInto;
+pub fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            println!("filling");
+            let arr = (0..SIZE)
+                .map(|i| i.try_into().unwrap())
+                .collect::<Vec<i32>>()
+                .into_boxed_slice();
 
-    println!("filling");
-    let arr = (0..SIZE)
-        .map(|i| i.try_into().unwrap())
-        .collect::<Vec<i32>>()
-        .into_boxed_slice();
+            let mut arr = Box::leak(arr);
+            let arr_ptr = arr.as_ptr();
 
-    let mut arr = Box::leak(arr);
-    let arr_ptr = arr.as_ptr();
+            println!("shuffling");
+            shuffle(&mut arr);
 
-    println!("shuffling");
-    shuffle(&mut arr);
+            println!("running");
+            let start = std::time::Instant::now();
+            quick_sort(arr).await;
 
-    println!("running");
-    let start = std::time::Instant::now();
-    quick_sort(arr).await;
-
-    println!("took {:?}", start.elapsed());
-    assert!(verify(unsafe { std::slice::from_raw_parts(arr_ptr, SIZE) }));
+            println!("took {:?}", start.elapsed());
+            assert!(verify(unsafe { std::slice::from_raw_parts(arr_ptr, SIZE) }));
+        });
 }
 
 fn verify(arr: &[i32]) -> bool {

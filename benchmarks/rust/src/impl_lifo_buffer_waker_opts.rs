@@ -160,6 +160,12 @@ struct Worker {
 unsafe impl Send for Worker {}
 unsafe impl Sync for Worker {}
 
+struct PoolRef {
+    pool: NonNull<Arc<Pool>>,
+    index: usize,
+    _pinned: PhantomPinned,
+}
+
 struct Pool {
     idle: AtomicUsize,
     sync: AtomicUsize,
@@ -169,24 +175,74 @@ struct Pool {
 }
 
 impl Pool {
-    fn with_tls<T>(f: impl FnOnce(&mut Option<(NonNull<Arc<Pool>>, usize)>) -> T) -> T {
-        thread_local!(static POOL_INDEX: UnsafeCell<Option<(NonNull<Arc<Pool>>, usize)>> = UnsafeCell::new(None));
-        POOL_INDEX.with(|pool_index| f(unsafe { &mut *pool_index.get() }))
+    #[cfg(not(unix))]
+    fn with_tls<T>(f: impl FnOnce(&mut Option<NonNull<PoolRef>>) -> T) -> T {
+        thread_local!(static POOL_INDEX: UnsafeCell<Option<NonNull<PoolRef>>> = UnsafeCell::new(None));
+        POOL_INDEX.with(|pool_ref| f(unsafe { &mut *pool_ref.get() }))
+    }
+
+    #[cfg(unix)]
+    fn with_tls<T>(f: impl FnOnce(&mut Option<NonNull<PoolRef>>) -> T) -> T {
+        #[link(name = "c")]
+        extern "C" {
+            fn pthread_key_create(key: *mut usize, callback: *const std::ffi::c_void) -> i32;
+            fn pthread_setspecific(key: usize, value: *mut std::ffi::c_void) -> i32;
+            fn pthread_getspecific(key: usize) -> *mut std::ffi::c_void;
+        }
+
+        struct TlsKey(UnsafeCell<usize>);
+        unsafe impl Send for TlsKey {}
+        unsafe impl Sync for TlsKey {}
+        static TLS_KEY: TlsKey = TlsKey(UnsafeCell::new(0));
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once_force(|_| unsafe {
+            assert_eq!(pthread_key_create(TLS_KEY.0.get(), ptr::null()), 0);
+        });
+
+        unsafe {
+            let tls_key = *TLS_KEY.0.get();
+            let pool_ref = NonNull::new(pthread_getspecific(tls_key) as *mut PoolRef);
+            
+            let mut update_ref = pool_ref;
+            let result = f(&mut update_ref);
+
+            if update_ref != pool_ref {
+                let ptr = update_ref.map(|p| p.as_ptr() as *mut _).unwrap_or(ptr::null_mut());
+                assert_eq!(pthread_setspecific(tls_key, ptr), 0);
+            }
+
+            result
+        }
     }
 
     fn with_current<T>(f: impl FnOnce(&Arc<Pool>, usize) -> T) -> T {
-        let pool_index = Self::with_tls(|pool_index| *pool_index);
-        let (pool, index) = pool_index.expect("Pool::with_current() called outside thread pool");
-        f(unsafe { pool.as_ref() }, index)
+        let pool_ref = Self::with_tls(|pool_ref| *pool_ref);
+        let pool_ref = pool_ref.expect("Pool::with_current() called outside thread pool");
+        unsafe {
+            let pool_ref = pool_ref.as_ref();
+            f(pool_ref.pool.as_ref(), pool_ref.index)
+        }
     }
 
     fn with_worker(self: &Arc<Pool>, index: usize) {
-        let old_pool_index = Self::with_tls(|pool_index| {
-            let new_pool_index = Some((NonNull::from(self), index));
-            mem::replace(pool_index, new_pool_index)
+        let pool_ref = PoolRef {
+            pool: NonNull::from(self),
+            index,
+            _pinned: PhantomPinned,
+        };
+
+        let pool_ref = NonNull::from(unsafe {
+            &*Pin::new_unchecked(&pool_ref)
         });
+        let old_pool_ref = Self::with_tls(|tls_pool_ref| {
+            mem::replace(tls_pool_ref, Some(pool_ref))   
+        });
+
         self.run(index);
-        Self::with_tls(|pool_index| *pool_index = old_pool_index)
+        Self::with_tls(|tls_pool_ref| {
+            *tls_pool_ref = old_pool_ref;
+        })
     }
 
     fn clone_ref(self: &Arc<Pool>) {

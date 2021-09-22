@@ -282,7 +282,7 @@ impl Pool {
     }
 
     fn run(self: &Arc<Self>, index: usize) {
-        let mut tick = 0; // index;
+        let mut tick = index;
         let mut is_waking = false;
         let mut xorshift = 0xdeadbeef + index;
 
@@ -317,6 +317,7 @@ impl Pool {
         tick: usize,
         xorshift: &mut usize,
     ) -> Option<(NonNull<Task>, bool)> {
+        // let _ = tick;
         if tick % 64 == 0 {
             if let Ok(task) = self.workers[index].buffer.consume(&self.workers[index].queue) {
                 return Some((task, true));
@@ -345,8 +346,7 @@ impl Pool {
             rng ^= rng >> shifts.1;
             rng ^= rng << shifts.2;
             *xorshift = rng;
-            
-            let mut buffer_contended = false;
+
             let mut queue_contended = match self.workers[index]
                 .buffer
                 .consume(&self.workers[index].queue)
@@ -367,16 +367,10 @@ impl Pool {
                 };
 
                 if steal_index != index {
-                    buffer_contended = match self.workers[steal_index].buffer.steal() {
-                        Ok(task) => return Some(task),
-                        Err(contended) => buffer_contended || contended,
-                    };
+                    if let Some(task) = self.workers[index].buffer.steal(&self.workers[steal_index].buffer) {
+                        return Some(task);
+                    }
                 }
-            }
-
-            if buffer_contended {
-                std::hint::spin_loop();
-                continue;
             }
 
             if queue_contended {
@@ -785,62 +779,73 @@ impl Buffer {
         });
     }
 
+    #[inline]
     fn pop(&self) -> Option<NonNull<Task>> {
+        let mut head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
 
-        let size = tail.wrapping_sub(head);
-        assert!(size <= self.array.len());
-        if size == 0 {
-            return None;
-        }
+        loop {
+            let size = tail.wrapping_sub(head);
+            assert!(size <= self.array.len());
 
-        let new_tail = tail.wrapping_sub(1);
-        self.tail.store(new_tail, Ordering::SeqCst);
-        let head = self.head.load(Ordering::SeqCst);
+            if size == 0 {
+                return None;
+            }
 
-        let size = tail.wrapping_sub(head);
-        assert!(size <= self.array.len());
-
-        let task = self.read(new_tail);
-        if size > 1 {
-            return Some(task);
-        }
-
-        self.tail.store(tail, Ordering::Relaxed);
-        if size == 1 {
-            match self.head.compare_exchange(
+            match self.head.compare_exchange_weak(
                 head,
-                tail,
-                Ordering::SeqCst,
+                head.wrapping_add(1),
+                Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(task),
-                Err(_) => {},
+                Ok(_) => return Some(self.read(head)),
+                Err(e) => head = e,
             }
         }
-
-        None
     }
 
-    fn steal(&self) -> Result<NonNull<Task>, bool> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        
-        let size = tail.wrapping_sub(head);
-        if size == 0 || size > self.array.len() {
-            return Err(false);
-        }
+    #[cold]
+    fn steal(&self, buffer: &Self) -> Option<NonNull<Task>> {
+        loop {
+            let buffer_head = buffer.head.load(Ordering::Acquire);
+            let buffer_tail = buffer.tail.load(Ordering::Acquire);
+            
+            let buffer_size = buffer_tail.wrapping_sub(buffer_head);
+            if buffer_size == 0 || buffer_size > buffer.array.len() {
+                return None;
+            }
 
-        let task = self.read(head);
-        match self.head.compare_exchange(
-            head,
-            head.wrapping_add(1),
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(task),
-            Err(_) => Err(true),
+            let head = self.head.load(Ordering::Relaxed);
+            let tail = self.tail.load(Ordering::Relaxed);
+            let size = tail.wrapping_sub(head);
+            assert!(size <= self.array.len());
+            
+            let buffer_steal = buffer_size - (buffer_size / 2);
+            let buffer_steal = buffer_steal.min(self.array.len() - size);
+            assert!(buffer_steal > 0);
+
+            let new_tail = (0..buffer_steal).fold(tail, |new_tail, offset| {
+                let task = buffer.read(buffer_head.wrapping_add(offset));
+                self.write(new_tail, task);
+                new_tail.wrapping_add(1)
+            });
+
+            if let Err(_) = buffer.head.compare_exchange(
+                buffer_head,
+                buffer_head.wrapping_add(buffer_steal),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                std::hint::spin_loop();
+                continue;
+            }
+            
+            let new_tail = new_tail.wrapping_sub(1);
+            if new_tail != tail {
+                self.tail.store(new_tail, Ordering::Release);
+            }
+
+            return Some(self.read(new_tail));
         }
     }
 

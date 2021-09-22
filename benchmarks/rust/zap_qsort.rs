@@ -3,8 +3,10 @@ const SIZE: usize = 10_000_000;
 pub fn main() {
     zap::Builder::new()
         .max_threads({
-            let cpus: u16 = num_cpus::get().try_into().unwrap_or(!0u16);
-            std::num::NonZeroU16::new(cpus.max(1)).unwrap()
+            // let cpus: u16 = num_cpus::get().try_into().unwrap_or(!0u16);
+            // std::num::NonZeroU16::new(cpus.max(1)).unwrap()
+            std::num::NonZeroUsize::new(8).unwrap()
+            //std::num::NonZeroU16::new(8).unwrap()
         })
         .block_on(async move {
             println!("filling");

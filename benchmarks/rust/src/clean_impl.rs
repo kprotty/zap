@@ -73,6 +73,7 @@ where
     F::Output: Send + 'static,
 {
     Pool::with_current(|pool, worker_index| TaskFuture::spawn(pool, worker_index, future))
+        .unwrap_or_else(|| unreachable!("spawn() called outside of thread pool"))
 }
 
 #[allow(unused)]
@@ -188,7 +189,7 @@ impl Into<usize> for SyncState {
 
 #[derive(Default)]
 struct Worker {
-    queue: Queue,
+    injector: Injector,
     buffer: Buffer,
 }
 
@@ -198,6 +199,7 @@ struct Pool {
     stack_size: Option<NonZeroUsize>,
     sync: AtomicUsize,
     pending: AtomicUsize,
+    injecting: AtomicUsize,
     workers: Box<[Worker]>,
 }
 
@@ -215,6 +217,7 @@ impl Pool {
             stack_size: builder.stack_size,
             sync: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
+            injecting: AtomicUsize::new(0),
             workers: (0..num_threads)
                 .map(|_| Worker::default())
                 .collect::<Vec<_>>()
@@ -402,10 +405,9 @@ impl Pool {
         })
     }
 
-    fn with_current<T>(f: impl FnOnce(&Arc<Self>, usize) -> T) -> T {
-        let pool_ref = Self::with_thread_local(|pool_ref| pool_ref.as_ref().map(|p| Rc::clone(p)));
-        let pool_ref = pool_ref.expect("Pool::with_current called outside of the thread pool");
-        f(&pool_ref.0, pool_ref.1)
+    fn with_current<T>(f: impl FnOnce(&Arc<Self>, usize) -> T) -> Option<T> {
+        Self::with_thread_local(|pool_ref| pool_ref.as_ref().map(|p| Rc::clone(p)))
+            .map(|pool_ref| f(&pool_ref.0, pool_ref.1))
     }
 
     fn run(self: &Arc<Self>, index: usize) {
@@ -448,16 +450,21 @@ impl Pool {
         });
     }
 
-    unsafe fn push(self: &Arc<Self>, index: usize, task: NonNull<Task>, be_fair: bool) {
+    unsafe fn push(self: &Arc<Self>, index: Option<usize>, task: NonNull<Task>, mut be_fair: bool) {
+        let index = index.unwrap_or_else(|| {
+            be_fair = true;
+            let inject_index = self.injecting.fetch_add(1, Ordering::Relaxed);
+            inject_index % self.workers.len()
+        });
+
+        let injector = Pin::new_unchecked(&self.workers[index].injector);
         if be_fair {
-            self.workers[index].queue.push(List {
+            injector.push(List {
                 head: task,
                 tail: task,
             });
         } else {
-            if let Err(overflowed) = self.workers[index].buffer.push(task) {
-                self.workers[index].queue.push(overflowed);
-            }
+            self.workers[index].buffer.push(task, injector);
         }
 
         self.emit(PoolEvent::WorkerPushed {
@@ -492,7 +499,9 @@ impl Pool {
     fn consume(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
         self.workers[index]
             .buffer
-            .consume(&self.workers[target_index].queue)
+            .consume(unsafe {
+                Pin::new_unchecked(&self.workers[target_index].injector)
+            })
             .map(|popped| {
                 self.emit(PoolEvent::WorkerStole {
                     worker_index: index,
@@ -571,13 +580,13 @@ struct List {
     tail: NonNull<Task>,
 }
 
-struct Queue {
+struct Injector {
     stub: Task,
     head: AtomicPtr<Task>,
     tail: AtomicPtr<Task>,
 }
 
-impl Default for Queue {
+impl Default for Injector {
     fn default() -> Self {
         const STUB_VTABLE: TaskVTable = TaskVTable {
             poll_fn: |_, _, _| unreachable!("vtable call to stub poll_fn"),
@@ -599,10 +608,10 @@ impl Default for Queue {
     }
 }
 
-impl Queue {
+impl Injector {
     const IS_CONSUMING: NonNull<Task> = NonNull::<Task>::dangling();
 
-    unsafe fn push(&self, list: List) {
+    unsafe fn push(self: Pin<&Self>, list: List) {
         list.tail
             .as_ref()
             .next
@@ -616,7 +625,7 @@ impl Queue {
             .store(list.head.as_ptr(), Ordering::Release);
     }
 
-    fn consume<'a>(&'a self) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
+    fn consume<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
         let tail = NonNull::new(self.tail.load(Ordering::Acquire));
         if tail.is_none() || tail == Some(NonNull::from(&self.stub)) {
             return None;
@@ -629,14 +638,14 @@ impl Queue {
         }
 
         struct Consumer<'a> {
-            queue: &'a Queue,
+            injector: Pin<&'a Injector>,
             head: NonNull<Task>,
         }
 
         impl<'a> Drop for Consumer<'a> {
             fn drop(&mut self) {
-                assert_ne!(self.head, Queue::IS_CONSUMING);
-                self.queue.head.store(self.head.as_ptr(), Ordering::Release);
+                assert_ne!(self.head, Injector::IS_CONSUMING);
+                self.injector.head.store(self.head.as_ptr(), Ordering::Release);
             }
         }
 
@@ -645,7 +654,7 @@ impl Queue {
 
             fn next(&mut self) -> Option<Self::Item> {
                 unsafe {
-                    let stub = NonNull::from(&self.queue.stub);
+                    let stub = NonNull::from(&self.injector.stub);
                     if self.head == stub {
                         let next = self.head.as_ref().next.load(Ordering::Acquire);
                         self.head = NonNull::new(next)?;
@@ -656,12 +665,12 @@ impl Queue {
                         return Some(mem::replace(&mut self.head, next));
                     }
 
-                    let tail = self.queue.tail.load(Ordering::Acquire);
+                    let tail = self.injector.tail.load(Ordering::Acquire);
                     if Some(self.head) != NonNull::new(tail) {
                         return None;
                     }
 
-                    self.queue.push(List {
+                    self.injector.push(List {
                         head: stub,
                         tail: stub,
                     });
@@ -674,7 +683,7 @@ impl Queue {
         }
 
         Some(Consumer {
-            queue: self,
+            injector: self,
             head: NonNull::new(head).unwrap_or(NonNull::from(&self.stub)),
         })
     }
@@ -711,7 +720,7 @@ impl Buffer {
         task.expect("invalid task read from Buffer")
     }
 
-    unsafe fn push(&self, task: NonNull<Task>) -> Result<(), List> {
+    unsafe fn push(&self, task: NonNull<Task>, overflow_injector: Pin<&Injector>) {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
 
@@ -721,7 +730,7 @@ impl Buffer {
         if size < self.array.len() {
             self.write(tail, task);
             self.tail.store(tail.wrapping_add(1), Ordering::Release);
-            return Ok(());
+            return;
         }
 
         let migrate = size / 2;
@@ -736,7 +745,7 @@ impl Buffer {
 
             self.write(tail, task);
             self.tail.store(tail.wrapping_add(1), Ordering::Release);
-            return Ok(());
+            return;
         }
 
         let first = self.read(head);
@@ -749,7 +758,7 @@ impl Buffer {
             next
         });
 
-        Err(List {
+        overflow_injector.push(List {
             head: first,
             tail: last,
         })
@@ -835,8 +844,8 @@ impl Buffer {
         }
     }
 
-    fn consume(&self, queue: &Queue) -> Option<Popped> {
-        queue.consume().and_then(|mut consumer| {
+    fn consume(&self, injector: Pin<&Injector>) -> Option<Popped> {
+        injector.consume().and_then(|mut consumer| {
             consumer.next().map(|consumed| {
                 let head = self.head.load(Ordering::Relaxed);
                 let tail = self.tail.load(Ordering::Relaxed);
@@ -929,6 +938,7 @@ impl From<u8> for TaskWakerState {
 
 struct TaskFuture<F: Future> {
     task: Task,
+    pool: Arc<Pool>,
     ref_count: AtomicUsize,
     data: UnsafeCell<TaskData<F>>,
     data_state: AtomicU8,
@@ -952,6 +962,7 @@ impl<F: Future> TaskFuture<F> {
                 vtable: &Self::TASK_VTABLE,
                 _pinned: PhantomPinned,
             },
+            pool: Arc::clone(pool),
             ref_count: AtomicUsize::new(2),
             data: UnsafeCell::new(TaskData::Polling(future)),
             data_state: AtomicU8::new(TaskDataState::Scheduled as u8),
@@ -965,16 +976,12 @@ impl<F: Future> TaskFuture<F> {
             pool.mark_task_begin();
             pool.emit(PoolEvent::TaskSpawned { worker_index, task });
 
-            pool.push(worker_index, task, false);
+            pool.push(Some(worker_index), task, false);
             JoinHandle {
                 task: Some(task),
                 _phantom: PhantomData,
             }
         }
-    }
-
-    unsafe fn schedule(task: NonNull<Task>, be_fair: bool) {
-        Pool::with_current(|pool, index| pool.push(index, task, be_fair))
     }
 
     unsafe fn from_task(task: NonNull<Task>) -> NonNull<Self> {
@@ -1025,7 +1032,7 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_wake(task: NonNull<Task>, also_drop: bool) {
-        match Self::with(task, |this| {
+        let schedule = match Self::with(task, |this| {
             this.data_state
                 .fetch_update(
                     Ordering::AcqRel,
@@ -1038,10 +1045,21 @@ impl<F: Future> TaskFuture<F> {
                 )
                 .map(TaskDataState::from)
         }) {
-            Ok(TaskDataState::Idle) => Self::schedule(task, false),
-            Ok(TaskDataState::Running) => {}
+            Ok(TaskDataState::Running) => false,
+            Ok(TaskDataState::Idle) => true,
             Ok(_) => unreachable!(),
-            _ => {}
+            _ => false,
+        };
+
+        let be_fair = false;
+        if schedule {
+            Pool::with_current(|pool, index| pool.push(Some(index), task, be_fair))
+                .unwrap_or_else(|| {
+                    Self::with(task, |this| {
+                        assert!(this.ref_count.load(Ordering::Acquire) > 1);
+                        this.pool.push(None, task, be_fair);
+                    });
+                });
         }
 
         if also_drop {
@@ -1087,7 +1105,7 @@ impl<F: Future> TaskFuture<F> {
                     Err(data_state) => {
                         let data_state: TaskDataState = data_state.into();
                         assert_eq!(data_state, TaskDataState::Notified);
-                        return pool.push(worker_index, task, false);
+                        return pool.push(Some(worker_index), task, false);
                     }
                 }
             }

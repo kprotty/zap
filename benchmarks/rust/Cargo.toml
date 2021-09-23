@@ -4,23 +4,19 @@ version = "0.0.0"
 edition = "2021"
 authors = ["kprotty"]
 
-[lib]
-name = "zap"
-path = "src/lib.rs"
-
-[[bin]]
+[[example]]
 name = "qsort"
-path = "tokio_qsort.rs"
+path = "examples/tokio_qsort.rs"
 
-[[bin]]
+[[example]]
 name = "rsort"
-path = "rayon_qsort.rs"
+path = "examples/rayon_qsort.rs"
 
-[[bin]]
+[[example]]
 name = "zsort"
-path = "zap_qsort.rs"
+path = "examples/zap_qsort.rs"
 
-[dependencies]
+[dev-dependencies]
 rayon = "1.5"
 num_cpus = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

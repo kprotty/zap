@@ -1,12 +1,12 @@
 use std::{
     cell::{RefCell, UnsafeCell},
     future::Future,
+    hint::spin_loop,
     marker::{PhantomData, PhantomPinned},
     mem::{self, MaybeUninit},
     num::NonZeroUsize,
     pin::Pin,
     ptr::{self, NonNull},
-    hint::spin_loop,
     rc::Rc,
     sync::{
         atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
@@ -174,16 +174,17 @@ impl Into<usize> for SyncState {
         let mut value = 0;
         value |= self.idle << (Self::COUNT_BITS + 4);
         value |= self.spawned << 4;
-        
+
         if self.notified {
             value |= 0b100;
         }
 
-        value | match self.status {
-            SyncStatus::Pending => 0b00,
-            SyncStatus::Waking => 0b01,
-            SyncStatus::Signaled => 0b10,
-        }
+        value
+            | match self.status {
+                SyncStatus::Pending => 0b00,
+                SyncStatus::Waking => 0b01,
+                SyncStatus::Signaled => 0b10,
+            }
     }
 }
 
@@ -193,6 +194,7 @@ struct Worker {
     buffer: Buffer,
 }
 
+#[repr(align(8))]
 struct Pool {
     idle_cond: Condvar,
     idle_sema: Mutex<usize>,
@@ -205,11 +207,7 @@ struct Pool {
 
 impl Pool {
     pub fn from_builder(builder: Builder) -> Arc<Pool> {
-        let num_threads = builder
-            .max_threads
-            .map(|t| t.get())
-            .unwrap_or(0)
-            .max(1);
+        let num_threads = builder.max_threads.map(|t| t.get()).unwrap_or(0).max(1);
 
         Arc::new(Self {
             idle_cond: Condvar::new(),
@@ -221,7 +219,7 @@ impl Pool {
             workers: (0..num_threads)
                 .map(|_| Worker::default())
                 .collect::<Vec<_>>()
-                .into_boxed_slice()
+                .into_boxed_slice(),
         })
     }
 
@@ -246,35 +244,37 @@ impl Pool {
 
     #[cold]
     fn notify(self: &Arc<Self>, is_waking: bool) {
-        let result = self.sync.fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
-            let mut state: SyncState = state.into();
-            assert!(state.idle <= state.spawned);
-            if is_waking {
-                assert_eq!(state.status, SyncStatus::Waking);
-            }
+        let result = self
+            .sync
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+                let mut state: SyncState = state.into();
+                assert!(state.idle <= state.spawned);
+                if is_waking {
+                    assert_eq!(state.status, SyncStatus::Waking);
+                }
 
-            let can_wake = is_waking || state.status == SyncStatus::Pending;
-            if can_wake && state.idle > 0 {
-                state.status = SyncStatus::Signaled;
-            } else if can_wake && state.spawned < self.workers.len() {
-                state.status = SyncStatus::Signaled;
-                state.spawned += 1;
-            } else if is_waking {
-                state.status = SyncStatus::Pending;
-            } else if state.notified {
-                return None;
-            }
-            
-            state.notified = true;
-            Some(state.into())
-        });
+                let can_wake = is_waking || state.status == SyncStatus::Pending;
+                if can_wake && state.idle > 0 {
+                    state.status = SyncStatus::Signaled;
+                } else if can_wake && state.spawned < self.workers.len() {
+                    state.status = SyncStatus::Signaled;
+                    state.spawned += 1;
+                } else if is_waking {
+                    state.status = SyncStatus::Pending;
+                } else if state.notified {
+                    return None;
+                }
+
+                state.notified = true;
+                Some(state.into())
+            });
 
         if let Ok(sync) = result.map(SyncState::from) {
             if is_waking || sync.status == SyncStatus::Pending {
                 if sync.idle > 0 {
                     return self.idle_post(1);
                 }
-                
+
                 if sync.spawned >= self.workers.len() {
                     return;
                 }
@@ -286,8 +286,8 @@ impl Pool {
                 }
 
                 // Create a ThreadBuilder to spawn a worker thread
-                let mut builder = std::thread::Builder::new()
-                    .name(String::from("zap-worker-thread"));
+                let mut builder =
+                    std::thread::Builder::new().name(String::from("zap-worker-thread"));
                 if let Some(stack_size) = self.stack_size {
                     builder = builder.stack_size(stack_size.get());
                 }
@@ -307,36 +307,38 @@ impl Pool {
     fn wait(self: &Arc<Self>, index: usize, mut is_waking: bool) -> Option<bool> {
         let mut is_idle = false;
         loop {
-            let result = self.sync.fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
-                let mut state: SyncState = state.into();
-                if is_waking {
-                    assert_eq!(state.status, SyncStatus::Waking);
-                }
-
-                assert!(state.idle <= state.spawned);
-                if !is_idle {
-                    assert!(state.idle < state.spawned);
-                }
-
-                if state.notified {
-                    if state.status == SyncStatus::Signaled {
-                        state.status = SyncStatus::Waking;
-                    }
-                    if is_idle {
-                        state.idle -= 1;
-                    }
-                } else if !is_idle {
-                    state.idle += 1;
+            let result = self
+                .sync
+                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                    let mut state: SyncState = state.into();
                     if is_waking {
-                        state.status = SyncStatus::Pending;
+                        assert_eq!(state.status, SyncStatus::Waking);
                     }
-                } else {
-                    return None;
-                }
 
-                state.notified = false;
-                Some(state.into())
-            });
+                    assert!(state.idle <= state.spawned);
+                    if !is_idle {
+                        assert!(state.idle < state.spawned);
+                    }
+
+                    if state.notified {
+                        if state.status == SyncStatus::Signaled {
+                            state.status = SyncStatus::Waking;
+                        }
+                        if is_idle {
+                            state.idle -= 1;
+                        }
+                    } else if !is_idle {
+                        state.idle += 1;
+                        if is_waking {
+                            state.status = SyncStatus::Pending;
+                        }
+                    } else {
+                        return None;
+                    }
+
+                    state.notified = false;
+                    Some(state.into())
+                });
 
             if let Ok(state) = result.map(SyncState::from) {
                 if state.notified {
@@ -377,7 +379,9 @@ impl Pool {
     #[cold]
     fn idle_post(self: &Arc<Self>, waiting: usize) {
         let mut idle_sema = self.idle_sema.lock().unwrap();
-        *idle_sema = idle_sema.checked_add(waiting).expect("idle semaphore count overflowed");
+        *idle_sema = idle_sema
+            .checked_add(waiting)
+            .expect("idle semaphore count overflowed");
 
         match waiting {
             1 => self.idle_cond.notify_one(),
@@ -387,9 +391,7 @@ impl Pool {
 
     fn with_thread_local<T>(f: impl FnOnce(&mut Option<Rc<(Arc<Self>, usize)>>) -> T) -> T {
         thread_local!(static POOL_REF: RefCell<Option<Rc<(Arc<Pool>, usize)>>> = RefCell::new(None));
-        POOL_REF.with(|pool_ref| {
-            f(&mut *pool_ref.borrow_mut())
-        })
+        POOL_REF.with(|pool_ref| f(&mut *pool_ref.borrow_mut()))
     }
 
     fn with_worker(self: &Arc<Self>, index: usize) {
@@ -499,9 +501,7 @@ impl Pool {
     fn consume(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
         self.workers[index]
             .buffer
-            .consume(unsafe {
-                Pin::new_unchecked(&self.workers[target_index].injector)
-            })
+            .consume(unsafe { Pin::new_unchecked(&self.workers[target_index].injector) })
             .map(|popped| {
                 self.emit(PoolEvent::WorkerStole {
                     worker_index: index,
@@ -645,7 +645,9 @@ impl Injector {
         impl<'a> Drop for Consumer<'a> {
             fn drop(&mut self) {
                 assert_ne!(self.head, Injector::IS_CONSUMING);
-                self.injector.head.store(self.head.as_ptr(), Ordering::Release);
+                self.injector
+                    .head
+                    .store(self.head.as_ptr(), Ordering::Release);
             }
         }
 
@@ -987,7 +989,7 @@ enum TaskData<F: Future> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TaskState {
+enum TaskStatus {
     Idle = 0,
     Scheduled = 1,
     Running = 2,
@@ -995,25 +997,47 @@ enum TaskState {
     Ready = 4,
 }
 
-impl From<u8> for TaskState {
-    fn from(value: u8) -> Self {
+impl From<usize> for TaskStatus {
+    fn from(value: usize) -> Self {
         match value {
             0 => Self::Idle,
             1 => Self::Scheduled,
             2 => Self::Running,
             3 => Self::Notified,
             4 => Self::Ready,
-            _ => unreachable!("invalid TaskState"),
+            _ => unreachable!("invalid TaskStatus"),
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TaskState {
+    pool: Option<NonNull<Pool>>,
+    status: TaskStatus,
+}
+
+impl From<usize> for TaskState {
+    fn from(value: usize) -> Self {
+        Self {
+            pool: NonNull::new((value & !0b111usize) as *mut Pool),
+            status: TaskStatus::from(value & 0b111),
+        }
+    }
+}
+
+impl Into<usize> for TaskState {
+    fn into(self) -> usize {
+        let pool = self.pool.map(|p| p.as_ptr() as usize).unwrap_or(0);
+        let status = self.status as usize;
+        pool | status
     }
 }
 
 struct TaskFuture<F: Future> {
     task: Task,
-    pool: Arc<Pool>,
+    state: AtomicUsize,
     waker: AtomicWaker,
     ref_count: AtomicUsize,
-    state: AtomicU8,
     data: UnsafeCell<TaskData<F>>,
 }
 
@@ -1033,10 +1057,15 @@ impl<F: Future> TaskFuture<F> {
                 vtable: &Self::TASK_VTABLE,
                 _pinned: PhantomPinned,
             },
-            pool: Arc::clone(pool),
+            state: AtomicUsize::new(
+                TaskState {
+                    pool: Some(NonNull::from(pool.as_ref())),
+                    status: TaskStatus::Scheduled,
+                }
+                .into(),
+            ),
             waker: AtomicWaker::default(),
             ref_count: AtomicUsize::new(2),
-            state: AtomicU8::new(TaskState::Scheduled as u8),
             data: UnsafeCell::new(TaskData::Polling(future)),
         })));
 
@@ -1090,7 +1119,8 @@ impl<F: Future> TaskFuture<F> {
         if dealloc {
             Self::with(task, |this| {
                 let state: TaskState = this.state.load(Ordering::Relaxed).into();
-                assert_eq!(state, TaskState::Ready);
+                assert_eq!(state.status, TaskStatus::Ready);
+                assert_eq!(state.pool, None);
             });
 
             let self_ptr = Self::from_task(task);
@@ -1099,34 +1129,49 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_wake(task: NonNull<Task>, also_drop: bool) {
-        let schedule = match Self::with(task, |this| {
+        let pool_ptr = match Self::with(task, |this| {
             this.state
-                .fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                    |state| match state.into() {
-                        TaskState::Running => Some(TaskState::Notified as u8),
-                        TaskState::Idle => Some(TaskState::Scheduled as u8),
-                        _ => None,
-                    },
-                )
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |state| {
+                    let mut state: TaskState = state.into();
+                    if state.status != TaskStatus::Ready {
+                        assert_ne!(state.pool, None);
+                    }
+
+                    state.status = match state.status {
+                        TaskStatus::Running => TaskStatus::Notified,
+                        TaskStatus::Idle => TaskStatus::Scheduled,
+                        _ => return None,
+                    };
+                    Some(state.into())
+                })
                 .map(TaskState::from)
         }) {
-            Ok(TaskState::Running) => false,
-            Ok(TaskState::Idle) => true,
-            Ok(_) => unreachable!(),
-            _ => false,
+            Err(_) => None,
+            Ok(state) => match state.status {
+                TaskStatus::Running => None,
+                TaskStatus::Idle => state.pool,
+                status => unreachable!("invalid task status when waking {:?}", status),
+            },
         };
 
         let be_fair = false;
-        if schedule {
-            Pool::with_current(|pool, index| pool.push(Some(index), task, be_fair))
-                .unwrap_or_else(|| {
-                    Self::with(task, |this| {
-                        assert!(this.ref_count.load(Ordering::Acquire) > 1);
-                        this.pool.push(None, task, be_fair);
-                    });
-                });
+        if let Some(pool_ptr) = pool_ptr {
+            Pool::with_current(|pool, index| {
+                // We're inside the pool, schedule from a worker thread
+                pool.push(Some(index), task, be_fair)
+            })
+            .unwrap_or_else(|| {
+                // We're outside the pool, schedule to a random worker thread.
+                //
+                // If we transitioned from TaskStatus::Idle to TaskStatus::Scheduled,
+                // then the Pool must still be alive since the TaskFuture hasn't completed yet (Ready).
+                //
+                // This means it should be safe to deref the pool from here,
+                // but we have to be careful not to drop the Arc<Pool> since it was never cloned.
+                let pool = Arc::from_raw(pool_ptr.as_ptr());
+                pool.push(None, task, be_fair);
+                mem::forget(pool);
+            });
         }
 
         if also_drop {
@@ -1135,21 +1180,25 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_poll(task: NonNull<Task>, pool: &Arc<Pool>, worker_index: usize) {
+        let pool_ptr = NonNull::from(pool.as_ref());
+
         let poll_result = Self::with(task, |this| {
-            let state: TaskState = this.state.load(Ordering::Relaxed).into();
-            match state {
-                TaskState::Scheduled | TaskState::Notified => {},
-                TaskState::Idle => unreachable!("polling task when idle"),
-                TaskState::Running => unreachable!("polling task when already running"),
-                TaskState::Ready => unreachable!("polling task when already completed"),
+            let mut state: TaskState = this.state.load(Ordering::Relaxed).into();
+            match state.status {
+                TaskStatus::Scheduled | TaskStatus::Notified => {}
+                TaskStatus::Idle => unreachable!("polling task when idle"),
+                TaskStatus::Running => unreachable!("polling task when already running"),
+                TaskStatus::Ready => unreachable!("polling task when already completed"),
             }
 
-            pool.emit(PoolEvent::TaskPolling { worker_index, task });
-            this.state
-                .store(TaskState::Running as u8, Ordering::Relaxed);
+            assert_eq!(state.pool, Some(pool_ptr));
+            state.status = TaskStatus::Running;
+            this.state.store(state.into(), Ordering::Relaxed);
 
+            pool.emit(PoolEvent::TaskPolling { worker_index, task });
             let poll_result = this.poll_future();
             pool.emit(PoolEvent::TaskPolled { worker_index, task });
+
             poll_result
         });
 
@@ -1157,21 +1206,31 @@ impl<F: Future> TaskFuture<F> {
             Poll::Ready(output) => output,
             Poll::Pending => {
                 match Self::with(task, |this| {
+                    let current_state = TaskState {
+                        pool: Some(pool_ptr),
+                        status: TaskStatus::Running,
+                    };
+
+                    let new_state = TaskState {
+                        pool: Some(pool_ptr),
+                        status: TaskStatus::Idle,
+                    };
+
                     this.state
                         .compare_exchange(
-                            TaskState::Running as u8,
-                            TaskState::Idle as u8,
+                            current_state.into(),
+                            new_state.into(),
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
-                        .map(TaskState::from)
+                        .map_err(TaskState::from)
                 }) {
                     Ok(_) => {
                         return pool.emit(PoolEvent::TaskIdling { worker_index, task });
                     }
                     Err(state) => {
-                        let state: TaskState = state.into();
-                        assert_eq!(state, TaskState::Notified);
+                        assert_eq!(state.pool, Some(pool_ptr));
+                        assert_eq!(state.status, TaskStatus::Notified);
                         return pool.push(Some(worker_index), task, false);
                     }
                 }
@@ -1185,11 +1244,12 @@ impl<F: Future> TaskFuture<F> {
                 TaskData::Joined => unreachable!("TaskData already joind when setting output"),
             }
 
-            this.state.store(
-                TaskState::Ready as u8,
-                Ordering::Release,
-            );
+            let new_state = TaskState {
+                pool: None,
+                status: TaskStatus::Ready,
+            };
 
+            this.state.store(new_state.into(), Ordering::Release);
             this.waker.wake();
         });
 
@@ -1239,9 +1299,7 @@ impl<F: Future> TaskFuture<F> {
             .and_then(|c| NonNull::new(c.1))
             .map(|p| p.cast::<F::Output>());
 
-        let updated_waker = Self::with(task, |this| {
-            this.waker.update(waker_ref)
-        });
+        let updated_waker = Self::with(task, |this| this.waker.update(waker_ref));
 
         if updated_waker && waker_ref.is_some() {
             return Poll::Pending;
@@ -1250,8 +1308,9 @@ impl<F: Future> TaskFuture<F> {
         if let Some(output_ptr) = output_ptr {
             Self::with(task, |this| {
                 let state: TaskState = this.state.load(Ordering::Acquire).into();
-                assert_eq!(state, TaskState::Ready);
-    
+                assert_eq!(state.status, TaskStatus::Ready);
+                assert_eq!(state.pool, None);
+
                 match mem::replace(&mut *this.data.get(), TaskData::Joined) {
                     TaskData::Polling(_) => unreachable!("TaskData joined while still polling"),
                     TaskData::Ready(output) => ptr::write(output_ptr.as_ptr(), output),

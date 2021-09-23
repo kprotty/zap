@@ -1,3 +1,3 @@
 mod runtime;
 
-pub use runtime::{Builder, spawn, JoinHandle};
+pub use runtime::{spawn, Builder, JoinHandle};

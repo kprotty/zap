@@ -39,7 +39,7 @@ impl Builder {
         self
     }
 
-    pub fn block_on<F>(self, future: F) -> F::Output
+    pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -171,15 +171,9 @@ impl Into<usize> for SyncState {
         assert!(self.idle <= Self::COUNT_MASK);
         assert!(self.spawned <= Self::COUNT_MASK);
 
-        let mut value = 0;
-        value |= self.idle << (Self::COUNT_BITS + 4);
-        value |= self.spawned << 4;
-
-        if self.notified {
-            value |= 0b100;
-        }
-
-        value
+        (self.idle << (Self::COUNT_BITS + 4))
+            | (self.spawned << 4)
+            | (if self.notified { 0b100 } else { 0 })
             | match self.status {
                 SyncStatus::Pending => 0b00,
                 SyncStatus::Waking => 0b01,
@@ -206,8 +200,13 @@ struct Pool {
 }
 
 impl Pool {
-    pub fn from_builder(builder: Builder) -> Arc<Pool> {
-        let num_threads = builder.max_threads.map(|t| t.get()).unwrap_or(0).max(1);
+    pub fn from_builder(builder: &Builder) -> Arc<Pool> {
+        let num_threads = builder
+            .max_threads
+            .map(|threads| threads.get())
+            .unwrap_or(0)
+            .min(SyncState::COUNT_MASK)
+            .max(1);
 
         Arc::new(Self {
             idle_cond: Condvar::new(),
@@ -479,22 +478,63 @@ impl Pool {
     }
 
     fn pop(self: &Arc<Self>, index: usize, xorshift: &mut usize, be_fair: bool) -> Option<Popped> {
-        if be_fair {
-            if let Some(popped) = self.consume(index, index) {
-                return Some(popped);
-            }
-        }
+        let popped = match be_fair {
+            true => self.pop_queues(index).or_else(|| self.pop_local(index)),
+            _ => self.pop_local(index).or_else(|| self.pop_queues(index)),
+        };
 
-        if let Some(popped) = self.workers[index].buffer.pop() {
+        popped.or_else(|| self.pop_shared(index, xorshift))
+    }
+
+    fn pop_local(self: &Arc<Self>, index: usize) -> Option<Popped> {
+        // TODO: add worker-local injector consume here
+
+        self.workers[index].buffer.pop().map(|popped| {
             self.emit(PoolEvent::WorkerPopped {
                 worker_index: index,
                 task: popped.task,
             });
 
+            popped
+        })
+    }
+
+    fn pop_queues(self: &Arc<Self>, index: usize) -> Option<Popped> {
+        if let Some(popped) = self.consume(index, index) {
             return Some(popped);
         }
 
-        self.steal(index, xorshift)
+        // TODO: add I/O non-block poll here
+        None
+    }
+
+    #[cold]
+    fn pop_shared(self: &Arc<Self>, index: usize, xorshift: &mut usize) -> Option<Popped> {
+        let shifts = match usize::BITS {
+            32 => (13, 17, 5),
+            64 => (13, 7, 17),
+            _ => unreachable!("architecture unsupported"),
+        };
+
+        let mut rng = *xorshift;
+        rng ^= rng << shifts.0;
+        rng ^= rng >> shifts.1;
+        rng ^= rng << shifts.2;
+        *xorshift = rng;
+
+        (0..self.workers.len())
+            .cycle()
+            .skip(rng % self.workers.len())
+            .take(self.workers.len())
+            .map(|steal_index| {
+                self.consume(index, steal_index)
+                    .or_else(|| match steal_index {
+                        _ if steal_index == index => None,
+                        _ => self.steal(index, steal_index),
+                    })
+            })
+            .filter_map(|popped| popped)
+            .next()
     }
 
     #[cold]
@@ -519,54 +559,25 @@ impl Pool {
     }
 
     #[cold]
-    fn steal(self: &Arc<Self>, index: usize, xorshift: &mut usize) -> Option<Popped> {
-        if let Some(popped) = self.consume(index, index) {
-            return Some(popped);
-        }
+    fn steal(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
+        assert_ne!(index, target_index);
+        self.workers[index]
+            .buffer
+            .steal(&self.workers[target_index].buffer)
+            .map(|popped| {
+                self.emit(PoolEvent::WorkerStole {
+                    worker_index: index,
+                    target_index,
+                    count: popped.pushed + 1,
+                });
 
-        let shifts = match usize::BITS {
-            32 => (13, 17, 5),
-            64 => (13, 7, 17),
-            _ => unreachable!("architecture unsupported"),
-        };
+                self.emit(PoolEvent::WorkerPopped {
+                    worker_index: index,
+                    task: popped.task,
+                });
 
-        let mut rng = *xorshift;
-        rng ^= rng << shifts.0;
-        rng ^= rng >> shifts.1;
-        rng ^= rng << shifts.2;
-        *xorshift = rng;
-
-        (0..self.workers.len())
-            .cycle()
-            .skip(rng % self.workers.len())
-            .take(self.workers.len())
-            .map(|steal_index| {
-                self.consume(index, steal_index).or_else(|| {
-                    if index == steal_index {
-                        return None;
-                    }
-
-                    self.workers[index]
-                        .buffer
-                        .steal(&self.workers[steal_index].buffer)
-                        .map(|popped| {
-                            self.emit(PoolEvent::WorkerStole {
-                                worker_index: index,
-                                target_index: steal_index,
-                                count: popped.pushed + 1,
-                            });
-
-                            self.emit(PoolEvent::WorkerPopped {
-                                worker_index: index,
-                                task: popped.task,
-                            });
-
-                            popped
-                        })
-                })
+                popped
             })
-            .filter_map(|popped| popped)
-            .next()
     }
 }
 

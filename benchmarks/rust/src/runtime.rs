@@ -638,7 +638,7 @@ impl Injector {
 
     fn consume<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
         let tail = NonNull::new(self.tail.load(Ordering::Acquire));
-        if tail.is_none() || tail == Some(NonNull::from(&self.stub)) {
+        if tail.is_none() {
             return None;
         }
 
@@ -679,15 +679,18 @@ impl Injector {
                     }
 
                     let tail = self.injector.tail.load(Ordering::Acquire);
-                    if Some(self.head) != NonNull::new(tail) {
-                        return None;
+                    if Some(self.head) == NonNull::new(tail) {
+                        stub.as_ref().next.store(ptr::null_mut(), Ordering::Relaxed);
+                        if let Ok(_) = self.injector.tail.compare_exchange(
+                            tail,
+                            ptr::null_mut(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            return Some(mem::replace(&mut self.head, stub));
+                        }
                     }
-
-                    self.injector.push(List {
-                        head: stub,
-                        tail: stub,
-                    });
-
+                    
                     let next = self.head.as_ref().next.load(Ordering::Acquire);
                     let next = NonNull::new(next)?;
                     Some(mem::replace(&mut self.head, next))

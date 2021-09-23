@@ -874,6 +874,98 @@ impl Buffer {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WakerState {
+    Empty = 0,
+    Updating = 1,
+    Ready = 2,
+    Waking = 3,
+}
+
+impl From<u8> for WakerState {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Empty,
+            1 => Self::Updating,
+            2 => Self::Ready,
+            3 => Self::Waking,
+            _ => unreachable!("invalid WakerState"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AtomicWaker {
+    state: AtomicU8,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+unsafe impl Send for AtomicWaker {}
+unsafe impl Sync for AtomicWaker {}
+
+impl AtomicWaker {
+    fn wake(&self) {
+        let state: WakerState = self
+            .state
+            .swap(WakerState::Waking as u8, Ordering::AcqRel)
+            .into();
+
+        assert_ne!(state, WakerState::Waking);
+        if state == WakerState::Ready {
+            mem::replace(unsafe { &mut *self.waker.get() }, None)
+                .expect("waker state was Ready without a Waker")
+                .wake();
+        }
+    }
+
+    fn update(&self, waker_ref: Option<&Waker>) -> bool {
+        let state: WakerState = self.state.load(Ordering::Acquire).into();
+        match state {
+            WakerState::Empty | WakerState::Ready => {}
+            WakerState::Updating => unreachable!("multiple threads trying to update Waker"),
+            WakerState::Waking => return false,
+        }
+
+        if let Err(new_state) = self.state.compare_exchange(
+            state as u8,
+            WakerState::Updating as u8,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            let new_state: WakerState = new_state.into();
+            assert_eq!(new_state, WakerState::Waking);
+            return false;
+        }
+
+        match mem::replace(
+            unsafe { &mut *self.waker.get() },
+            waker_ref.map(|waker| waker.clone()),
+        ) {
+            Some(_dropped_waker) => assert_eq!(state, WakerState::Ready),
+            None => assert_eq!(state, WakerState::Empty),
+        }
+
+        let new_state = match waker_ref {
+            Some(_) => WakerState::Ready,
+            None => WakerState::Empty,
+        };
+
+        if let Err(new_state) = self.state.compare_exchange(
+            WakerState::Updating as u8,
+            new_state as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            let new_state: WakerState = new_state.into();
+            assert_eq!(new_state, WakerState::Waking);
+            unsafe { *self.waker.get() = None };
+            return false;
+        }
+
+        true
+    }
+}
+
 struct Task {
     next: AtomicPtr<Self>,
     vtable: &'static TaskVTable,
@@ -895,7 +987,7 @@ enum TaskData<F: Future> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TaskDataState {
+enum TaskState {
     Idle = 0,
     Scheduled = 1,
     Running = 2,
@@ -903,7 +995,7 @@ enum TaskDataState {
     Ready = 4,
 }
 
-impl From<u8> for TaskDataState {
+impl From<u8> for TaskState {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Idle,
@@ -911,27 +1003,7 @@ impl From<u8> for TaskDataState {
             2 => Self::Running,
             3 => Self::Notified,
             4 => Self::Ready,
-            _ => unreachable!("invalid TaskDataState"),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TaskWakerState {
-    Empty = 0,
-    Updating = 1,
-    Ready = 2,
-    Waking = 3,
-}
-
-impl From<u8> for TaskWakerState {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => Self::Empty,
-            1 => Self::Updating,
-            2 => Self::Ready,
-            3 => Self::Waking,
-            _ => unreachable!("invalid TaskWakerState"),
+            _ => unreachable!("invalid TaskState"),
         }
     }
 }
@@ -939,11 +1011,10 @@ impl From<u8> for TaskWakerState {
 struct TaskFuture<F: Future> {
     task: Task,
     pool: Arc<Pool>,
+    waker: AtomicWaker,
     ref_count: AtomicUsize,
+    state: AtomicU8,
     data: UnsafeCell<TaskData<F>>,
-    data_state: AtomicU8,
-    waker: UnsafeCell<Option<Waker>>,
-    waker_state: AtomicU8,
 }
 
 impl<F: Future> TaskFuture<F> {
@@ -963,11 +1034,10 @@ impl<F: Future> TaskFuture<F> {
                 _pinned: PhantomPinned,
             },
             pool: Arc::clone(pool),
+            waker: AtomicWaker::default(),
             ref_count: AtomicUsize::new(2),
+            state: AtomicU8::new(TaskState::Scheduled as u8),
             data: UnsafeCell::new(TaskData::Polling(future)),
-            data_state: AtomicU8::new(TaskDataState::Scheduled as u8),
-            waker: UnsafeCell::new(None),
-            waker_state: AtomicU8::new(TaskWakerState::Empty as u8),
         })));
 
         unsafe {
@@ -1019,11 +1089,8 @@ impl<F: Future> TaskFuture<F> {
 
         if dealloc {
             Self::with(task, |this| {
-                let data_state: TaskDataState = this.data_state.load(Ordering::Relaxed).into();
-                assert_eq!(data_state, TaskDataState::Ready);
-
-                let waker_state: TaskWakerState = this.waker_state.load(Ordering::Relaxed).into();
-                assert_eq!(waker_state, TaskWakerState::Waking);
+                let state: TaskState = this.state.load(Ordering::Relaxed).into();
+                assert_eq!(state, TaskState::Ready);
             });
 
             let self_ptr = Self::from_task(task);
@@ -1033,20 +1100,20 @@ impl<F: Future> TaskFuture<F> {
 
     unsafe fn on_wake(task: NonNull<Task>, also_drop: bool) {
         let schedule = match Self::with(task, |this| {
-            this.data_state
+            this.state
                 .fetch_update(
                     Ordering::AcqRel,
                     Ordering::Relaxed,
-                    |data_state| match data_state.into() {
-                        TaskDataState::Running => Some(TaskDataState::Notified as u8),
-                        TaskDataState::Idle => Some(TaskDataState::Scheduled as u8),
+                    |state| match state.into() {
+                        TaskState::Running => Some(TaskState::Notified as u8),
+                        TaskState::Idle => Some(TaskState::Scheduled as u8),
                         _ => None,
                     },
                 )
-                .map(TaskDataState::from)
+                .map(TaskState::from)
         }) {
-            Ok(TaskDataState::Running) => false,
-            Ok(TaskDataState::Idle) => true,
+            Ok(TaskState::Running) => false,
+            Ok(TaskState::Idle) => true,
             Ok(_) => unreachable!(),
             _ => false,
         };
@@ -1069,17 +1136,17 @@ impl<F: Future> TaskFuture<F> {
 
     unsafe fn on_poll(task: NonNull<Task>, pool: &Arc<Pool>, worker_index: usize) {
         let poll_result = Self::with(task, |this| {
-            let data_state: TaskDataState = this.data_state.load(Ordering::Relaxed).into();
-            match data_state {
-                TaskDataState::Scheduled | TaskDataState::Notified => {},
-                TaskDataState::Idle => unreachable!("polling task when idle"),
-                TaskDataState::Running => unreachable!("polling task when already running"),
-                TaskDataState::Ready => unreachable!("polling task when already completed"),
+            let state: TaskState = this.state.load(Ordering::Relaxed).into();
+            match state {
+                TaskState::Scheduled | TaskState::Notified => {},
+                TaskState::Idle => unreachable!("polling task when idle"),
+                TaskState::Running => unreachable!("polling task when already running"),
+                TaskState::Ready => unreachable!("polling task when already completed"),
             }
 
             pool.emit(PoolEvent::TaskPolling { worker_index, task });
-            this.data_state
-                .store(TaskDataState::Running as u8, Ordering::Relaxed);
+            this.state
+                .store(TaskState::Running as u8, Ordering::Relaxed);
 
             let poll_result = this.poll_future();
             pool.emit(PoolEvent::TaskPolled { worker_index, task });
@@ -1090,21 +1157,21 @@ impl<F: Future> TaskFuture<F> {
             Poll::Ready(output) => output,
             Poll::Pending => {
                 match Self::with(task, |this| {
-                    this.data_state
+                    this.state
                         .compare_exchange(
-                            TaskDataState::Running as u8,
-                            TaskDataState::Idle as u8,
+                            TaskState::Running as u8,
+                            TaskState::Idle as u8,
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
-                        .map(TaskDataState::from)
+                        .map(TaskState::from)
                 }) {
                     Ok(_) => {
                         return pool.emit(PoolEvent::TaskIdling { worker_index, task });
                     }
-                    Err(data_state) => {
-                        let data_state: TaskDataState = data_state.into();
-                        assert_eq!(data_state, TaskDataState::Notified);
+                    Err(state) => {
+                        let state: TaskState = state.into();
+                        assert_eq!(state, TaskState::Notified);
                         return pool.push(Some(worker_index), task, false);
                     }
                 }
@@ -1118,19 +1185,12 @@ impl<F: Future> TaskFuture<F> {
                 TaskData::Joined => unreachable!("TaskData already joind when setting output"),
             }
 
-            let waker_state = TaskWakerState::from({
-                this.data_state
-                    .store(TaskDataState::Ready as u8, Ordering::Release);
-                this.waker_state
-                    .swap(TaskWakerState::Waking as u8, Ordering::AcqRel)
-            });
+            this.state.store(
+                TaskState::Ready as u8,
+                Ordering::Release,
+            );
 
-            assert_ne!(waker_state, TaskWakerState::Waking);
-            if waker_state == TaskWakerState::Ready {
-                mem::replace(&mut *this.waker.get(), None)
-                    .expect("waker_state was Ready without a Waker")
-                    .wake();
-            }
+            this.waker.wake();
         });
 
         pool.mark_task_end();
@@ -1162,7 +1222,8 @@ impl<F: Future> TaskFuture<F> {
 
         let poll_output = match &mut *self.data.get() {
             TaskData::Polling(ref mut future) => {
-                Pin::new_unchecked(future).poll(&mut Context::from_waker(&waker))
+                let mut context = Context::from_waker(&waker);
+                Pin::new_unchecked(future).poll(&mut context)
             }
             TaskData::Ready(_) => unreachable!("TaskData polled when already ready"),
             TaskData::Joined => unreachable!("TaskData polled when already joined"),
@@ -1173,88 +1234,34 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_join(task: NonNull<Task>, context: Option<(&Waker, *mut ())>) -> Poll<()> {
-        match context {
-            None => Self::do_detach(task),
-            Some((waker_ref, output_ptr)) => Self::do_join(task, waker_ref, output_ptr),
-        }
-    }
+        let waker_ref = context.map(|c| c.0);
+        let output_ptr = context
+            .and_then(|c| NonNull::new(c.1))
+            .map(|p| p.cast::<F::Output>());
 
-    unsafe fn do_detach(task: NonNull<Task>) -> Poll<()> {
-        Self::update_join_waker(task, None);
-        Self::on_drop(task);
-        Poll::Ready(())
-    }
+        let updated_waker = Self::with(task, |this| {
+            this.waker.update(waker_ref)
+        });
 
-    unsafe fn do_join(task: NonNull<Task>, waker_ref: &Waker, output_ptr: *mut ()) -> Poll<()> {
-        let output_ptr = NonNull::new(output_ptr)
-            .expect("invalid output ptr provided for on_join()")
-            .cast::<F::Output>()
-            .as_ptr();
-
-        if Self::update_join_waker(task, Some(waker_ref)) {
+        if updated_waker && waker_ref.is_some() {
             return Poll::Pending;
         }
 
-        Self::with(task, |this| {
-            let data_state: TaskDataState = this.data_state.load(Ordering::Acquire).into();
-            assert_eq!(data_state, TaskDataState::Ready);
-
-            match mem::replace(&mut *this.data.get(), TaskData::Joined) {
-                TaskData::Polling(_) => unreachable!("TaskData joined while still polling"),
-                TaskData::Ready(output) => ptr::write(output_ptr, output),
-                TaskData::Joined => unreachable!("TaskData already joined when joining"),
-            }
-        });
+        if let Some(output_ptr) = output_ptr {
+            Self::with(task, |this| {
+                let state: TaskState = this.state.load(Ordering::Acquire).into();
+                assert_eq!(state, TaskState::Ready);
+    
+                match mem::replace(&mut *this.data.get(), TaskData::Joined) {
+                    TaskData::Polling(_) => unreachable!("TaskData joined while still polling"),
+                    TaskData::Ready(output) => ptr::write(output_ptr.as_ptr(), output),
+                    TaskData::Joined => unreachable!("TaskData already joined when joining"),
+                }
+            });
+        }
 
         Self::on_drop(task);
         Poll::Ready(())
-    }
-
-    unsafe fn update_join_waker(task: NonNull<Task>, waker_ref: Option<&Waker>) -> bool {
-        Self::with(task, |this| {
-            let waker_state: TaskWakerState = this.waker_state.load(Ordering::Acquire).into();
-            match waker_state {
-                TaskWakerState::Empty | TaskWakerState::Ready => {}
-                TaskWakerState::Updating => unreachable!("multiple threads trying to update Waker"),
-                TaskWakerState::Waking => return false,
-            }
-
-            if let Err(new_waker_state) = this.waker_state.compare_exchange(
-                waker_state as u8,
-                TaskWakerState::Updating as u8,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                let new_waker_state: TaskWakerState = new_waker_state.into();
-                assert_eq!(new_waker_state, TaskWakerState::Waking);
-                return false;
-            }
-
-            match mem::replace(&mut *this.waker.get(), waker_ref.map(|w| w.clone())) {
-                Some(_dropped_waker) => assert_eq!(waker_state, TaskWakerState::Ready),
-                None => assert_eq!(waker_state, TaskWakerState::Empty),
-            }
-
-            let new_waker_state = match waker_ref {
-                Some(_) => TaskWakerState::Ready,
-                None => TaskWakerState::Empty,
-            };
-
-            match this.waker_state.compare_exchange(
-                TaskWakerState::Updating as u8,
-                new_waker_state as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => true,
-                Err(new_waker_state) => {
-                    let new_waker_state: TaskWakerState = new_waker_state.into();
-                    assert_eq!(new_waker_state, TaskWakerState::Waking);
-                    *this.waker.get() = None;
-                    false
-                }
-            }
-        })
     }
 }
 

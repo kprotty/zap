@@ -16,9 +16,11 @@ path = "examples/rayon_qsort.rs"
 name = "zsort"
 path = "examples/zap_qsort.rs"
 
+[dependencies]
+num_cpus = "1"
+
 [dev-dependencies]
 rayon = "1.5"
-num_cpus = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [profile.release]

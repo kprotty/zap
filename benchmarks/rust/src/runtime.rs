@@ -22,9 +22,9 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            max_threads: None,
+            max_threads: NonZeroUsize::new(num_cpus::get()),
             stack_size: None,
         }
     }

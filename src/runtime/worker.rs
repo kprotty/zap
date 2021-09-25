@@ -3,7 +3,10 @@ use super::{
     queue::{Buffer, Injector, List, Popped},
     task::Task,
 };
-use std::{cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::atomic::Ordering, sync::Arc};
+use std::{
+    cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::atomic::Ordering, sync::Arc,
+    time::Duration,
+};
 
 #[derive(Default)]
 pub struct Worker {
@@ -133,8 +136,10 @@ impl Pool {
             return Some(popped);
         }
 
-        // TODO: add I/O non-block poll here
-        None
+        match self.io_poll(Some(Duration::ZERO)) {
+            Some(n) if n > 0 => self.pop_local(index).or_else(|| self.consume(index, index)),
+            _ => None,
+        }
     }
 
     #[cold]

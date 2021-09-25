@@ -6,7 +6,7 @@ authors = ["kprotty"]
 
 [dependencies]
 num_cpus = "1"
-mio = { version = "0.7", features = ["net"] }
+mio = { version = "0.7", features = ["net", "os-poll"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

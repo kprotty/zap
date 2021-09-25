@@ -1,4 +1,4 @@
-use super::{builder::Builder, task::Task, worker::Worker};
+use super::{builder::Builder, io::Poller, task::Task, worker::Worker};
 use std::{
     mem,
     num::NonZeroUsize,
@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
+    time::Duration,
 };
 
 #[allow(unused)]
@@ -61,6 +62,48 @@ pub enum PoolEvent {
     WorkerShutdown {
         worker_index: usize,
     },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IoStatus {
+    Empty,
+    Polling,
+    Waiting,
+    Notified,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct IoState {
+    pending: usize,
+    status: IoStatus,
+}
+
+impl From<usize> for IoState {
+    fn from(value: usize) -> Self {
+        Self {
+            pending: value >> 2,
+            status: match value & 0b11 {
+                0 => IoStatus::Empty,
+                1 => IoStatus::Polling,
+                2 => IoStatus::Waiting,
+                3 => IoStatus::Notified,
+                _ => unreachable!(),
+            },
+        }
+    }
+}
+
+impl Into<usize> for IoState {
+    fn into(self) -> usize {
+        assert!(self.pending <= usize::MAX >> 2);
+        (self.pending << 2)
+            | match self.status {
+                IoStatus::Empty => 0,
+                IoStatus::Polling => 1,
+                IoStatus::Waiting => 2,
+                IoStatus::Notified => 3,
+            }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -122,6 +165,8 @@ pub struct Pool {
     stack_size: Option<NonZeroUsize>,
     sync: AtomicUsize,
     pending: AtomicUsize,
+    io_state: AtomicUsize,
+    io_poller: Poller,
     pub injecting: AtomicUsize,
     pub workers: Box<[Worker]>,
 }
@@ -141,6 +186,8 @@ impl Pool {
             stack_size: builder.stack_size,
             sync: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
+            io_state: AtomicUsize::new(0),
+            io_poller: Poller::default(),
             injecting: AtomicUsize::new(0),
             workers: (0..num_threads)
                 .map(|_| Worker::default())
@@ -232,7 +279,7 @@ impl Pool {
     #[cold]
     pub fn wait(self: &Arc<Self>, index: usize, mut is_waking: bool) -> Option<bool> {
         let mut is_idle = false;
-        loop {
+        let result = loop {
             let result = self
                 .sync
                 .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
@@ -268,26 +315,38 @@ impl Pool {
 
             if let Ok(state) = result.map(SyncState::from) {
                 if state.notified {
-                    return Some(is_waking || state.status == SyncStatus::Signaled);
+                    break Some(is_waking || state.status == SyncStatus::Signaled);
                 }
 
                 assert!(!is_idle);
                 is_idle = true;
                 is_waking = false;
+
+                self.emit(PoolEvent::WorkerIdling {
+                    worker_index: index,
+                });
             }
 
             match self.pending.load(Ordering::SeqCst) {
-                0 => return None,
-                _ => self.idle_wait(index),
+                0 => break None,
+                _ => self.idle_wait(),
             }
+        };
+
+        if is_idle {
+            self.emit(PoolEvent::WorkerScheduled {
+                worker_index: index,
+            });
         }
+
+        result
     }
 
     #[cold]
-    fn idle_wait(self: &Arc<Self>, index: usize) {
-        self.emit(PoolEvent::WorkerIdling {
-            worker_index: index,
-        });
+    fn idle_wait(self: &Arc<Self>) {
+        if let Some(_) = self.io_poll(None) {
+            return;
+        }
 
         {
             let mut idle_sema = self.idle_sema.lock().unwrap();
@@ -296,14 +355,14 @@ impl Pool {
             }
             *idle_sema -= 1;
         }
-
-        self.emit(PoolEvent::WorkerScheduled {
-            worker_index: index,
-        });
     }
 
     #[cold]
     fn idle_post(self: &Arc<Self>, waiting: usize) {
+        if self.io_notify() && waiting == 1 {
+            return;
+        }
+
         let mut idle_sema = self.idle_sema.lock().unwrap();
         *idle_sema = idle_sema
             .checked_add(waiting)
@@ -313,5 +372,76 @@ impl Pool {
             1 => self.idle_cond.notify_one(),
             _ => self.idle_cond.notify_all(),
         }
+    }
+
+    pub fn io_poll(self: &Arc<Self>, timeout: Option<Duration>) -> Option<usize> {
+        self.io_state
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |io_state| {
+                let mut io_state: IoState = io_state.into();
+                if io_state.pending == 0 {
+                    return None;
+                }
+
+                io_state.status = match io_state.status {
+                    IoStatus::Empty => match timeout {
+                        Some(Duration::ZERO) => IoStatus::Polling,
+                        _ => IoStatus::Waiting,
+                    },
+                    _ => return None,
+                };
+
+                Some(io_state.into())
+            })
+            .and_then(|_| unsafe {
+                let mut notified = false;
+                let mut resumed = self.io_poller.poll(&mut notified, timeout);
+                assert_eq!(notified, false);
+
+                self.io_state
+                    .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
+                        let mut io_state: IoState = io_state.into();
+                        assert!(io_state.pending >= resumed);
+
+                        assert_ne!(io_state.status, IoStatus::Empty);
+                        if io_state.status == IoStatus::Notified {
+                            while !notified {
+                                resumed += self.io_poller.poll(&mut notified, None);
+                            }
+                        }
+
+                        assert_eq!(
+                            io_state.status,
+                            match timeout {
+                                Some(Duration::ZERO) => IoStatus::Polling,
+                                _ => IoStatus::Waiting,
+                            }
+                        );
+
+                        io_state.pending -= resumed;
+                        io_state.status = IoStatus::Empty;
+                        Some(io_state.into())
+                    })
+                    .map(|_| resumed)
+            })
+            .ok()
+    }
+
+    fn io_notify(self: &Arc<Self>) -> bool {
+        self.io_state
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
+                let mut io_state: IoState = io_state.into();
+                if io_state.pending == 0 {
+                    return None;
+                }
+
+                io_state.status = match io_state.status {
+                    IoStatus::Waiting => IoStatus::Notified,
+                    _ => return None,
+                };
+
+                Some(io_state.into())
+            })
+            .map(|_| self.io_poller.notify())
+            .is_ok()
     }
 }

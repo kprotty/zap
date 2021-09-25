@@ -1,0 +1,13 @@
+[package]
+name = "zap"
+version = "0.0.0"
+edition = "2021"
+authors = ["kprotty"]
+
+[dependencies]
+num_cpus = "1"
+mio = { version = "0.7", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+

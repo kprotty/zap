@@ -1,7 +1,4 @@
-use std::{
-    cell::UnsafeCell,
-    ops::{Deref, DerefMut},
-};
+use std::cell::UnsafeCell;
 
 pub struct Lock<T> {
     os_lock: os::Lock,
@@ -11,6 +8,12 @@ pub struct Lock<T> {
 unsafe impl<T: Send> Send for Lock<T> {}
 unsafe impl<T: Send> Sync for Lock<T> {}
 
+impl<T: Default> Default for Lock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T> Lock<T> {
     pub const fn new(value: T) -> Self {
         Self {
@@ -19,31 +22,13 @@ impl<T> Lock<T> {
         }
     }
 
-    pub fn lock(&self) -> LockGuard<'_, T> {
-        unsafe { self.os_lock.acquire() };
-        LockGuard(self)
-    }
-}
-
-pub struct LockGuard<'a, T>(&'a Lock<T>);
-
-impl<'a, T> Drop for LockGuard<'a, T> {
-    fn drop(&mut self) {
-        unsafe { self.0.os_lock.release() }
-    }
-}
-
-impl<'a, T> DerefMut for LockGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.0.value.get() }
-    }
-}
-
-impl<'a, T> Deref for LockGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        unsafe { &*self.0.value.get() }
+    pub fn with<F>(&self, f: impl FnOnce(&mut T) -> F) -> F {
+        unsafe {
+            self.os_lock.acquire();
+            let result = f(&mut *self.value.get());
+            self.os_lock.release();
+            result
+        }
     }
 }
 

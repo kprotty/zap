@@ -6,7 +6,14 @@ use std::{
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum WakerState {
+pub enum WakerUpdate {
+    New,
+    Replaced,
+    Notified,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WakerState {
     Empty = 0,
     Updating = 1,
     Ready = 2,
@@ -35,34 +42,39 @@ unsafe impl Send for AtomicWaker {}
 unsafe impl Sync for AtomicWaker {}
 
 impl AtomicWaker {
-    pub fn wake(&self) -> bool {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(WakerState::Empty as u8),
+            waker: UnsafeCell::new(None),
+        }
+    }
+
+    pub fn wake(&self) -> WakerState {
         let state: WakerState = self
             .state
             .swap(WakerState::Waking as u8, Ordering::AcqRel)
             .into();
 
-        assert_ne!(state, WakerState::Waking);
-        if state != WakerState::Ready {
-            return false;
+        if state == WakerState::Ready {
+            mem::replace(unsafe { &mut *self.waker.get() }, None)
+                .expect("waker state was Ready without a Waker")
+                .wake();
         }
 
-        mem::replace(unsafe { &mut *self.waker.get() }, None)
-            .expect("waker state was Ready without a Waker")
-            .wake();
-        true
+        state
     }
 
-    pub fn reset(&self) {
+    pub unsafe fn reset(&self) {
         let new_state = WakerState::Empty as u8;
         self.state.store(new_state, Ordering::Relaxed);
     }
 
-    pub fn update(&self, waker_ref: Option<&Waker>) -> bool {
+    pub fn update(&self, waker_ref: Option<&Waker>) -> WakerUpdate {
         let state: WakerState = self.state.load(Ordering::Acquire).into();
         match state {
             WakerState::Empty | WakerState::Ready => {}
             WakerState::Updating => unreachable!("multiple threads trying to update Waker"),
-            WakerState::Waking => return false,
+            WakerState::Waking => return WakerUpdate::Notified,
         }
 
         if let Err(new_state) = self.state.compare_exchange(
@@ -73,7 +85,7 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            return false;
+            return WakerUpdate::Notified;
         }
 
         match mem::replace(
@@ -98,9 +110,13 @@ impl AtomicWaker {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
             unsafe { *self.waker.get() = None };
-            return false;
+            return WakerUpdate::Notified;
         }
 
-        true
+        match state {
+            WakerState::Ready => WakerUpdate::Replaced,
+            WakerState::Empty => WakerUpdate::New,
+            _ => unreachable!(),
+        }
     }
 }

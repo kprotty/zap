@@ -1,6 +1,6 @@
 use super::{
     pool::{Pool, PoolEvent},
-    waker::AtomicWaker,
+    waker::{AtomicWaker, WakerState, WakerUpdate},
 };
 use std::{
     cell::UnsafeCell,
@@ -285,13 +285,17 @@ impl<F: Future> TaskFuture<F> {
                 TaskData::Joined => unreachable!("TaskData already joind when setting output"),
             }
 
-            let new_state = TaskState {
-                pool: None,
-                status: TaskStatus::Ready,
-            };
+            this.state.store(
+                TaskState {
+                    pool: None,
+                    status: TaskStatus::Ready,
+                }
+                .into(),
+                Ordering::Release,
+            );
 
-            this.state.store(new_state.into(), Ordering::Release);
-            this.waker.wake();
+            let waker_state = this.waker.wake();
+            assert_ne!(waker_state, WakerState::Waking);
         });
 
         pool.mark_task_end();
@@ -340,9 +344,9 @@ impl<F: Future> TaskFuture<F> {
             .and_then(|c| NonNull::new(c.1))
             .map(|p| p.cast::<F::Output>());
 
-        let updated_waker = Self::with(task, |this| this.waker.update(waker_ref));
+        let waker_update = Self::with(task, |this| this.waker.update(waker_ref));
 
-        if updated_waker && waker_ref.is_some() {
+        if waker_ref.is_some() && waker_update != WakerUpdate::Notified {
             return Poll::Pending;
         }
 

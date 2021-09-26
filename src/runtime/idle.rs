@@ -108,20 +108,18 @@ impl IdleQueue {
             });
     }
 
-    pub fn signal<P: IdleNodeProvider>(&self, node_provider: P) {
-        let _ = self
-            .state
+    pub fn signal<P: IdleNodeProvider>(&self, node_provider: P) -> bool {
+        self.state
             .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
                 let mut state: IdleState = state.into();
                 state.index = match state.index {
                     IdleIndex::Shutdown => return None,
                     IdleIndex::Notified => return None,
                     IdleIndex::Empty => IdleIndex::Notified,
-                    IdleIndex::Waiting(index) => node_provider
-                        .with_node(index, |node| {
-                            let state: IdleState = node.state.load(Ordering::Relaxed).into();
-                            state.index
-                        }),
+                    IdleIndex::Waiting(index) => node_provider.with_node(index, |node| {
+                        let state: IdleState = node.state.load(Ordering::Relaxed).into();
+                        state.index
+                    }),
                 };
                 Some(state.into())
             })
@@ -130,11 +128,13 @@ impl IdleQueue {
                 IdleIndex::Waiting(index) => {
                     node_provider.with_node(index, |node| unsafe {
                         Pin::map_unchecked(node, |node| &node.event).notify()
-                    })
+                    });
+                    true
                 }
-                IdleIndex::Notified => {}
+                IdleIndex::Notified => false,
                 _ => unreachable!(),
-            });
+            })
+            .unwrap_or(false)
     }
 
     pub fn shutdown<P: IdleNodeProvider>(&self, node_provider: P) {

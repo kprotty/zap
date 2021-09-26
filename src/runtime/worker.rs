@@ -1,5 +1,6 @@
 use super::{
     idle::IdleNode,
+    io::IoNodeCache,
     pool::{Pool, PoolEvent},
     queue::{Buffer, Injector, List, Popped},
     task::Task,
@@ -11,6 +12,7 @@ pub struct Worker {
     buffer: Buffer,
     injector: Injector,
     pub idle_node: IdleNode,
+    pub io_node_cache: IoNodeCache,
 }
 
 impl Pool {

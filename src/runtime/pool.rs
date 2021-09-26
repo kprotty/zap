@@ -331,8 +331,8 @@ impl Pool {
 
     #[cold]
     fn workers_notify(&self) {
-        if !self.io_driver.notify() {
-            self.idle_queue.signal(self);
+        if !self.idle_queue.signal(self) {
+            let _ = self.io_driver.notify();
         }
     }
 

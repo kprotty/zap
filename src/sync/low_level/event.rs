@@ -178,7 +178,11 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
-    use std::{pin::Pin, ptr, sync::atomic::{AtomicI32, Ordering}};
+    use std::{
+        pin::Pin,
+        ptr,
+        sync::atomic::{AtomicI32, Ordering},
+    };
 
     const EMPTY: i32 = 0;
     const WAITING: i32 = 1;
@@ -198,15 +202,13 @@ mod os {
 
     impl AutoResetEvent {
         pub fn wait(self: Pin<&Self>) {
-            match self.state.compare_exchange(
-                EMPTY,
-                WAITING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {},
+            match self
+                .state
+                .compare_exchange(EMPTY, WAITING, Ordering::Acquire, Ordering::Acquire)
+            {
+                Ok(_) => {}
                 Err(NOTIFIED) => return,
-                Err(_) => unreachable!("invalid AutoResetEvent state")
+                Err(_) => unreachable!("invalid AutoResetEvent state"),
             }
 
             loop {
@@ -222,7 +224,7 @@ mod os {
 
         pub fn notify(self: Pin<&Self>) {
             match self.state.swap(NOTIFIED, Ordering::Release) {
-                EMPTY => {},
+                EMPTY => {}
                 WAITING => unsafe { Self::futex_wake(&self.state, 1) },
                 NOTIFIED => unreachable!("AutoResetEvent notified multiple times"),
                 _ => unreachable!("invalid AutoResetEvent state"),
@@ -269,6 +271,16 @@ mod os {
 
     unsafe impl Send for PosixMutexCond {}
     unsafe impl Sync for PosixMutexCond {}
+
+    impl Default for PosixMutexCond {
+        fn default() -> Self {
+            Self {
+                mutex: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+                cond: UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+                _pinned: PhantomPinned,
+            }
+        }
+    }
 
     impl super::mutex_cond::MutexCond for PosixMutexCond {
         unsafe fn lock(self: Pin<&Self>) {

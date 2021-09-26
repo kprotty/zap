@@ -8,17 +8,17 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-pub struct Popped {
-    pub task: NonNull<Task>,
-    pub pushed: usize,
+pub(crate) struct Popped {
+    pub(crate) task: NonNull<Task>,
+    pub(crate) pushed: usize,
 }
 
-pub struct List {
-    pub head: NonNull<Task>,
-    pub tail: NonNull<Task>,
+pub(crate) struct List {
+    pub(crate) head: NonNull<Task>,
+    pub(crate) tail: NonNull<Task>,
 }
 
-pub struct Injector {
+pub(crate) struct Injector {
     stub: Task,
     head: AtomicPtr<Task>,
     tail: AtomicPtr<Task>,
@@ -132,7 +132,7 @@ impl Injector {
     }
 }
 
-pub struct Buffer {
+pub(crate) struct Buffer {
     head: AtomicUsize,
     tail: AtomicUsize,
     array: [AtomicPtr<Task>; Self::CAPACITY],

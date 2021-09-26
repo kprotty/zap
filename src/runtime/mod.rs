@@ -3,9 +3,8 @@ mod idle;
 mod io;
 mod pool;
 mod queue;
-mod task;
+pub mod task;
 mod waker;
 mod worker;
 
 pub use builder::Builder;
-pub use task::{spawn, JoinHandle};

@@ -16,18 +16,18 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-pub struct Task {
-    pub next: AtomicPtr<Self>,
-    pub vtable: &'static TaskVTable,
-    pub _pinned: PhantomPinned,
+pub(crate) struct Task {
+    pub(crate) next: AtomicPtr<Self>,
+    pub(crate) vtable: &'static TaskVTable,
+    pub(crate) _pinned: PhantomPinned,
 }
 
-pub struct TaskVTable {
-    pub clone_fn: unsafe fn(NonNull<Task>),
-    pub drop_fn: unsafe fn(NonNull<Task>),
-    pub wake_fn: unsafe fn(NonNull<Task>, bool),
-    pub poll_fn: unsafe fn(NonNull<Task>, &Arc<Pool>, usize),
-    pub join_fn: unsafe fn(NonNull<Task>, Option<(&Waker, *mut ())>) -> Poll<()>,
+pub(crate) struct TaskVTable {
+    pub(crate) clone_fn: unsafe fn(NonNull<Task>),
+    pub(crate) drop_fn: unsafe fn(NonNull<Task>),
+    pub(crate) wake_fn: unsafe fn(NonNull<Task>, bool),
+    pub(crate) poll_fn: unsafe fn(NonNull<Task>, &Arc<Pool>, usize),
+    pub(crate) join_fn: unsafe fn(NonNull<Task>, Option<(&Waker, *mut ())>) -> Poll<()>,
 }
 
 enum TaskData<F: Future> {
@@ -81,7 +81,7 @@ impl Into<usize> for TaskState {
     }
 }
 
-pub struct TaskFuture<F: Future> {
+pub(crate) struct TaskFuture<F: Future> {
     task: Task,
     waker: AtomicWaker,
     state: AtomicUsize,
@@ -416,4 +416,25 @@ impl<T> Future for JoinHandle<T> {
             Poll::Ready(output.assume_init())
         }
     }
+}
+
+pub fn yield_now() -> impl Future<Output = ()> {
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<()> {
+            if mem::replace(&mut self.yielded, true) {
+                return Poll::Ready(());
+            }
+
+            ctx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldNow { yielded: false }
 }

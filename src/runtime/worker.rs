@@ -79,7 +79,7 @@ impl Pool {
         });
     }
 
-    pub unsafe fn push(
+    pub(crate) unsafe fn push(
         self: &Arc<Self>,
         index: Option<usize>,
         task: NonNull<Task>,

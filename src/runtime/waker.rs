@@ -88,12 +88,19 @@ impl AtomicWaker {
             return WakerUpdate::Notified;
         }
 
-        match mem::replace(
-            unsafe { &mut *self.waker.get() },
-            waker_ref.map(|waker| waker.clone()),
-        ) {
-            Some(_dropped_waker) => assert_eq!(state, WakerState::Ready),
-            None => assert_eq!(state, WakerState::Empty),
+        let will_wake = (unsafe { &*self.waker.get() })
+            .as_ref()
+            .and_then(|waker| waker_ref.map(|waker_ref| waker_ref.will_wake(waker)))
+            .unwrap_or(false);
+
+        if !will_wake {
+            match mem::replace(
+                unsafe { &mut *self.waker.get() },
+                waker_ref.map(|waker| waker.clone()),
+            ) {
+                Some(_dropped_waker) => assert_eq!(state, WakerState::Ready),
+                None => assert_eq!(state, WakerState::Empty),
+            }
         }
 
         let new_state = match waker_ref {

@@ -18,7 +18,7 @@ use std::{
 
 #[allow(unused)]
 #[derive(Debug)]
-pub enum PoolEvent {
+pub(crate) enum PoolEvent {
     TaskSpawned {
         worker_index: usize,
         task: NonNull<Task>,
@@ -167,7 +167,7 @@ impl Pool {
         &self.workers[..]
     }
 
-    pub fn emit(&self, event: PoolEvent) {
+    pub(crate) fn emit(&self, event: PoolEvent) {
         // TODO: Add custom tracing/handling here
         mem::drop(event)
     }

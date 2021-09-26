@@ -1,17 +1,16 @@
 use super::{
+    idle::IdleNode,
     pool::{Pool, PoolEvent},
     queue::{Buffer, Injector, List, Popped},
     task::Task,
 };
-use std::{
-    cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::atomic::Ordering, sync::Arc,
-    time::Duration,
-};
+use std::{cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::Arc, time::Duration};
 
 #[derive(Default)]
 pub struct Worker {
-    injector: Injector,
     buffer: Buffer,
+    injector: Injector,
+    pub idle_node: IdleNode,
 }
 
 impl Pool {
@@ -84,20 +83,20 @@ impl Pool {
         task: NonNull<Task>,
         mut be_fair: bool,
     ) {
+        let workers = self.workers();
         let index = index.unwrap_or_else(|| {
             be_fair = true;
-            let inject_index = self.injecting.fetch_add(1, Ordering::Relaxed);
-            inject_index % self.workers.len()
+            self.next_inject_index()
         });
 
-        let injector = Pin::new_unchecked(&self.workers[index].injector);
+        let injector = Pin::new_unchecked(&workers[index].injector);
         if be_fair {
             injector.push(List {
                 head: task,
                 tail: task,
             });
         } else {
-            self.workers[index].buffer.push(task, injector);
+            workers[index].buffer.push(task, injector);
         }
 
         self.emit(PoolEvent::WorkerPushed {
@@ -121,7 +120,7 @@ impl Pool {
     fn pop_local(self: &Arc<Self>, index: usize) -> Option<Popped> {
         // TODO: add worker-local injector consume here
 
-        self.workers[index].buffer.pop().map(|popped| {
+        self.workers()[index].buffer.pop().map(|popped| {
             self.emit(PoolEvent::WorkerPopped {
                 worker_index: index,
                 task: popped.task,
@@ -136,10 +135,11 @@ impl Pool {
             return Some(popped);
         }
 
-        match self.io_poll(Some(Duration::ZERO)) {
-            Some(n) if n > 0 => self.pop_local(index).or_else(|| self.consume(index, index)),
-            _ => None,
+        if self.io_driver.poll(Some(Duration::ZERO)) {
+            return self.pop_local(index).or_else(|| self.consume(index, index));
         }
+
+        None
     }
 
     #[cold]
@@ -156,10 +156,11 @@ impl Pool {
         rng ^= rng << shifts.2;
         *xorshift = rng;
 
-        (0..self.workers.len())
+        let num_workers = self.workers().len();
+        (0..num_workers)
             .cycle()
-            .skip(rng % self.workers.len())
-            .take(self.workers.len())
+            .skip(rng % num_workers)
+            .take(num_workers)
             .map(|steal_index| {
                 self.consume(index, steal_index)
                     .or_else(|| match steal_index {
@@ -173,9 +174,9 @@ impl Pool {
 
     #[cold]
     fn consume(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
-        self.workers[index]
+        self.workers()[index]
             .buffer
-            .consume(unsafe { Pin::new_unchecked(&self.workers[target_index].injector) })
+            .consume(unsafe { Pin::new_unchecked(&self.workers()[target_index].injector) })
             .map(|popped| {
                 self.emit(PoolEvent::WorkerStole {
                     worker_index: index,
@@ -195,9 +196,9 @@ impl Pool {
     #[cold]
     fn steal(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
         assert_ne!(index, target_index);
-        self.workers[index]
+        self.workers()[index]
             .buffer
-            .steal(&self.workers[target_index].buffer)
+            .steal(&self.workers()[target_index].buffer)
             .map(|popped| {
                 self.emit(PoolEvent::WorkerStole {
                     worker_index: index,

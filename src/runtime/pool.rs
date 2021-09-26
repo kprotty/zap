@@ -1,13 +1,19 @@
-use super::{builder::Builder, io::Poller, task::Task, worker::Worker};
+use super::{
+    builder::Builder,
+    idle::{IdleNode, IdleNodeProvider, IdleQueue},
+    io::IoDriver,
+    task::Task,
+    worker::Worker,
+};
 use std::{
     mem,
     num::NonZeroUsize,
+    pin::Pin,
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        Arc,
     },
-    time::Duration,
 };
 
 #[allow(unused)]
@@ -65,48 +71,6 @@ pub enum PoolEvent {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum IoStatus {
-    Empty,
-    Polling,
-    Waiting,
-    Notified,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct IoState {
-    pending: usize,
-    status: IoStatus,
-}
-
-impl From<usize> for IoState {
-    fn from(value: usize) -> Self {
-        Self {
-            pending: value >> 2,
-            status: match value & 0b11 {
-                0 => IoStatus::Empty,
-                1 => IoStatus::Polling,
-                2 => IoStatus::Waiting,
-                3 => IoStatus::Notified,
-                _ => unreachable!(),
-            },
-        }
-    }
-}
-
-impl Into<usize> for IoState {
-    fn into(self) -> usize {
-        assert!(self.pending <= usize::MAX >> 2);
-        (self.pending << 2)
-            | match self.status {
-                IoStatus::Empty => 0,
-                IoStatus::Polling => 1,
-                IoStatus::Waiting => 2,
-                IoStatus::Notified => 3,
-            }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum SyncStatus {
     Pending,
     Waking,
@@ -160,15 +124,20 @@ impl Into<usize> for SyncState {
 
 #[repr(align(8))]
 pub struct Pool {
-    idle_cond: Condvar,
-    idle_sema: Mutex<usize>,
-    stack_size: Option<NonZeroUsize>,
     sync: AtomicUsize,
     pending: AtomicUsize,
-    io_state: AtomicUsize,
-    io_poller: Poller,
-    pub injecting: AtomicUsize,
-    pub workers: Box<[Worker]>,
+    injecting: AtomicUsize,
+    idle_queue: IdleQueue,
+    stack_size: Option<NonZeroUsize>,
+    pub io_driver: IoDriver,
+    pub workers: Pin<Box<[Worker]>>,
+}
+
+impl<'a> IdleNodeProvider for &'a Pool {
+    fn with_node<T>(&self, index: usize, f: impl FnOnce(Pin<&IdleNode>) -> T) -> T {
+        let idle_node = &self.workers()[index].idle_node;
+        f(unsafe { Pin::new_unchecked(idle_node) })
+    }
 }
 
 impl Pool {
@@ -181,37 +150,43 @@ impl Pool {
             .max(1);
 
         Arc::new(Self {
-            idle_cond: Condvar::new(),
-            idle_sema: Mutex::new(0),
-            stack_size: builder.stack_size,
             sync: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
-            io_state: AtomicUsize::new(0),
-            io_poller: Poller::default(),
             injecting: AtomicUsize::new(0),
+            idle_queue: IdleQueue::default(),
+            stack_size: builder.stack_size,
+            io_driver: IoDriver::default(),
             workers: (0..num_threads)
                 .map(|_| Worker::default())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+                .collect::<Box<[Worker]>>()
+                .into(),
         })
     }
 
-    pub fn emit(self: &Arc<Self>, event: PoolEvent) {
-        // TODO: Add custom tracing/handling here
-        let _ = event;
+    pub fn workers(&self) -> &[Worker] {
+        &self.workers[..]
     }
 
-    pub fn mark_task_begin(self: &Arc<Self>) {
+    pub fn emit(&self, event: PoolEvent) {
+        // TODO: Add custom tracing/handling here
+        mem::drop(event)
+    }
+
+    pub fn next_inject_index(&self) -> usize {
+        self.injecting.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+    }
+
+    pub fn mark_task_begin(&self) {
         let pending = self.pending.fetch_add(1, Ordering::Relaxed);
         assert_ne!(pending, usize::MAX);
     }
 
-    pub fn mark_task_end(self: &Arc<Self>) {
+    pub fn mark_task_end(&self) {
         let pending = self.pending.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(pending, 0);
 
         if pending == 1 {
-            self.idle_post(self.workers.len());
+            self.workers_shutdown();
         }
     }
 
@@ -245,7 +220,7 @@ impl Pool {
         if let Ok(sync) = result.map(SyncState::from) {
             if is_waking || sync.status == SyncStatus::Pending {
                 if sync.idle > 0 {
-                    return self.idle_post(1);
+                    return self.workers_notify();
                 }
 
                 if sync.spawned >= self.workers.len() {
@@ -329,7 +304,7 @@ impl Pool {
 
             match self.pending.load(Ordering::SeqCst) {
                 0 => break None,
-                _ => self.idle_wait(),
+                _ => self.workers_wait(index),
             }
         };
 
@@ -343,105 +318,27 @@ impl Pool {
     }
 
     #[cold]
-    fn idle_wait(self: &Arc<Self>) {
-        if let Some(_) = self.io_poll(None) {
+    fn workers_wait(&self, index: usize) {
+        if self.io_driver.poll(None) {
             return;
         }
 
-        {
-            let mut idle_sema = self.idle_sema.lock().unwrap();
-            while *idle_sema == 0 {
-                idle_sema = self.idle_cond.wait(idle_sema).unwrap();
-            }
-            *idle_sema -= 1;
+        self.idle_queue.wait(self, index, || {
+            let sync: SyncState = self.sync.load(Ordering::Relaxed).into();
+            !sync.notified
+        });
+    }
+
+    #[cold]
+    fn workers_notify(&self) {
+        if !self.io_driver.notify() {
+            self.idle_queue.signal(self);
         }
     }
 
     #[cold]
-    fn idle_post(self: &Arc<Self>, waiting: usize) {
-        if self.io_notify() && waiting == 1 {
-            return;
-        }
-
-        let mut idle_sema = self.idle_sema.lock().unwrap();
-        *idle_sema = idle_sema
-            .checked_add(waiting)
-            .expect("idle semaphore count overflowed");
-
-        match waiting {
-            1 => self.idle_cond.notify_one(),
-            _ => self.idle_cond.notify_all(),
-        }
-    }
-
-    pub fn io_poll(self: &Arc<Self>, timeout: Option<Duration>) -> Option<usize> {
-        self.io_state
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |io_state| {
-                let mut io_state: IoState = io_state.into();
-                if io_state.pending == 0 {
-                    return None;
-                }
-
-                io_state.status = match io_state.status {
-                    IoStatus::Empty => match timeout {
-                        Some(Duration::ZERO) => IoStatus::Polling,
-                        _ => IoStatus::Waiting,
-                    },
-                    _ => return None,
-                };
-
-                Some(io_state.into())
-            })
-            .and_then(|_| unsafe {
-                let mut notified = false;
-                let mut resumed = self.io_poller.poll(&mut notified, timeout);
-                assert_eq!(notified, false);
-
-                self.io_state
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
-                        let mut io_state: IoState = io_state.into();
-                        assert!(io_state.pending >= resumed);
-
-                        assert_ne!(io_state.status, IoStatus::Empty);
-                        if io_state.status == IoStatus::Notified {
-                            while !notified {
-                                resumed += self.io_poller.poll(&mut notified, None);
-                            }
-                        }
-
-                        assert_eq!(
-                            io_state.status,
-                            match timeout {
-                                Some(Duration::ZERO) => IoStatus::Polling,
-                                _ => IoStatus::Waiting,
-                            }
-                        );
-
-                        io_state.pending -= resumed;
-                        io_state.status = IoStatus::Empty;
-                        Some(io_state.into())
-                    })
-                    .map(|_| resumed)
-            })
-            .ok()
-    }
-
-    fn io_notify(self: &Arc<Self>) -> bool {
-        self.io_state
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
-                let mut io_state: IoState = io_state.into();
-                if io_state.pending == 0 {
-                    return None;
-                }
-
-                io_state.status = match io_state.status {
-                    IoStatus::Waiting => IoStatus::Notified,
-                    _ => return None,
-                };
-
-                Some(io_state.into())
-            })
-            .map(|_| self.io_poller.notify())
-            .is_ok()
+    fn workers_shutdown(&self) {
+        let _ = self.io_driver.notify();
+        self.idle_queue.shutdown(self)
     }
 }

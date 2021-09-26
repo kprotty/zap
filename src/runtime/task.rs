@@ -83,10 +83,17 @@ impl Into<usize> for TaskState {
 
 pub struct TaskFuture<F: Future> {
     task: Task,
-    state: AtomicUsize,
     waker: AtomicWaker,
-    ref_count: AtomicUsize,
+    state: AtomicUsize,
     data: UnsafeCell<TaskData<F>>,
+}
+
+impl<F: Future> Drop for TaskFuture<F> {
+    fn drop(&mut self) {
+        let state: TaskState = self.state.load(Ordering::Relaxed).into();
+        assert_eq!(state.status, TaskStatus::Ready);
+        assert_eq!(state.pool, None);
+    }
 }
 
 impl<F: Future> TaskFuture<F> {
@@ -99,12 +106,13 @@ impl<F: Future> TaskFuture<F> {
     };
 
     pub fn spawn(pool: &Arc<Pool>, worker_index: usize, future: F) -> JoinHandle<F::Output> {
-        let this_ptr = NonNull::<Self>::from(Box::leak(Box::new(Self {
+        let this = Arc::pin(Self {
             task: Task {
                 next: AtomicPtr::new(ptr::null_mut()),
                 vtable: &Self::TASK_VTABLE,
                 _pinned: PhantomPinned,
             },
+            waker: AtomicWaker::default(),
             state: AtomicUsize::new(
                 TaskState {
                     pool: Some(NonNull::from(pool.as_ref())),
@@ -112,18 +120,19 @@ impl<F: Future> TaskFuture<F> {
                 }
                 .into(),
             ),
-            waker: AtomicWaker::default(),
-            ref_count: AtomicUsize::new(2),
             data: UnsafeCell::new(TaskData::Polling(future)),
-        })));
+        });
 
         unsafe {
-            let task = NonNull::from(&this_ptr.as_ref().task);
+            let this = Pin::into_inner_unchecked(this);
+            let task = NonNull::from(&this.task);
+            mem::forget(this.clone()); // keep a reference for JoinHandle
+            mem::forget(this); // keep a reference for ourselves
 
             pool.mark_task_begin();
             pool.emit(PoolEvent::TaskSpawned { worker_index, task });
-
             pool.push(Some(worker_index), task, false);
+
             JoinHandle {
                 task: Some(task),
                 _phantom: PhantomData,
@@ -135,7 +144,7 @@ impl<F: Future> TaskFuture<F> {
         let task_offset = {
             let stub = MaybeUninit::<Self>::uninit();
             let base_ptr = stub.as_ptr();
-            let field_ptr = ptr::addr_of!((*(base_ptr)).task);
+            let field_ptr = ptr::addr_of!((*base_ptr).task);
             (field_ptr as usize) - (base_ptr as usize)
         };
 
@@ -150,30 +159,14 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_clone(task: NonNull<Task>) {
-        Self::with(task, |this| {
-            let ref_count = this.ref_count.fetch_add(1, Ordering::Relaxed);
-            assert_ne!(ref_count, usize::MAX);
-            assert_ne!(ref_count, 0);
-        })
+        let this = Arc::from_raw(task.as_ptr());
+        mem::forget(this.clone());
+        mem::forget(this)
     }
 
     unsafe fn on_drop(task: NonNull<Task>) {
-        let dealloc = Self::with(task, |this| {
-            let ref_count = this.ref_count.fetch_sub(1, Ordering::AcqRel);
-            assert_ne!(ref_count, 0);
-            ref_count == 1
-        });
-
-        if dealloc {
-            Self::with(task, |this| {
-                let state: TaskState = this.state.load(Ordering::Relaxed).into();
-                assert_eq!(state.status, TaskStatus::Ready);
-                assert_eq!(state.pool, None);
-            });
-
-            let self_ptr = Self::from_task(task);
-            mem::drop(Box::from_raw(self_ptr.as_ptr()));
-        }
+        let this = Arc::from_raw(task.as_ptr());
+        mem::drop(this)
     }
 
     unsafe fn on_wake(task: NonNull<Task>, also_drop: bool) {

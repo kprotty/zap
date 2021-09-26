@@ -1,4 +1,5 @@
 mod builder;
+mod idle;
 mod io;
 mod pool;
 mod queue;

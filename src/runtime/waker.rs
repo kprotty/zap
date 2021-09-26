@@ -35,18 +35,26 @@ unsafe impl Send for AtomicWaker {}
 unsafe impl Sync for AtomicWaker {}
 
 impl AtomicWaker {
-    pub fn wake(&self) {
+    pub fn wake(&self) -> bool {
         let state: WakerState = self
             .state
             .swap(WakerState::Waking as u8, Ordering::AcqRel)
             .into();
 
         assert_ne!(state, WakerState::Waking);
-        if state == WakerState::Ready {
-            mem::replace(unsafe { &mut *self.waker.get() }, None)
-                .expect("waker state was Ready without a Waker")
-                .wake();
+        if state != WakerState::Ready {
+            return false;
         }
+
+        mem::replace(unsafe { &mut *self.waker.get() }, None)
+            .expect("waker state was Ready without a Waker")
+            .wake();
+        true
+    }
+
+    pub fn reset(&self) {
+        let new_state = WakerState::Empty as u8;
+        self.state.store(new_state, Ordering::Relaxed);
     }
 
     pub fn update(&self, waker_ref: Option<&Waker>) -> bool {

@@ -5,8 +5,10 @@ edition = "2021"
 authors = ["kprotty"]
 
 [dependencies]
+libc = "0.2"
 num_cpus = "1"
 mio = { version = "0.7", features = ["net", "os-poll"] }
+tokio = { version = "1" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

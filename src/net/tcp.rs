@@ -144,6 +144,58 @@ impl TcpStream {
             Err(TcpReuniteError(reader, writer))
         }
     }
+
+    pub fn nodelay(&self) -> io::Result<bool> {
+        self.source.as_ref().nodelay()
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.source.as_ref().set_nodelay(nodelay)
+    }
+
+    pub fn ttl(&self) -> io::Result<u32> {
+        self.source.as_ref().ttl()
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.source.as_ref().set_ttl(ttl)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.source.as_ref().local_addr()
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.source.as_ref().peer_addr()
+    }
+
+    pub fn poll_peek(
+        &self,
+        ctx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<usize>> {
+        unsafe {
+            let polled = self.reader.borrow_mut().poll_io(
+                &self.source,
+                IoKind::Read,
+                ctx.waker(),
+                || {
+                    let buf = &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
+                    self.source.as_ref().peek(buf)
+                },
+            );
+
+            match polled {
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(n)) => {
+                    buf.assume_init(n);
+                    buf.advance(n);
+                    Poll::Ready(Ok(n))
+                }
+            }
+        }
+    }
 }
 
 pub struct TcpReuniteError(pub TcpReader, pub TcpWriter);
@@ -155,6 +207,34 @@ pub struct TcpReader {
 impl TcpReader {
     pub fn reunite(self, writer: TcpWriter) -> Result<TcpStream, TcpReuniteError> {
         TcpStream::reunite(self, writer)
+    }
+
+    pub fn poll_peek(
+        &self,
+        ctx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<usize>> {
+        unsafe {
+            let polled = self.stream.reader.borrow_mut().poll_io(
+                &self.stream.source,
+                IoKind::Read,
+                ctx.waker(),
+                || {
+                    let buf = &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
+                    self.stream.source.as_ref().peek(buf)
+                },
+            );
+
+            match polled {
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(n)) => {
+                    buf.assume_init(n);
+                    buf.advance(n);
+                    Poll::Ready(Ok(n))
+                }
+            }
+        }
     }
 }
 

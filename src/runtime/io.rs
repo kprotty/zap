@@ -306,7 +306,6 @@ impl IoDriver {
 
                 let mut notified = false;
                 let mut resumed = do_poll(&mut notified, timeout);
-                assert_eq!(notified, false);
 
                 self.io_state
                     .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
@@ -431,7 +430,7 @@ impl<S: mio::event::Source> IoSource<S> {
                 }
                 WakerUpdate::Notified => {
                     io_driver.cancel_pending();
-                }
+                },
             }
 
             if yield_now() {

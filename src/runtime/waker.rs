@@ -116,7 +116,6 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            unsafe { *self.waker.get() = None };
             return WakerUpdate::Notified;
         }
 

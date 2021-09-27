@@ -3,14 +3,17 @@ use super::{
     waker::{AtomicWaker, WakerUpdate},
 };
 use std::{
-    cell::{Cell},
+    cell::Cell,
     future::Future,
     io,
     marker::PhantomPinned,
     mem,
     pin::Pin,
-    ptr::{NonNull},
-    sync::{Mutex, atomic::{AtomicU8, Ordering}},
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -95,7 +98,7 @@ struct IoPoller {
 }
 
 impl IoPoller {
-    pub fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>)  {
+    pub fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>) {
         if let Err(_) = self.io_poll.poll(&mut self.io_events, timeout) {
             return;
         }
@@ -177,60 +180,76 @@ impl Default for IoDriver {
 
 impl IoDriver {
     pub fn notify(&self) -> bool {
-        self.io_notify.fetch_update(Ordering::Release, Ordering::Relaxed, |io_notify| {
-            match IoNotify::from(io_notify) {
-                IoNotify::Empty => Some(IoNotify::Notified as u8),
-                IoNotify::Waiting => Some(IoNotify::Notified as u8),
-                IoNotify::Notified => None, 
-            }
-        })
-        .map(IoNotify::from)
-        .map(|io_notify| io_notify == IoNotify::Waiting && {
-            self.io_waker.wake().expect("failed to wake up os notifier");
-            true
-        })
-        .unwrap_or(false)
+        self.io_notify
+            .fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |io_notify| match IoNotify::from(io_notify) {
+                    IoNotify::Empty => Some(IoNotify::Notified as u8),
+                    IoNotify::Waiting => Some(IoNotify::Notified as u8),
+                    IoNotify::Notified => None,
+                },
+            )
+            .map(IoNotify::from)
+            .map(|io_notify| {
+                io_notify == IoNotify::Waiting && {
+                    self.io_waker.wake().expect("failed to wake up os notifier");
+                    true
+                }
+            })
+            .unwrap_or(false)
     }
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.io_poller.try_lock().map(|mut io_poller| {
-            let mut notified = false;
-            if let Some(Duration::ZERO) = timeout {
-                io_poller.poll(&mut notified, timeout);
-                return true;
-            }
-
-            if let Err(io_notify) = self.io_notify.compare_exchange(
-                IoNotify::Empty as u8,
-                IoNotify::Waiting as u8,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                let io_notify: IoNotify = io_notify.into();
-                assert_eq!(io_notify, IoNotify::Notified);
-                self.io_notify.store(IoNotify::Empty as u8, Ordering::Relaxed);
-                return true;
-            }
-
-            io_poller.poll(&mut notified, timeout);
-
-            if let Err(io_notify) = self.io_notify.compare_exchange(
-                IoNotify::Waiting as u8,
-                IoNotify::Empty as u8,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                let io_notify: IoNotify = io_notify.into();
-                assert_eq!(io_notify, IoNotify::Notified);
-                self.io_notify.store(IoNotify::Empty as u8, Ordering::Relaxed);
-                while !notified {
-                    io_poller.poll(&mut notified, None);
+        self.io_poller
+            .try_lock()
+            .map(|mut io_poller| {
+                let mut notified = false;
+                if let Some(Duration::ZERO) = timeout {
+                    io_poller.poll(&mut notified, timeout);
+                    return true;
                 }
-            }
 
-            true
-        })
-        .unwrap_or(false)
+                let io_notify: IoNotify = self.io_notify.load(Ordering::Acquire).into();
+                if io_notify == IoNotify::Notified {
+                    self.io_notify
+                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                    return true;
+                }
+
+                if let Err(io_notify) = self.io_notify.compare_exchange(
+                    IoNotify::Empty as u8,
+                    IoNotify::Waiting as u8,
+                    Ordering::Acquire,
+                    Ordering::Acquire,
+                ) {
+                    let io_notify: IoNotify = io_notify.into();
+                    assert_eq!(io_notify, IoNotify::Notified);
+                    self.io_notify
+                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                    return true;
+                }
+
+                io_poller.poll(&mut notified, timeout);
+
+                if let Err(io_notify) = self.io_notify.compare_exchange(
+                    IoNotify::Waiting as u8,
+                    IoNotify::Empty as u8,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    let io_notify: IoNotify = io_notify.into();
+                    assert_eq!(io_notify, IoNotify::Notified);
+                    self.io_notify
+                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                    while !notified {
+                        io_poller.poll(&mut notified, None);
+                    }
+                }
+
+                true
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -260,10 +279,14 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
         unsafe {
             self.detach_io(IoKind::Read);
             self.detach_io(IoKind::Write);
-            
+
             let io_driver = self.io_driver.as_ref();
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
-            io_driver.io_node_cache.lock().unwrap().dealloc(self.io_node);
+            io_driver
+                .io_node_cache
+                .lock()
+                .unwrap()
+                .dealloc(self.io_node);
         }
     }
 }
@@ -271,12 +294,7 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
 impl<S: mio::event::Source> IoSource<S> {
     pub fn new(mut source: S) -> Self {
         Pool::with_current(|pool, _index| {
-            let node = pool
-                .io_driver
-                .io_node_cache
-                .lock()
-                .unwrap()
-                .alloc();
+            let node = pool.io_driver.io_node_cache.lock().unwrap().alloc();
 
             pool.io_driver
                 .io_registry

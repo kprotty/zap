@@ -12,7 +12,6 @@ use std::{
 pub struct TcpStream {
     source: IoSource<mio::net::TcpStream>,
     reader: RefCell<IoFairness>,
-    writer: RefCell<IoFairness>,
 }
 
 impl TcpStream {
@@ -20,7 +19,6 @@ impl TcpStream {
         Self {
             source: IoSource::new(stream),
             reader: RefCell::new(IoFairness::default()),
-            writer: RefCell::new(IoFairness::default()),
         }
     }
 
@@ -76,11 +74,12 @@ impl tokio::io::AsyncWrite for TcpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.writer
-                .borrow_mut()
-                .poll_io(&self.source, IoKind::Write, ctx.waker(), || {
-                    self.source.as_ref().write(buf)
-                })
+            self.source.poll_io(
+                IoKind::Write,
+                ctx.waker(),
+                || false,
+                || self.source.as_ref().write(buf),
+            )
         }
     }
 
@@ -90,11 +89,12 @@ impl tokio::io::AsyncWrite for TcpStream {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.writer
-                .borrow_mut()
-                .poll_io(&self.source, IoKind::Write, ctx.waker(), || {
-                    self.source.as_ref().write_vectored(bufs)
-                })
+            self.source.poll_io(
+                IoKind::Write,
+                ctx.waker(),
+                || false,
+                || self.source.as_ref().write_vectored(bufs),
+            )
         }
     }
 

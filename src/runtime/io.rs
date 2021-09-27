@@ -11,7 +11,10 @@ use std::{
     mem,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::{Arc, Once, atomic::{AtomicPtr, AtomicU8, Ordering}},
+    sync::{
+        atomic::{AtomicPtr, AtomicU8, Ordering},
+        Arc, Once,
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -278,7 +281,8 @@ impl IoDriver {
     }
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.with_inner(|inner| inner.poll(timeout)).unwrap_or(false)
+        self.with_inner(|inner| inner.poll(timeout))
+            .unwrap_or(false)
     }
 
     fn with_inner<T>(&self, f: impl FnOnce(&IoDriverInner) -> T) -> Option<T> {
@@ -292,9 +296,7 @@ impl IoDriver {
             self.inner.store(inner, Ordering::Release);
         });
 
-        unsafe {
-            &*self.inner.load(Ordering::Acquire)
-        }
+        unsafe { &*self.inner.load(Ordering::Acquire) }
     }
 }
 
@@ -340,7 +342,8 @@ impl<S: mio::event::Source> IoSource<S> {
             let inner = pool.io_driver.get_inner();
             let node = inner.io_node_cache.with(|cache| cache.alloc());
 
-            inner.io_registry
+            inner
+                .io_registry
                 .register(
                     &mut source,
                     mio::Token(node.as_ptr() as usize),

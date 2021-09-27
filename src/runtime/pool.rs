@@ -1,4 +1,10 @@
-use super::{builder::Builder, idle::IdleQueue, io::IoDriver, task::Task, worker::Worker};
+use super::{
+    builder::Builder,
+    idle::{IdleNode, IdleNodeProvider, IdleQueue},
+    io::IoDriver,
+    task::Task,
+    worker::Worker,
+};
 use std::{
     mem,
     num::NonZeroUsize,
@@ -127,6 +133,12 @@ pub struct Pool {
     pub workers: Pin<Box<[Worker]>>,
 }
 
+impl<'a> IdleNodeProvider for &'a Pool {
+    fn with<T>(&self, index: usize, f: impl FnOnce(Pin<&IdleNode>) -> T) -> T {
+        f(unsafe { Pin::new_unchecked(&self.workers()[index].idle_node) })
+    }
+}
+
 impl Pool {
     pub fn from_builder(builder: &Builder) -> Arc<Pool> {
         let num_threads = builder
@@ -135,9 +147,7 @@ impl Pool {
             .min(SyncState::COUNT_MASK)
             .max(1);
 
-        let stack_size = builder
-            .stack_size
-            .and_then(NonZeroUsize::new);
+        let stack_size = builder.stack_size.and_then(NonZeroUsize::new);
 
         Arc::new(Self {
             sync: AtomicUsize::new(0),
@@ -293,7 +303,7 @@ impl Pool {
 
             match self.pending.load(Ordering::SeqCst) {
                 0 => break None,
-                _ => self.workers_wait(),
+                _ => self.workers_wait(index),
             }
         };
 
@@ -307,12 +317,12 @@ impl Pool {
     }
 
     #[cold]
-    fn workers_wait(&self) {
+    fn workers_wait(&self, index: usize) {
         if self.io_driver.poll(None) {
             return;
         }
 
-        self.idle_queue.wait(|| {
+        self.idle_queue.wait(self, index, || {
             let sync: SyncState = self.sync.load(Ordering::Relaxed).into();
             !sync.notified
         });
@@ -320,7 +330,7 @@ impl Pool {
 
     #[cold]
     fn workers_notify(&self) {
-        if !self.idle_queue.signal() {
+        if !self.idle_queue.signal(self) {
             let _ = self.io_driver.notify();
         }
     }
@@ -328,6 +338,6 @@ impl Pool {
     #[cold]
     fn workers_shutdown(&self) {
         let _ = self.io_driver.notify();
-        self.idle_queue.shutdown()
+        self.idle_queue.shutdown(self);
     }
 }

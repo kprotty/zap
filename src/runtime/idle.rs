@@ -1,15 +1,23 @@
 use super::super::sync::low_level::{AutoResetEvent, Lock};
-use std::{cell::Cell, pin::Pin, ptr::NonNull};
+use std::{cell::Cell, pin::Pin};
 
-struct IdleWaiter {
-    next: Cell<Option<NonNull<Self>>>,
+#[derive(Default)]
+pub struct IdleNode {
+    next: Cell<Option<usize>>,
     event: AutoResetEvent,
+}
+
+unsafe impl Send for IdleNode {}
+unsafe impl Sync for IdleNode {}
+
+pub trait IdleNodeProvider {
+    fn with<T>(&self, index: usize, f: impl FnOnce(Pin<&IdleNode>) -> T) -> T;
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum IdleState {
     Empty,
-    Waiting(NonNull<IdleWaiter>),
+    Waiting(usize),
     Notified,
     Shutdown,
 }
@@ -28,27 +36,26 @@ pub struct IdleQueue {
 }
 
 impl IdleQueue {
-    pub fn wait(&self, validate: impl Fn() -> bool) {
-        let waiter = IdleWaiter {
-            next: Cell::new(None),
-            event: AutoResetEvent::default(),
-        };
-
-        let waiter = unsafe { Pin::new_unchecked(&waiter) };
+    pub fn wait<P: IdleNodeProvider>(
+        &self,
+        node_provider: P,
+        index: usize,
+        validate: impl Fn() -> bool,
+    ) {
         let is_waiting = self.state.with(|state| {
             if !validate() {
                 return false;
             }
 
-            let ptr = NonNull::from(&*waiter);
             match *state {
                 IdleState::Empty => {
-                    *state = IdleState::Waiting(ptr);
+                    node_provider.with(index, |node| node.next.set(None));
+                    *state = IdleState::Waiting(index);
                     true
                 }
-                IdleState::Waiting(head) => {
-                    waiter.next.set(Some(head));
-                    *state = IdleState::Waiting(ptr);
+                IdleState::Waiting(old_index) => {
+                    node_provider.with(index, |node| node.next.set(Some(old_index)));
+                    *state = IdleState::Waiting(index);
                     true
                 }
                 IdleState::Notified => {
@@ -60,51 +67,50 @@ impl IdleQueue {
         });
 
         if is_waiting {
-            unsafe {
-                Pin::map_unchecked(waiter, |w| &w.event).wait();
-            }
+            node_provider.with(index, |node| unsafe {
+                Pin::map_unchecked(node, |node| &node.event).wait()
+            })
         }
     }
 
-    pub fn signal(&self) -> bool {
+    pub fn signal<P: IdleNodeProvider>(&self, node_provider: P) -> bool {
         self.state
-            .with(|state| unsafe {
-                match *state {
-                    IdleState::Empty => {
-                        *state = IdleState::Notified;
-                        None
-                    }
-                    IdleState::Waiting(head) => {
-                        *state = match head.as_ref().next.get() {
-                            Some(new_head) => IdleState::Waiting(new_head),
-                            None => IdleState::Empty,
-                        };
-                        Some(head)
-                    }
-                    IdleState::Notified => None,
-                    IdleState::Shutdown => None,
+            .with(|state| match *state {
+                IdleState::Empty => {
+                    *state = IdleState::Notified;
+                    None
                 }
+                IdleState::Waiting(index) => {
+                    *state = match node_provider.with(index, |node| node.next.get()) {
+                        Some(new_index) => IdleState::Waiting(new_index),
+                        None => IdleState::Empty,
+                    };
+                    Some(index)
+                }
+                IdleState::Notified => None,
+                IdleState::Shutdown => None,
             })
-            .map(|waiter| unsafe {
-                Pin::new_unchecked(&waiter.as_ref().event).notify();
-                true
+            .map(|index| {
+                node_provider.with(index, |node| unsafe {
+                    Pin::map_unchecked(node, |node| &node.event).notify()
+                })
             })
-            .unwrap_or(false)
+            .is_some()
     }
 
-    pub fn shutdown(&self) {
+    pub fn shutdown<P: IdleNodeProvider>(&self, node_provider: P) {
         let mut state = self
             .state
             .with(|state| std::mem::replace(state, IdleState::Shutdown));
 
-        while let IdleState::Waiting(waiter) = state {
-            unsafe {
-                state = match waiter.as_ref().next.get() {
-                    Some(new_waiter) => IdleState::Waiting(new_waiter),
+        while let IdleState::Waiting(index) = state {
+            node_provider.with(index, |node| unsafe {
+                state = match node.next.get() {
+                    Some(new_index) => IdleState::Waiting(new_index),
                     None => IdleState::Empty,
                 };
-                Pin::new_unchecked(&waiter.as_ref().event).notify();
-            }
+                Pin::map_unchecked(node, |node| &node.event).notify()
+            })
         }
     }
 }

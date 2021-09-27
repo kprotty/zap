@@ -1,17 +1,4 @@
-use super::super::sync::low_level::AutoResetEvent;
-use std::{
-    pin::Pin,
-    sync::{Mutex, Condvar},
-};
-
-#[derive(Default)]
-pub struct IdleNode {
-    _event: AutoResetEvent,
-}
-
-pub trait IdleNodeProvider {
-    fn with_node<T>(&self, index: usize, f: impl FnOnce(Pin<&IdleNode>) -> T) -> T;
-}
+use std::sync::{Condvar, Mutex};
 
 #[derive(Default)]
 pub struct IdleQueue {
@@ -20,12 +7,7 @@ pub struct IdleQueue {
 }
 
 impl IdleQueue {
-    pub fn wait<P: IdleNodeProvider>(
-        &self,
-        _node_provider: P,
-        _index: usize,
-        validate: impl Fn() -> bool,
-    ) {
+    pub fn wait(&self, validate: impl Fn() -> bool) {
         let mut count = self.count.lock().unwrap();
         loop {
             if !validate() {
@@ -41,14 +23,14 @@ impl IdleQueue {
         }
     }
 
-    pub fn signal<P: IdleNodeProvider>(&self, _node_provider: P) -> bool {
+    pub fn signal(&self) -> bool {
         let mut count = self.count.lock().unwrap();
         *count += 1;
         self.cond.notify_one();
         *count == 1
     }
 
-    pub fn shutdown<P: IdleNodeProvider>(&self, _node_provider: P) {
+    pub fn shutdown(&self) {
         let mut count = self.count.lock().unwrap();
         *count = usize::MAX;
         self.cond.notify_all();

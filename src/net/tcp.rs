@@ -1,11 +1,11 @@
 use super::super::runtime::io::{IoFairness, IoKind, IoSource};
 use std::{
     cell::RefCell,
+    future::Future,
     io::{self, Read, Write},
     mem::MaybeUninit,
     net::SocketAddr,
     pin::Pin,
-    future::Future,
     task::{Context, Poll, Waker},
 };
 

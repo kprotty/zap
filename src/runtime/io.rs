@@ -3,9 +3,9 @@ use super::{
     waker::{AtomicWaker, WakerState, WakerUpdate},
 };
 use std::{
-    io,
     cell::{Cell, UnsafeCell},
     future::Future,
+    io,
     marker::PhantomPinned,
     mem,
     pin::Pin,
@@ -430,7 +430,7 @@ impl<S: mio::event::Source> IoSource<S> {
                 }
                 WakerUpdate::Notified => {
                     io_driver.cancel_pending();
-                },
+                }
             }
 
             if yield_now() {
@@ -479,14 +479,7 @@ impl<S: mio::event::Source> IoSource<S> {
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
                 let source = self.source.expect("wait_for polled after completion");
-                let polled = unsafe {
-                    source.poll_io(
-                        self.kind,
-                        ctx.waker(),
-                        || false,
-                        || Ok(()),
-                    )
-                };
+                let polled = unsafe { source.poll_io(self.kind, ctx.waker(), || false, || Ok(())) };
 
                 match polled {
                     Poll::Pending => Poll::Pending,

@@ -1,5 +1,4 @@
 use super::{
-    idle::IdleNode,
     io::IoNodeCache,
     pool::{Pool, PoolEvent},
     queue::{Buffer, Injector, List, Popped},
@@ -11,7 +10,6 @@ use std::{cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::Arc, time::D
 pub struct Worker {
     buffer: Buffer,
     injector: Injector,
-    pub idle_node: IdleNode,
     pub io_node_cache: IoNodeCache,
 }
 

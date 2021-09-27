@@ -1,10 +1,4 @@
-use super::{
-    builder::Builder,
-    idle::{IdleNode, IdleNodeProvider, IdleQueue},
-    io::IoDriver,
-    task::Task,
-    worker::Worker,
-};
+use super::{builder::Builder, idle::IdleQueue, io::IoDriver, task::Task, worker::Worker};
 use std::{
     mem,
     num::NonZeroUsize,
@@ -131,13 +125,6 @@ pub struct Pool {
     stack_size: Option<NonZeroUsize>,
     pub io_driver: IoDriver,
     pub workers: Pin<Box<[Worker]>>,
-}
-
-impl<'a> IdleNodeProvider for &'a Pool {
-    fn with_node<T>(&self, index: usize, f: impl FnOnce(Pin<&IdleNode>) -> T) -> T {
-        let idle_node = &self.workers()[index].idle_node;
-        f(unsafe { Pin::new_unchecked(idle_node) })
-    }
 }
 
 impl Pool {
@@ -304,7 +291,7 @@ impl Pool {
 
             match self.pending.load(Ordering::SeqCst) {
                 0 => break None,
-                _ => self.workers_wait(index),
+                _ => self.workers_wait(),
             }
         };
 
@@ -318,12 +305,12 @@ impl Pool {
     }
 
     #[cold]
-    fn workers_wait(&self, index: usize) {
+    fn workers_wait(&self) {
         if self.io_driver.poll(None) {
             return;
         }
 
-        self.idle_queue.wait(self, index, || {
+        self.idle_queue.wait(|| {
             let sync: SyncState = self.sync.load(Ordering::Relaxed).into();
             !sync.notified
         });
@@ -331,7 +318,7 @@ impl Pool {
 
     #[cold]
     fn workers_notify(&self) {
-        if !self.idle_queue.signal(self) {
+        if !self.idle_queue.signal() {
             let _ = self.io_driver.notify();
         }
     }
@@ -339,6 +326,6 @@ impl Pool {
     #[cold]
     fn workers_shutdown(&self) {
         let _ = self.io_driver.notify();
-        self.idle_queue.shutdown(self)
+        self.idle_queue.shutdown()
     }
 }

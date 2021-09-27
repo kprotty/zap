@@ -48,29 +48,36 @@ mod mutex_cond {
 
         pub fn wait(self: Pin<&Self>) {
             self.with_lock(|this| unsafe {
-                let mut is_waiting = false;
-                while {
+                {
                     let state = &mut *this.state.get();
                     match *state {
-                        MutexCondState::Empty if !is_waiting => {
-                            *state = MutexCondState::Waiting;
-                            is_waiting = true;
-                            true
-                        }
-                        MutexCondState::Empty => {
-                            unreachable!("thread waiting with invalid state")
-                        }
-                        MutexCondState::Waiting if is_waiting => true,
+                        MutexCondState::Empty => *state = MutexCondState::Waiting,
                         MutexCondState::Waiting => {
-                            unreachable!("multple threads waiting on same AutoResetEvent")
+                            unreachable!("multiple threads waiting on same AutoResetEvent")
                         }
                         MutexCondState::Notified => {
                             *state = MutexCondState::Empty;
-                            false
+                            return;
                         }
                     }
-                } {
+                }
+
+                loop {
                     Pin::new_unchecked(&this.mutex_cond).wait();
+
+                    {
+                        let state = &mut *this.state.get();
+                        match *state {
+                            MutexCondState::Empty => {
+                                unreachable!("thread waiting on AutoResetEvent with invalid state")
+                            }
+                            MutexCondState::Waiting => continue,
+                            MutexCondState::Notified => {
+                                *state = MutexCondState::Empty;
+                                return;
+                            }
+                        }
+                    }
                 }
             })
         }
@@ -91,7 +98,7 @@ mod mutex_cond {
 
 #[cfg(target_os = "windows")]
 mod os {
-    use std::{cell::UnsafeCell, ffi::c_void, ptr};
+    use std::{cell::UnsafeCell, ffi::c_void, pin::Pin, ptr};
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -113,6 +120,15 @@ mod os {
         cond: UnsafeCell<*mut c_void>,
     }
 
+    impl Default for SRWMutexCond {
+        fn default() -> Self {
+            Self {
+                srwlock: UnsafeCell::new(ptr::null_mut()),
+                cond: UnsafeCell::new(ptr::null_mut()),
+            }
+        }
+    }
+
     unsafe impl Send for SRWMutexCond {}
     unsafe impl Sync for SRWMutexCond {}
 
@@ -126,7 +142,8 @@ mod os {
         }
 
         unsafe fn wait(self: Pin<&Self>) {
-            SleepConditionVariableSRW(self.cond.get(), self.srwlock.get(), u32::MAX, 0)
+            let rc = SleepConditionVariableSRW(self.cond.get(), self.srwlock.get(), u32::MAX, 0);
+            assert_ne!(rc, 0);
         }
 
         unsafe fn signal(self: Pin<&Self>) {
@@ -207,7 +224,7 @@ mod os {
                 .compare_exchange(EMPTY, WAITING, Ordering::Acquire, Ordering::Acquire)
             {
                 Ok(_) => {}
-                Err(NOTIFIED) => return,
+                Err(NOTIFIED) => return self.state.store(EMPTY, Ordering::Relaxed),
                 Err(_) => unreachable!("invalid AutoResetEvent state"),
             }
 
@@ -216,7 +233,7 @@ mod os {
                 match self.state.load(Ordering::Acquire) {
                     EMPTY => unreachable!("AutoResetEvent waiting while empty"),
                     WAITING => continue,
-                    NOTIFIED => return,
+                    NOTIFIED => return self.state.store(EMPTY, Ordering::Relaxed),
                     _ => unreachable!("invalid AutoResetEvent state"),
                 }
             }
@@ -295,10 +312,8 @@ mod os {
 
         unsafe fn wait(self: Pin<&Self>) {
             let this = Pin::into_inner_unchecked(self);
-            assert_eq!(
-                0,
-                libc::pthread_cond_wait(this.cond.get(), this.mutex.get(), ptr::null(),)
-            )
+            let rc = libc::pthread_cond_wait(this.cond.get(), this.mutex.get(), ptr::null());
+            assert_eq!(rc, 0);
         }
 
         unsafe fn signal(self: Pin<&Self>) {

@@ -222,7 +222,7 @@ impl Pool {
 
                 // Create a ThreadBuilder to spawn a worker thread
                 let mut builder =
-                    std::thread::Builder::new().name(String::from("zap-worker-thread"));
+                    std::thread::Builder::new().name(String::from("zap-thread"));
                 if let Some(stack_size) = self.stack_size {
                     builder = builder.stack_size(stack_size.get());
                 }

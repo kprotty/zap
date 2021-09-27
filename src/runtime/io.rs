@@ -1,23 +1,22 @@
 use super::{
     pool::Pool,
-    waker::{AtomicWaker, WakerState, WakerUpdate},
+    waker::{AtomicWaker, WakerUpdate},
 };
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{Cell},
     future::Future,
     io,
     marker::PhantomPinned,
     mem,
     pin::Pin,
-    ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    ptr::{NonNull},
+    sync::{Mutex, atomic::{AtomicU8, Ordering}},
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
 struct IoNode {
     next: Cell<Option<NonNull<Self>>>,
-    cache: Cell<Option<NonNull<IoNodeCache>>>,
     reader: AtomicWaker,
     writer: AtomicWaker,
     _pinned: PhantomPinned,
@@ -34,10 +33,9 @@ impl IoNodeBlock {
 }
 
 impl IoNodeBlock {
-    unsafe fn alloc(cache: &IoNodeCache, next: Option<Pin<Box<Self>>>) -> Pin<Box<Self>> {
+    unsafe fn alloc(next: Option<Pin<Box<Self>>>) -> Pin<Box<Self>> {
         const EMPTY_NODE: IoNode = IoNode {
             next: Cell::new(None),
-            cache: Cell::new(None),
             reader: AtomicWaker::new(),
             writer: AtomicWaker::new(),
             _pinned: PhantomPinned,
@@ -49,7 +47,6 @@ impl IoNodeBlock {
         }));
 
         for index in 0..Self::BLOCK_COUNT {
-            block.nodes[index].cache.set(Some(NonNull::from(cache)));
             block.nodes[index].next.set(match index + 1 {
                 Self::BLOCK_COUNT => None,
                 next => Some(NonNull::from(&block.nodes[next])),
@@ -61,55 +58,34 @@ impl IoNodeBlock {
 }
 
 #[derive(Default)]
-struct IoNodeCacheInner {
+struct IoNodeCache {
     stack: Option<NonNull<IoNode>>,
     blocks: Option<Pin<Box<IoNodeBlock>>>,
-}
-
-#[derive(Default)]
-pub struct IoNodeCache {
-    free: AtomicPtr<IoNode>,
-    inner: UnsafeCell<IoNodeCacheInner>,
 }
 
 unsafe impl Send for IoNodeCache {}
 unsafe impl Sync for IoNodeCache {}
 
 impl IoNodeCache {
-    unsafe fn alloc(&self) -> NonNull<IoNode> {
-        let inner = &mut *self.inner.get();
-        let node = inner.stack.unwrap_or_else(|| {
-            if !self.free.load(Ordering::Relaxed).is_null() {
-                let free = self.free.swap(ptr::null_mut(), Ordering::Acquire);
-                return NonNull::new(free).expect("free list was empty");
-            }
+    fn alloc(&mut self) -> NonNull<IoNode> {
+        unsafe {
+            let node = self.stack.unwrap_or_else(|| {
+                let block = IoNodeBlock::alloc(self.blocks.take());
+                let block = Pin::into_inner_unchecked(block);
+                let node = NonNull::from(&block.nodes[0]);
 
-            let block = IoNodeBlock::alloc(self, inner.blocks.take());
-            let block = Pin::into_inner_unchecked(block);
-            let node = NonNull::from(&block.nodes[0]);
+                self.blocks = Some(Pin::new_unchecked(block));
+                node
+            });
 
-            inner.blocks = Some(Pin::new_unchecked(block));
+            self.stack = node.as_ref().next.get();
             node
-        });
-
-        inner.stack = node.as_ref().next.get();
-        node
+        }
     }
 
-    unsafe fn dealloc(&self, node: NonNull<IoNode>) {
-        let mut free = self.free.load(Ordering::Relaxed);
-        loop {
-            node.as_ref().next.set(NonNull::new(free));
-            match self.free.compare_exchange_weak(
-                free,
-                node.as_ptr(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(e) => free = e,
-            }
-        }
+    unsafe fn dealloc(&mut self, node: NonNull<IoNode>) {
+        node.as_ref().next.set(self.stack);
+        self.stack = Some(node);
     }
 }
 
@@ -119,12 +95,11 @@ struct IoPoller {
 }
 
 impl IoPoller {
-    pub fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>) -> usize {
+    pub fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>)  {
         if let Err(_) = self.io_poll.poll(&mut self.io_events, timeout) {
-            return 0;
+            return;
         }
 
-        let mut resumed = 0;
         for event in &self.io_events {
             let node = match NonNull::new(event.token().0 as *mut IoNode) {
                 Some(node) => unsafe { &*node.as_ptr() },
@@ -135,73 +110,40 @@ impl IoPoller {
             };
 
             if event.is_writable() || event.is_write_closed() || event.is_error() {
-                if node.writer.wake() == WakerState::Ready {
-                    resumed += 1;
-                }
+                node.writer.wake();
             }
 
             if event.is_readable() || event.is_read_closed() || event.is_error() {
-                if node.reader.wake() == WakerState::Ready {
-                    resumed += 1;
-                }
+                node.reader.wake();
             }
         }
-
-        resumed
     }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum IoStatus {
-    Empty,
-    Polling,
-    Waiting,
-    Notified,
+enum IoNotify {
+    Empty = 0,
+    Waiting = 1,
+    Notified = 2,
 }
 
-#[derive(Copy, Clone, Debug)]
-struct IoState {
-    pending: usize,
-    status: IoStatus,
-}
-
-impl IoState {
-    const MAX_PENDING: usize = usize::MAX >> 2;
-}
-
-impl From<usize> for IoState {
-    fn from(value: usize) -> Self {
-        Self {
-            pending: value >> 2,
-            status: match value & 0b11 {
-                0 => IoStatus::Empty,
-                1 => IoStatus::Polling,
-                2 => IoStatus::Waiting,
-                3 => IoStatus::Notified,
-                _ => unreachable!(),
-            },
+impl From<u8> for IoNotify {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Empty,
+            1 => Self::Waiting,
+            2 => Self::Notified,
+            _ => unreachable!(),
         }
     }
 }
 
-impl Into<usize> for IoState {
-    fn into(self) -> usize {
-        assert!(self.pending <= Self::MAX_PENDING);
-        (self.pending << 2)
-            | match self.status {
-                IoStatus::Empty => 0,
-                IoStatus::Polling => 1,
-                IoStatus::Waiting => 2,
-                IoStatus::Notified => 3,
-            }
-    }
-}
-
 pub struct IoDriver {
-    io_state: AtomicUsize,
+    io_notify: AtomicU8,
     io_waker: mio::Waker,
     io_registry: mio::Registry,
-    io_poller: UnsafeCell<IoPoller>,
+    io_poller: Mutex<IoPoller>,
+    io_node_cache: Mutex<IoNodeCache>,
 }
 
 unsafe impl Send for IoDriver {}
@@ -224,116 +166,71 @@ impl Default for IoDriver {
             .expect("failed to create os notification waker");
 
         Self {
-            io_state: AtomicUsize::new(0),
+            io_notify: AtomicU8::new(IoNotify::Empty as u8),
             io_waker,
             io_registry,
-            io_poller: UnsafeCell::new(io_poller),
+            io_poller: Mutex::new(io_poller),
+            io_node_cache: Mutex::new(IoNodeCache::default()),
         }
     }
 }
 
 impl IoDriver {
-    fn prepare_pending(&self) {
-        let mut state = IoState {
-            pending: 1,
-            status: IoStatus::Empty,
-        };
-
-        state = self
-            .io_state
-            .fetch_add(state.into(), Ordering::SeqCst)
-            .into();
-
-        assert_ne!(state.pending, IoState::MAX_PENDING);
-    }
-
-    fn cancel_pending(&self) {
-        let mut state = IoState {
-            pending: 1,
-            status: IoStatus::Empty,
-        };
-
-        state = self
-            .io_state
-            .fetch_sub(state.into(), Ordering::SeqCst)
-            .into();
-
-        assert_ne!(state.pending, 0);
-    }
-
     pub fn notify(&self) -> bool {
-        self.io_state
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
-                let mut io_state: IoState = io_state.into();
-                if io_state.pending == 0 {
-                    return None;
-                }
-
-                io_state.status = match io_state.status {
-                    IoStatus::Waiting => IoStatus::Notified,
-                    _ => return None,
-                };
-
-                Some(io_state.into())
-            })
-            .map(|_| self.io_waker.wake().expect("failed to wake up os notifier"))
-            .is_ok()
+        self.io_notify.fetch_update(Ordering::Release, Ordering::Relaxed, |io_notify| {
+            match IoNotify::from(io_notify) {
+                IoNotify::Empty => Some(IoNotify::Notified as u8),
+                IoNotify::Waiting => Some(IoNotify::Notified as u8),
+                IoNotify::Notified => None, 
+            }
+        })
+        .map(IoNotify::from)
+        .map(|io_notify| io_notify == IoNotify::Waiting && {
+            self.io_waker.wake().expect("failed to wake up os notifier");
+            true
+        })
+        .unwrap_or(false)
     }
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.io_state
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |io_state| {
-                let mut io_state: IoState = io_state.into();
-                if io_state.pending == 0 {
-                    return None;
+        self.io_poller.try_lock().map(|mut io_poller| {
+            let mut notified = false;
+            if let Some(Duration::ZERO) = timeout {
+                io_poller.poll(&mut notified, timeout);
+                return true;
+            }
+
+            if let Err(io_notify) = self.io_notify.compare_exchange(
+                IoNotify::Empty as u8,
+                IoNotify::Waiting as u8,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                let io_notify: IoNotify = io_notify.into();
+                assert_eq!(io_notify, IoNotify::Notified);
+                self.io_notify.store(IoNotify::Empty as u8, Ordering::Relaxed);
+                return true;
+            }
+
+            io_poller.poll(&mut notified, timeout);
+
+            if let Err(io_notify) = self.io_notify.compare_exchange(
+                IoNotify::Waiting as u8,
+                IoNotify::Empty as u8,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                let io_notify: IoNotify = io_notify.into();
+                assert_eq!(io_notify, IoNotify::Notified);
+                self.io_notify.store(IoNotify::Empty as u8, Ordering::Relaxed);
+                while !notified {
+                    io_poller.poll(&mut notified, None);
                 }
+            }
 
-                io_state.status = match io_state.status {
-                    IoStatus::Empty => match timeout {
-                        Some(Duration::ZERO) => IoStatus::Polling,
-                        _ => IoStatus::Waiting,
-                    },
-                    _ => return None,
-                };
-
-                Some(io_state.into())
-            })
-            .and_then(|_| {
-                let do_poll = |notified: &mut bool, timeout: Option<Duration>| -> usize {
-                    let io_poller = unsafe { &mut *self.io_poller.get() };
-                    io_poller.poll(notified, timeout)
-                };
-
-                let mut notified = false;
-                let mut resumed = do_poll(&mut notified, timeout);
-
-                self.io_state
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |io_state| {
-                        let mut io_state: IoState = io_state.into();
-                        assert_ne!(io_state.status, IoStatus::Empty);
-
-                        if io_state.status == IoStatus::Notified {
-                            while !notified {
-                                resumed += do_poll(&mut notified, None);
-                            }
-                        } else {
-                            assert_eq!(
-                                io_state.status,
-                                match timeout {
-                                    Some(Duration::ZERO) => IoStatus::Polling,
-                                    _ => IoStatus::Waiting,
-                                }
-                            );
-                        }
-
-                        assert!(io_state.pending >= resumed);
-                        io_state.pending -= resumed;
-
-                        io_state.status = IoStatus::Empty;
-                        Some(io_state.into())
-                    })
-            })
-            .is_ok()
+            true
+        })
+        .unwrap_or(false)
     }
 }
 
@@ -361,27 +258,25 @@ impl<S: mio::event::Source> AsRef<S> for IoSource<S> {
 impl<S: mio::event::Source> Drop for IoSource<S> {
     fn drop(&mut self) {
         unsafe {
-            let io_node = self.io_node.as_ref();
-            let io_driver = self.io_driver.as_ref();
-
             self.detach_io(IoKind::Read);
             self.detach_io(IoKind::Write);
+            
+            let io_driver = self.io_driver.as_ref();
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
-
-            io_node
-                .cache
-                .get()
-                .expect("IoNode without an IoNodeCache")
-                .as_ref()
-                .dealloc(self.io_node)
+            io_driver.io_node_cache.lock().unwrap().dealloc(self.io_node);
         }
     }
 }
 
 impl<S: mio::event::Source> IoSource<S> {
     pub fn new(mut source: S) -> Self {
-        Pool::with_current(|pool, index| {
-            let node = unsafe { pool.workers()[index].io_node_cache.alloc() };
+        Pool::with_current(|pool, _index| {
+            let node = pool
+                .io_driver
+                .io_node_cache
+                .lock()
+                .unwrap()
+                .alloc();
 
             pool.io_driver
                 .io_registry
@@ -401,14 +296,12 @@ impl<S: mio::event::Source> IoSource<S> {
         .expect("IoSource::new() called outside the runtime")
     }
 
-    fn unpack(&self, kind: IoKind) -> (&IoDriver, &AtomicWaker) {
+    fn to_waker(&self, kind: IoKind) -> &AtomicWaker {
         unsafe {
-            let io_driver = self.io_driver.as_ref();
-            let io_waker = match kind {
+            match kind {
                 IoKind::Read => &self.io_node.as_ref().reader,
                 IoKind::Write => &self.io_node.as_ref().writer,
-            };
-            (io_driver, io_waker)
+            }
         }
     }
 
@@ -419,18 +312,12 @@ impl<S: mio::event::Source> IoSource<S> {
         mut yield_now: impl FnMut() -> bool,
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
-        let (io_driver, io_waker) = self.unpack(kind);
+        let io_waker = self.to_waker(kind);
         loop {
-            io_driver.prepare_pending();
             match io_waker.update(Some(waker)) {
                 WakerUpdate::New => return Poll::Pending,
-                WakerUpdate::Replaced => {
-                    io_driver.cancel_pending();
-                    return Poll::Pending;
-                }
-                WakerUpdate::Notified => {
-                    io_driver.cancel_pending();
-                }
+                WakerUpdate::Replaced => return Poll::Pending,
+                WakerUpdate::Notified => {}
             }
 
             if yield_now() {
@@ -452,10 +339,8 @@ impl<S: mio::event::Source> IoSource<S> {
     }
 
     pub unsafe fn detach_io(&self, kind: IoKind) {
-        let (io_driver, io_waker) = self.unpack(kind);
-        if io_waker.update(None) == WakerUpdate::Replaced {
-            io_driver.cancel_pending();
-        }
+        let io_waker = self.to_waker(kind);
+        io_waker.update(None);
     }
 
     pub unsafe fn wait_for<'a>(&'a self, kind: IoKind) -> impl Future<Output = ()> + 'a {

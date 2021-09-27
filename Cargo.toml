@@ -11,7 +11,11 @@ mio = { version = "0.7", features = ["net", "os-poll"] }
 tokio = { version = "1" }
 
 [dev-dependencies]
-hyper = { version = "0.14", features = ["server", "http1"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [[example]]
 name = "http"
+
+[[example]]
+name = "tokio_http"

@@ -10,7 +10,6 @@ async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
 
 pub fn main() -> Result<(), hyper::Error> {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(6)
         .enable_io()
         .build()
         .unwrap()

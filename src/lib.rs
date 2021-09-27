@@ -3,3 +3,4 @@ pub mod runtime;
 pub mod sync;
 
 pub use runtime::task;
+pub use runtime::task::spawn;

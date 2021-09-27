@@ -14,6 +14,9 @@ pub struct TcpStream {
     reader: RefCell<IoFairness>,
 }
 
+unsafe impl Send for TcpStream {}
+unsafe impl Sync for TcpStream {}
+
 impl TcpStream {
     fn new(stream: mio::net::TcpStream) -> Self {
         Self {
@@ -119,6 +122,9 @@ pub struct TcpListener {
     fairness: RefCell<IoFairness>,
 }
 
+unsafe impl Send for TcpListener {}
+unsafe impl Sync for TcpListener {}
+
 impl TcpListener {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let source = mio::net::TcpListener::bind(addr)?;
@@ -128,7 +134,7 @@ impl TcpListener {
         })
     }
 
-    pub fn accept<'a>(&'a self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
+    pub fn accept<'a>(&'a mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
         struct Accept<'a> {
             listener: Option<&'a TcpListener>,
         }

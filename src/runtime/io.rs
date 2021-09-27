@@ -4,12 +4,13 @@ use super::{
 };
 use std::{
     cell::{Cell, UnsafeCell},
+    future::Future,
     marker::PhantomPinned,
     mem,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
-    task::{Poll, Waker},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -22,7 +23,7 @@ struct IoNode {
 }
 
 struct IoNodeBlock {
-    next: Cell<Option<Pin<Box<Self>>>>,
+    _next: Cell<Option<Pin<Box<Self>>>>,
     nodes: [IoNode; Self::BLOCK_COUNT],
 }
 
@@ -42,7 +43,7 @@ impl IoNodeBlock {
         };
 
         let block = Pin::into_inner_unchecked(Box::pin(Self {
-            next: Cell::new(next),
+            _next: Cell::new(next),
             nodes: [EMPTY_NODE; Self::BLOCK_COUNT],
         }));
 
@@ -335,6 +336,12 @@ impl IoDriver {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IoKind {
+    Read,
+    Write,
+}
+
 pub struct IoSource<S: mio::event::Source> {
     io_source: S,
     io_node: NonNull<IoNode>,
@@ -353,8 +360,8 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
             let io_node = self.io_node.as_ref();
             let io_driver = self.io_driver.as_ref();
 
-            let _ = self.poll_update(true, None);
-            let _ = self.poll_update(false, None);
+            let _ = self.poll_update(IoKind::Read, None);
+            let _ = self.poll_update(IoKind::Write, None);
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
 
             io_node
@@ -390,11 +397,11 @@ impl<S: mio::event::Source> IoSource<S> {
         .expect("IoSource::new() called outside the runtime")
     }
 
-    pub unsafe fn poll_update(&self, readable: bool, waker_ref: Option<&Waker>) -> Poll<()> {
+    pub unsafe fn poll_update(&self, kind: IoKind, waker_ref: Option<&Waker>) -> Poll<()> {
         let io_driver = self.io_driver.as_ref();
-        let io_waker = match readable {
-            true => &self.io_node.as_ref().reader,
-            _ => &self.io_node.as_ref().writer,
+        let io_waker = match kind {
+            IoKind::Read => &self.io_node.as_ref().reader,
+            IoKind::Write => &self.io_node.as_ref().writer,
         };
 
         let waker = match waker_ref {
@@ -403,17 +410,122 @@ impl<S: mio::event::Source> IoSource<S> {
                 if io_waker.update(None) == WakerUpdate::Replaced {
                     io_driver.cancel_pending();
                 }
+                io_waker.reset();
                 return Poll::Ready(());
             }
         };
 
         io_driver.prepare_pending();
-        if io_waker.update(Some(waker)) != WakerUpdate::Notified {
-            return Poll::Pending;
+        match io_waker.update(Some(waker)) {
+            WakerUpdate::New => Poll::Pending,
+            WakerUpdate::Replaced => {
+                io_driver.cancel_pending();
+                Poll::Pending
+            }
+            WakerUpdate::Notified => {
+                io_driver.cancel_pending();
+                io_waker.reset();
+                Poll::Ready(())
+            }
+        }
+    }
+
+    pub unsafe fn wait_for<'a>(&'a self, kind: IoKind) -> impl Future<Output = ()> + 'a {
+        struct WaitFor<'a, S: mio::event::Source> {
+            source: Option<&'a IoSource<S>>,
+            kind: IoKind,
         }
 
-        io_driver.cancel_pending();
-        io_waker.reset();
-        Poll::Ready(())
+        impl<'a, S: mio::event::Source> Drop for WaitFor<'a, S> {
+            fn drop(&mut self) {
+                if let Some(source) = self.source.take() {
+                    let _ = unsafe { source.poll_update(self.kind, None) };
+                }
+            }
+        }
+
+        impl<'a, S: mio::event::Source> Future for WaitFor<'a, S> {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+                let source = self.source.expect("wait_for polled after completion");
+                let polled = unsafe { source.poll_update(self.kind, Some(ctx.waker())) };
+
+                if polled == Poll::Ready(()) {
+                    self.source = None;
+                }
+
+                polled
+            }
+        }
+
+        WaitFor {
+            source: Some(self),
+            kind,
+        }
+    }
+}
+
+struct IoReadyState {
+    tick: u8,
+    available: bool,
+}
+
+#[derive(Default)]
+pub struct IoReadiness {
+    state: u8,
+}
+
+impl IoReadiness {
+    fn with_ready_state<T>(&mut self, f: impl FnOnce(&mut IoReadyState) -> T) -> T {
+        let mut ready_state = IoReadyState {
+            tick: self.state >> 1,
+            available: self.state & 1 != 0,
+        };
+
+        let result = f(&mut ready_state);
+        self.state = (ready_state.available as u8) | (ready_state.tick & (u8::MAX >> 1));
+        result
+    }
+
+    pub fn poll<T, S: mio::event::Source>(
+        &mut self,
+        source: &IoSource<S>,
+        kind: IoKind,
+        waker: &Waker,
+        mut do_io: impl FnMut() -> std::io::Result<T>,
+    ) -> Poll<std::io::Result<T>> {
+        self.with_ready_state(|ready_state| unsafe {
+            loop {
+                if !ready_state.available {
+                    ready_state.available = match source.poll_update(kind, Some(waker)) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => true,
+                    };
+                }
+
+                ready_state.tick += 1;
+                match ready_state.tick - 1 {
+                    0 => {}
+                    t if t % 128 == 0 => {
+                        waker.wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    _ => {}
+                }
+
+                let result = loop {
+                    match do_io() {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => break result,
+                    }
+                };
+
+                ready_state.available = match result {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                    result => return Poll::Ready(result),
+                };
+            }
+        })
     }
 }

@@ -1,6 +1,6 @@
 mod builder;
 mod idle;
-mod io;
+pub(crate) mod io;
 mod pool;
 mod queue;
 pub mod task;

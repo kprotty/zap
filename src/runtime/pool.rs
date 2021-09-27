@@ -129,7 +129,7 @@ pub struct Pool {
     injecting: AtomicUsize,
     idle_queue: IdleQueue,
     stack_size: Option<NonZeroUsize>,
-    pub io_driver: IoDriver,
+    pub io_driver: Arc<IoDriver>,
     pub workers: Pin<Box<[Worker]>>,
 }
 
@@ -155,7 +155,7 @@ impl Pool {
             injecting: AtomicUsize::new(0),
             idle_queue: IdleQueue::default(),
             stack_size: stack_size,
-            io_driver: IoDriver::default(),
+            io_driver: Arc::new(IoDriver::default()),
             workers: (0..num_threads)
                 .map(|_| Worker::default())
                 .collect::<Box<[Worker]>>()

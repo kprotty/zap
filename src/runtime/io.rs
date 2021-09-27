@@ -10,8 +10,8 @@ use std::{
     marker::PhantomPinned,
     mem,
     pin::Pin,
-    ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
+    ptr::{self, NonNull},
+    sync::{Arc, Once, atomic::{AtomicPtr, AtomicU8, Ordering}},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -139,7 +139,7 @@ impl From<u8> for IoNotify {
     }
 }
 
-pub struct IoDriver {
+struct IoDriverInner {
     io_notify: AtomicU8,
     io_waker: mio::Waker,
     io_registry: mio::Registry,
@@ -147,10 +147,10 @@ pub struct IoDriver {
     io_node_cache: Lock<IoNodeCache>,
 }
 
-unsafe impl Send for IoDriver {}
-unsafe impl Sync for IoDriver {}
+unsafe impl Send for IoDriverInner {}
+unsafe impl Sync for IoDriverInner {}
 
-impl Default for IoDriver {
+impl Default for IoDriverInner {
     fn default() -> Self {
         let io_poller = IoPoller {
             io_poll: mio::Poll::new().expect("failed to create os poller"),
@@ -176,7 +176,7 @@ impl Default for IoDriver {
     }
 }
 
-impl IoDriver {
+impl IoDriverInner {
     pub fn notify(&self) -> bool {
         self.io_notify
             .fetch_update(
@@ -250,6 +250,54 @@ impl IoDriver {
     }
 }
 
+pub struct IoDriver {
+    inner: AtomicPtr<IoDriverInner>,
+    once: Once,
+}
+
+impl Default for IoDriver {
+    fn default() -> Self {
+        Self {
+            inner: AtomicPtr::new(ptr::null_mut()),
+            once: Once::new(),
+        }
+    }
+}
+
+impl Drop for IoDriver {
+    fn drop(&mut self) {
+        if let Some(inner_ptr) = NonNull::new(self.inner.load(Ordering::Acquire)) {
+            mem::drop(unsafe { Box::from_raw(inner_ptr.as_ptr()) });
+        }
+    }
+}
+
+impl IoDriver {
+    pub fn notify(&self) -> bool {
+        self.with_inner(|inner| inner.notify()).unwrap_or(false)
+    }
+
+    pub fn poll(&self, timeout: Option<Duration>) -> bool {
+        self.with_inner(|inner| inner.poll(timeout)).unwrap_or(false)
+    }
+
+    fn with_inner<T>(&self, f: impl FnOnce(&IoDriverInner) -> T) -> Option<T> {
+        NonNull::new(self.inner.load(Ordering::Acquire))
+            .map(|inner_ptr| f(unsafe { inner_ptr.as_ref() }))
+    }
+
+    fn get_inner(&self) -> &IoDriverInner {
+        self.once.call_once(|| {
+            let inner = Box::into_raw(Box::new(IoDriverInner::default()));
+            self.inner.store(inner, Ordering::Release);
+        });
+
+        unsafe {
+            &*self.inner.load(Ordering::Acquire)
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum IoKind {
     Read,
@@ -259,7 +307,7 @@ pub enum IoKind {
 pub struct IoSource<S: mio::event::Source> {
     io_source: S,
     io_node: NonNull<IoNode>,
-    io_driver: NonNull<IoDriver>,
+    io_driver: Arc<IoDriver>,
 }
 
 unsafe impl<S: mio::event::Source + Send> Send for IoSource<S> {}
@@ -277,7 +325,7 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
             self.detach_io(IoKind::Read);
             self.detach_io(IoKind::Write);
 
-            let io_driver = self.io_driver.as_ref();
+            let io_driver = self.io_driver.as_ref().get_inner();
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
             io_driver
                 .io_node_cache
@@ -289,10 +337,10 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
 impl<S: mio::event::Source> IoSource<S> {
     pub fn new(mut source: S) -> Self {
         Pool::with_current(|pool, _index| {
-            let node = pool.io_driver.io_node_cache.with(|cache| cache.alloc());
+            let inner = pool.io_driver.get_inner();
+            let node = inner.io_node_cache.with(|cache| cache.alloc());
 
-            pool.io_driver
-                .io_registry
+            inner.io_registry
                 .register(
                     &mut source,
                     mio::Token(node.as_ptr() as usize),
@@ -303,7 +351,7 @@ impl<S: mio::event::Source> IoSource<S> {
             Self {
                 io_source: source,
                 io_node: node,
-                io_driver: NonNull::from(&pool.io_driver),
+                io_driver: pool.io_driver.clone(),
             }
         })
         .expect("IoSource::new() called outside the runtime")

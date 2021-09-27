@@ -175,15 +175,14 @@ impl TcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            let polled = self.reader.borrow_mut().poll_io(
-                &self.source,
-                IoKind::Read,
-                ctx.waker(),
-                || {
-                    let buf = &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
-                    self.source.as_ref().peek(buf)
-                },
-            );
+            let polled =
+                self.reader
+                    .borrow_mut()
+                    .poll_io(&self.source, IoKind::Read, ctx.waker(), || {
+                        let buf =
+                            &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
+                        self.source.as_ref().peek(buf)
+                    });
 
             match polled {
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

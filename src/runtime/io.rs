@@ -1,5 +1,5 @@
 use super::{
-    super::sync::low_level::Lock,
+    super::sync::low_level::{Lock, Once},
     pool::Pool,
     waker::{AtomicWaker, WakerUpdate},
 };
@@ -13,7 +13,7 @@ use std::{
     ptr::{self, NonNull},
     sync::{
         atomic::{AtomicPtr, AtomicU8, Ordering},
-        Arc, Once,
+        Arc,
     },
     task::{Context, Poll, Waker},
     time::Duration,

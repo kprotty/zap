@@ -22,6 +22,17 @@ impl<T> Lock<T> {
         }
     }
 
+    pub fn try_with<F>(&self, f: impl FnOnce(&mut T) -> F) -> Option<F> {
+        unsafe {
+            if !self.os_lock.try_acquire() {
+                return None;
+            }
+            let result = f(&mut *self.value.get());
+            self.os_lock.release();
+            Some(result)
+        }
+    }
+
     pub fn with<F>(&self, f: impl FnOnce(&mut T) -> F) -> F {
         unsafe {
             self.os_lock.acquire();
@@ -38,6 +49,7 @@ mod os {
 
     #[link(name = "kernel32")]
     extern "system" {
+        fn TryAcquireSRWLockExclusive(p: *mut *mut c_void) -> u8;
         fn AcquireSRWLockExclusive(p: *mut *mut c_void);
         fn ReleaseSRWLockExclusive(p: *mut *mut c_void);
     }
@@ -56,12 +68,16 @@ mod os {
             }
         }
 
+        pub unsafe fn try_acquire(&self) -> bool {
+            TryAcquireSRWLockExclusive(self.srwlock.get()) != 0
+        }
+
         pub unsafe fn acquire(&self) {
             AcquireSRWLockExclusive(self.srwlock.get())
         }
 
         pub unsafe fn release(&self) {
-            AcquireSRWLockExclusive(self.srwlock.get())
+            ReleaseSRWLockExclusive(self.srwlock.get())
         }
     }
 }
@@ -72,6 +88,7 @@ mod os {
 
     #[link(name = "c")]
     extern "C" {
+        fn os_unfair_lock_trylock(p: *mut u32) -> bool;
         fn os_unfair_lock_lock(p: *mut u32);
         fn os_unfair_lock_unlock(p: *mut u32);
     }
@@ -88,6 +105,10 @@ mod os {
             Self {
                 oul: UnsafeCell::new(0),
             }
+        }
+
+        pub unsafe fn try_acquire(&self) -> bool {
+            os_unfair_lock_trylock(self.oul.get())
         }
 
         pub unsafe fn acquire(&self) {
@@ -122,6 +143,12 @@ mod os {
             Self {
                 state: AtomicI32::new(UNLOCKED),
             }
+        }
+
+        pub unsafe fn try_acquire(&self) -> bool {
+            self.state
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
         }
 
         pub unsafe fn acquire(&self) {
@@ -268,6 +295,22 @@ mod os {
             Self {
                 state: AtomicUsize::new(UNLOCKED),
             }
+        }
+
+        pub unsafe fn try_acquire(&self) -> bool {
+            let mut state = self.state.load(Ordering::Relaxed);
+            while state & LOCKED == 0 {
+                match self.state.compare_exchange(
+                    state,
+                    state | LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(e) => state = e,
+                }
+            }
+            false
         }
 
         pub unsafe fn acquire(&self) {

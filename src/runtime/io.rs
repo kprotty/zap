@@ -1,4 +1,5 @@
 use super::{
+    super::sync::low_level::Lock,
     pool::Pool,
     waker::{AtomicWaker, WakerUpdate},
 };
@@ -10,10 +11,7 @@ use std::{
     mem,
     pin::Pin,
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -145,8 +143,8 @@ pub struct IoDriver {
     io_notify: AtomicU8,
     io_waker: mio::Waker,
     io_registry: mio::Registry,
-    io_poller: Mutex<IoPoller>,
-    io_node_cache: Mutex<IoNodeCache>,
+    io_poller: Lock<IoPoller>,
+    io_node_cache: Lock<IoNodeCache>,
 }
 
 unsafe impl Send for IoDriver {}
@@ -172,8 +170,8 @@ impl Default for IoDriver {
             io_notify: AtomicU8::new(IoNotify::Empty as u8),
             io_waker,
             io_registry,
-            io_poller: Mutex::new(io_poller),
-            io_node_cache: Mutex::new(IoNodeCache::default()),
+            io_poller: Lock::new(io_poller),
+            io_node_cache: Lock::new(IoNodeCache::default()),
         }
     }
 }
@@ -202,8 +200,7 @@ impl IoDriver {
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
         self.io_poller
-            .try_lock()
-            .map(|mut io_poller| {
+            .try_with(|io_poller| {
                 let mut notified = false;
                 if let Some(Duration::ZERO) = timeout {
                     io_poller.poll(&mut notified, timeout);
@@ -284,9 +281,7 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
             io_driver
                 .io_node_cache
-                .lock()
-                .unwrap()
-                .dealloc(self.io_node);
+                .with(|cache| cache.dealloc(self.io_node));
         }
     }
 }
@@ -294,7 +289,7 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
 impl<S: mio::event::Source> IoSource<S> {
     pub fn new(mut source: S) -> Self {
         Pool::with_current(|pool, _index| {
-            let node = pool.io_driver.io_node_cache.lock().unwrap().alloc();
+            let node = pool.io_driver.io_node_cache.with(|cache| cache.alloc());
 
             pool.io_driver
                 .io_registry

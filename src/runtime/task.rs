@@ -1,6 +1,6 @@
 use super::{
+    super::sync::low_level::{AtomicWaker, WakerState, WakerUpdate},
     pool::{Pool, PoolEvent},
-    waker::{AtomicWaker, WakerState, WakerUpdate},
 };
 use std::{
     cell::UnsafeCell,

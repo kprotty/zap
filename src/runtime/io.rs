@@ -1,7 +1,6 @@
 use super::{
-    super::sync::low_level::{Lock, Once},
+    super::sync::low_level::{AtomicWaker, Lock, Once, WakerUpdate},
     pool::Pool,
-    waker::{AtomicWaker, WakerUpdate},
 };
 use std::{
     cell::Cell,

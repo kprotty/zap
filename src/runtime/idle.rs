@@ -131,7 +131,7 @@ impl IdleQueue {
                     });
                     true
                 }
-                IdleIndex::Notified => false,
+                IdleIndex::Empty => false,
                 _ => unreachable!(),
             })
             .unwrap_or(false)

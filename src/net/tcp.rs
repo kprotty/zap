@@ -120,19 +120,43 @@ impl TcpListener {
                 self.source.wait_for(IoKind::Read).await;
             }
 
-            loop {
-                match self.source.as_ref().accept() {
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                    Ok((stream, addr)) => {
-                        let stream = TcpStream {
-                            source: IoSource::new(stream),
-                            reader: RefCell::new(IoReadiness::default()),
-                            writer: RefCell::new(IoReadiness::default()),
-                        };
-                        return Ok((stream, addr));
-                    }
+            match self.try_accept() {
+                Poll::Pending => continue,
+                Poll::Ready(result) => return result,
+            }
+        }
+    }
+
+    pub fn poll_accept(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+    ) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        loop {
+            match unsafe { self.source.poll_update(IoKind::Read, Some(ctx.waker())) } {
+                Poll::Ready(_) => {}
+                Poll::Pending => return Poll::Pending,
+            }
+
+            match self.try_accept() {
+                Poll::Pending => continue,
+                Poll::Ready(result) => return Poll::Ready(result),
+            }
+        }
+    }
+
+    fn try_accept(&self) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        loop {
+            match self.source.as_ref().accept() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok((stream, addr)) => {
+                    let stream = TcpStream {
+                        source: IoSource::new(stream),
+                        reader: RefCell::new(IoReadiness::default()),
+                        writer: RefCell::new(IoReadiness::default()),
+                    };
+                    return Poll::Ready(Ok((stream, addr)));
                 }
             }
         }

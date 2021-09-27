@@ -1,3 +1,3 @@
 pub mod tcp;
 
-pub use tcp::TcpStream;
+pub use tcp::{TcpStream, TcpListener};

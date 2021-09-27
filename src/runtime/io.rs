@@ -316,18 +316,19 @@ impl IoDriver {
                             while !notified {
                                 resumed += do_poll(&mut notified, None);
                             }
+                        } else {
+                            assert_eq!(
+                                io_state.status,
+                                match timeout {
+                                    Some(Duration::ZERO) => IoStatus::Polling,
+                                    _ => IoStatus::Waiting,
+                                }
+                            );
                         }
 
                         assert!(io_state.pending >= resumed);
-                        assert_eq!(
-                            io_state.status,
-                            match timeout {
-                                Some(Duration::ZERO) => IoStatus::Polling,
-                                _ => IoStatus::Waiting,
-                            }
-                        );
-
                         io_state.pending -= resumed;
+                        
                         io_state.status = IoStatus::Empty;
                         Some(io_state.into())
                     })
@@ -347,6 +348,9 @@ pub struct IoSource<S: mio::event::Source> {
     io_node: NonNull<IoNode>,
     io_driver: NonNull<IoDriver>,
 }
+
+unsafe impl<S: mio::event::Source + Send> Send for IoSource<S> {}
+unsafe impl<S: mio::event::Source + Sync> Sync for IoSource<S> {}
 
 impl<S: mio::event::Source> AsRef<S> for IoSource<S> {
     fn as_ref(&self) -> &S {

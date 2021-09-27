@@ -3,6 +3,7 @@ use super::{
     waker::{AtomicWaker, WakerState, WakerUpdate},
 };
 use std::{
+    io,
     cell::{Cell, UnsafeCell},
     future::Future,
     marker::PhantomPinned,
@@ -328,7 +329,7 @@ impl IoDriver {
 
                         assert!(io_state.pending >= resumed);
                         io_state.pending -= resumed;
-                        
+
                         io_state.status = IoStatus::Empty;
                         Some(io_state.into())
                     })
@@ -364,8 +365,8 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
             let io_node = self.io_node.as_ref();
             let io_driver = self.io_driver.as_ref();
 
-            let _ = self.poll_update(IoKind::Read, None);
-            let _ = self.poll_update(IoKind::Write, None);
+            self.detach_io(IoKind::Read);
+            self.detach_io(IoKind::Write);
             let _ = io_driver.io_registry.deregister(&mut self.io_source);
 
             io_node
@@ -401,36 +402,60 @@ impl<S: mio::event::Source> IoSource<S> {
         .expect("IoSource::new() called outside the runtime")
     }
 
-    pub unsafe fn poll_update(&self, kind: IoKind, waker_ref: Option<&Waker>) -> Poll<()> {
-        let io_driver = self.io_driver.as_ref();
-        let io_waker = match kind {
-            IoKind::Read => &self.io_node.as_ref().reader,
-            IoKind::Write => &self.io_node.as_ref().writer,
-        };
+    fn unpack(&self, kind: IoKind) -> (&IoDriver, &AtomicWaker) {
+        unsafe {
+            let io_driver = self.io_driver.as_ref();
+            let io_waker = match kind {
+                IoKind::Read => &self.io_node.as_ref().reader,
+                IoKind::Write => &self.io_node.as_ref().writer,
+            };
+            (io_driver, io_waker)
+        }
+    }
 
-        let waker = match waker_ref {
-            Some(waker) => waker,
-            None => {
-                if io_waker.update(None) == WakerUpdate::Replaced {
+    pub unsafe fn poll_io<T>(
+        &self,
+        kind: IoKind,
+        waker: &Waker,
+        mut yield_now: impl FnMut() -> bool,
+        mut do_io: impl FnMut() -> io::Result<T>,
+    ) -> Poll<io::Result<T>> {
+        let (io_driver, io_waker) = self.unpack(kind);
+        loop {
+            io_driver.prepare_pending();
+            match io_waker.update(Some(waker)) {
+                WakerUpdate::New => return Poll::Pending,
+                WakerUpdate::Replaced => {
+                    io_driver.cancel_pending();
+                    return Poll::Pending;
+                }
+                WakerUpdate::Notified => {
                     io_driver.cancel_pending();
                 }
-                io_waker.reset();
-                return Poll::Ready(());
             }
-        };
 
-        io_driver.prepare_pending();
-        match io_waker.update(Some(waker)) {
-            WakerUpdate::New => Poll::Pending,
-            WakerUpdate::Replaced => {
-                io_driver.cancel_pending();
-                Poll::Pending
+            if yield_now() {
+                waker.wake_by_ref();
+                return Poll::Pending;
             }
-            WakerUpdate::Notified => {
-                io_driver.cancel_pending();
-                io_waker.reset();
-                Poll::Ready(())
+
+            loop {
+                match do_io() {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        io_waker.reset();
+                        break;
+                    }
+                    result => return Poll::Ready(result),
+                }
             }
+        }
+    }
+
+    pub unsafe fn detach_io(&self, kind: IoKind) {
+        let (io_driver, io_waker) = self.unpack(kind);
+        if io_waker.update(None) == WakerUpdate::Replaced {
+            io_driver.cancel_pending();
         }
     }
 
@@ -443,7 +468,9 @@ impl<S: mio::event::Source> IoSource<S> {
         impl<'a, S: mio::event::Source> Drop for WaitFor<'a, S> {
             fn drop(&mut self) {
                 if let Some(source) = self.source.take() {
-                    let _ = unsafe { source.poll_update(self.kind, None) };
+                    unsafe {
+                        source.detach_io(self.kind);
+                    }
                 }
             }
         }
@@ -453,13 +480,23 @@ impl<S: mio::event::Source> IoSource<S> {
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
                 let source = self.source.expect("wait_for polled after completion");
-                let polled = unsafe { source.poll_update(self.kind, Some(ctx.waker())) };
+                let polled = unsafe {
+                    source.poll_io(
+                        self.kind,
+                        ctx.waker(),
+                        || false,
+                        || Ok(()),
+                    )
+                };
 
-                if polled == Poll::Ready(()) {
-                    self.source = None;
+                match polled {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(_)) => unreachable!(),
+                    Poll::Ready(Ok(_)) => {
+                        self.source = None;
+                        Poll::Ready(())
+                    }
                 }
-
-                polled
             }
         }
 
@@ -470,66 +507,28 @@ impl<S: mio::event::Source> IoSource<S> {
     }
 }
 
-struct IoReadyState {
-    tick: u8,
-    available: bool,
-}
-
 #[derive(Default)]
-pub struct IoReadiness {
-    state: u8,
+pub struct IoFairness {
+    tick: u8,
 }
 
-impl IoReadiness {
-    fn with_ready_state<T>(&mut self, f: impl FnOnce(&mut IoReadyState) -> T) -> T {
-        let mut ready_state = IoReadyState {
-            tick: self.state >> 1,
-            available: self.state & 1 != 0,
-        };
-
-        let result = f(&mut ready_state);
-        self.state = (ready_state.available as u8) | (ready_state.tick & (u8::MAX >> 1));
-        result
-    }
-
-    pub fn poll<T, S: mio::event::Source>(
+impl IoFairness {
+    pub unsafe fn poll_io<T, S: mio::event::Source>(
         &mut self,
         source: &IoSource<S>,
         kind: IoKind,
         waker: &Waker,
-        mut do_io: impl FnMut() -> std::io::Result<T>,
-    ) -> Poll<std::io::Result<T>> {
-        self.with_ready_state(|ready_state| unsafe {
-            loop {
-                if !ready_state.available {
-                    ready_state.available = match source.poll_update(kind, Some(waker)) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(()) => true,
-                    };
-                }
-
-                ready_state.tick += 1;
-                match ready_state.tick - 1 {
-                    0 => {}
-                    t if t % 128 == 0 => {
-                        waker.wake_by_ref();
-                        return Poll::Pending;
-                    }
-                    _ => {}
-                }
-
-                let result = loop {
-                    match do_io() {
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        result => break result,
-                    }
-                };
-
-                ready_state.available = match result {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                    result => return Poll::Ready(result),
-                };
+        do_io: impl FnMut() -> io::Result<T>,
+    ) -> Poll<io::Result<T>> {
+        let yield_now = || {
+            let tick = self.tick;
+            self.tick = tick.wrapping_add(1);
+            match tick {
+                0 => false,
+                _ => tick % 128 == 0,
             }
-        })
+        };
+
+        source.poll_io(kind, waker, yield_now, do_io)
     }
 }

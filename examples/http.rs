@@ -1,5 +1,9 @@
+use hyper::{
+    server::{conn::Http, Builder},
+    service::{make_service_fn, service_fn},
+    Body, Request, Response,
+};
 use std::convert::Infallible;
-use hyper::{Body, Request, Response, server::{Builder, conn::Http}, service::{make_service_fn, service_fn}};
 
 async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
     Ok(Response::new(Body::from("Hello World")))
@@ -8,12 +12,10 @@ async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
 pub fn main() -> Result<(), hyper::Error> {
     zap::runtime::Builder::new().block_on(async {
         let addr = "127.0.0.1:3000".parse().unwrap();
-        let listener = zap::net::TcpListener::bind(addr)
-            .expect("failed to bind TcpListener");
+        let listener = zap::net::TcpListener::bind(addr).expect("failed to bind TcpListener");
 
-        let make_svc = make_service_fn(|_conn| async { 
-            Ok::<_, Infallible>(service_fn(hello_world))
-        });
+        let make_svc =
+            make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(hello_world)) });
 
         let server = Builder::new(compat::HyperListener(listener), Http::new())
             .executor(compat::HyperExecutor)
@@ -27,10 +29,10 @@ pub fn main() -> Result<(), hyper::Error> {
 
 mod compat {
     use std::{
-        io,
         future::Future,
+        io,
         pin::Pin,
-        task::{Poll, Context},
+        task::{Context, Poll},
     };
 
     #[derive(Clone)]

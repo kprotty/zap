@@ -1,27 +1,32 @@
-use super::super::runtime::io::{IoKind, IoReadiness, IoSource};
+use super::super::runtime::io::{IoFairness, IoKind, IoSource};
 use std::{
     cell::RefCell,
     io::{self, Read, Write},
     mem::MaybeUninit,
     net::SocketAddr,
     pin::Pin,
-    task::{Context, Poll},
+    future::Future,
+    task::{Context, Poll, Waker},
 };
 
 pub struct TcpStream {
     source: IoSource<mio::net::TcpStream>,
-    reader: RefCell<IoReadiness>,
-    writer: RefCell<IoReadiness>,
+    reader: RefCell<IoFairness>,
+    writer: RefCell<IoFairness>,
 }
 
 impl TcpStream {
+    fn new(stream: mio::net::TcpStream) -> Self {
+        Self {
+            source: IoSource::new(stream),
+            reader: RefCell::new(IoFairness::default()),
+            writer: RefCell::new(IoFairness::default()),
+        }
+    }
+
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let stream = mio::net::TcpStream::connect(addr)?;
-        let this = Self {
-            source: IoSource::new(stream),
-            reader: RefCell::new(IoReadiness::default()),
-            writer: RefCell::new(IoReadiness::default()),
-        };
+        let this = Self::new(stream);
 
         unsafe {
             this.source.wait_for(IoKind::Write).await;
@@ -41,22 +46,25 @@ impl tokio::io::AsyncRead for TcpStream {
         ctx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let polled =
-            self.reader
-                .borrow_mut()
-                .poll(&self.source, IoKind::Read, ctx.waker(), || unsafe {
-                    let buf = &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
-                    self.source.as_ref().read(buf)
-                });
+        unsafe {
+            let polled =
+                self.reader
+                    .borrow_mut()
+                    .poll_io(&self.source, IoKind::Read, ctx.waker(), || {
+                        let buf =
+                            &mut *(buf.unfilled_mut() as *mut [MaybeUninit<u8>] as *mut [u8]);
+                        self.source.as_ref().read(buf)
+                    });
 
-        match polled {
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(n)) => unsafe {
-                buf.assume_init(n);
-                buf.advance(n);
-                Poll::Ready(Ok(()))
-            },
+            match polled {
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(n)) => {
+                    buf.assume_init(n);
+                    buf.advance(n);
+                    Poll::Ready(Ok(()))
+                }
+            }
         }
     }
 }
@@ -67,11 +75,13 @@ impl tokio::io::AsyncWrite for TcpStream {
         ctx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.writer
-            .borrow_mut()
-            .poll(&self.source, IoKind::Write, ctx.waker(), || {
-                self.source.as_ref().write(buf)
-            })
+        unsafe {
+            self.writer
+                .borrow_mut()
+                .poll_io(&self.source, IoKind::Write, ctx.waker(), || {
+                    self.source.as_ref().write(buf)
+                })
+        }
     }
 
     fn poll_write_vectored(
@@ -79,11 +89,13 @@ impl tokio::io::AsyncWrite for TcpStream {
         ctx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.writer
-            .borrow_mut()
-            .poll(&self.source, IoKind::Write, ctx.waker(), || {
-                self.source.as_ref().write_vectored(bufs)
-            })
+        unsafe {
+            self.writer
+                .borrow_mut()
+                .poll_io(&self.source, IoKind::Write, ctx.waker(), || {
+                    self.source.as_ref().write_vectored(bufs)
+                })
+        }
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -104,6 +116,7 @@ impl tokio::io::AsyncWrite for TcpStream {
 
 pub struct TcpListener {
     source: IoSource<mio::net::TcpListener>,
+    fairness: RefCell<IoFairness>,
 }
 
 impl TcpListener {
@@ -111,19 +124,44 @@ impl TcpListener {
         let source = mio::net::TcpListener::bind(addr)?;
         Ok(Self {
             source: IoSource::new(source),
+            fairness: RefCell::new(IoFairness::default()),
         })
     }
 
-    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        loop {
-            unsafe {
-                self.source.wait_for(IoKind::Read).await;
-            }
+    pub fn accept<'a>(&'a self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
+        struct Accept<'a> {
+            listener: Option<&'a TcpListener>,
+        }
 
-            match self.try_accept() {
-                Poll::Pending => continue,
-                Poll::Ready(result) => return result,
+        impl<'a> Drop for Accept<'a> {
+            fn drop(&mut self) {
+                if let Some(listener) = self.listener {
+                    unsafe {
+                        listener.source.detach_io(IoKind::Read);
+                    }
+                }
             }
+        }
+
+        impl<'a> Future for Accept<'a> {
+            type Output = io::Result<(TcpStream, SocketAddr)>;
+
+            fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+                let listener = self.listener.expect("Accept polled after completion");
+                let polled = unsafe { listener.poll_accept_inner(ctx.waker()) };
+
+                match polled {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => {
+                        self.listener = None;
+                        Poll::Ready(result)
+                    }
+                }
+            }
+        }
+
+        Accept {
+            listener: Some(self),
         }
     }
 
@@ -131,34 +169,17 @@ impl TcpListener {
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
     ) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        loop {
-            match unsafe { self.source.poll_update(IoKind::Read, Some(ctx.waker())) } {
-                Poll::Ready(_) => {}
-                Poll::Pending => return Poll::Pending,
-            }
-
-            match self.try_accept() {
-                Poll::Pending => continue,
-                Poll::Ready(result) => return Poll::Ready(result),
-            }
-        }
+        unsafe { self.poll_accept_inner(ctx.waker()) }
     }
 
-    fn try_accept(&self) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        loop {
-            match self.source.as_ref().accept() {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Poll::Ready(Err(e)),
-                Ok((stream, addr)) => {
-                    let stream = TcpStream {
-                        source: IoSource::new(stream),
-                        reader: RefCell::new(IoReadiness::default()),
-                        writer: RefCell::new(IoReadiness::default()),
-                    };
-                    return Poll::Ready(Ok((stream, addr)));
-                }
-            }
-        }
+    unsafe fn poll_accept_inner(&self, waker: &Waker) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+        self.fairness
+            .borrow_mut()
+            .poll_io(&self.source, IoKind::Read, waker, || {
+                self.source
+                    .as_ref()
+                    .accept()
+                    .map(|(stream, addr)| (TcpStream::new(stream), addr))
+            })
     }
 }

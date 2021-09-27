@@ -134,7 +134,9 @@ impl TcpListener {
         })
     }
 
-    pub fn accept<'a>(&'a mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
+    pub fn accept<'a>(
+        &'a mut self,
+    ) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
         struct Accept<'a> {
             listener: Option<&'a TcpListener>,
         }

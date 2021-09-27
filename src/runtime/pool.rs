@@ -131,17 +131,20 @@ impl Pool {
     pub fn from_builder(builder: &Builder) -> Arc<Pool> {
         let num_threads = builder
             .max_threads
-            .map(|threads| threads.get())
-            .unwrap_or(0)
+            .unwrap_or_else(|| num_cpus::get())
             .min(SyncState::COUNT_MASK)
             .max(1);
+
+        let stack_size = builder
+            .stack_size
+            .and_then(NonZeroUsize::new);
 
         Arc::new(Self {
             sync: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             injecting: AtomicUsize::new(0),
             idle_queue: IdleQueue::default(),
-            stack_size: builder.stack_size,
+            stack_size: stack_size,
             io_driver: IoDriver::default(),
             workers: (0..num_threads)
                 .map(|_| Worker::default())

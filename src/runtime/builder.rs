@@ -1,7 +1,6 @@
 use super::{pool::Pool, task::TaskFuture};
 use std::{
     future::Future,
-    num::NonZeroUsize,
     pin::Pin,
     ptr,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -9,24 +8,24 @@ use std::{
 
 #[derive(Default)]
 pub struct Builder {
-    pub max_threads: Option<NonZeroUsize>,
-    pub stack_size: Option<NonZeroUsize>,
+    pub max_threads: Option<usize>,
+    pub stack_size: Option<usize>,
 }
 
 impl Builder {
     pub fn new() -> Self {
         Self {
-            max_threads: NonZeroUsize::new(num_cpus::get()),
+            max_threads: None,
             stack_size: None,
         }
     }
 
-    pub fn max_threads(mut self, num_threads: NonZeroUsize) -> Self {
+    pub fn max_threads(mut self, num_threads: usize) -> Self {
         self.max_threads = Some(num_threads);
         self
     }
 
-    pub fn stack_size(mut self, stack_size: NonZeroUsize) -> Self {
+    pub fn stack_size(mut self, stack_size: usize) -> Self {
         self.stack_size = Some(stack_size);
         self
     }

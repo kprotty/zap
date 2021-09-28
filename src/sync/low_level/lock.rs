@@ -102,7 +102,7 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
-    use super::super::event::Futex;
+    use super::super::{event::Futex, Spin};
     use std::{
         hint::spin_loop,
         sync::atomic::{AtomicI32, Ordering},
@@ -138,13 +138,8 @@ mod os {
         #[cold]
         fn acquire_slow(&self) {
             let mut state = UNLOCKED;
-            for spin in 0..=10 {
-                if spin <= 3 {
-                    (0..(1 << spin)).for_each(|_| spin_loop());
-                } else {
-                    thread::yield_now();
-                }
-
+            let mut spin = Spin::default();
+            while spin.yield_now() {
                 state = self.state.load(Ordering::Relaxed);
                 match state {
                     UNLOCKED => match self.state.compare_exchange(

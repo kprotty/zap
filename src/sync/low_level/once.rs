@@ -109,7 +109,7 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
-    use super::super::event::Futex;
+    use super::super::{event::Futex, Spin};
     use std::{
         hint::spin_loop,
         sync::atomic::{AtomicI32, Ordering},
@@ -161,13 +161,8 @@ mod os {
                 }
             };
 
-            for spin in 0..=10 {
-                if spin <= 3 {
-                    (0..(1 << spin)).for_each(|_| spin_loop());
-                } else {
-                    thread::yield_now();
-                }
-
+            let mut spin = Spin::default();
+            while spin.yield_now() {
                 state = self.state.load(Ordering::Acquire);
                 match state {
                     UNINIT => unreachable!("Once thread waiting while uninit"),
@@ -207,7 +202,7 @@ mod os {
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
 mod os {
-    use super::super::AutoResetEvent;
+    use super::super::{AutoResetEvent, Spin};
     use std::{
         cell::Cell,
         hint::spin_loop,
@@ -274,13 +269,8 @@ mod os {
                 }
             };
 
-            for spin in 0..=10 {
-                if spin <= 3 {
-                    (0..(1 << spin)).for_each(|_| spin_loop());
-                } else {
-                    thread::yield_now();
-                }
-
+            let mut spin = Spin::default();
+            while spin.yield_now() {
                 state = self.state.load(Ordering::Acquire);
                 match state & 0b11 {
                     UNINIT => unreachable!("Once thread waiting while uninit"),

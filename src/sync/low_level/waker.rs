@@ -13,7 +13,7 @@ pub enum WakerUpdate {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WakerState {
+enum WakerState {
     Empty = 0,
     Updating = 1,
     Ready = 2,
@@ -49,7 +49,7 @@ impl AtomicWaker {
         }
     }
 
-    pub fn wake(&self) -> WakerState {
+    pub fn wake(&self) {
         let state: WakerState = self
             .state
             .swap(WakerState::Waking as u8, Ordering::AcqRel)
@@ -60,8 +60,6 @@ impl AtomicWaker {
                 .expect("waker state was Ready without a Waker")
                 .wake();
         }
-
-        state
     }
 
     pub unsafe fn reset(&self) {

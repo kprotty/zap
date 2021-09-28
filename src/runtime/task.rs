@@ -285,17 +285,13 @@ impl<F: Future> TaskFuture<F> {
                 TaskData::Joined => unreachable!("TaskData already joind when setting output"),
             }
 
-            this.state.store(
-                TaskState {
-                    pool: None,
-                    status: TaskStatus::Ready,
-                }
-                .into(),
-                Ordering::Release,
-            );
+            let new_state = TaskState {
+                pool: None,
+                status: TaskStatus::Ready,
+            };
 
-            let waker_state = this.waker.wake();
-            assert_ne!(waker_state, WakerState::Waking);
+            this.state.store(new_state.into(), Ordering::Release);
+            this.waker.wake();
         });
 
         pool.mark_task_end();

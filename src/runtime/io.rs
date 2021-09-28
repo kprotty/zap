@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicPtr, AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -204,52 +204,52 @@ impl IoDriverInner {
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
         self.try_with_poller(|io_poller| {
-                let mut notified = false;
-                if let Some(Duration::ZERO) = timeout {
-                    io_poller.poll(&mut notified, timeout);
-                    return true;
-                }
-
-                let io_notify: IoNotify = self.io_notify.load(Ordering::Acquire).into();
-                if io_notify == IoNotify::Notified {
-                    self.io_notify
-                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
-                    return true;
-                }
-
-                if let Err(io_notify) = self.io_notify.compare_exchange(
-                    IoNotify::Empty as u8,
-                    IoNotify::Waiting as u8,
-                    Ordering::Acquire,
-                    Ordering::Acquire,
-                ) {
-                    let io_notify: IoNotify = io_notify.into();
-                    assert_eq!(io_notify, IoNotify::Notified);
-                    self.io_notify
-                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
-                    return true;
-                }
-
+            let mut notified = false;
+            if let Some(Duration::ZERO) = timeout {
                 io_poller.poll(&mut notified, timeout);
+                return true;
+            }
 
-                if let Err(io_notify) = self.io_notify.compare_exchange(
-                    IoNotify::Waiting as u8,
-                    IoNotify::Empty as u8,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    let io_notify: IoNotify = io_notify.into();
-                    assert_eq!(io_notify, IoNotify::Notified);
-                    self.io_notify
-                        .store(IoNotify::Empty as u8, Ordering::Relaxed);
-                    while !notified {
-                        io_poller.poll(&mut notified, None);
-                    }
+            let io_notify: IoNotify = self.io_notify.load(Ordering::Acquire).into();
+            if io_notify == IoNotify::Notified {
+                self.io_notify
+                    .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                return true;
+            }
+
+            if let Err(io_notify) = self.io_notify.compare_exchange(
+                IoNotify::Empty as u8,
+                IoNotify::Waiting as u8,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                let io_notify: IoNotify = io_notify.into();
+                assert_eq!(io_notify, IoNotify::Notified);
+                self.io_notify
+                    .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                return true;
+            }
+
+            io_poller.poll(&mut notified, timeout);
+
+            if let Err(io_notify) = self.io_notify.compare_exchange(
+                IoNotify::Waiting as u8,
+                IoNotify::Empty as u8,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                let io_notify: IoNotify = io_notify.into();
+                assert_eq!(io_notify, IoNotify::Notified);
+                self.io_notify
+                    .store(IoNotify::Empty as u8, Ordering::Relaxed);
+                while !notified {
+                    io_poller.poll(&mut notified, None);
                 }
+            }
 
-                true
-            })
-            .unwrap_or(false)
+            true
+        })
+        .unwrap_or(false)
     }
 
     fn try_with_poller<T>(&self, f: impl FnOnce(&mut IoPoller) -> T) -> Option<T> {
@@ -261,7 +261,7 @@ impl IoDriverInner {
         {
             match self.io_poller_owned.swap(true, Ordering::Acquire) {
                 true => return None,
-                _ => {},
+                _ => {}
             }
         }
 
@@ -274,7 +274,7 @@ impl IoDriverInner {
                 Ordering::Relaxed,
             ) {
                 Err(_) => return None,
-                _ => {},
+                _ => {}
             }
         }
 

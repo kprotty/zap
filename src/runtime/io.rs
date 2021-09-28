@@ -3,7 +3,7 @@ use super::{
     pool::Pool,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     future::Future,
     io,
     marker::PhantomPinned,
@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicPtr, AtomicU8, Ordering},
+        atomic::{AtomicPtr, AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -145,7 +145,8 @@ struct IoDriverInner {
     io_notify: AtomicU8,
     io_waker: mio::Waker,
     io_registry: mio::Registry,
-    io_poller: Lock<IoPoller>,
+    io_poller: UnsafeCell<IoPoller>,
+    io_poller_owned: AtomicBool,
     io_node_cache: Lock<IoNodeCache>,
 }
 
@@ -172,7 +173,8 @@ impl Default for IoDriverInner {
             io_notify: AtomicU8::new(IoNotify::Empty as u8),
             io_waker,
             io_registry,
-            io_poller: Lock::new(io_poller),
+            io_poller: UnsafeCell::new(io_poller),
+            io_poller_owned: AtomicBool::new(false),
             io_node_cache: Lock::new(IoNodeCache::default()),
         }
     }
@@ -201,8 +203,7 @@ impl IoDriverInner {
     }
 
     pub fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.io_poller
-            .try_with(|io_poller| {
+        self.try_with_poller(|io_poller| {
                 let mut notified = false;
                 if let Some(Duration::ZERO) = timeout {
                     io_poller.poll(&mut notified, timeout);
@@ -249,6 +250,37 @@ impl IoDriverInner {
                 true
             })
             .unwrap_or(false)
+    }
+
+    fn try_with_poller<T>(&self, f: impl FnOnce(&mut IoPoller) -> T) -> Option<T> {
+        if self.io_poller_owned.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            match self.io_poller_owned.swap(true, Ordering::Acquire) {
+                true => return None,
+                _ => {},
+            }
+        }
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            match self.io_poller_owned.compare_exchange(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Err(_) => return None,
+                _ => {},
+            }
+        }
+
+        let result = f(unsafe { &mut *self.io_poller.get() });
+        self.io_poller_owned.store(false, Ordering::Release);
+        Some(result)
     }
 }
 

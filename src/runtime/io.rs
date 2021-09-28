@@ -7,11 +7,11 @@ use std::{
     future::Future,
     io,
     marker::PhantomPinned,
-    mem,
+    mem::{self, MaybeUninit},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -285,49 +285,71 @@ impl IoDriverInner {
 }
 
 pub struct IoDriver {
-    inner: AtomicPtr<IoDriverInner>,
     once: Once,
+    initialized: AtomicBool,
+    inner: UnsafeCell<MaybeUninit<IoDriverInner>>,
 }
+
+unsafe impl Send for IoDriver {}
+unsafe impl Sync for IoDriver {}
 
 impl Default for IoDriver {
     fn default() -> Self {
         Self {
-            inner: AtomicPtr::new(ptr::null_mut()),
             once: Once::new(),
+            initialized: AtomicBool::new(false),
+            inner: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
 impl Drop for IoDriver {
     fn drop(&mut self) {
-        if let Some(inner_ptr) = NonNull::new(self.inner.load(Ordering::Acquire)) {
-            mem::drop(unsafe { Box::from_raw(inner_ptr.as_ptr()) });
+        if self.initialized.load(Ordering::Acquire) {
+            unsafe {
+                let maybe_inner = &mut *self.inner.get();
+                ptr::drop_in_place(maybe_inner.as_mut_ptr());
+            }
         }
     }
 }
 
 impl IoDriver {
     pub fn notify(&self) -> bool {
-        self.with_inner(|inner| inner.notify()).unwrap_or(false)
-    }
-
-    pub fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.with_inner(|inner| inner.poll(timeout))
+        self.try_inner()
+            .map(|inner| inner.notify())
             .unwrap_or(false)
     }
 
-    fn with_inner<T>(&self, f: impl FnOnce(&IoDriverInner) -> T) -> Option<T> {
-        NonNull::new(self.inner.load(Ordering::Acquire))
-            .map(|inner_ptr| f(unsafe { inner_ptr.as_ref() }))
+    pub fn poll(&self, timeout: Option<Duration>) -> bool {
+        self.try_inner()
+            .map(|inner| inner.poll(timeout))
+            .unwrap_or(false)
+    }
+
+    fn try_inner(&self) -> Option<&IoDriverInner> {
+        match self.initialized.load(Ordering::Acquire) {
+            false => None,
+            true => Some(unsafe {
+                let maybe_inner = &*self.inner.get();
+                &*maybe_inner.as_ptr()
+            }),
+        }
     }
 
     fn get_inner(&self) -> &IoDriverInner {
-        self.once.call_once(|| {
-            let inner = Box::into_raw(Box::new(IoDriverInner::default()));
-            self.inner.store(inner, Ordering::Release);
-        });
+        unsafe {
+            self.once.call_once(|| {
+                {
+                    let maybe_inner = &mut *self.inner.get();
+                    maybe_inner.write(IoDriverInner::default());
+                }
+                self.initialized.store(true, Ordering::Release);
+            });
 
-        unsafe { &*self.inner.load(Ordering::Acquire) }
+            let maybe_inner = &*self.inner.get();
+            &*maybe_inner.as_ptr()
+        }
     }
 }
 
@@ -358,11 +380,13 @@ impl<S: mio::event::Source> Drop for IoSource<S> {
             self.detach_io(IoKind::Read);
             self.detach_io(IoKind::Write);
 
-            let io_driver = self.io_driver.as_ref().get_inner();
-            let _ = io_driver.io_registry.deregister(&mut self.io_source);
-            io_driver
-                .io_node_cache
-                .with(|cache| cache.dealloc(self.io_node));
+            let inner = self
+                .io_driver
+                .try_inner()
+                .expect("IoDriverInner uninitialized while IoSource exists");
+
+            let _ = inner.io_registry.deregister(&mut self.io_source);
+            inner.io_node_cache.with(|c| c.dealloc(self.io_node));
         }
     }
 }

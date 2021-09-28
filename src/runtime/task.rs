@@ -1,5 +1,5 @@
 use super::{
-    super::sync::low_level::{AtomicWaker, WakerState, WakerUpdate},
+    super::sync::low_level::{AtomicWaker, WakerUpdate},
     pool::{Pool, PoolEvent},
 };
 use std::{

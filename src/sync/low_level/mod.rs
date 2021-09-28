@@ -6,4 +6,4 @@ mod waker;
 pub use event::AutoResetEvent;
 pub use lock::Lock;
 pub use once::Once;
-pub use waker::{AtomicWaker, WakerState, WakerUpdate};
+pub use waker::{AtomicWaker, WakerUpdate};

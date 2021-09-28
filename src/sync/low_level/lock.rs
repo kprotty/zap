@@ -123,9 +123,9 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
+    use super::super::event::Futex;
     use std::{
         hint::spin_loop,
-        ptr,
         sync::atomic::{AtomicI32, Ordering},
         thread,
     };
@@ -221,7 +221,7 @@ mod os {
                     }
                 }
 
-                unsafe { Self::futex_wait(&self.state, CONTENDED) };
+                unsafe { Futex::wait(&self.state, CONTENDED) };
                 state = self.state.load(Ordering::Relaxed);
             }
         }
@@ -230,30 +230,9 @@ mod os {
             match self.state.swap(UNLOCKED, Ordering::Release) {
                 UNLOCKED => unreachable!("unlocked an unlocked Lock"),
                 LOCKED => {}
-                CONTENDED => Self::futex_wake(&self.state, 1),
+                CONTENDED => Futex::wake(&self.state, 1),
                 _ => unreachable!("invalid Lock state"),
             }
-        }
-
-        #[cold]
-        unsafe fn futex_wait(ptr: &AtomicI32, value: i32) {
-            let _ = libc::syscall(
-                libc::SYS_futex,
-                ptr,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                value,
-                ptr::null::<libc::timespec>(),
-            );
-        }
-
-        #[cold]
-        unsafe fn futex_wake(ptr: &AtomicI32, waiters: i32) {
-            let _ = libc::syscall(
-                libc::SYS_futex,
-                ptr,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                waiters,
-            );
         }
     }
 }

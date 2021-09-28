@@ -110,9 +110,9 @@ mod os {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
+    use super::super::event::Futex;
     use std::{
         hint::spin_loop,
-        ptr,
         sync::atomic::{AtomicI32, Ordering},
         thread,
     };
@@ -155,7 +155,7 @@ mod os {
                     return match self.state.swap(CALLED, Ordering::Release) {
                         UNINIT => unreachable!("Once calling while uninit"),
                         CALLING => {}
-                        WAITING => unsafe { Self::futex_wake(&self.state, i32::MAX) },
+                        WAITING => unsafe { Futex::wake(&self.state, i32::MAX) },
                         CALLED => unreachable!("Once called when already called"),
                         _ => unreachable!("invalid Once state"),
                     };
@@ -194,32 +194,11 @@ mod os {
             }
 
             while state == WAITING {
-                unsafe { Self::futex_wait(&self.state, WAITING) };
+                unsafe { Futex::wait(&self.state, WAITING) };
                 state = self.state.load(Ordering::Acquire);
             }
 
             assert_eq!(state, CALLED);
-        }
-
-        #[cold]
-        unsafe fn futex_wait(ptr: &AtomicI32, value: i32) {
-            let _ = libc::syscall(
-                libc::SYS_futex,
-                ptr,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                value,
-                ptr::null::<libc::timespec>(),
-            );
-        }
-
-        #[cold]
-        unsafe fn futex_wake(ptr: &AtomicI32, waiters: i32) {
-            let _ = libc::syscall(
-                libc::SYS_futex,
-                ptr,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                waiters,
-            );
         }
     }
 }

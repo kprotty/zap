@@ -1,4 +1,4 @@
-pub use os::AutoResetEvent;
+pub use os::*;
 
 #[cfg_attr(
     any(target_os = "linux", target_os = "android", target_vendor = "apple"),
@@ -229,7 +229,7 @@ mod os {
             }
 
             loop {
-                unsafe { Self::futex_wait(&self.state, WAITING) };
+                unsafe { Futex::wait(&self.state, WAITING) };
                 match self.state.load(Ordering::Acquire) {
                     EMPTY => unreachable!("AutoResetEvent waiting while empty"),
                     WAITING => continue,
@@ -242,14 +242,18 @@ mod os {
         pub fn notify(self: Pin<&Self>) {
             match self.state.swap(NOTIFIED, Ordering::Release) {
                 EMPTY => {}
-                WAITING => unsafe { Self::futex_wake(&self.state, 1) },
+                WAITING => unsafe { Futex::wake(&self.state, 1) },
                 NOTIFIED => unreachable!("AutoResetEvent notified multiple times"),
                 _ => unreachable!("invalid AutoResetEvent state"),
             }
         }
+    }
 
+    pub struct Futex;
+
+    impl Futex {
         #[cold]
-        unsafe fn futex_wait(ptr: &AtomicI32, value: i32) {
+        pub unsafe fn wait(ptr: &AtomicI32, value: i32) {
             let _ = libc::syscall(
                 libc::SYS_futex,
                 ptr,
@@ -260,11 +264,11 @@ mod os {
         }
 
         #[cold]
-        unsafe fn futex_wake(ptr: &AtomicI32, waiters: i32) {
+        pub unsafe fn wake(ptr: &AtomicI32, waiters: i32) {
             let _ = libc::syscall(
                 libc::SYS_futex,
                 ptr,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
                 waiters,
             );
         }

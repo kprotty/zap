@@ -179,6 +179,7 @@ impl WaitQueue {
         }
     }
 
+    #[cold]
     pub async fn wait<V, C>(&self, key: usize, validate: V, cancelled: C) -> Option<WakeToken>
     where
         V: FnOnce() -> Option<WaitToken>,
@@ -193,7 +194,7 @@ impl WaitQueue {
         impl<'a, 'b, C: FnOnce(WaitToken, bool)> WaitFuture<'a, 'b, C> {
             #[cold]
             fn drop_slow(&mut self, node: Pin<&'a WaitNode>) {
-                if node.waker.update(None) == WakerUpdate::Notified {
+                if node.waker.is_notified() {
                     return;
                 }
 
@@ -236,8 +237,10 @@ impl WaitQueue {
                     let waker = Waker::from_raw(raw_waker);
 
                     match node.waker.update(Some(&waker)) {
-                        WakerUpdate::New => event.wait(),
-                        WakerUpdate::Replaced => unreachable!("waker should have been emptied"),
+                        WakerUpdate::New => {
+                            unreachable!("waker with event when not already waiting")
+                        }
+                        WakerUpdate::Replaced => event.wait(),
                         WakerUpdate::Notified => {}
                     }
                 }
@@ -310,6 +313,7 @@ impl WaitQueue {
         }
     }
 
+    #[cold]
     pub fn wake(
         &self,
         key: usize,
@@ -348,12 +352,19 @@ impl WaitQueue {
         }
     }
 
-    pub fn notify(&self, key: usize, mut count: usize, before_wake: impl FnOnce(bool)) {
+    #[cold]
+    pub fn notify(
+        &self,
+        key: usize,
+        token: WakeToken,
+        mut count: usize,
+        before_wake: impl FnOnce(bool),
+    ) {
         let filter = |_| match count {
             0 => None,
             _ => {
                 count -= 1;
-                Some(WakeToken(0))
+                Some(token)
             }
         };
 

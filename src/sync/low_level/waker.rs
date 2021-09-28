@@ -67,6 +67,11 @@ impl AtomicWaker {
         self.state.store(new_state, Ordering::Relaxed);
     }
 
+    pub fn is_notified(&self) -> bool {
+        let state: WakerState = self.state.load(Ordering::Acquire).into();
+        state == WakerState::Waking
+    }
+
     pub fn update(&self, waker_ref: Option<&Waker>) -> WakerUpdate {
         let state: WakerState = self.state.load(Ordering::Acquire).into();
         match state {

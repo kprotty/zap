@@ -60,7 +60,7 @@ mod os {
 
 #[cfg(target_vendor = "apple")]
 mod os {
-    use std::cell::UnsafeCell;
+    use std::{cell::UnsafeCell, ffi::c_void};
 
     #[link(name = "c")]
     extern "C" {
@@ -92,13 +92,12 @@ mod os {
                 extern "C" fn init_fn(param: *mut c_void) {
                     let this = unsafe { &mut *(param as *mut Self) };
                     (this.0.take().unwrap())();
-                    0
                 }
             }
 
             let mut init_fn = InitFn(Some(f));
             unsafe {
-                dispatch_once(
+                dispatch_once_f(
                     self.dispatch_once.get(),
                     InitFn::<Func>::init_fn,
                     (&mut init_fn) as *mut InitFn<Func> as *mut c_void,

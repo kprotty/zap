@@ -1,5 +1,4 @@
 const std = @import("std");
-const Lock = std.Thread.Mutex;
 const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
 
@@ -11,8 +10,8 @@ const Loop = @This();
 
 workers: []Worker,
 net_poller: NetPoller,
-pool: ThreadPool,
-idle: WorkerStack = .{},
+therad_pool: ThreadPool,
+idle_workers: WorkerStack = .{},
 injecting: Atomic(usize) = Atomic(usize).init(0),
 searching: Atomic(usize) = Atomic(usize).init(0),
 
@@ -20,7 +19,7 @@ fn schedule(self: *Loop, task: *Task) void {
     const list = List.from(task);
     const thread = Thread.current orelse return self.inject(list);
 
-    const worker = thread.worker orelse @panic("schedule on thread without worker");
+    const worker = thread.worker orelse unreachable;
     worker.queue.push(list);
     self.notify();
 }
@@ -39,7 +38,7 @@ fn notify(self: *Loop) void {
 }
 
 fn wake(self: *Loop, use_caller: bool) void {
-    if (!self.idle.poppable())
+    if (!self.idle_workers.poppable())
         return;
 
     if (self.searching.load(.Monotonic) > 0)
@@ -48,8 +47,10 @@ fn wake(self: *Loop, use_caller: bool) void {
     if (self.searching.compareAndSwap(0, 1, .SeqCst, .Monotonic)) |_|
         return;
 
-    if (self.idle.pop()) |worker| {
-        self.pool.spawn(worker, use_caller) catch self.idle.push(worker);
+    if (self.idle_workers.pop()) |worker| {
+        self.thread_pool.spawn(worker, use_caller) catch {
+            self.idle_workers.push(worker);
+        };
     }
 
     const searching = self.searching.fetchSub(1, .Monotonic);
@@ -441,7 +442,7 @@ const Thread = struct {
                     return task;
             }
 
-            loop.idle.push(worker);
+            loop.idle_workers.push(worker);
             self.worker = null;
             
             if (self.searching) {
@@ -450,7 +451,7 @@ const Thread = struct {
                 self.searching = false;
 
                 if (searching == 1 and self.pollable()) blk: {
-                    self.worker = self.loop.idle.pop() orelse break :blk;
+                    self.worker = self.loop.idle_workers.pop() orelse break :blk;
 
                     const searching = loop.searching.fetchAdd(1, .Monotonic);
                     assert(searching < loop.workers.len);
@@ -463,7 +464,7 @@ const Thread = struct {
             if (loop.net_poller.poll()) |*list| blk: {
                 const task = list.pop() orelse break :blk;
 
-                if (self.loop.idle.pop()) |new_worker| {
+                if (loop.idle_workers.pop()) |new_worker| {
                     self.worker = new_worker;
                     new_worker.queue.push(list);
 
@@ -478,7 +479,7 @@ const Thread = struct {
                 loop.inject(list);
             }
 
-            self.worker = loop.pool.wait() catch return null;
+            self.worker = loop.thread_pool.wait() catch return null;
             self.searching = true;
         }
     }
@@ -660,11 +661,20 @@ const ThreadPool = struct {
 };
 
 const NetPoller = struct {
-    
-    
+    reactor: Reactor,
+    pending: Atomic(usize) = Atomic(usize).init(0),
+    polling: Atomic(?*const u64) = Atomic(?*const u64).init(null),
+
+    fn notify(self: *NetPoller, until: u64) void {
+        // notify if polling waiting for more than until
+    }
+
+    fn poll(self: *NetPoller, clock: *Clock, until: u64) ?Batch {
+        // try to polling, waiting for at least until (timeout_ns = until -| clock.nanotime())
+    }
 };
 
-const NetPoll = switch (target.os.tag) {
+const Reactor = switch (target.os.tag) {
     .windows => Iocp,
     .linux => Epoll,
     else => Kqueue,
@@ -674,12 +684,250 @@ const Iocp = @compileError("TODO: Windows AFD + IO_STATUS_BLOCK per read/write")
 const Kqueue = @compileError("TODO: EVFILT_USER for macos/freebsd, EVFILT_TIMER for openbsd");
 
 const DelayQueue = struct {
-    
+    lock: Lock = .{},
+    pending: usize = 0,
+    wheel: TimerWheel = .{},
+    expires: AtomicTimestamp = .{},
+
+    const Delay = struct {
+        task: Task,
+        timeout: TimerWheel.Timeout,
+        queue: Atomic(?*DelayQueue) = Atomic(?*DelayQueue).init(null),
+
+        fn cancel(self: *Delay) bool {
+            const queue = self.queue.swap(null, .Acquire) orelse return false;
+
+            const held = queue.lock.acquire();
+            defer held.release();
+
+            const cancelled = self.wheel.remove(&self.timeout);
+            if (cancelled) self.pending -= 1;
+            return cancelled;
+        }
+    };
+
+    fn init(now: u64) DelayQueue {
+        return .{ .wheel = .{ .current = now } };
+    }
+
+    fn schedule(self: *DelayQueue, clock: *Clock, delay: *Delay, timeout_ns: u64) void {
+        const held = self.lock.acquire();
+        defer held.release();
+        
+        assert(delay.task.frame != null);
+        self.pending += 1;
+
+        const now = clock.nanotime();
+        assert(now != 0);
+
+        const ticks = (now - self.wheel.current) + timeout_ns;
+        self.wheel.insert(&delay.timeout, ticks);
+
+        assert(delay.queue.loadUnchecked() == null);
+        delay.queue.store(self, .Monotonic);
+
+        const expiry = now + timeout_ns;
+        const expires = self.expires.readUnchecked();
+        if (expires == 0 or expiry < expires)
+            self.expires.write(expiry);
+    }
+
+    fn poll(self: *DelayQueue, clock: *Clock, until: *u64) ?Batch {
+        var expires = self.expires.read();
+        if (expires == 0)
+            return null;
+
+        const held = self.lock.tryAcquire() orelse {
+            until.* = std.math.min(until.*, expires);
+            return null;
+        };
+        defer held.release();
+
+        const now = clock.nanotime();
+        assert(now != 0);
+
+        const polled = self.wheel.poll(now);
+        if (polled.next_expire) |next_expire| {
+            assert(next_expire > now);
+            until.* = std.math.min(until.*, next_expire);
+            self.expires.write(next_expire);
+        }
+
+        var list = List{};
+        var scheduled: usize = 0;
+        while (polled.expired.peek()) |timeout| {
+            polled.expired.remove(timeout);
+
+            const delay = @fieldParentPtr(Delay, "timeout", timeout);
+            defer list.push(&delay.task);
+
+            const queue = delay.queue.swap(null, .Acquire) orelse continue;
+            assert(queue == self);
+        }
+
+        return list;
+    }
+};
+
+const AtomicTimestamp = struct {
+    timestamp: Timestamp = .{},
+
+    /// Multiple threads are safe to read from it
+    pub fn read(self: *const AtomicTimestamp) u64 {
+        return self.timestamp.read();
+    }
+
+    // Safe to read by the writer thread
+    pub fn readUnchecked(self: *const AtomicTimestamp) u64 {
+        return self.timestamp.readUnchecked();
+    }
+
+    /// Only one thread can write to it at a time
+    pub fn write(self: *AtomicTimestamp, value: u64) void {
+        self.timestamp.write(value);
+    }
+
+    const Timestamp = switch (@bitSizeOf(usize)) {
+        64 => Timestamp64,
+        32 => Timestamp32,
+        else => @compileError("Architecture is not supported"),
+    };
+
+    const Timestamp64 = struct {
+        value: Atomic(u64) = Atomic(u64).init(0),
+
+        fn read(self: *const Timestamp) u64 {
+            return self.value.load(.Monotonic);
+        }
+
+        fn write(self: *Timestamp, value: u64) void {
+            return self.value.store(value, .Monotonic);
+        }
+    };
+
+    const Timestamp32 = struct {
+        low: Atomic(u32) = Atomic(u32).init(0),
+        high: Atomic(u32) = Atomic(u32).init(0),
+        high2: Atomic(u32) = Atomic(u32).init(0),
+
+        fn read(self: *const Timestamp) u64 {
+            while (true) {
+                const high = self.high.load(.Acquire);
+                const low = self.low.load(.Acquire);
+                const high2 = self.high2.load(.Monotonic);
+                if (high2 == high) {
+                    return (@as(u64, high) << 32) | low;
+                }
+            }
+        }
+
+        fn write(self: *Timestamp, value: u64) void {
+            const low = @truncate(u32, value);
+            const high = @truncate(u32, value >> 32);
+
+            self.high2.store(high, .Monotonic);
+            self.low.store(low, .Release);
+            self.high.store(high, .Release);
+        }
+    };
+};
+
+const Clock = struct {
+    started: Instant,
+
+    fn init() Clock {
+        return .{ .started = Instant.now() };
+    }
+
+    fn nanotime(self: Clock) u64 {
+        return Instant.now().since(self.started);
+    }
+};
+
+const Instant = struct {
+    ts: if (target.os.tag == .windows or target.os.tag.isDarwin()) u64 else os.timespec,
+
+    fn now() Instant {
+        if (target.os.tag == .windows)
+            return .{ .ts = os.windows.QueryPerformanceCounter() };
+
+        if (comptime target.os.tag.isDarwin())
+            return .{ .ts = os.darwin.mach_absolute_time() };
+
+        const clock_id = switch (target.os.tag) {
+            .openbsd, .linux => os.CLOCK.BOOTTIME,
+            else => os.CLOCK.MONOTONIC,
+        };
+
+        var self: Instant = undefined;
+        os.clock_gettime(clock_id, &self.ts) catch unreachable;
+        return self;
+    }
+
+    fn order(self: Instant, other: Instant) std.math.Order {
+        if (target.os.tag == .windows or target.os.tag.isDarwin())
+            return std.math.order(self.ts, other.ts);
+
+        return switch (std.math.order(self.ts.tv_sec, other.ts.tv_sec)) {
+            .eq => std.math.order(self.ts.tv_nsec, other.ts.tv_nsec),
+            else => |ord| ord,
+        };
+    }
+
+    fn since(self: Instant, earlier: Instant) u64 {
+        switch (self.order(earlier)) {
+            .eq => return 0,
+            .lt => unreachable,
+            .gt => {},
+        }
+        
+        if (target.os.tag == .windows) {
+            const frequency = os.windows.QueryPerformanceFrequency();
+            const counter = self.ts - earlier.ts;
+
+            const common_freq = 10_000_000;
+            if (frequency == common_freq)
+                return counter * (std.time.ns_per_s / common_freq);   
+
+            return safeMulDiv(counter, std.time.ns_per_s, frequency);
+        }
+
+        if (comptime target.os.tag.isDarwin()) {
+            var info: os.darwin.mach_timebase_info_data = undefined;
+            assert(os.darwin.mach_timebase_info(&info) == 0);
+
+            const counter = self.ts - earlier.ts;
+            if (info.numer == info.denom)
+                return counter;
+
+            return safeMulDiv(counter, info.numer, info.denom);
+        }
+
+        var secs = self.ts.tv_sec - earlier.ts.tv_sec;
+        var nsecs = self.ts.tv_nsec - earlier.ts.tv_nsec;
+        if (nsecs < 0) {
+            secs += 1;
+            nsecs += std.time.ns_per_s;
+        }
+
+        const seconds = @intCast(u64, secs) * std.time.ns_per_s;
+        return seconds + @intCast(u64, nsecs);
+    }
+
+    fn safeMulDiv(ticks: u64, numer: u64, denom: u64) u64 {
+        var mult: u64 = undefined;
+        if (!@mulWithOverflow(u64, ticks, numer, &mult))
+            return mult / denom;
+
+        const part = ((ticks % denom) * numer) / denom;
+        const whole = (ticks / denom) * numer;
+        return whole + part;
+    }
 };
 
 const TimerWheel = struct {
     const wheel_bit = 6;
-    const wheel_num = 6;
+    const wheel_num = 4;
     const timeout_t = u64;
 
     const wheel_len = 1 << wheel_bit;
@@ -874,4 +1122,94 @@ const TimerWheel = struct {
 
         return polled;
     }
+};
+
+const Lock = struct {
+    os_lock: OsLock = .{},
+
+    pub fn tryAcquire(self: *Lock) ?Held {
+        if (!self.os_lock.tryAcquire()) return null;
+        return Held{ .lock = self };
+    }
+
+    pub fn acquire(self: *Lock) Held {
+        self.os_lock.acquire();
+        return Held{ .lock = self };
+    }
+
+    pub const Held = struct {
+        lock: *Lock,
+
+        pub fn release(self: Held) void {
+            self.lock.os_lock.release();
+        }
+    }''
+
+    const OsLock = switch (target.os.tag) {
+        .macos, .ios, .tvos, .watchos => OsUnfairLock,
+        .windows => SRWLock,
+        else => FutexLock,
+    };
+
+    const SRWLock = struct {
+        srwlock: os.windows.SRWLOCK = os.windows.SRWLOCK_INIT,
+
+        fn tryAcquire(self: *OsLock) bool {
+            return os.windows.kernel32.TryAcquireSRWLockExclusive(&self.srwlock) != 0;
+        }
+
+        fn acquire(self: *OsLock) void {
+            os.windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+        }
+
+        fn release(self: *OsLock) void {
+            os.windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+        }
+    };
+
+    const OsUnfairLock = struct {
+        oul: os.darwin.os_unfair_lock = .{},
+
+        fn tryAcquire(self: *OsLock) bool {
+            return os.darwin.os_unfair_lock_trylock(&self.oul);
+        }
+
+        fn acquire(self: *OsLock) void {
+            os.darwin.os_unfair_lock_lock(&self.oul);
+        }
+
+        fn release(self: *OsLock) void {
+            os.darwin.os_unfair_lock_unlock(&self.oul);
+        }
+    };
+
+    const FutexLock = struct {
+        state: Atomic(u32) = Atomic(u32).init(UNLOCKED),
+
+        const UNLOCKED = 0;
+        const LOCKED = 1;
+        const CONTENDED = 2;
+
+        fn tryAcquire(self: *OsLock) bool {
+            return self.state.compareAndSwap(
+                UNLOCKED,
+                LOCKED,
+                .Acquire,
+                .Monotonic,
+            ) == null;
+        }
+
+        fn acquire(self: *OsLock) void {
+            if (self.state.swap(LOCKED, .Acquire) == UNLOCKED)
+                return;
+
+            while (self.state.swap(CONTENDED, .Acquire) != UNLOCKED)
+                std.Thread.Futex.wait(&self.state, CONTENDED, null) catch unreachable;
+        }
+
+        fn release(self: *OsLock) void {
+            if (self.state.swap(UNLOCKED, .Release) == CONTENDED)
+                std.Thread.Futex.wake(&self.state, 1);
+        }
+    };
 };

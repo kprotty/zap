@@ -461,6 +461,10 @@ const Thread = struct {
                 }
             }
 
+            while (true) {
+                pollTimers();
+            }
+
             if (loop.net_poller.poll()) |*list| blk: {
                 const task = list.pop() orelse break :blk;
 
@@ -479,7 +483,10 @@ const Thread = struct {
                 loop.inject(list);
             }
 
-            self.worker = loop.thread_pool.wait() catch return null;
+            self.worker = loop.thread_pool.wait() catch |err| switch (err) {
+                error.Shutdown => return null,
+                error.TimedOut => 
+            };
             self.searching = true;
         }
     }
@@ -533,28 +540,82 @@ const ThreadPool = struct {
     lock: Lock = .{},
     joiner: ?*Signal = null,
     running: bool = true,
-    idle: ?*Waiter = null,
+    idle: WaitQueue = .{},
     spawned: usize = 0,
     max_spawn: usize,
     stack_size: u32,
 
     const Waiter = struct {
+        idle: bool = false,
+        prev: ?*Waiter = null,
         next: ?*Waiter = null,
         signal: Signal = .{},
         worker: ?*Worker = null,
     };
 
+    const WaitQueue = struct {
+        stack: ?*Waiter = null,
+
+        fn push(self: *WaitQueue, waiter: *Waiter) void {
+            waiter.* = .{
+                .idle = true,
+                .next = self.stack,
+            };
+
+            var stack: ?*Waiter = waiter;
+            std.mem.swap(?*Waiter, &self.stack, &stack);
+
+            if (stack) |old_head| {
+                assert(old_head.prev == null);
+                old_head.prev = &waiter;
+            }
+        }
+
+        fn pop(self: *WaitQueue) ?*Waiter {
+            const top = self.stack orelse return null;
+            assert(self.remove(top));
+            return top;
+        }
+
+        fn remove(self: *WaitQueue, waiter: *Waiter) bool {
+            if (!waiter.idle) return false;
+            waiter.idle = false;
+
+            const top = self.stack orelse unreachable;
+            assert(top.prev == null);
+
+            if (waiter.prev) |prev| {
+                prev.next = waiter.next;
+                if (waiter.next) |next| {
+                    next.prev = prev;
+                }
+            } else {
+                assert(top == waiter);
+                self.stack = waiter.next;
+                if (self.stack) |new_top| {
+                    assert(new_top.prev == waiter);
+                    new_top.prev = null;
+                }
+            }
+        }
+    };
+
     const Signal = struct {
         futex: Atomic(u32) = Atomic(u32).init(0),
-
-        fn wait(self: *Signal) void {
-            while (self.futex.load(.Acquire) == 0)
-                std.Thread.Futex.wait(&self.futex, 0, null) catch unreachable;
-        }
 
         fn notify(self: *Signal) void {
             self.futex.store(1, .Release);
             std.Thread.Futex.wake(&self.futex);
+        }
+
+        fn wait(self: *Signal, clock: *Clock, deadline: u64) error{TimedOut}!void {
+            while (self.futex.load(.Acquire) == 0) {
+                try std.Thread.Futex.wait(&self.futex, 0, blk: {
+                    const now = clock.nanotime();
+                    if (now >= deadline) return error.TimedOut;
+                    break :blk (deadline - now);
+                });
+            }
         }
     };
 
@@ -568,8 +629,7 @@ const ThreadPool = struct {
             return error.Shutdown;
         }
 
-        if (self.idle) |waiter| {
-            self.idle = waiter.next;
+        if (self.idle.pop()) |waiter| {
             held.release();
             waiter.worker = worker;
             return waiter.signal.notify();
@@ -598,35 +658,44 @@ const ThreadPool = struct {
         thread.detach();
     }
 
-    fn wait(self: *ThreadPool) error{Shutdown}!*Worker {
-        const held = self.lock.acquire();
+    fn wait(self: *ThreadPool, clock: *Clock, deadline: u64) error{Shutdown, TimedOut}!*Worker {
+        var held = self.lock.acquire();
 
         if (!self.running) {
             held.release();
             return error.Shutdown;
         }
 
-        var waiter = Waiter{ .next = self.idle };
-        self.idle = &waiter;
+        var waiter: Waiter = undefined;
+        self.idle.push(&waiter);
         held.release();
 
-        waiter.signal.wait();
+        waiter.signal.wait(clock, deadline) catch {
+            held = self.lock.acquire();
+
+            if (self.idle.remove(&waiter)) {
+                held.release();
+                return error.TimedOut;
+            }
+
+            held.release();
+            waiter.signal.wait(clock, std.math.maxInt(u64)) catch unreachable;            
+        };
+
         return waiter.worker orelse error.Shutdown;
     }
 
     fn shutdown(self: *ThreadPool) void {
-        var waiters: ?*Waiter = null;
-        defer while (waiters) |waiter| {
-            waiters = waiter.next;
-            waiter.worker = null;
+        var waiters = WaitQueue{};
+        defer while (waiters.pop()) |waiter|
             waiter.signal.notify();
-        };
 
         const held = self.lock.acquire();
         defer held.release();
 
         self.running = false;
-        std.mem.swap(?*Waiter, &self.idle, &waiters);
+        while (self.idle.pop()) |waiter|
+            waiters.push(waiter);
     }
 
     fn complete(self: *ThreadPool) void {

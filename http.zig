@@ -35,5 +35,33 @@ fn runClient(stream: net.Stream, allocator: *std.mem.Allocator) anyerror!void {
         suspend { allocator.destroy(@frame()); }
     }
 
-    std.debug.warn("handling {}\n", .{stream});
+    errdefer |err| {
+        std.debug.warn("client {} got err {}\n", .{stream, err});
+    }
+
+    var offset: usize = 0;
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const req_buf = buffer[0..offset];
+        const clrf = "\r\n\r\n";
+
+        if (std.mem.indexOf(u8, req_buf, clrf)) |req_end| {
+            const request = req_buf[0..req_end + clrf.len];
+            std.mem.copyBackwards(u8, &buffer, request);
+            offset -= request.len;
+
+            const resp = "HTTP/1.1 200 Ok\r\nContent-Length: 10\r\nContent-Type: text/plain; charset=utf8\r\n\r\nHelloWorld";
+            try stream.writer().writeAll(resp);
+            continue;
+        }
+
+        const read_buf = buffer[offset..];
+        if (read_buf.len == 0)
+            return error.RequestTooBig;
+
+        const bytes = try stream.read(read_buf);
+        offset += bytes;
+        if (bytes == 0)
+            return error.Eof;
+    }
 }

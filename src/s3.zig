@@ -63,8 +63,13 @@ fn runTask(task: *Task) !void {
 }
 
 pub fn schedule(self: *Loop, task: *Task) void {
+    const list = Task.List.from(task);
+    return self.inject(list);
+}
+
+fn inject(self: *Loop, list: Task.List) void {
     const held = self.lock.acquire();
-    self.runnable.push(Task.List.from(task));
+    self.runnable.push(list);
 
     if (!self.running) {
         return held.release();
@@ -130,8 +135,9 @@ fn poll(self: *Loop) error{Shutdown}!*Task {
             self.notified.store(false, .Release);
         }
 
+        self.inject(list);
+
         held = self.lock.acquire();
-        self.runnable.push(list);
         self.idle -= 1;
 
         if (!self.running) blk: {
@@ -663,11 +669,22 @@ pub const net = struct {
         }
 
         pub fn read(self: Stream, buffer: []u8) ReadError!usize {
-            return self.socket.recvfrom(buffer, null);
+            return self.socket.recvfrom(buffer, null) catch |err| switch (err) {
+                error.Unexpected => error.Unexpected,
+                error.SocketNotConnected => error.ConnectionTimedOut,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                else => unreachable,
+            };
         }
 
         pub fn write(self: Stream, buffer: []const u8) WriteError!usize {
-            return self.socket.sendto(buffer, null);
+            return self.socket.sendto(buffer, null) catch |err| switch (err) {
+                error.AccessDenied => error.AccessDenied,
+                error.SystemResources => error.SystemResources,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.SocketNotConnected => error.NotOpenForWriting,
+                else => unreachable,
+            };
         }
     };
 
@@ -804,38 +821,7 @@ pub const net = struct {
         }
 
         pub fn connect(self: Socket, addr: Address) !void {
-            const OsConnect = struct {
-                fn call(sock: os.socket_t, sock_addr: *os.sockaddr, len: os.socklen_t) !void {
-                    if (target.os.tag != .windows) {
-                        return os.connect(sock, sock_addr, len);
-                    }
-
-                    // stdlib does unreachable for WSAEWOULDBLOCK here for some reason
-                    const rc = os.ws2_32.connect(sock, sock_addr, @intCast(i32, len));
-                    if (rc == 0) return;
-                    switch (os.windows.ws2_32.WSAGetLastError()) {
-                        .WSAEADDRINUSE => return error.AddressInUse,
-                        .WSAEADDRNOTAVAIL => return error.AddressNotAvailable,
-                        .WSAECONNREFUSED => return error.ConnectionRefused,
-                        .WSAECONNRESET => return error.ConnectionResetByPeer,
-                        .WSAETIMEDOUT => return error.ConnectionTimedOut,
-                        .WSAEHOSTUNREACH,
-                        .WSAENETUNREACH,
-                        => return error.NetworkUnreachable,
-                        .WSAEFAULT => unreachable,
-                        .WSAEINVAL => unreachable,
-                        .WSAEISCONN => unreachable,
-                        .WSAENOTSOCK => unreachable,
-                        .WSAEWOULDBLOCK => error.WouldBlock,
-                        .WSAEACCES => unreachable,
-                        .WSAENOBUFS => return error.SystemResources,
-                        .WSAEAFNOSUPPORT => return error.AddressFamilyNotSupported,
-                        else => |err| return os.windows.unexpectedWSAError(err),
-                    }
-                }
-            };
-
-            OsConnect.call(self.fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+            System.connect(self.fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
                 else => return err,
                 error.WouldBlock => {
                     Loop.instance.?.waitForWritable(self.fd);
@@ -869,7 +855,7 @@ pub const net = struct {
                 const adr = if (addr) |*a| &a.any else null;
                 const adr_len: os.socklen_t = if (addr) |_| @sizeOf(Address) else 0;
 
-                return os.sendto(self.fd, buf, io_flags, adr, adr_len) catch |err| switch (err) {
+                return System.sendto(self.fd, buf, io_flags, adr, adr_len) catch |err| switch (err) {
                     else => return err,
                     error.WouldBlock => {
                         Loop.instance.?.waitForWritable(self.fd);
@@ -882,10 +868,10 @@ pub const net = struct {
         pub fn recvfrom(self: Socket, buf: []u8, addr: ?*Address) !usize {
             while (true) {
                 var len: os.socklen_t = @sizeOf(Address);
-                const adr = if (addr) |*a| &a.any else null;
+                const adr = if (addr) |a| &a.any else null;
                 const adr_len = if (addr) |_| &len else null;
 
-                return os.recvfrom(self.fd, buf, io_flags, adr, adr_len) catch |err| switch (err) {
+                return System.recvfrom(self.fd, buf, io_flags, adr, adr_len) catch |err| switch (err) {
                     else => return err,
                     error.WouldBlock => {
                         Loop.instance.?.waitForReadable(self.fd);
@@ -894,5 +880,121 @@ pub const net = struct {
                 };
             }
         }
+
+        // stdlib has a bunch of stuff not working for windows
+        const System = switch (target.os.tag) {
+            .windows => WindowsSystem,
+            else => StdSystem,
+        };
+
+        const StdSystem = struct {
+            const connect = os.connect;
+            const sendto = os.sendto;
+            const recvfrom = os.recvfrom;
+        };
+
+        const WindowsSystem = struct {
+            fn connect(sock: os.socket_t, sock_addr: *os.sockaddr, len: os.socklen_t) !void {
+                const rc = os.ws2_32.connect(sock, sock_addr, @intCast(i32, len));
+                if (rc == 0) return;
+                switch (os.windows.ws2_32.WSAGetLastError()) {
+                    .WSAEADDRINUSE => return error.AddressInUse,
+                    .WSAEADDRNOTAVAIL => return error.AddressNotAvailable,
+                    .WSAECONNREFUSED => return error.ConnectionRefused,
+                    .WSAECONNRESET => return error.ConnectionResetByPeer,
+                    .WSAETIMEDOUT => return error.ConnectionTimedOut,
+                    .WSAEHOSTUNREACH,
+                    .WSAENETUNREACH,
+                    => return error.NetworkUnreachable,
+                    .WSAEFAULT => unreachable,
+                    .WSAEINVAL => unreachable,
+                    .WSAEISCONN => unreachable,
+                    .WSAENOTSOCK => unreachable,
+                    .WSAEWOULDBLOCK => error.WouldBlock,
+                    .WSAEACCES => unreachable,
+                    .WSAENOBUFS => return error.SystemResources,
+                    .WSAEAFNOSUPPORT => return error.AddressFamilyNotSupported,
+                    else => |err| return os.windows.unexpectedWSAError(err),
+                }
+            }
+
+            const win = struct {
+                extern "ws2_32" fn sendto(
+                    s: os.socket_t,
+                    buf: [*]const u8,
+                    len: i32,
+                    flags: i32,
+                    to: ?*const os.sockaddr,
+                    tolen: i32,
+                ) callconv(os.windows.WINAPI) i32;
+            };
+
+            fn sendto(sockfd: os.socket_t, buf: []const u8, flags: u32, dest_addr: ?*const os.sockaddr, addrlen: os.socklen_t) !usize {
+                while (true) {
+                    const rc = win.sendto(
+                        sockfd, 
+                        buf.ptr, 
+                        @intCast(i32, buf.len), 
+                        @bitCast(i32, flags), 
+                        dest_addr, 
+                        @bitCast(i32, addrlen),
+                    );
+                    if (rc == os.windows.ws2_32.SOCKET_ERROR) {
+                        switch (os.windows.ws2_32.WSAGetLastError()) {
+                            .WSAEACCES => return error.AccessDenied,
+                            .WSAEADDRNOTAVAIL => return error.AddressNotAvailable,
+                            .WSAECONNRESET => return error.ConnectionResetByPeer,
+                            .WSAEMSGSIZE => return error.MessageTooBig,
+                            .WSAENOBUFS => return error.SystemResources,
+                            .WSAENOTSOCK => return error.FileDescriptorNotASocket,
+                            .WSAEAFNOSUPPORT => return error.AddressFamilyNotSupported,
+                            .WSAEDESTADDRREQ => unreachable, // A destination address is required.
+                            .WSAEFAULT => unreachable, // The lpBuffers, lpTo, lpOverlapped, lpNumberOfBytesSent, or lpCompletionRoutine parameters are not part of the user address space, or the lpTo parameter is too small.
+                            .WSAEHOSTUNREACH => return error.NetworkUnreachable,
+                            // TODO: WSAEINPROGRESS, WSAEINTR
+                            .WSAEINVAL => unreachable,
+                            .WSAENETDOWN => return error.NetworkSubsystemFailed,
+                            .WSAENETRESET => return error.ConnectionResetByPeer,
+                            .WSAENETUNREACH => return error.NetworkUnreachable,
+                            .WSAENOTCONN => return error.SocketNotConnected,
+                            .WSAESHUTDOWN => unreachable, // The socket has been shut down; it is not possible to WSASendTo on a socket after shutdown has been invoked with how set to SD_SEND or SD_BOTH.
+                            .WSAEWOULDBLOCK => return error.WouldBlock,
+                            .WSANOTINITIALISED => unreachable, // A successful WSAStartup call must occur before using this function.
+                            else => |err| return os.windows.unexpectedWSAError(err),
+                        }
+                    } else {
+                        return @intCast(usize, rc);
+                    }
+                }
+            }
+
+            fn recvfrom(sockfd: os.socket_t, buf: []u8, flags: u32, src_addr: ?*os.sockaddr, addrlen: ?*os.socklen_t) !usize {
+                while (true) {
+                    const rc = os.windows.ws2_32.recvfrom(
+                        sockfd, 
+                        buf.ptr, 
+                        @intCast(i32, buf.len), 
+                        @bitCast(i32, flags), 
+                        src_addr, 
+                        @ptrCast(?*i32, addrlen),
+                    );
+                    if (rc == os.windows.ws2_32.SOCKET_ERROR) {
+                        switch (os.windows.ws2_32.WSAGetLastError()) {
+                            .WSANOTINITIALISED => unreachable,
+                            .WSAECONNRESET => return error.ConnectionResetByPeer,
+                            .WSAEINVAL => return error.SocketNotBound,
+                            .WSAEMSGSIZE => return error.MessageTooBig,
+                            .WSAENETDOWN => return error.NetworkSubsystemFailed,
+                            .WSAENOTCONN => return error.SocketNotConnected,
+                            .WSAEWOULDBLOCK => return error.WouldBlock,
+                            // TODO: handle more errors
+                            else => |err| return os.windows.unexpectedWSAError(err),
+                        }
+                    } else {
+                        return @intCast(usize, rc);
+                    }
+                }
+            }
+        };
     };
 };

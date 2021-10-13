@@ -372,10 +372,10 @@ const BSDReactor = struct {
     fn schedule(self: Reactor, fd: os.fd_t, io_type: IoType, completion: *Completion) !void {
         try self.kevent(.{
             .ident = @intCast(usize, fd),
-            .filter = switch (io_type) {
+            .filter = @as(i32, switch (io_type) {
                 .read => os.system.EVFILT_READ,
                 .write => os.system.EVFILT_WRITE,
-            },
+            }),
             .flags = os.system.EV_ADD | os.system.EV_ENABLE | os.system.EV_ONESHOT,
             .fflags = 0, // fflags usused for read/write events
             .udata = @ptrToInt(&completion.task),
@@ -413,7 +413,7 @@ const BSDReactor = struct {
 
     fn poll(self: Reactor, notified: *bool) Task.List {
         var events: [64]os.Kevent = undefined;
-        const found = try os.kevent(
+        const found = os.kevent(
             self.kqueue_fd,
             &[0]os.Kevent{},
             &events,
@@ -675,20 +675,30 @@ pub const net = struct {
 
         pub fn read(self: Stream, buffer: []u8) ReadError!usize {
             return self.socket.recvfrom(buffer, null) catch |err| switch (err) {
-                error.Unexpected => error.Unexpected,
-                error.SocketNotConnected => error.ConnectionTimedOut,
-                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
-                else => unreachable,
+                error.ConnectionRefused => unreachable,
+                error.SocketNotBound => unreachable,
+                error.MessageTooBig => unreachable,
+                error.NetworkSubsystemFailed => unreachable,
+                error.SocketNotConnected => unreachable,
+                else => |e| e,
             };
         }
 
         pub fn write(self: Stream, buffer: []const u8) WriteError!usize {
             return self.socket.sendto(buffer, null) catch |err| switch (err) {
-                error.AccessDenied => error.AccessDenied,
-                error.SystemResources => error.SystemResources,
-                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
-                error.SocketNotConnected => error.NotOpenForWriting,
-                else => unreachable,
+                error.FastOpenAlreadyInProgress => unreachable,
+                error.MessageTooBig => unreachable,
+                error.FileDescriptorNotASocket => unreachable,
+                error.NetworkUnreachable => unreachable,
+                error.NetworkSubsystemFailed => unreachable,
+                error.AddressFamilyNotSupported => unreachable,
+                error.SymLinkLoop => unreachable,
+                error.NameTooLong => unreachable,
+                error.FileNotFound => unreachable,
+                error.SocketNotConnected => unreachable,
+                error.AddressNotAvailable => unreachable,
+                error.NotDir => unreachable,
+                else => |e| e,
             };
         }
     };
@@ -800,12 +810,12 @@ pub const net = struct {
 
         fn fromFd(fd: os.socket_t) !Socket {
             if (comptime target.os.tag.isDarwin()) {
-                try os.setsockopt(
+                os.setsockopt(
                     fd,
                     os.SOL.SOCKET,
                     os.SO.NOSIGPIPE,
                     &std.mem.toBytes(@as(c_int, 1)),
-                );
+                ) catch return error.NetworkSubsystemFailed;
             }
             return Socket{ .fd = fd };
         }
@@ -836,7 +846,7 @@ pub const net = struct {
             };
         }
 
-        pub fn accept(self: Socket, addr: *Address) !Socket {
+        pub fn accept(self: Socket, addr: *Address) os.AcceptError!Socket {
             var addr_len: os.socklen_t = @sizeOf(Address);
             while (true) {
                 const fd = os.accept(self.fd, &addr.any, &addr_len, os.SOCK.CLOEXEC) catch |err| switch (err) {
@@ -856,7 +866,7 @@ pub const net = struct {
             else => os.MSG.NOSIGNAL,
         };
 
-        pub fn sendto(self: Socket, buf: []const u8, addr: ?Address) !usize {
+        pub fn sendto(self: Socket, buf: []const u8, addr: ?Address) os.SendToError!usize {
             while (true) {
                 const adr = if (addr) |*a| &a.any else null;
                 const adr_len: os.socklen_t = if (addr) |_| @sizeOf(Address) else 0;
@@ -871,7 +881,7 @@ pub const net = struct {
             }
         }
 
-        pub fn recvfrom(self: Socket, buf: []u8, addr: ?*Address) !usize {
+        pub fn recvfrom(self: Socket, buf: []u8, addr: ?*Address) os.RecvFromError!usize {
             while (true) {
                 var len: os.socklen_t = @sizeOf(Address);
                 const adr = if (addr) |a| &a.any else null;

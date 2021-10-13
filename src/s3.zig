@@ -62,6 +62,11 @@ fn runTask(task: *Task) !void {
     self.schedule(task);
 }
 
+pub fn yield(self: *Loop) void {
+    var task = Task.init(@frame());
+    suspend { self.schedule(&task); }
+}
+
 pub fn schedule(self: *Loop, task: *Task) void {
     const list = Task.List.from(task);
     return self.inject(list);
@@ -254,16 +259,16 @@ const LinuxReactor = struct {
     pub fn init() !Reactor {
         var self: Reactor = undefined;
 
-        self.epoll_fd = try os.epoll_create1(os.EPOLL.CLOEXEC);
+        self.epoll_fd = try os.epoll_create1(os.linux.EPOLL.CLOEXEC);
         errdefer os.close(self.epoll_fd);
 
-        self.event_fd = try os.eventfd(0, os.EFD.CLOEXEC | os.EFD.NONBLOCK);
+        self.event_fd = try os.eventfd(0, os.linux.EFD.CLOEXEC | os.linux.EFD.NONBLOCK);
         errdefer os.close(self.event_fd);
 
         try self.register(
-            os.EPOLL.CTL_ADD,
+            os.linux.EPOLL.CTL_ADD,
             self.event_fd,
-            os.EPOLL.IN, // level-triggered, readable
+            os.linux.EPOLL.IN, // level-triggered, readable
             0 // zero epoll_event.data.ptr for event_fd
         );
 
@@ -281,21 +286,21 @@ const LinuxReactor = struct {
 
     fn schedule(self: Reactor, fd: os.fd_t, io_type: IoType, completion: *Completion) !void {
         const ptr = @ptrToInt(&completion.task);
-        const events = os.EPOLL.ONESHOT | switch (io_type) {
-            .read => os.EPOLL.IN | os.EPOLL.RDHUP,
-            .write => os.EPOLL.OUT,
-        };
+        const events = os.linux.EPOLL.ONESHOT | @as(u32, switch (io_type) {
+            .read => os.linux.EPOLL.IN | os.linux.EPOLL.RDHUP,
+            .write => os.linux.EPOLL.OUT,
+        });
 
-        return self.register(os.EPOLL.CTL_MOD, fd, events, ptr) catch |err| switch (err) {
-            error.FileDescriptorNotRegistered => self.register(os.EPOLL_CTL_ADD, fd, events, ptr),
+        return self.register(os.linux.EPOLL.CTL_MOD, fd, events, ptr) catch |err| switch (err) {
+            error.FileDescriptorNotRegistered => self.register(os.linux.EPOLL.CTL_ADD, fd, events, ptr),
             else => err,
         };
     }
 
     fn register(self: Reactor, op: u32, fd: os.fd_t, events: u32, user_data: usize) !void {
-        var event = os.epoll_event{
+        var event = os.linux.epoll_event{
             .data = .{ .ptr = user_data },
-            .events = events | os.EPOLL.ERR | os.EPOLL.HUP,
+            .events = events | os.linux.EPOLL.ERR | os.linux.EPOLL.HUP,
         };
         try os.epoll_ctl(self.epoll_fd, op, fd, &event);
     }
@@ -307,7 +312,7 @@ const LinuxReactor = struct {
     }
 
     fn poll(self: Reactor, notified: *bool) Task.List {
-        var events: [128]os.epoll_event = undefined;
+        var events: [128]os.linux.epoll_event = undefined;
         const found = os.epoll_wait(self.epoll_fd, &events, -1);
 
         var list = Task.List{};
@@ -785,6 +790,7 @@ pub const net = struct {
 
     pub const Socket = struct {
         fd: os.socket_t,
+        read_tick: u8 = 0,
 
         pub fn init(domain: u32, sock_type: u32, protocol: u32) !Socket {
             const fd = try os.socket(domain, sock_type | os.SOCK.NONBLOCK | os.SOCK.CLOEXEC, protocol);
@@ -847,7 +853,7 @@ pub const net = struct {
         const io_flags = switch (target.os.tag) {
             .macos, .ios, .watchos, .tvos => 0,
             .windows => 0,
-            else => os.MSG_NOSIGNAL,
+            else => os.MSG.NOSIGNAL,
         };
 
         pub fn sendto(self: Socket, buf: []const u8, addr: ?Address) !usize {

@@ -107,9 +107,8 @@ fn runWorker(self: *Loop) void {
 }
 
 fn poll(self: *Loop) error{Shutdown}!*Task {
+    var held = self.lock.acquire();
     while (true) {
-        var held = self.lock.acquire();
-
         if (self.runnable.pop()) |task| {
             held.release();
             return task;

@@ -30,17 +30,16 @@ fn runServer() anyerror!void {
 }
 
 fn runClient(stream: net.Stream, allocator: *std.mem.Allocator) anyerror!void {
+    Loop.instance.?.yield();
     defer {
         stream.close();
         suspend { allocator.destroy(@frame()); }
     }
 
-    errdefer |err| {
-        std.debug.warn("client {} got err {}\n", .{stream, err});
-    }
-
     var offset: usize = 0;
+    var fair_tick: u8 = 0;
     var buffer: [4096]u8 = undefined;
+    
     while (true) {
         const req_buf = buffer[0..offset];
         const clrf = "\r\n\r\n";
@@ -61,6 +60,11 @@ fn runClient(stream: net.Stream, allocator: *std.mem.Allocator) anyerror!void {
 
         const bytes = try stream.read(read_buf);
         offset += bytes;
+
+        fair_tick +%= 1;
+        if (fair_tick == 128)
+            Loop.instance.?.yield();
+
         if (bytes == 0)
             return error.Eof;
     }

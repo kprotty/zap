@@ -229,7 +229,7 @@ pub fn waitForWritable(self: *Loop, fd: os.fd_t) void {
 }
 
 fn waitFor(self: *Loop, fd: os.fd_t, io_type: IoType) void {
-    var completion = std.mem.zeroes(Reactor.Completion);
+    var completion: Reactor.Completion = undefined;
     completion.task = Task.init(@frame());
     suspend {
         self.reactor.schedule(fd, io_type, &completion) catch resume @frame();
@@ -522,19 +522,25 @@ const WindowsReactor = struct {
     };
 
     fn schedule(self: Reactor, fd: os.fd_t, io_type: IoType, completion: *Completion) !void {
-        completion.io_status_block.u.Status = .PENDING;
+        const afd_events = @as(os.windows.ULONG, switch (io_type) {
+            .read => AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT,
+            .write => AFD_POLL_SEND,
+        });
+
         completion.afd_poll_info = .{
             .Timeout = std.math.maxInt(os.windows.LARGE_INTEGER),
             .NumberOfHandles = 1,
             .Exclusive = os.windows.FALSE,
             .Handles = [_]AFD_POLL_HANDLE_INFO{.{
                 .Handle = fd,
-                .Status = 0,
-                .Events = AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | AFD_POLL_CONNECT_FAIL | switch (io_type) {
-                    .read => AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT,
-                    .write => AFD_POLL_SEND,
-                },
+                .Status = .SUCCESS,
+                .Events = AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | AFD_POLL_CONNECT_FAIL | afd_events,
             }},
+        };
+
+        completion.io_status_block = .{
+            .u = .{ .Status = .PENDING },
+            .Information = 0,
         };
 
         const status = os.windows.ntdll.NtDeviceIoControlFile(

@@ -15,7 +15,7 @@ runnable: Task.List = .{},
 join_futex: Atomic(u32) = Atomic(u32).init(0),
 idle: usize = 0,
 spawned: usize = 0,
-max_threads: usize = 0,
+max_threads: usize,
 running: bool = true,
 notified: Atomic(bool) = Atomic(bool).init(false),
 reactor: Reactor,
@@ -42,7 +42,13 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !@typeInfo(@TypeOf(asyncFn)
 }
 
 fn runTask(task: *Task) !void {
-    var self = Loop{ .reactor = try Reactor.init() };
+    var self = Loop{
+        .reactor = try Reactor.init(),
+        .max_threads = if (single_threaded) 1 else blk: {
+            break :blk std.math.max(1, std.Thread.getCpuCount() catch 1);
+        },
+    };
+
     defer {
         self.shutdown();
         self.join();
@@ -598,7 +604,7 @@ const WindowsReactor = struct {
 };
 
 pub const net = struct {
-    pub const Address = Address;
+    pub const Address = std.net.Address;
 
     pub fn tcpConnectToHost(allocator: *Allocator, name: []const u8, port: u16) !Stream {
         const list = try std.net.getAddressList(allocator, name, port);
@@ -618,7 +624,7 @@ pub const net = struct {
     }
 
     pub fn tcpConnectToAddress(address: Address) !Stream {
-        const socket = try Socket.init(address.any.family, os.SOCK_STREAM, os.IPPROTO.TCP);
+        const socket = try Socket.init(address.any.family, os.SOCK.STREAM, os.IPPROTO.TCP);
         errdefer socket.close();
 
         try socket.connect(address);
@@ -693,10 +699,13 @@ pub const net = struct {
 
         pub fn listen(self: *StreamServer, address: Address) !void {
             const proto = if (address.any.family == os.AF.UNIX) @as(u32, 0) else os.IPPROTO.TCP;
-            const socket = try Socket.init(address.any.family, os.SOCK_STREAM, proto);
+            const socket = try Socket.init(address.any.family, os.SOCK.STREAM, proto);
             errdefer socket.close();
 
             const sock_fd = socket.getHandle();
+            self.socket = socket;
+            errdefer self.socket = null;
+
             if (self.options.reuse_address) {
                 try os.setsockopt(
                     sock_fd,
@@ -706,12 +715,11 @@ pub const net = struct {
                 );
             }
 
+            self.address = address;
             var socklen = address.getOsSockLen();
-            try os.bind(sock_fd, &address.any, socklen);
+            try os.bind(sock_fd, &self.address.any, socklen);
             try os.listen(sock_fd, self.options.kernel_backlog);
-            try os.getsockname(sock_fd, &self.addres.any, &socklen);
-
-            self.socket = socket;
+            try os.getsockname(sock_fd, &self.address.any, &socklen);            
         }
 
         pub const AcceptError = error{
@@ -754,15 +762,15 @@ pub const net = struct {
     };
 
     pub const Socket = struct {
-        fd: os.fd_t,
+        fd: os.socket_t,
 
         pub fn init(domain: u32, sock_type: u32, protocol: u32) !Socket {
-            const fd = try os.socket(domain, sock_type | os.SOCK_CLOEXEC | os.SOCK_NONBLOCK, protocol);
+            const fd = try os.socket(domain, sock_type | os.SOCK.NONBLOCK | os.SOCK.CLOEXEC, protocol);
             errdefer os.closeSocket(fd);
             return Socket.fromFd(fd);
         }
 
-        fn fromFd(fd: os.fd_t) !Socket {
+        fn fromFd(fd: os.socket_t) !Socket {
             if (comptime target.os.tag.isDarwin()) {
                 try os.setsockopt(
                     fd,
@@ -782,7 +790,7 @@ pub const net = struct {
             };
         }
 
-        pub fn getHandle(self: Socket) os.fd_t {
+        pub fn getHandle(self: Socket) os.socket_t {
             return self.fd;
         }
 

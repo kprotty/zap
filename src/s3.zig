@@ -10,15 +10,12 @@ const single_threaded = builtin.single_threaded;
 
 pub const Loop = @This();
 
-lock: std.Thread.Mutex = .{},
-runnable: Task.List = .{},
-join_futex: Atomic(u32) = Atomic(u32).init(0),
-idle: usize = 0,
-spawned: usize = 0,
-max_threads: usize,
-running: bool = true,
-notified: Atomic(bool) = Atomic(bool).init(false),
-reactor: Reactor,
+workers: []Worker,
+net_poller: NetPoller,
+thread_pool: Thread.Pool,
+idle_workers: Worker.Stack = .{},
+injecting: Atomic(usize) = Atomic(usize).init(0),
+searching: Atomic(usize) = Atomic(usize).init(0),
 
 pub var instance: ?*Loop = null;
 
@@ -42,17 +39,50 @@ pub fn run(comptime asyncFn: anytype, args: anytype) !@typeInfo(@TypeOf(asyncFn)
 }
 
 fn runTask(task: *Task) !void {
+    const num_cpus = switch (single_threaded) {
+        true => 1,
+        else => std.math.max(1, std.Thread.getCpuCount() catch 1), 
+    };
+
+    if (num_cpus == 1) {
+        var workers: [1]Worker = undefined;
+        return runTaskWithWorkers(task, &workers);
+    }
+
+    var win_heap = if (target.os.tag == .windows) std.heap.HeapAllocator.init() else {};
+    const allocator = if (builtin.link_libc)
+        std.heap.c_allocator
+    else if (target.os.tag == .windows)
+        &win_heap.allocator
+    else
+        std.heap.page_allocator;
+
+    const workers = try allocator.alloc(Worker, num_cpus);
+    defer allocator.free(workers);
+    return runTaskWithWorkers(task, workers);
+}
+
+fn runTaskWithWorkers(task: *Task, workers: []Worker) !void {
+    for (workers) |*worker, index| {
+        worker.* = .{ .next = undefined };
+        if (index == workers.len - 1) {
+            worker.next = null;
+        } else {
+            worker.next = &workers[index + 1];
+        }
+    }
+
     var self = Loop{
-        .reactor = try Reactor.init(),
-        .max_threads = if (single_threaded) 1 else blk: {
-            break :blk std.math.max(1, std.Thread.getCpuCount() catch 1);
-        },
+        .workers = workers,
+        .net_poller = try NetPoller.init(),
+        .idle_workers = Worker.Stack.init(&workers[0]),
+        .thread_pool = Thread.Pool{ .max_threads = workers.len },
     };
 
     defer {
         self.shutdown();
-        self.join();
-        self.reactor.deinit();
+        self.thread_pool.join();
+        self.net_poller.deinit();
     }
 
     assert(instance == null);
@@ -69,158 +99,659 @@ pub fn yield(self: *Loop) void {
 
 pub fn schedule(self: *Loop, task: *Task) void {
     const list = Task.List.from(task);
-    return self.inject(list);
+    const thread = Thread.current orelse return self.inject(list);
+
+    const worker = thread.worker orelse unreachable;
+    worker.queue.push(task);
+    self.notify();
 }
 
 fn inject(self: *Loop, list: Task.List) void {
-    const held = self.lock.acquire();
-    self.runnable.push(list);
+    const rand_worker_index = self.injecting.fetchAdd(1, .Monotonic) % self.workers.len;
+    const rand_worker = &self.workers[rand_worker_index];
 
-    if (!self.running) {
-        return held.release();
-    }
-
-    if (self.idle > 0) {
-        held.release();
-        if (self.notified.load(.Monotonic)) return;
-        if (self.notified.swap(true, .Acquire)) return;
-        return self.reactor.notify();
-    }
-
-    if (self.spawned == self.max_threads) {
-        return held.release();
-    }
-
-    const use_caller_thread = self.spawned == 0;
-    self.spawned += 1;
-    held.release();
-
-    if (use_caller_thread) {
-        return self.runWorker();
-    }
-
-    if (single_threaded) {
-        @panic("Tried to spawn a Thread when single_threaded");
-    }
-
-    const thread = std.Thread.spawn(.{}, Loop.runWorker, .{self}) catch return self.finish();
-    thread.detach();
+    rand_worker.queue.inject(list);
+    std.atomic.fence(.SeqCst);
+    self.notify();
 }
 
-fn runWorker(self: *Loop) void {
-    defer self.finish();
+fn notify(self: *Loop) void {
+    if (self.idle_workers.peek() == null)
+        return;
+    
+    if (self.searching.load(.Monotonic) > 0)
+        return;
 
-    while (true) {
-        const task = self.poll() catch break;
-        resume task.node.data;
+    if (self.searching.compareAndSwap(0, 1, .Acquire, .Monotonic)) |_|
+        return;
+
+    if (self.idle_workers.pop()) |worker| blk: {
+        return self.thread_pool.spawn(worker) catch {
+            self.idle_workers.push(worker);
+            break :blk;
+        };
     }
-}
 
-fn poll(self: *Loop) error{Shutdown}!*Task {
-    var held = self.lock.acquire();
-    while (true) {
-        if (self.runnable.pop()) |task| {
-            held.release();
-            return task;
-        }
-
-        if (!self.running) {
-            held.release();
-            return error.Shutdown;
-        }
-
-        self.idle += 1;
-        held.release();
-
-        var notified = false;
-        var list = self.reactor.poll(&notified);
-
-        if (notified) {
-            assert(self.notified.load(.Monotonic));
-            self.notified.store(false, .Release);
-        }
-
-        self.inject(list);
-
-        held = self.lock.acquire();
-        self.idle -= 1;
-
-        if (!self.running) blk: {
-            if (self.notified.load(.Monotonic)) break :blk;
-            if (self.notified.swap(true, .Acquire)) break :blk;
-            self.reactor.notify();
-        }
-    }
+    const searching = self.searching.fetchSub(1, .Monotonic);
+    assert(searching > 0);
 }
 
 fn shutdown(self: *Loop) void {
-    if (blk: {
-        const held = self.lock.acquire();
-        defer held.release();
-
-        self.running = false;
-        break :blk (self.idle > 0);
-    }) {
-        if (self.notified.swap(true, .Acquire)) return;
-        return self.reactor.notify();
-    }
+    self.net_poller.notify();
+    self.thread_pool.shutdown();
 }
 
-fn finish(self: *Loop) void {
-    if (blk: {
-        const held = self.lock.acquire();
-        defer held.release();
+const Worker = struct {
+    next: ?*Worker = null,
+    queue: Task.Queue = .{},
+
+    const Stack = struct {
+        lock: Thread.Pool.Lock = .{},
+        stack: Atomic(?*Worker) = Atomic(?*Worker).init(null),
+
+        fn init(top_worker: *Worker) Stack {
+            return .{ .stack = Atomic(?*Worker).init(top_worker) };
+        }
+
+        fn push(self: *Stack, worker: *Worker) void {
+            self.lock.acquire();
+            defer self.lock.release();
+
+            worker.next = self.stack.loadUnchecked();
+            self.stack.store(worker, .Monotonic);
+        }
+
+        fn peek(self: *const Stack) ?*Worker {
+            return self.stack.load(.Acquire);
+        }
+
+        fn pop(self: *Stack) ?*Worker {
+            self.lock.acquire();
+            defer self.lock.release();
+
+            const worker = self.stack.loadUnchecked() orelse return null;
+            self.stack.store(worker.next, .Monotonic);
+            return worker;
+        }   
+    };
+};
+
+const Thread = struct {
+    loop: *Loop,
+    worker: ?*Worker,
+    searching: bool,
+    xorshift: u32,
+    tick: u32,
+
+    threadlocal var current: ?*Thread = null;
+
+    fn run(loop: *Loop, worker: *Worker) void {
+        var self = Thread{
+            .loop = loop,
+            .worker = worker,
+            .searching = true,
+            .xorshift = @truncate(u32, @ptrToInt(worker)) | 1,
+            .tick = 0,
+        };
+
+        current = &self;
+        defer current = null;
+
+        while (self.poll()) |task| {
+            if (self.searching) {
+                const searching = loop.searching.fetchSub(1, .Monotonic);
+                assert(searching > 0);
+                self.searching = false;
+
+                if (searching == 1) {
+                    loop.notify();
+                }
+            }
+
+            self.tick +%= 1;
+            const frame = task.frame orelse unreachable;
+            resume frame;
+        }
+    }
+
+    fn poll(self: *Thread) ?*Task {
+        while (true) {
+            const worker = self.worker orelse return null;
+            const loop = self.loop;
+            
+
+            const be_fair = self.tick % 128 == 0;
+            if (worker.queue.pop(be_fair)) |task| {
+                return task;
+            }
+
+            if (!self.searching) blk: {
+                var searching = loop.searching.load(.Monotonic);
+                if (2 * searching >= loop.workers.len) {
+                    break :blk;
+                }
+
+                searching = loop.searching.fetchAdd(1, .SeqCst);
+                assert(searching < loop.workers.len);
+                self.searching = true;
+            }
+
+            if (self.searching) {
+                if (self.pollSearch(worker)) |task| {
+                    return task;
+                }
+            }
+
+            loop.idle_workers.push(worker);
+            self.worker = null;
+
+            if (self.searching) {
+                var searching = loop.searching.fetchSub(1, .SeqCst);
+                assert(searching > 0);
+                self.searching = false;
+                
+                if (searching == 1 and self.pollConsumable()) blk: {
+                    self.worker = loop.idle_workers.pop() orelse break :blk;
+
+                    searching = loop.searching.fetchAdd(1, .SeqCst);
+                    assert(searching <= loop.workers.len);
+                    self.searching = true;
+                    continue;
+                }
+            }
+
+            if (loop.net_poller.poll()) |polled| blk: {
+                var list = polled;
+                if (list.len == 0) 
+                    break :blk;
+
+                self.worker = loop.idle_workers.pop() orelse {
+                    loop.inject(list);
+                    break :blk;
+                };
+
+                const searching = loop.searching.fetchAdd(1, .SeqCst);
+                assert(searching <= loop.workers.len);
+                self.searching = true;
+
+                const task = list.pop() orelse unreachable;
+                self.worker.?.queue.inject(list);
+                return task;
+            }
+
+            self.worker = loop.thread_pool.wait() catch return null;
+        }
+    }
+
+    fn pollConsumable(self: *Thread) bool {
+        for (self.loop.workers) |*worker| {
+            if (worker.queue.consumable())
+                return true;
+        }
+        return false;
+    }
+
+    fn pollSearch(self: *Thread, worker: *Worker) ?*Task {
+        var attempts: usize = 32;
+        while (true) {
+            return self.pollSteal(worker) catch |err| switch (err) {
+                error.Empty => return null,
+                error.Contended => {
+                    attempts = std.math.sub(usize, attempts, 1) catch return null;
+                    std.atomic.spinLoopHint();
+                    continue;
+                },
+            };
+        }
+    }
+
+    fn pollSteal(self: *Thread, worker: *Worker) error{Empty, Contended}!*Task {
+        var xs = self.xorshift;
+        xs ^= xs << 13;
+        xs ^= xs >> 17;
+        xs ^= xs << 7;
+        self.xorshift = xs;
+
+        var was_contended = false;
+        var i: usize = self.loop.workers.len;
+        var target_index = xs % self.loop.workers.len;
         
-        self.spawned -= 1;
-        break :blk (self.spawned == 0 and !self.running and self.idle > 0);
-    }) {
-        self.join_futex.store(1, .Release);
-        std.Thread.Futex.wake(&self.join_futex, 1);
-    }
-}
+        while (i > 0) : (i -= 1) {
+            const target_worker = &self.loop.workers[target_index];
+            return worker.queue.steal(&target_worker.queue) catch |err| {
+                if (err == error.Contended) 
+                    was_contended = true;
+                target_index = (target_index + 1) % self.loop.workers.len;
+                continue;
+            };
+        }
 
-fn join(self: *Loop) void {
-    var joining = false;
-    defer while (joining and self.join_futex.load(.Acquire) == 0)
-        std.Thread.Futex.wait(&self.join_futex, 0, null) catch unreachable;
-
-    const held = self.lock.acquire();
-    defer held.release();
-
-    if (self.spawned == 0) {
-        return;
+        if (was_contended) return error.Contended;
+        return error.Empty;
     }
 
-    assert(self.idle == 0);
-    self.idle = 1;
-}
+    const Pool = struct {
+        lock: Lock = .{},
+        idle: IdleQueue = .{},
+        joiner: ?*Event = null,
+        running: bool = true,
+        spawned: usize = 0,
+        max_threads: usize,
+
+        const Lock = struct {
+            state: Atomic(u32) = Atomic(u32).init(0),
+
+            fn acquire(self: *Lock) void {
+                if (self.state.swap(1, .Acquire) == 0)
+                    return;
+                while (self.state.swap(2, .Acquire) != 0)
+                    std.Thread.Futex.wait(&self.state, 2, null) catch unreachable;
+            }
+
+            fn release(self: *Lock) void {
+                if (self.state.swap(0, .Release) == 2)
+                    std.Thread.Futex.wake(&self.state, 1);
+            }
+        };
+
+        const Event = struct {
+            state: Atomic(u32) = Atomic(u32).init(0),
+
+            fn wait(self: *Event) void {
+                while (self.state.load(.Acquire) == 0)
+                    std.Thread.Futex.wait(&self.state, 0, null) catch unreachable;
+            }
+
+            fn wake(self: *Event) void {
+                self.state.store(1, .Release);
+                std.Thread.Futex.wake(&self.state, 1);
+            }
+        };
+
+        const IdleQueue = std.TailQueue(struct {
+            event: Event = .{},
+            worker: ?*Worker = null,
+
+            pub fn wait(self: *@This()) ?*Worker {
+                self.event.wait();
+                return self.worker;
+            }
+
+            pub fn wake(self: *@This(), worker: ?*Worker) void {
+                self.worker = worker;
+                self.event.wake();
+            }
+        });
+
+        fn spawn(self: *Pool, worker: *Worker) !void {
+            self.lock.acquire();
+
+            if (!self.running) {
+                self.lock.release();
+                return error.Shutdown;
+            }
+
+            if (self.idle.popFirst()) |waiter| {
+                self.lock.release();
+                return waiter.data.wake(worker);
+            }
+
+            if (self.spawned == self.max_threads) {
+                self.lock.release();
+                return error.ThreadQuotaExceeded;
+            }
+
+            const use_caller_thread = self.spawned == 0;
+            self.spawned += 1;
+            self.lock.release();
+
+            if (use_caller_thread) 
+                return self.run(worker);
+
+            if (single_threaded)
+                @panic("tried to spawn thread in single_threaded");
+
+            errdefer self.finish();
+            const thread = try std.Thread.spawn(.{}, Pool.run, .{self, worker});
+            thread.detach();
+        }
+
+        fn run(self: *Pool, worker: *Worker) void {
+            defer self.finish();
+            const loop = @fieldParentPtr(Loop, "thread_pool", self);
+            return Thread.run(loop, worker);
+        }
+
+        fn wait(self: *Pool) error{Shutdown}!*Worker {
+            var waiter: IdleQueue.Node = undefined;
+            {
+                self.lock.acquire();
+                defer self.lock.release();
+
+                if (!self.running)
+                    return error.Shutdown;
+
+                waiter = .{ .data = .{} };
+                self.idle.prepend(&waiter);
+            }
+            return waiter.data.wait() orelse error.Shutdown;
+        }
+
+        fn shutdown(self: *Pool) void {
+            var idle = IdleQueue{};
+            defer while (idle.popFirst()) |waiter|
+                waiter.data.wake(null);
+            
+            self.lock.acquire();
+            defer self.lock.release();
+
+            self.running = false;
+            std.mem.swap(IdleQueue, &self.idle, &idle);
+        }
+
+        fn finish(self: *Pool) void {
+            var joiner: ?*Event = null;
+            defer if (joiner) |join_event|
+                join_event.wake();
+
+            self.lock.acquire();
+            defer self.lock.release();
+
+            self.spawned -= 1;
+            if (self.spawned == 0)
+                std.mem.swap(?*Event, &self.joiner, &joiner);
+        }
+
+        fn join(self: *Pool) void {
+            var joiner: ?Event = null;
+            defer if (joiner) |*join_event|
+                join_event.wait();
+
+            self.lock.acquire();
+            defer self.lock.release();
+
+            if (self.spawned > 0) {
+                joiner = Event{};
+                if (joiner) |*join_event| 
+                    self.joiner = join_event;
+            }
+        }
+    };
+};
 
 pub const Task = struct {
-    node: Queue.Node,
-
-    const Queue = std.TailQueue(anyframe);
+    next: ?*Task = null,
+    frame: ?anyframe = null,
 
     pub fn init(frame: anyframe) Task {
-        return .{ .node = .{ .data = frame } };
+        return .{ .frame = frame };
     }
 
     const List = struct {
-        queue: Queue = .{},
+        len: usize = 0,
+        head: ?*Task = null,
+        tail: ?*Task = null,
 
         fn from(task: *Task) List {
-            var queue = Queue{};
-            queue.append(&task.node);
-            return .{ .queue = queue };
+            task.next = null;
+            return .{
+                .len = 1,
+                .head = task,
+                .tail = task,
+            };
         }
 
         fn push(self: *List, list: List) void {
-            var _list = list;
-            self.queue.concatByMoving(&_list.queue);
+            if (list.len == 0) {
+                return;
+            }
+
+            if (self.len == 0) self.tail = list.tail;
+            list.tail.?.next = self.head;
+            self.head = list.head;
+            self.len += list.len;
         }
 
         fn pop(self: *List) ?*Task {
-            const node = self.queue.popFirst() orelse return null;
-            return @fieldParentPtr(Task, "node", node);
+            self.len = std.math.sub(usize, self.len, 1) catch return null;
+         
+            if (self.len == 0) self.tail = null;
+            const task = self.head orelse unreachable;
+            self.head = task.next;
+            return task;
+        }
+    };
+
+    const Queue = struct {
+        buffer: Buffer = .{},
+        injector: Injector = .{},
+
+        fn push(self: *Queue, task: *Task) void {
+            self.buffer.push(task, &self.injector);
+        }
+
+        fn inject(self: *Queue, list: List) void {
+            self.injector.push(list);
+        }
+
+        fn consumable(self: *const Queue) bool {
+            return self.injector.consumable() or self.buffer.consumable();
+        }
+
+        fn pop(self: *Queue, be_fair: bool) ?*Task {
+            return switch (be_fair) {
+                true => self.buffer.consume(&self.injector) catch self.buffer.pop() orelse null,
+                else => self.buffer.pop() orelse self.buffer.consume(&self.injector) catch null,
+            };
+        }
+
+        fn steal(self: *Queue, queue: *Queue) error{Empty, Contended}!*Task {
+            return self.buffer.consume(&queue.injector) catch |consume_error| {
+                return self.buffer.steal(&queue.buffer) orelse consume_error;
+            };
+        }
+    };
+
+    const Injector = struct {
+        pushed: Atomic(?*Task) = Atomic(?*Task).init(null),
+        popped: Atomic(?*Task) = Atomic(?*Task).init(null),
+        
+        fn push(self: *Injector, list: List) void {
+            if (list.len == 0) {
+                return;
+            }
+
+            var pushed = self.pushed.load(.Monotonic);
+            while (true) {
+                list.tail.?.next = pushed;
+                pushed = self.pushed.tryCompareAndSwap(
+                    pushed,
+                    list.head,
+                    .Release,
+                    .Monotonic,
+                ) orelse break;
+            }
+        }
+
+        var consuming: Task = undefined;
+
+        fn consumable(self: *const Injector) bool {
+            const popped = self.popped.load(.Monotonic);
+            if (popped == &consuming)
+                return false;
+
+            const pushed = self.pushed.load(.Monotonic);
+            return (popped orelse pushed) != null;
+        }
+
+        fn consume(self: *Injector) error{Empty, Contended}!Consumer {
+            var popped = self.popped.load(.Monotonic);
+            while (true) {
+                if (popped == null and self.pushed.load(.Monotonic) == null)
+                    return error.Empty;
+                if (popped == &consuming)
+                    return error.Contended;
+
+                popped = self.popped.tryCompareAndSwap(
+                    popped,
+                    &consuming,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return Consumer{
+                    .injector = self,
+                    .popped = popped,
+                };
+            }
+        }
+
+        const Consumer = struct {
+            injector: *Injector,
+            popped: ?*Task,
+
+            fn pop(self: *Consumer) ?*Task {
+                const task = self.popped orelse self.injector.pushed.swap(null, .Acquire) orelse return null;
+                self.popped = task.next;
+                return task;
+            }
+
+            fn release(self: Consumer) void {
+                assert(self.injector.popped.load(.Unordered) == &consuming);
+                assert(self.popped != &consuming);
+                self.injector.popped.store(self.popped, .Release);
+            }
+        };
+    };
+
+    const Buffer = struct {
+        head: Atomic(usize) = Atomic(usize).init(0),
+        tail: Atomic(usize) = Atomic(usize).init(0),
+        array: @TypeOf(array_init) = array_init,
+
+        const capacity = 256;
+        const array_slot = Atomic(?*Task).init(null);
+        const array_init = [_]Atomic(?*Task){ array_slot } ** capacity;
+
+        fn push(self: *Buffer, task: *Task, injector: *Injector) void {
+            var head = self.head.load(.Monotonic);
+            const tail = self.tail.loadUnchecked();
+
+            while (true) {
+                const size = tail -% head;
+                assert(size <= capacity);
+
+                if (size < capacity) {
+                    self.array[tail % capacity].store(task, .Unordered);
+                    self.tail.store(tail +% 1, .Release);
+                    return;
+                }
+
+                var migrate = size / 2;
+                head = self.head.tryCompareAndSwap(
+                    head,
+                    head +% migrate,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse {
+                    var list = Task.List{};
+                    while (migrate > 0) : (migrate -= 1) {
+                        const migrated = self.array[head % capacity].loadUnchecked() orelse unreachable;
+                        list.push(Task.List.from(migrated));
+                        head +%= 1;
+                    }
+
+                    list.push(Task.List.from(task));
+                    injector.push(list);
+                    return;
+                };
+            }
+        }
+
+        fn pop(self: *Buffer) ?*Task {
+            const head = self.head.fetchSub(1, .Acquire);
+            const tail = self.tail.loadUnchecked();
+
+            const size = tail -% head;
+            assert(size <= self.array.len);
+
+            if (size > 0) {
+                return self.array[head % capacity].loadUnchecked();
+            }
+
+            self.head.store(head, .Monotonic);
+            return null;
+        }
+
+        fn consumable(self: *const Buffer) bool {
+            const head = self.head.load(.Acquire);
+            const tail = self.tail.load(.Acquire);
+            return (tail != head) and (tail != head -% 1);
+        }
+
+        fn steal(self: *Buffer, buffer: *Buffer) ?*Task {
+            if (self == buffer)
+                return null;
+
+            while (true) : (std.atomic.spinLoopHint()) {
+                const buffer_head = buffer.head.load(.Acquire);
+                const buffer_tail = buffer.tail.load(.Acquire);
+
+                const buffer_size = buffer_tail -% buffer_head;
+                if (buffer_size == 0)
+                    return null;
+                if (buffer_size == @as(usize, 0) -% 1)
+                    return null;
+
+                const buffer_steal = buffer_size - (buffer_size / 2);
+                if (buffer_steal > capacity / 2)
+                    continue;
+
+                const head = self.head.load(.Unordered);
+                const tail = self.tail.loadUnchecked();
+                assert(head == tail);
+
+                var i: usize = 0;
+                while (i < buffer_steal) : (i += 1) {
+                    const task = buffer.array[(buffer_head +% i) % capacity].load(.Unordered);
+                    self.array[(tail +% i) % capacity].store(task, .Unordered);
+                }
+
+                _ = buffer.head.compareAndSwap(
+                    buffer_head,
+                    buffer_head +% buffer_steal,
+                    .AcqRel,
+                    .Monotonic,
+                ) orelse {
+                    const new_tail = tail +% (buffer_steal - 1);
+                    if (tail != new_tail)
+                        self.tail.store(new_tail, .Release);
+                    return self.array[new_tail % capacity].loadUnchecked();
+                };
+            }
+        }
+
+        fn consume(self: *Buffer, injector: *Injector) error{Empty, Contended}!*Task {
+            var consumer = try injector.consume();
+            defer consumer.release();
+
+            const head = self.head.load(.Monotonic);
+            const tail = self.tail.loadUnchecked();
+
+            const size = tail -% head;
+            assert(size <= capacity);
+
+            var new_tail = tail;
+            var available = capacity - size;
+            var consumed = consumer.pop() orelse return error.Empty;
+
+            while (available > 0) : (available -= 1) {
+                const task = consumer.pop() orelse break;
+                self.array[new_tail % capacity].store(task, .Unordered);
+                new_tail +%= 1;
+            }
+
+            if (new_tail != tail) 
+                self.tail.store(new_tail, .Release);
+            return consumed;
         }
     };
 };
@@ -241,10 +772,73 @@ pub fn waitForWritable(self: *Loop, fd: os.fd_t) void {
 fn waitFor(self: *Loop, fd: os.fd_t, io_type: IoType) void {
     var completion: Reactor.Completion = undefined;
     completion.task = Task.init(@frame());
+
+    self.net_poller.begin();
     suspend {
-        self.reactor.schedule(fd, io_type, &completion) catch resume @frame();
+        self.net_poller.reactor.schedule(fd, io_type, &completion) catch {
+            self.net_poller.finish(1);
+            resume @frame();
+        };
     }
 }
+
+const NetPoller = struct {
+    notified: Atomic(bool) = Atomic(bool).init(false),
+    polling: Atomic(bool) = Atomic(bool).init(false),
+    pending: Atomic(usize) = Atomic(usize).init(0),
+    reactor: Reactor,
+
+    fn init() !NetPoller {
+        return NetPoller{ .reactor = try Reactor.init() };
+    }
+
+    fn deinit(self: *NetPoller) void {
+        self.reactor.deinit();
+        assert(self.pending.load(.Monotonic) == 0);
+        assert(!self.polling.load(.Monotonic));
+    }
+
+    fn begin(self: *NetPoller) void {
+        const pending = self.pending.fetchAdd(1, .SeqCst);
+        assert(pending < std.math.maxInt(usize));
+    }
+
+    fn finish(self: *NetPoller, count: usize) void {
+        const pending = self.pending.fetchSub(count, .Monotonic);
+        assert(pending >= count);
+    }
+
+    fn acquire(self: *NetPoller, flag: *Atomic(bool)) bool {
+        if (self.pending.load(.Monotonic) == 0) return false;
+        if (flag.load(.Monotonic)) return false;
+        return !flag.swap(true, .Acquire);
+    }
+
+    fn notify(self: *NetPoller) void {
+        if (self.acquire(&self.notified)) {
+            self.reactor.notify();
+        }
+    }
+
+    fn poll(self: *NetPoller) ?Task.List {
+        if (!self.acquire(&self.polling)) return null;
+        defer self.polling.store(false, .Release);
+
+        var notified = false;
+        var list = self.reactor.poll(&notified);
+
+        if (list.len > 0) {
+            self.finish(list.len);
+        }
+
+        if (notified) {
+            assert(self.notified.load(.Monotonic));
+            self.notified.store(false, .Release);
+        }
+
+        return list;
+    }
+};
 
 const Reactor = switch (target.os.tag) {
     .windows => WindowsReactor,

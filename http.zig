@@ -30,7 +30,7 @@ fn runServer() anyerror!void {
 }
 
 fn runClient(stream: net.Stream, allocator: *std.mem.Allocator) anyerror!void {
-    Loop.instance.?.yield();
+    Loop.instance.?.reschedule();
     defer {
         stream.close();
         suspend { allocator.destroy(@frame()); }

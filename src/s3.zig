@@ -13,7 +13,7 @@ pub const Loop = @This();
 workers: []Worker,
 net_poller: NetPoller,
 thread_pool: Thread.Pool,
-idle_workers: Worker.Stack = .{},
+idle: Atomic(usize) = Atomic(usize).init(0),
 injecting: Atomic(usize) = Atomic(usize).init(0),
 searching: Atomic(usize) = Atomic(usize).init(0),
 
@@ -63,18 +63,16 @@ fn runTask(task: *Task) !void {
 }
 
 fn runTaskWithWorkers(task: *Task, workers: []Worker) !void {
-    var idle_workers = Worker.Stack{};
-    for (workers) |*worker| {
-        worker.* = .{};
-        idle_workers.push(worker);
-    }
-
     var self = Loop{
         .workers = workers,
         .net_poller = try NetPoller.init(),
-        .idle_workers = idle_workers,
         .thread_pool = Thread.Pool{ .max_threads = workers.len },
     };
+
+    for (workers) |*worker| {
+        worker.* = .{};
+        self.putIdleWorker(worker);
+    }
 
     defer {
         self.shutdown();
@@ -89,9 +87,14 @@ fn runTaskWithWorkers(task: *Task, workers: []Worker) !void {
     self.schedule(task);
 }
 
-pub fn yield(self: *Loop) void {
+pub fn reschedule(self: *Loop) void {
     var task = Task.init(@frame());
     suspend { self.schedule(&task); }
+}
+
+pub fn yield(self: *Loop) void {
+    var task = Task.init(@frame());
+    suspend { self.inject(Task.List.from(&task)); }
 }
 
 pub fn schedule(self: *Loop, task: *Task) void {
@@ -113,7 +116,7 @@ fn inject(self: *Loop, list: Task.List) void {
 }
 
 fn notify(self: *Loop) void {
-    if (self.idle_workers.peek() == null)
+    if (self.peekIdleWorker() == null)
         return;
     
     if (self.searching.load(.Monotonic) > 0)
@@ -122,9 +125,9 @@ fn notify(self: *Loop) void {
     if (self.searching.compareAndSwap(0, 1, .Acquire, .Monotonic)) |_|
         return;
 
-    if (self.idle_workers.pop()) |worker| blk: {
+    if (self.getIdleWorker()) |worker| blk: {
         return self.thread_pool.spawn(worker) catch {
-            self.idle_workers.push(worker);
+            self.putIdleWorker(worker);
             break :blk;
         };
     }
@@ -139,39 +142,59 @@ fn shutdown(self: *Loop) void {
 }
 
 const Worker = struct {
-    next: ?*Worker = null,
+    next: Atomic(Idle.Count) = Atomic(Idle.Count).init(0),
     queue: Task.Queue = .{},
-
-    const Stack = struct {
-        lock: Thread.Pool.Lock = .{},
-        stack: Atomic(?*Worker) = Atomic(?*Worker).init(null),
-
-        fn init(top_worker: *Worker) Stack {
-            return .{ .stack = Atomic(?*Worker).init(top_worker) };
-        }
-
-        fn push(self: *Stack, worker: *Worker) void {
-            self.lock.acquire();
-            defer self.lock.release();
-
-            worker.next = self.stack.loadUnchecked();
-            self.stack.store(worker, .Monotonic);
-        }
-
-        fn peek(self: *const Stack) ?*Worker {
-            return self.stack.load(.Acquire);
-        }
-
-        fn pop(self: *Stack) ?*Worker {
-            self.lock.acquire();
-            defer self.lock.release();
-
-            const worker = self.stack.loadUnchecked() orelse return null;
-            self.stack.store(worker.next, .Monotonic);
-            return worker;
-        }   
-    };
 };
+
+const Idle = packed struct {
+    index: Count = 0,
+    aba: Count = 0,
+    const Count = std.meta.Int(.unsigned, @bitSizeOf(usize) / 2);
+};
+
+fn putIdleWorker(self: *Loop, worker: *Worker) void {
+    const index = (@ptrToInt(worker) - @ptrToInt(self.workers.ptr)) / @sizeOf(Worker);
+    const worker_index = @intCast(Idle.Count, index);
+
+    var idle = @bitCast(Idle, self.idle.load(.Monotonic));
+    while (true) {
+        var new_idle = idle;
+        new_idle.aba +%= 1;
+        new_idle.index = worker_index + 1;
+        worker.next.store(idle.index, .Monotonic);
+
+        idle = @bitCast(Idle, self.idle.tryCompareAndSwap(
+            @bitCast(usize, idle),
+            @bitCast(usize, new_idle),
+            .Release,
+            .Monotonic,
+        ) orelse return);
+    }
+}
+
+fn peekIdleWorker(self: *Loop) ?*Worker {
+    const idle = @bitCast(Idle, self.idle.load(.Acquire));
+    const worker_index = std.math.sub(usize, idle.index, 1) catch return null;
+    return &self.workers[worker_index];
+}
+
+fn getIdleWorker(self: *Loop) ?*Worker {
+    var idle = @bitCast(Idle, self.idle.load(.Acquire));
+    while (true) {
+        const worker_index = std.math.sub(usize, idle.index, 1) catch return null;
+        const worker = &self.workers[worker_index];
+
+        var new_idle = idle;
+        new_idle.index = worker.next.load(.Monotonic);
+
+        idle = @bitCast(Idle, self.idle.tryCompareAndSwap(
+            @bitCast(usize, idle),
+            @bitCast(usize, new_idle),
+            .Acquire,
+            .Acquire,
+        ) orelse return worker);
+    }
+}
 
 const Thread = struct {
     loop: *Loop,
@@ -238,7 +261,7 @@ const Thread = struct {
                 }
             }
 
-            loop.idle_workers.push(worker);
+            loop.putIdleWorker(worker);
             self.worker = null;
 
             if (self.searching) {
@@ -247,7 +270,7 @@ const Thread = struct {
                 self.searching = false;
                 
                 if (searching == 1 and self.pollConsumable()) blk: {
-                    self.worker = loop.idle_workers.pop() orelse break :blk;
+                    self.worker = loop.getIdleWorker() orelse break :blk;
 
                     searching = loop.searching.fetchAdd(1, .SeqCst);
                     assert(searching <= loop.workers.len);
@@ -261,7 +284,7 @@ const Thread = struct {
                 if (list.len == 0) 
                     break :blk;
 
-                self.worker = loop.idle_workers.pop() orelse {
+                self.worker = loop.getIdleWorker() orelse {
                     loop.inject(list);
                     break :blk;
                 };

@@ -63,19 +63,16 @@ fn runTask(task: *Task) !void {
 }
 
 fn runTaskWithWorkers(task: *Task, workers: []Worker) !void {
-    for (workers) |*worker, index| {
-        worker.* = .{ .next = undefined };
-        if (index == workers.len - 1) {
-            worker.next = null;
-        } else {
-            worker.next = &workers[index + 1];
-        }
+    var idle_workers = Worker.Stack{};
+    for (workers) |*worker| {
+        worker.* = .{};
+        idle_workers.push(worker);
     }
 
     var self = Loop{
         .workers = workers,
         .net_poller = try NetPoller.init(),
-        .idle_workers = Worker.Stack.init(&workers[0]),
+        .idle_workers = idle_workers,
         .thread_pool = Thread.Pool{ .max_threads = workers.len },
     };
 
@@ -218,7 +215,6 @@ const Thread = struct {
         while (true) {
             const worker = self.worker orelse return null;
             const loop = self.loop;
-            
 
             const be_fair = self.tick % 128 == 0;
             if (worker.queue.pop(be_fair)) |task| {
@@ -280,6 +276,7 @@ const Thread = struct {
             }
 
             self.worker = loop.thread_pool.wait() catch return null;
+            self.searching = true;
         }
     }
 
@@ -667,18 +664,24 @@ pub const Task = struct {
         }
 
         fn pop(self: *Buffer) ?*Task {
-            const head = self.head.fetchSub(1, .Acquire);
+            var head = self.head.load(.Monotonic);
             const tail = self.tail.loadUnchecked();
 
-            const size = tail -% head;
-            assert(size <= self.array.len);
+            while (true) {
+                const size = tail -% head;
+                assert(size <= self.array.len);
 
-            if (size > 0) {
-                return self.array[head % capacity].loadUnchecked();
+                if (size == 0) {
+                    return null;
+                }
+
+                head = self.head.tryCompareAndSwap(
+                    head,
+                    head +% 1,
+                    .Acquire,
+                    .Monotonic,
+                ) orelse return self.array[head % capacity].loadUnchecked();
             }
-
-            self.head.store(head, .Monotonic);
-            return null;
         }
 
         fn consumable(self: *const Buffer) bool {
@@ -697,8 +700,6 @@ pub const Task = struct {
 
                 const buffer_size = buffer_tail -% buffer_head;
                 if (buffer_size == 0)
-                    return null;
-                if (buffer_size == @as(usize, 0) -% 1)
                     return null;
 
                 const buffer_steal = buffer_size - (buffer_size / 2);

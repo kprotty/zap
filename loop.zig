@@ -555,59 +555,61 @@ const WindowsInstant = struct {
     }
 };
 
-const IoKind = enum {
-    read = 0,
-    write = 1,
+const NetPoller = struct {
+    reactor: Reactor,
+    pending: Atomic(usize) = Atomic(usize).init(0),
+    polling: Atomic(bool) = Atomic(bool).init(false),
+    notified: Atomic(bool) = Atomic(bool).init(false),
+
+    fn acquire(self: *NetPoller, flag: *Atomic(bool))
 };
 
-const IoDriver = switch (target.os.tag) {
-    .freebsd, .openbsd, .netbsd, .dragonfly => BSDIoDriver,
-    .macos, .ios, .tvos, .watchos => DarwinIoDriver,
-    .windows => WindowsIoDriver,
-    .linux => LinuxIoDriver,
-    else => PosixIoDriver,
+const Reactor = switch (target.os.tag) {
+    .windows => WindowsReactor,
+    .linux => LinuxReactor,
+    else => BSDReactor,
 };
 
-const LinuxIoDriver = PosixIoDriverImpl(struct {
+const LinuxReactor = PosixReactorImpl(struct {
     epoll_fd: os.fd_t,
     event_fd: os.fd_t,
 
-    const Self = @This();
-
-    fn init() !Self {
+    fn init() !Reactor {
 
     }
 
-    fn deinit(self: Self) void {
+    fn deinit(self: Reactor) void {
 
     }
 
-    fn register(self: Self, fd: os.fd_t, ptr: usize) !void {
+    fn register(self: Reactor, socket: os.socket_t, node: *IoNode) !void {
 
     }
 
-    fn unregister(self: Self, fd: os.fd_t) void {
+    fn unregister(self: Reactor, socket: os.socket_t) void {
 
     }
 
-    fn notify(self: Self) void {
+    fn notify(self: Reactor) void {
 
     }
     
-    fn poll(self: Self, notified: *bool, timeout_ms: ?u64) Batch {
+    fn poll(self: Reactor, notified: *bool, timeout_ms: ?u64) Batch {
 
     }
 });
 
-fn PosixIoDriverImpl(comptime IoDriverImpl: type) type {
+fn PosixReactorImpl(comptime ReactorImpl: type) type {
     return struct {
-        impl: IoDriverImpl,
-        lock: Lock = .{},
-        free: ?*IoNode = null,
-        blocks: ?*IoBlock = null,
-        allocator: *Allocator,
+        impl: ReactorImpl,
+        node_cache: IoNodeCache,
 
-        const IoNode = struct {
+        const IoKind = enum {
+            read = 0,
+            write = 1,
+        };
+
+        const IoNode = extern struct {
             fd: os.fd_t,
             next: ?*IoNode = null,
             waiters: [2]Atomic(?*Task) = [_]Atomic(?*Task){
@@ -615,71 +617,257 @@ fn PosixIoDriverImpl(comptime IoDriverImpl: type) type {
                 Atomic(?*Task).init(null),
             },
 
-            var closed: Task = undefined;
             var notified: Task = undefined;
 
-            fn wait(self: *IoNode, kind: IoKind, driver: *IoDriver) error{Closed}!void {
+            fn wait(self: *IoNode, kind: IoKind, net_poller: *NetPoller) void {
+                const ptr = &self.waiters[@enumToInt(kind)];
 
+                const waiters = ptr.load(.Acquire);
+                defer ptr.store(null, .Monotonic);
+
+                if (waiters != &notified) {
+                    assert(waiters == null);
+
+                    const pending = net_poller.pending.fetchAdd(1, .Monotonic);
+                    assert(pending < std.math.maxInt(usize));
+                    
+                    var task = Task.init(@frame());
+                    suspend {
+                        if (ptr.compareAndSwap(null, &task, .AcqRel, .Acquire)) |updated| {
+                            assert(updated == &notified);
+                            resume @frame();
+                        } else {
+                            pending = net_poller.pending.fetchSub(1, .Monotonic);
+                            assert(pending > 0);
+                        }
+                    }
+                }
             }
 
-            fn wake(self: *IoNode, kind: IoKind, close: bool) ?*Task {
+            fn wake(self: *IoNode, kind: IoKind) ?*Task {
+                const ptr = &self.waiters[@enumToInt(kind)];
 
+                const waiters = ptr.swap(null, .AcqRel);
+                if (waiters == &notified)
+                    return null;
+
+                return waiters;
             }
         };
 
-        pub const IoSource = struct {
+        const IoNodeCache = struct {
+            lock: Lock = .{},
+            free: ?*IoNode = null,
+            arena: std.heap.ArenaAllocator,
+
+            fn init(allocator: *Allocator) IoNodeCache {
+                return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+            }
+
+            fn deinit(self: *IoNodeCache) void {
+                self.arena.deinit();
+                self.free = null;
+            }
+
+            fn alloc(self: *IoNodeCache) !*IoNodeCache {
+                self.lock.acquire();
+                defer self.lock.release();
+
+                if (self.free) |node| {
+                    self.free = node.next;
+                    return node;
+                }
+
+                return self.arena.alloc(IoNode);
+            }
+
+            fn free(self: *IoNodeCache, node: *IoNode) void {
+                self.lock.acquire();
+                defer self.lock.release();
+
+                node.next = self.free;
+                self.free = node;
+            }
+        };
+
+        const IoSource = struct {
             node: *IoNode,
-            poller: *IoPoller,
+            net_poller: *NetPoller,
 
-            pub fn init(fd: os.fd_t) !IoSource {
+            fn from(fd: os.fd_t) !IoSource {
+                errdefer os.close(fd);
 
+                const thread = Thread.current orelse @panic("IoSource used outside runtime");
+                const net_poller = &thread.loop.net_poller;
+                const reactor = &net_poller.reactor;
+
+                const node = try reactor.node_cache.alloc(fd);
+                errdefer reactor.node_cache.free(node);
+
+                node.* = .{ .fd = fd };
+                try reactor.impl.register(fd, @ptrCast(*c_void, node));
+
+                return IoSource{
+                    .node = node,
+                    .net_poller = net_poller,
+                };
             }
 
-            pub fn deinit(self: IoSource) void {
+            fn close(self: IoSource) void {
+                const reactor = &self.net_poller.reactor;
+                const fd = self.node.fd;
 
+                reactor.impl.unregister(fd);
+                os.close(fd);
+
+                reactor.node_cache.free(self.node);
             }
 
-            pub fn getFd(self: IoSource) os.fd_t {
+            fn getFd(self: IoSource) os.fd_t {
                 return self.node.fd;
             }
 
-            pub fn wait(self: IoSource, kind: IoKind) error{Closed}!void {
-                
+            fn wait(self: IoSource, kind: IoKind) void {
+                return self.node.wait(kind, self.net_poller);
             }
         };
 
         pub const Socket = struct {
-            source: IoSource,
+            fd: os.fd_t,
 
-            pub fn init(domain: u32, sock_type: u32, protocol: u32) !Socket {
-
+            pub fn open(domain: u32, sock_type: u32, protocol: u32) !Socket {
+                const fd = try os.socket(domain, sock_type | os.SOCK.NONBLOCK | os.SOCK.CLOEXEC, protocol);
+                return Socket.from(fd);
             }
 
-            pub fn deinit(self: Socket) void {
+            fn from(fd: os.fd_t) !Socket {
+                errdefer os.close(fd);
 
+                if (comptime target.os.tag.isDarwin()) {
+                    os.setsockopt(
+                        fd,
+                        os.SOL.SOCKET,
+                        os.SO.NOSIGPIPE,
+                        &std.mem.toBytes(@as(c_int, 1)),
+                    ) catch return error.NetworkSubsystemFailed;
+                }
+
+                return Socket{ .fd = fd };
+            }
+
+            pub fn close(self: Socket) void {
+                os.close(self.fd);
             }
 
             pub fn getHandle(self: Socket) os.socket_t {
+                return self.fd;
+            }
+
+            pub fn listen(self: Socket, addr: std.net.Address, backlog: u16) !Listener {
+                {
+                    errdefer self.close();
+                    try os.listen(self.fd, backlog);
+                    try os.bind(self.fd, &addr.any, addr.getOsSockLen());
+                }
+
+                const source = try IoSource.from(fd);
+                return Listener{ .source = source };
+            }
+
+            pub fn connect(self: Socket, addr: std.net.Address) !Stream {
+                const source = try IoSource.from(self.fd);
+                errdefer source.close();
+
+                os.connect(source.getFd(), &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        source.wait(.write);
+                        try os.getsockoptError(source.getFd());
+                    },
+                    else => |e| return e,
+                };
+
+                return Stream{ .source = source };
+            }
+        };
+
+        pub const Listener = struct {
+            source: IoSource,
+
+            pub fn close(self: Listener) void {
+                self.source.close();
+            }
+
+            pub fn accept(self: *Listener, addr: *std.net.Address) !Stream {
+                while (true) {
+                    var addr_len: os.socklen_t = @sizeOf(std.net.Address);
+                    const fd = os.accept(self.source.getFd(), &addr.any, &addr_len, sock_flags) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            self.source.wait(.read);
+                            continue;
+                        },
+                        else => |e| return e,
+                    };
+                    
+                    const source = try IoSource.from(fd);
+                    return Stream{ .source = source };
+                }
+            }
+        };
+
+        pub const Stream = struct {
+            source: IoSource,
+
+            pub fn close(self: Stream) void {
 
             }
 
-            pub fn listen(self: Socket, backlog: u16) !void {
-
+            pub fn read(self: Stream, buf: []u8) !usize {
+                while (true) {
+                    
+                }
             }
 
-            pub fn bind(self: Socket, addr: std.net.Address) !void {
+            pub fn write(self: Stream, buf: []const u8) !usize {
 
             }
+        };
 
-            pub fn accept(self: Socket, addr: *std.net.Address) !Socket {
+        pub const Pipe = struct {
+            streams: [2]Stream,
 
+            pub fn open() !Pipe {
+                const fds = try os.pipe2(os.O.NONBLOCK);
+
+                const read_source = IoSource.from(fds[0]) catch |err| {
+                    os.close(fds[0]);
+                    os.close(fds[1]);
+                    return err;
+                };
+                
+                const write_source = IoSource.from(fds[1]) catch |err| {
+                    read_source.close();
+                    os.close(fds[1]);
+                    return err;
+                };
+
+                var streams: [2]Stream = undefined;
+                streams[@enumToInt(IoKind.read)] = .{ .source = read_source };
+                streams[@enumToInt(IoKind.write)] = .{ .source = write_source };
+                return Pipe{ .streams = streams };
             }
 
-            pub fn connect(self: Socket, addr: std.net.Address) !void {
-
+            pub fn close(self: Pipe) !void {
+                for (self.streams) |stream|
+                    stream.close();
             }
 
-            pub fn sendmsg(self: Socket, )
+            pub fn read(self: Pipe, buf: []u8) !usize {
+                return self.streams[@enumToInt(IoKind.read)].read(buf);
+            }
+
+            pub fn write(self: Pipe, buf: []const u8) !usize {
+                return self.streams[@enumToInt(IoKind.write)].write(buf);
+            }
         };
     };
 }

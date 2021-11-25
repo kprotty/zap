@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ThreadPool = @import("thread_pool");
 
 /// Global thread pool which mimics other async runtimes
@@ -53,13 +54,13 @@ pub fn run(comptime asyncFn: anytype, args: anytype) ReturnTypeOf(asyncFn) {
 
     // On windows, use the process heap allocator.
     // On posix systems, use the libc allocator.
-    const is_windows = std.builtin.target.os.tag == .windows;
+    const is_windows = builtin.target.os.tag == .windows;
     var win_heap: if (is_windows) std.heap.HeapAllocator else void = undefined;
     if (is_windows) {
         win_heap = @TypeOf(win_heap).init();
         win_heap.heap_handle = std.os.windows.kernel32.GetProcessHeap() orelse unreachable;
         allocator = &win_heap.allocator;
-    } else if (std.builtin.link_libc) {
+    } else if (builtin.link_libc) {
         allocator = std.heap.c_allocator;
     } else {
         @compileError("link to libc with '-Dc' as zig stdlib doesn't provide a fast, libc-less, general purpose allocator (yet)");

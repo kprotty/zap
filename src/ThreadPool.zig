@@ -110,8 +110,15 @@ pub fn schedule(self: *ThreadPool, batch: Batch) void {
     // Try to push one of the batch's runnables to the local Runnable Buffer
     // if this thread is actually a thread pool worker thread.
     if (Buffer.current) |buffer| {
-        const runnable = mut_batch.pop() orelse unreachable;
-        buffer.push(runnable, &self.injector);
+        if (blk: {
+            const buffer_ptr = @ptrToInt(buffer);
+            const buffers_begin = @ptrToInt(self.buffers.ptr);
+            const buffers_end = buffers_begin + (self.buffers.len * @sizeOf(Buffer));
+            break :blk (buffer_ptr >= bufers_begin) and (buffer_ptr < buffers_end);
+        }) {
+            const runnable = mut_batch.pop() orelse unreachable;
+            buffer.push(runnable, &self.injector);
+        }
     }
     
     // Push any remaining Runnables from the batch to the shared injector
@@ -149,6 +156,7 @@ const State = packed struct {
     const Padding = std.meta.Int(.unsigned, @bitSizeOf(usize) % 3);
 };
 
+/// Creates or wakes up worker threads to process Runnables if they aren't already.
 fn notify(self: *ThreadPool) void {
     var state = @bitCast(State, self.state.load(.Monotonic));
     while (true) {
@@ -274,28 +282,41 @@ fn join(self: *ThreadPool) void {
     }
 }
 
+/// Tries to mark the caller worker thread as "searching".
+/// There's a quick soft-limit here to limit searching workers which decreases atomic contention overhead.
+/// Multiplication of searching is used instead of division of buffers as mul is often faster than div on modern CPUs.
+/// Each observation of the state, we do a sanity check to ensure "searching" doesn't overflow the amount of buffers.
 fn markSearching(self: *ThreadPool) bool {
     var state = @bitCast(State, self.state.load(.Monotonic));
     assert(state.searching <= self.buffers.len);
     if ((2 * state.searching) >= self.buffers.len)
         return false;
 
+    // Acquire barrier to ensure search() only happens after we've bumped the searching count.
     const update = @bitCast(usize, State{ .searching = 1 });
     state = @bitCast(State, self.state.fetchAdd(update, .Acquire));
     assert(state.searching < self.buffers.len);
     return true;
 }
 
+/// Once a searching worker threads finds a Runnable to execute, it calls this function.
+/// The last searching thread to find a Runnable must try to wake up another worker thread.
+/// This implements wake up throttling which both decreases searching contention and average syscall latency of notify().
 fn markDiscovered(self: *ThreadPool) void {
+    // Release barrier to ensure the search() previously don't happens before we bump down searching for the next worker thread.
     const update = @bitCast(usize, State{ .searching = 1 });
     const state = @bitCast(State, self.state.fetchSub(update, .Release));
     
+    // The load() in notify() cant be reordered before the fetchSub() since they're on the same atomic variable
     assert(state.searching <= self.buffers.len);
     assert(state.searching > 0);
     if (state.searching == 1)
         self.notify();
 }
 
+/// Before putting a worker thread to sleep, this must be called to ensure it can be woken up after.
+/// This bumps up the idle count and bumps down the searching count if the worker therad was searching before going idle.
+/// The last searching thread to go idle must check the injector again and issue a notify() to avoid a race described below.
 fn markIdle(self: *ThreadPool, was_searching: bool) error{Shutdown}!void {
     const one_searching = @bitCast(usize, State{ .searching = 1 });
     const search_shift = @ctz(usize, one_searching);
@@ -303,51 +324,90 @@ fn markIdle(self: *ThreadPool, was_searching: bool) error{Shutdown}!void {
     var update = @bitCast(usize, State{ .idle = 1 });
     update -%= @as(usize, @boolToInt(was_searching)) << search_shift;
 
-    const state = @bitCast(State, self.state.fetchAdd(update, .AcqRel));
+    // Acquire to ensure that the injector.pending() check is done after the searching is decremented.
+    // Release to ensure that search() happens before the searching is decremented or our marking of idle.
+    var state = @bitCast(State, self.state.fetchAdd(update, .AcqRel));
     assert(state.idle < self.buffers.len);
     assert(state.searching <= self.buffers.len);
     assert(state.searching >= @boolToInt(was_searching));
 
-    if (state.terminated != 0)
+    // If the thread pool is shutting down, we need to undo the idle inc we did above.
+    // Once shutting down, it is expected that there will no longer be any threads sleeping on idle_sema.
+    if (state.terminated != 0) {
+        state = @bitCast(State, self.state.fetchSub(update, .Monotonic));
+        assert(state.idle <= self.buffers.len);
+        assert(state.idle > 0);
         return error.Shutdown;
+    }
+
+    // We were the last searching worker thread. 
+    // Send a notification if we detect work as pushed while we were decrementing searching.
+    // This helps avoid this race condition:
+    //
+    // - last_worker: search failed, calls markIdle(), is preempted
+    // - schedule(): pushes to injector, notify() sees state.searching > 1 and returns
+    // - last_worker: state.searching -= 1 -> state.searching=0 which would now be notify()'able
+    // - last_worker: **if doesn't check injector again, goes to sleep while theres runnables in injector**
+    //
+    // Note that the injector check must strictly happen after the searching count is decremented to avoid the race.
+    // Only the injector is checked instead of all buffers as this race only produces deadlock for work outside the thread pool.
+    // A running worker prevents this by ensuring that it will eventually poll for tasks later.
+    if (was_searching and state.searching == 1 and self.injector.pending())
+        self.notify();
 }
 
+/// Entry point and executor loop for a worker thread
 fn run(self: *ThreadPool, buffer_index: usize) void {
+    // A worker starts off as searching as per the state update done in notify().
+    // Once finished, it's "despawned" from the thread pool, making sure not to access it after as it can be invalidated.
     var is_searching = true;
     defer self.complete(is_searching);
 
+    // Set the thread local buffer for the worker
     const buffer = &self.buffers[buffer_index];
     Buffer.current = buffer;
-    defer Buffer.current = null;
 
-    var xorshift = buffer_index + 1;
+    // Seed the Xorshift PRNG (0 value is invalid)
+    var xorshift = buffer_index;
+    if (xorshift == 0)
+        xorshift = 0xdeadbeef;
+
     while (true) {
+        // Poll for a Runnable on the thread pool
         const polled = buffer.pop() orelse blk: {
             is_searching = is_searching or self.markSearching();
             if (is_searching) break :blk self.search(buffer, &xorshift);
             break :blk null;
         };
 
+        // Stop searching for Runnables if we were
         const was_searching = is_searching;
         is_searching = false;
 
+        // Execute the Runnables when found
         if (polled) |runnable| {
             if (was_searching) self.markDiscovered();
             (runnable.runFn)(runnable);
             continue;
         }
 
+        // Wait on the thread pool and try again if we couldn't find any work.
         self.markIdle(was_searching) catch break;
         self.idle_sema.wait();
         is_searching = true;
     }
 }
 
+/// Using the provided buffer and the prng, 
+/// perform work stealing on both the injector queue and other worker buffers.
 fn search(self: *ThreadPool, buffer: *Buffer, xorshift: *usize) ?*Runnable {
-    var retries: u8 = 2;
+    // number of steal iterations to attempt even when we've observed all Empty
+    var retries: u8 = 1;
+    // total number of steal iterations to possibly attempt before giving up (either to contention or empty)
     var attempts: u8 = 32;
 
     while (true) {
+        // Try to steal work from the shared injector before checking other buffers 
         return buffer.inject(&self.injector) catch |inject_err| {
             const shifts = switch (@bitSizeOf(usize)) {
                 64 => .{ 13, 17, 5 },
@@ -365,12 +425,17 @@ fn search(self: *ThreadPool, buffer: *Buffer, xorshift: *usize) ?*Runnable {
             var steal_index = rng % self.buffers.len;
             var was_contended = inject_err == error.Contended;
 
+            // Iterate and try to steal from all the buffers
             while (iter > 0) : (iter -= 1) {
+                // Branchless version of algorithm which iterates all values from 0..self.buffers.len 
+                // in a random order using the co_prime computed at init().
+                // https://lemire.me/blog/2017/09/18/visiting-all-values-in-an-array-exactly-once-in-random-order/
                 defer {
                     steal_index += self.co_prime;
                     steal_index -= self.buffers.len * @boolToInt(steal_index >= self.buffers.len);
                 }
 
+                // Don't steal from ourselves since we know our buffer is empty from failing pop()
                 const steal_buffer = &self.buffers[steal_index];
                 if (buffer == steal_buffer)
                     continue;
@@ -381,18 +446,29 @@ fn search(self: *ThreadPool, buffer: *Buffer, xorshift: *usize) ?*Runnable {
                 };
             }
 
+            // Bounded spinning on contention reduces the latency of stealing by
+            // not transitioning to idle and going to sleep immediately
+            // but also by not hogging the CPU indefinitely until the time quota expires.
+            //
+            // spinLoopHint() acts as a small delay to decrease contention and 
+            // indicate to the cpu & compiler optimizer that we're intentionally looping
+            // while waiting on an external condition.
             attempts = std.math.sub(u8, attempts, 1) catch return null;
             if (was_contended) {
                 std.atomic.spinLoopHint();
                 continue;
             }
 
+            // Try to yield the time quota to another therad when we retry on Empty.
+            // TODO: Should this be removed since it's technically unspecified?
             retries = std.math.sub(u8, retries, 1) catch return null;
             std.os.sched_yield() catch {};
         };
     }
 }
 
+/// An unbounded, MPMC queue of Runnables.
+/// It's actually an MPSC where the consumer side is protected by a non-blocking "try-lock".
 const Injector = extern struct {
     pushed: Atomic(?*Runnable) = Atomic(?*Runnable).init(null),
     popped: Atomic(?*Runnable) = Atomic(?*Runnable).init(null),
@@ -402,9 +478,9 @@ const Injector = extern struct {
         const head = batch.head orelse unreachable;
         const tail = batch.tail orelse unreachable;
 
-        // Pushes to the pushed trieber stack using AcqRel instead of just Release:
+        // Pushes to the trieber stack using AcqRel instead of just Release:
         // - Release to ensure that consume()/Consumer.pop() sees the Runnable .next links on Acquire
-        // - Acquire to ensure that notify() after Injector.push() is not reordered before it (see notify() comment)
+        // - Acquire to ensure that notify() load after Injector.push() is not reordered before it (see schedule() comment)
         var pushed = self.pushed.load(.Monotonic);
         while (true) {
             tail.next = pushed;
@@ -417,8 +493,23 @@ const Injector = extern struct {
         }
     }
 
+    /// The address of this valid is used to indicate that
+    /// the consumer side (popped) is currently owned/held by a thread.
     var consuming: Runnable = undefined;
 
+    /// Returns true if a thread could potentially consume Runnables from this Injector.
+    fn pending(self: *const Injector) bool {
+        const popped = self.popped.load(.Acquire);
+        const pushed = self.pushed.load(.Acquire);
+
+        const is_contended = popped == @as(?*Runnable, &consuming);
+        const is_empty = popped == null and pushed == null;
+        
+        return !(is_empty or is_contended);
+    }
+
+    /// Tries to acquire a Consumer for the Injector
+    /// which provides exclusive access to the consuming side to deque Runnables from it.
     fn consume(self: *Injector) error{Empty, Contended}!Consumer {
         var popped = self.popped.load(.Monotonic);
         while (true) {
@@ -426,7 +517,10 @@ const Injector = extern struct {
                 return error.Empty;
             if (popped == @as(?*Runnable, &consuming))
                 return error.Contended;
-
+            
+            // Acquire to ensure that we see the .next links observed by
+            // the Acquire of pushed in Consumer.pop() then Release of popped in Consumer.release().
+            // Acquire also ensures that we only start dequeing Runnables once we own the consumer side.
             popped = self.popped.tryCompareAndSwap(
                 popped,
                 &consuming,

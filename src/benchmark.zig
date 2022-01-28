@@ -16,7 +16,7 @@ const WaitGroup = struct {
 
     fn done(self: *WaitGroup) void {
         const count = self.count.fetchSub(1 << 1, .AcqRel);
-        if (count & 1 != 0) {
+        if (count == ((1 << 1) | 1)) {
             self.futex.store(1, .Release);
             std.Thread.Futex.wake(&self.futex, 1);
         }
@@ -80,15 +80,18 @@ fn bench(comptime name: []const u8, comptime Pool: type) !void {
         pool.join();
     }
 
-    const tasks = try allocator.alloc(Task, 10_000_000);
+    const tasks = try allocator.alloc(Task, 100_000);
     defer allocator.free(tasks);
 
     var wg = WaitGroup{};
+    var batch = Pool.Batch{};
     for (tasks) |*task| {
         wg.add();
         task.* = .{ .wg = &wg };
-        pool.schedule(Pool.Batch.from(&task.runnable));
+        batch.push(Pool.Batch.from(&task.runnable));
     }
+
+    pool.schedule(batch);
 
     if (@hasDecl(Pool, "run")) pool.run();
     wg.wait();

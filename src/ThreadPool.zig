@@ -313,20 +313,27 @@ fn run(self: *ThreadPool, worker_id: u8) void {
                 var attempts: u8 = 32;
                 while (attempts > 0) : (attempts -= 1) {
                     var was_contended = false;
+                    var stole: ?*Runnable = null;
                     var seq = Random.Sequence.init(options.max_workers, options.co_prime, &rng);
+
                     while (seq.next()) |steal_id| {
                         const target = workers[steal_id].load(.Acquire) orelse continue;
-                        break :steal worker.steal(target) catch |err| {
+                        stole = worker.steal(target) catch |err| {
                             if (err == error.Contended) was_contended = true;
                             continue;
                         };
                     }
 
-                    break :steal worker.steal(&self.injector) catch |err| {
-                        if (err == error.Contended) was_contended = true;
-                        if (was_contended) continue;
-                        break;
-                    };
+                    if (stole == null) blk: {
+                        stole = worker.steal(&self.injector) catch |err| {
+                            if (err == error.Contended) was_contended = true;
+                            break :blk;
+                        };
+                    }
+
+                    if (stole) |runnable| break :steal runnable;
+                    if (!was_contended) break;
+                    std.atomic.spinLoopHint(); 
                 }
             }
 

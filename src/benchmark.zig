@@ -36,8 +36,8 @@ const WaitGroup = struct {
 };
 
 pub fn main() !void {
-    try bench("serial", SerialPool);
-    try bench("serial", ThreadPool);
+    try bench("serial  ", SerialPool);
+    try bench("threaded", ThreadPool);
 }
 
 fn bench(comptime name: []const u8, comptime Pool: type) !void {
@@ -56,7 +56,7 @@ fn bench(comptime name: []const u8, comptime Pool: type) !void {
             elapsed /= std.time.ns_per_us;
             unit = "us";
         }
-        std.debug.print("{s}\t\t{d:>.2}{s}\n", .{ name, elapsed, unit });
+        std.debug.print("{s} = {d:>.2}{s}\n", .{ name, elapsed, unit });
     }
 
     const Task = struct {
@@ -68,6 +68,7 @@ fn bench(comptime name: []const u8, comptime Pool: type) !void {
             defer self.wg.done();
 
             // TODO: work here
+            std.os.sched_yield() catch {};
         } 
     };
 
@@ -79,7 +80,7 @@ fn bench(comptime name: []const u8, comptime Pool: type) !void {
         pool.join();
     }
 
-    const tasks = try allocator.alloc(Task, 100_000);
+    const tasks = try allocator.alloc(Task, 10_000_000);
     defer allocator.free(tasks);
 
     var wg = WaitGroup{};

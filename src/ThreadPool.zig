@@ -601,6 +601,7 @@ const Buffer = struct {
 
         runnable.next = self.array[(tail -% 1) % capacity].loadUnchecked();
         self.array[tail % capacity].store(runnable, .Unordered);
+        self.tail.store(tail +% 1, .Release);
     }
 
     fn pop(self: *Buffer) ?*Runnable {
@@ -614,7 +615,7 @@ const Buffer = struct {
         assert(size <= capacity);
 
         const runnable = self.array[new_tail % capacity].loadUnchecked();
-        if (size >= 1) {
+        if (size > 1) {
             return (runnable orelse unreachable);
         }
 

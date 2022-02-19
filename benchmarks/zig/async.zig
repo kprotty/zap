@@ -6,7 +6,7 @@ const ThreadPool = @import("thread_pool");
 var thread_pool: ThreadPool = undefined;
 
 /// Global allocator which mimics other async runtimes
-pub var allocator: *std.mem.Allocator = undefined;
+pub var allocator: std.mem.Allocator = undefined;
 
 /// Zig async wrapper around ThreadPool.Task
 const Task = struct {
@@ -59,7 +59,7 @@ pub fn run(comptime asyncFn: anytype, args: anytype) ReturnTypeOf(asyncFn) {
     if (is_windows) {
         win_heap = @TypeOf(win_heap).init();
         win_heap.heap_handle = std.os.windows.kernel32.GetProcessHeap() orelse unreachable;
-        allocator = &win_heap.allocator;
+        allocator = win_heap.allocator;
     } else if (builtin.link_libc) {
         allocator = std.heap.c_allocator;
     } else {

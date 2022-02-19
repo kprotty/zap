@@ -10,16 +10,16 @@ pub fn main() void {
 fn asyncMain() void {
     const arr = Async.allocator.alloc(i32, SIZE) catch @panic("failed to allocate array");
     defer Async.allocator.free(arr);
-    
-    std.debug.warn("filling\n", .{});
+
+    std.debug.print("filling\n", .{});
     for (arr) |*item, i| {
         item.* = @intCast(i32, i);
     }
 
-    std.debug.warn("shuffling\n", .{});
+    std.debug.print("shuffling\n", .{});
     shuffle(arr);
 
-    std.debug.warn("running\n", .{});
+    std.debug.print("running\n", .{});
     var timer = std.time.Timer.start() catch @panic("failed to create os timer");
     quickSort(arr);
 
@@ -36,7 +36,7 @@ fn asyncMain() void {
         units = "us";
     }
 
-    std.debug.warn("took {d:.2}{s}\n", .{ elapsed, units });
+    std.debug.print("took {d:.2}{s}\n", .{ elapsed, units });
     if (!verify(arr)) {
         std.debug.panic("array not sorted", .{});
     }

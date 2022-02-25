@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
@@ -218,7 +219,7 @@ const Thread = struct {
 
             // assert(sync.stealing > 0);
             if (sync.stealing == 0) {
-                std.debug.warn("{} resetspinning(): {}\n", .{std.Thread.getCurrentId(), sync});
+                std.debug.print("{} resetspinning(): {}\n", .{std.Thread.getCurrentId(), sync});
                 unreachable;
             }
 
@@ -526,7 +527,7 @@ const Node = struct {
                 // On x86, a fetchAdd ("lock xadd") can be faster than a tryCompareAndSwap ("lock cmpxchg").
                 // If the increment makes the head go past the tail, it means the queue was emptied before we incremented so revert.
                 // Acquire barrier to ensure that any writes we do to the popped Node only happen after the head increment.
-                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                if (comptime builtin.target.cpu.arch.isX86()) {
                     head = self.head.fetchAdd(1, .Acquire);
                     if (head == tail) {
                         self.head.store(head, .Monotonic);
@@ -561,7 +562,7 @@ const Node = struct {
 
                 // On x86, the target buffer thread uses fetchAdd to increment the head which can go over if it's zero.
                 // Account for that here by understanding that it's empty here.
-                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                if (comptime builtin.target.cpu.arch.isX86()) {
                     if (head == tail +% 1) {
                         return false;
                     }
@@ -627,7 +628,7 @@ const Node = struct {
 
                 // On x86, the target buffer thread uses fetchAdd to increment the head which can go over if it's zero.
                 // Account for that here by understanding that it's empty here.
-                if (comptime std.builtin.target.cpu.arch.isX86()) {
+                if (comptime builtin.target.cpu.arch.isX86()) {
                     if (buffer_head == buffer_tail +% 1) {
                         return null;
                     }

@@ -50,7 +50,7 @@ int main()
     }
 
     std::vector<int> vec(10'000'000);
-    std::iota(vec.begin(), vec.end(), 10);
+    std::iota(vec.begin(), vec.end(), 0);
     std::shuffle(vec.begin(), vec.end(), std::mt19937{std::random_device{}()});
     // Use a strand to ensure that the quicksort function is executed in order
     // and that no two quicksort tasks are executed concurrently

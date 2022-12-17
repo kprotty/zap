@@ -11,8 +11,6 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const asio = gitClone(b);
-
     const exe = b.addExecutable("asio-qsort", null);
     exe.setTarget(target);
     exe.setBuildMode(mode);
@@ -30,10 +28,4 @@ pub fn build(b: *std.build.Builder) void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
-    const git_step = b.step("git", "Run git clone asio");
-    git_step.dependOn(&asio.step);
-}
-
-fn gitClone(b: *std.build.Builder) *std.build.RunStep {
-    return b.addSystemCommand(&[_][]const u8{ "git", "clone", "https://github.com/chriskohlhoff/asio", "vendor/asio" });
 }

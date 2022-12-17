@@ -6,74 +6,75 @@
 #include <random>
 #include <vector>
 
-using namespace asio;
-using namespace std;
 using namespace std::chrono;
 
-void insertionSort(vector<int>& arr);
-int partition(vector<int>& arr);
+void insertionSort(std::vector<int>& arr);
+int partition(std::vector<int>& arr);
 
-void shuffle(vector<int>& arr) {
-    mt19937 rng(random_device{}());
-    shuffle(begin(arr), end(arr), rng);
+void shuffle(std::vector<int>& arr) {
+    std::mt19937 rng(std::random_device{}());
+    std::shuffle(std::begin(arr), std::end(arr), rng);
 }
 
-void quickSort(vector<int>& arr) {
+void quickSort(std::vector<int>& arr) {
     if (arr.size() <= 32) {
         insertionSort(arr);
     } else {
-        io_context ctx;
-        steady_timer timer{ctx};
-        vector<int> arr1, arr2;
+        asio::io_context ctx;
+        asio::steady_timer timer{ctx};
+
+        std::vector<int> arr1, arr2;
         const auto pivot = partition(arr);
-        arr1.assign(begin(arr), begin(arr) + pivot);
-        arr2.assign(begin(arr) + pivot, end(arr));
-        async(launch::async, [&] { quickSort(arr1); });
-        async(launch::async, [&] { quickSort(arr2); });
+        arr1.assign(std::begin(arr), begin(arr) + pivot);
+        arr2.assign(std::begin(arr) + pivot, end(arr));
+        
+        std::async(std::launch::async, [&] { quickSort(arr1); });
+        std::async(std::launch::async, [&] { quickSort(arr2); });
         ctx.run();
-        copy(begin(arr1), end(arr1), begin(arr));
-        copy(begin(arr2), end(arr2), begin(arr) + pivot);
+        
+        std::copy(begin(arr1), end(arr1), begin(arr));
+        std::copy(begin(arr2), end(arr2), begin(arr) + pivot);
     }
 }
 
-int partition(vector<int>& arr) {
+int partition(std::vector<int>& arr) {
     const auto pivot = arr.size() - 1;
     int i = 0;
-    for (int j = 0; j < pivot; ++j) {
+    for (unsigned long j = 0; j < pivot; ++j) {
         if (arr[j] <= arr[pivot]) {
-            swap(arr[i], arr[j]);
+            std::swap(arr[i], arr[j]);
             ++i;
         }
     }
-    swap(arr[i], arr[pivot]);
+    std::swap(arr[i], arr[pivot]);
     return i;
 }
 
-void insertionSort(vector<int>& arr) {
+void insertionSort(std::vector<int>& arr) {
     for (int i = 1; i < arr.size(); ++i) {
-        for (int n = i; n > 0 && arr[n] < arr[n - 1]; --n) {
-            swap(arr[n], arr[n - 1]);
+        for (unsigned long n = i; n > 0 && arr[n] < arr[n - 1]; --n) {
+            std::swap(arr[n], arr[n - 1]);
         }
     }
 }
 
 int main() {
-    vector<int> arr(10'000'000);
+    std::vector<int> arr(10'000'000);
 
-    cout << "filling" << endl;
-    iota(begin(arr), end(arr), 0);
+    std::cout << "filling" << std::endl;
+    std::iota(std::begin(arr), std::end(arr), 0);
 
-    cout << "shuffling" << endl;
+    std::cout << "shuffling" << std::endl;
     shuffle(arr);
 
-    cout << "running" << endl;
+    std::cout << "running" << std::endl;
     const auto start = high_resolution_clock::now();
     quickSort(arr);
     const auto elapsed =
         duration_cast<milliseconds>(high_resolution_clock::now() - start);
-    cout << "took " << elapsed.count() << "ms" << endl;
+    std::cout << "took " << elapsed.count() << "ms" << std::endl;
 
-    if (!is_sorted(begin(arr), end(arr))) {
-        throw runtime_error("array not sorted");
+    if (!is_sorted(std::begin(arr), std::end(arr))) {
+        throw std::runtime_error("array not sorted");
     }
 }

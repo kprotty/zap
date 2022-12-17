@@ -1,0 +1,3 @@
+[submodule "benchmarks/cpp/vendor/asio"]
+	path = benchmarks/cpp/vendor/asio
+	url = https://github.com/chriskohlhoff/asio

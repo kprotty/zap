@@ -17,8 +17,9 @@ pub fn build(b: *std.build.Builder) void {
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addIncludePath("vendor/asio/asio/include");
-    exe.addCSourceFile("src/qsort.cpp", &.{ "-Oz", "-Wall", "-std=c++14" });
+    exe.addCSourceFile("src/qsort.cpp", &.{ "-Oz", "-Wall", "-Wextra", "-std=c++14", "-fno-sanitize=all" });
     exe.linkLibCpp();
+    exe.linkLibC();
     exe.install();
 
     const run_cmd = exe.run();

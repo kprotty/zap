@@ -1,84 +1,79 @@
-#include <asio.hpp>
-#include <iostream>
-#include <vector>
 #include <algorithm>
-#include <numeric>
+#include <array>
+#include <asio.hpp>
+#include <chrono>
+#include <iostream>
 #include <random>
+#include <vector>
 
 using namespace asio;
+using namespace std;
+using namespace std::chrono;
 
-// A function to perform quicksort on a vector of integers
-void quicksort(std::vector<int>& vec, int low, int high)
-{
-    if (low < high)
-    {
-        int pivot = low;
-        int left = low + 1;
-        int right = high;
-        while (left <= right)
-        {
-            while (left <= right && vec[left] <= vec[pivot])
-            {
-                left++;
-            }
-            while (left <= right && vec[right] > vec[pivot])
-            {
-                right--;
-            }
-            if (left < right)
-            {
-                std::swap(vec[left], vec[right]);
-            }
-        }
-        std::swap(vec[pivot], vec[right]);
-        int pivot_point = right;
-        quicksort(vec, low, pivot_point - 1);
-        quicksort(vec, pivot_point + 1, high);
+void insertionSort(vector<int>& arr);
+int partition(vector<int>& arr);
+
+void shuffle(vector<int>& arr) {
+    mt19937 rng(random_device{}());
+    shuffle(begin(arr), end(arr), rng);
+}
+
+void quickSort(vector<int>& arr) {
+    if (arr.size() <= 32) {
+        insertionSort(arr);
+    } else {
+        io_context ctx;
+        steady_timer timer{ctx};
+        vector<int> arr1, arr2;
+        const auto pivot = partition(arr);
+        arr1.assign(begin(arr), begin(arr) + pivot);
+        arr2.assign(begin(arr) + pivot, end(arr));
+        async(launch::async, [&] { quickSort(arr1); });
+        async(launch::async, [&] { quickSort(arr2); });
+        ctx.run();
+        copy(begin(arr1), end(arr1), begin(arr));
+        copy(begin(arr2), end(arr2), begin(arr) + pivot);
     }
 }
 
-int main()
-{
-    io_context io;
-    // Create a thread pool with max threads
-    unsigned int num_cpus = std::thread::hardware_concurrency();
-    io_context::work work{io};
-    std::vector<std::thread> threads;
-    for (int i = 0; i < num_cpus ; i++)
-    {
-        threads.emplace_back([&io]{io.run();});
-    }
-
-    std::vector<int> vec(10'000'000);
-    std::iota(vec.begin(), vec.end(), 0);
-    std::shuffle(vec.begin(), vec.end(), std::mt19937{std::random_device{}()});
-    // Use a strand to ensure that the quicksort function is executed in order
-    // and that no two quicksort tasks are executed concurrently
-    io_context::strand strand{io};
-
-    // Start the quicksort task asynchronously
-    strand.post([&]{
-        quicksort(vec, 0, vec.size() - 1);
-    });
-
-    // Wait for the quicksort task to complete
-    strand.post([&]{
-        // Print the sorted vector
-        for (int x : vec)
-        {
-            std::cout << x << " ";
+int partition(vector<int>& arr) {
+    const auto pivot = arr.size() - 1;
+    int i = 0;
+    for (int j = 0; j < pivot; ++j) {
+        if (arr[j] <= arr[pivot]) {
+            swap(arr[i], arr[j]);
+            ++i;
         }
-        std::cout << std::endl;
-        // Stop the io_context and all the threads in the thread pool
-        io.stop();
-    });
-
-    // Wait for all the threads in the thread pool to complete
-    for (auto& t : threads)
-    {
-        t.join();
     }
-
-    return 0;
+    swap(arr[i], arr[pivot]);
+    return i;
 }
 
+void insertionSort(vector<int>& arr) {
+    for (int i = 1; i < arr.size(); ++i) {
+        for (int n = i; n > 0 && arr[n] < arr[n - 1]; --n) {
+            swap(arr[n], arr[n - 1]);
+        }
+    }
+}
+
+int main() {
+    vector<int> arr(10'000'000);
+
+    cout << "filling" << endl;
+    iota(begin(arr), end(arr), 0);
+
+    cout << "shuffling" << endl;
+    shuffle(arr);
+
+    cout << "running" << endl;
+    const auto start = high_resolution_clock::now();
+    quickSort(arr);
+    const auto elapsed =
+        duration_cast<milliseconds>(high_resolution_clock::now() - start);
+    cout << "took " << elapsed.count() << "ms" << endl;
+
+    if (!is_sorted(begin(arr), end(arr))) {
+        throw runtime_error("array not sorted");
+    }
+}

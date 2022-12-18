@@ -28,8 +28,17 @@ void quickSort(std::vector<int>& arr) {
         arr1.assign(std::begin(arr), begin(arr) + pivot);
         arr2.assign(std::begin(arr) + pivot, end(arr));
         
-        std::async(std::launch::async, [&] { quickSort(arr1); });
-        std::async(std::launch::async, [&] { quickSort(arr2); });
+        // Create a strand to wrap the async calls to quickSort
+        asio::io_context::strand strand{ctx};
+        auto quickSortWrapper = [&](auto&& arr) {
+            quickSort(arr);
+        };
+        
+        // Use the strand to dispatch the async calls to quickSort
+        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr1)));
+        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr2)));
+        
+        // Run the io_context to process the dispatched tasks
         ctx.run();
         
         std::copy(begin(arr1), end(arr1), begin(arr));

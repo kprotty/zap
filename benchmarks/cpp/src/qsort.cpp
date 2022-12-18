@@ -8,48 +8,10 @@
 
 using namespace std::chrono;
 
-void insertionSort(std::vector<int>& arr);
-int partition(std::vector<int>& arr);
-
-void shuffle(std::vector<int>& arr) {
-    std::mt19937 rng(std::random_device{}());
-    std::shuffle(std::begin(arr), std::end(arr), rng);
-}
-
-void quickSort(std::vector<int>& arr) {
-    if (arr.size() <= 32) {
-        insertionSort(arr);
-    } else {
-        asio::io_context ctx;
-        asio::steady_timer timer{ctx};
-
-        std::vector<int> arr1, arr2;
-        const auto pivot = partition(arr);
-        arr1.assign(std::begin(arr), begin(arr) + pivot);
-        arr2.assign(std::begin(arr) + pivot, end(arr));
-        
-        // Create a strand to wrap the async calls to quickSort
-        asio::io_context::strand strand{ctx};
-        auto quickSortWrapper = [&](auto&& arr) {
-            quickSort(arr);
-        };
-        
-        // Use the strand to dispatch the async calls to quickSort
-        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr1)));
-        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr2)));
-        
-        // Run the io_context to process the dispatched tasks
-        ctx.run();
-        
-        std::copy(begin(arr1), end(arr1), begin(arr));
-        std::copy(begin(arr2), end(arr2), begin(arr) + pivot);
-    }
-}
-
-int partition(std::vector<int>& arr) {
-    const auto pivot = arr.size() - 1;
-    int i = 0;
-    for (unsigned long j = 0; j < pivot; ++j) {
+int partition(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
+    const auto pivot = static_cast<unsigned long>(end - 1);
+    int i = start;
+    for (int j = start; j < pivot; ++j) {
         if (arr[j] <= arr[pivot]) {
             std::swap(arr[i], arr[j]);
             ++i;
@@ -59,11 +21,41 @@ int partition(std::vector<int>& arr) {
     return i;
 }
 
-void insertionSort(std::vector<int>& arr) {
-    for (int i = 1; i < arr.size(); ++i) {
-        for (unsigned long n = i; n > 0 && arr[n] < arr[n - 1]; --n) {
+void insertionSort(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
+    for (int i = start + 1; i < end; ++i) {
+        for (unsigned long n = i; n > start && arr[n] < arr[n - 1]; --n) {
             std::swap(arr[n], arr[n - 1]);
         }
+    }
+}
+
+void shuffle(std::vector<int>& arr) {
+    std::mt19937 rng(std::random_device{}());
+    std::shuffle(std::begin(arr), std::end(arr), rng);
+}
+
+void quickSort(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
+    if (end - start <= 32) {
+        insertionSort(arr, start, end);
+    } else {
+        asio::io_context ctx;
+        asio::steady_timer timer{ctx};
+
+        const auto pivot = partition(arr, start, end);
+        
+        // Create a strand to wrap the async calls to quickSort
+        asio::io_context::strand strand{ctx};
+        auto quickSortWrapper = [&](auto&& arr, auto start, auto end) {
+            quickSort(arr, start, end);
+        };
+        
+        // Use the strand to dispatch the async calls to quickSort
+        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr), start, start + pivot));
+        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr), start + pivot, end));
+        
+        std::cout << start << " - " << end << "\n";
+        // Run the io_context to process the dispatched tasks
+        ctx.run();
     }
 }
 
@@ -78,7 +70,9 @@ int main() {
 
     std::cout << "running" << std::endl;
     const auto start = high_resolution_clock::now();
-    quickSort(arr);
+    unsigned long begin = 0;
+    unsigned long end = arr.size();
+    quickSort(arr, begin, end);
     const auto elapsed =
         duration_cast<milliseconds>(high_resolution_clock::now() - start);
     std::cout << "took " << elapsed.count() << "ms" << std::endl;

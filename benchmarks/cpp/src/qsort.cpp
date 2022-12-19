@@ -36,18 +36,23 @@ void shuffle(std::vector<int>& arr) {
 }
 
 awaitable<void> quickSort(asio::io_context& ctx, std::vector<int>& arr, unsigned long start, unsigned long end) noexcept {
-    if (end - start <= 32) {
-        insertionSort(arr, start, end);
+     std::cout << "Values before co_await: " << start << " - " << end << "\n";
+    if (end - start <= end) {
+        // slow
+        // insertionSort(arr, start, end);
+        // fast
+        std::sort(arr.begin() + start, arr.begin() + end);
         co_return;
     }
 
     const auto pivot = partition(arr, start, end);
     co_await quickSort(ctx, arr, start, start + pivot);
     co_await quickSort(ctx, arr, start + pivot, end);
+    std::cout << "Values after co_await: " << start << " - " << end << "\n";
 }
 
 int main() {
-    std::vector<int> arr(10'000);
+    std::vector<int> arr(10'000'000);
 
     std::cout << "filling" << std::endl;
     std::iota(arr.begin(), arr.end(), 0);
@@ -57,7 +62,8 @@ int main() {
 
     std::cout << "running" << std::endl;
     const auto start = high_resolution_clock::now();
-    asio::io_context ctx;
+    asio::io_context ctx{5};
+
     co_spawn(ctx, [&]() -> awaitable<void> {
         co_await quickSort(ctx, arr, 0, arr.size());
     }, detached);

@@ -1,78 +1,68 @@
 #include <algorithm>
-#include <array>
 #include <asio.hpp>
-#include <chrono>
+#include <vector>
 #include <iostream>
 #include <random>
-#include <vector>
 
 using namespace std::chrono;
+using asio::awaitable;
+using asio::co_spawn;
+using asio::detached;
 
-int partition(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
+constexpr int partition(std::vector<int>& arr, unsigned long start, unsigned long end) noexcept {
     const auto pivot = static_cast<unsigned long>(end - 1);
     int i = start;
-    for (int j = start; j < pivot; ++j) {
+    for (unsigned long j = start; j < pivot; ++j) {
         if (arr[j] <= arr[pivot]) {
-            std::swap(arr[i], arr[j]);
+            std::iter_swap(arr.begin() + i, arr.begin() + j);
             ++i;
         }
     }
-    std::swap(arr[i], arr[pivot]);
+    std::iter_swap(arr.begin() + i, arr.begin() + pivot);
     return i;
 }
 
-void insertionSort(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
-    for (int i = start + 1; i < end; ++i) {
+constexpr void insertionSort(std::vector<int>& arr, unsigned long start, unsigned long end) noexcept {
+    for (unsigned long i = start + 1; i < end; ++i) {
         for (unsigned long n = i; n > start && arr[n] < arr[n - 1]; --n) {
-            std::swap(arr[n], arr[n - 1]);
+            std::iter_swap(arr.begin() + n, arr.begin() + n - 1);
         }
     }
 }
 
 void shuffle(std::vector<int>& arr) {
     std::mt19937 rng(std::random_device{}());
-    std::shuffle(std::begin(arr), std::end(arr), rng);
+    std::shuffle(arr.begin(), arr.end(), rng);
 }
 
-void quickSort(std::vector<int>& arr, unsigned long& start, unsigned long& end) {
+awaitable<void> quickSort(asio::io_context& ctx, std::vector<int>& arr, unsigned long start, unsigned long end) noexcept {
     if (end - start <= 32) {
         insertionSort(arr, start, end);
-    } else {
-        asio::io_context ctx;
-        asio::steady_timer timer{ctx};
-
-        const auto pivot = partition(arr, start, end);
-        
-        // Create a strand to wrap the async calls to quickSort
-        asio::io_context::strand strand{ctx};
-        auto quickSortWrapper = [&](auto&& arr, auto start, auto end) {
-            quickSort(arr, start, end);
-        };
-        
-        // Use the strand to dispatch the async calls to quickSort
-        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr), start, start + pivot));
-        strand.dispatch(std::bind(quickSortWrapper, std::ref(arr), start + pivot, end));
-        
-        std::cout << start << " - " << end << "\n";
-        // Run the io_context to process the dispatched tasks
-        ctx.run();
+        co_return;
     }
+
+    const auto pivot = partition(arr, start, end);
+    co_await quickSort(ctx, arr, start, start + pivot);
+    co_await quickSort(ctx, arr, start + pivot, end);
 }
 
 int main() {
-    std::vector<int> arr(10'000'000);
+    std::vector<int> arr(10'000);
 
     std::cout << "filling" << std::endl;
-    std::iota(std::begin(arr), std::end(arr), 0);
+    std::iota(arr.begin(), arr.end(), 0);
 
     std::cout << "shuffling" << std::endl;
     shuffle(arr);
 
     std::cout << "running" << std::endl;
     const auto start = high_resolution_clock::now();
-    unsigned long begin = 0;
-    unsigned long end = arr.size();
-    quickSort(arr, begin, end);
+    asio::io_context ctx;
+    co_spawn(ctx, [&]() -> awaitable<void> {
+        co_await quickSort(ctx, arr, 0, arr.size());
+    }, detached);
+    ctx.run();
+
     const auto elapsed =
         duration_cast<milliseconds>(high_resolution_clock::now() - start);
     std::cout << "took " << elapsed.count() << "ms" << std::endl;

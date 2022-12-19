@@ -19,8 +19,9 @@ pub fn build(b: *std.build.Builder) void {
         "-Oz",
         "-Wall",
         "-Wextra",
-        "-std=c++14",
+        "-std=c++20",
         "-fno-sanitize=all",
+        "-fcoroutines-ts",
     });
     exe.linkLibCpp();
     exe.linkLibC();

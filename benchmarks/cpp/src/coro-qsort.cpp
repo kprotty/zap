@@ -18,15 +18,8 @@ awaitable<void> quickSort(asio::io_context &ctx,
     // Use std::sort for small inputs
     std::sort(begin, end);
   } else {
-
     auto pivot = begin + std::distance(begin, end) - 1;
-    auto i = begin;
-    for (auto j = begin; j < pivot; ++j) {
-      if (*j <= *pivot) {
-        std::swap(*i, *j);
-        ++i;
-      }
-    }
+    auto i = std::partition(begin, pivot, [=](int x){ return x <= *pivot; });
     std::swap(*i, *pivot);
 
     auto quickSortWrapper = [&](auto &&begin, auto &&end) {

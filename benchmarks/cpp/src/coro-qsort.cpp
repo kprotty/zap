@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <asio.hpp>
 #include <chrono>
 #include <iostream>
@@ -6,14 +7,17 @@
 #include <vector>
 
 using namespace std::chrono;
+using asio::awaitable;
+using asio::co_spawn;
+using asio::detached;
 
-void quickSort(asio::io_context &ctx, std::vector<int>::iterator begin,
-               std::vector<int>::iterator end) {
+awaitable<void> quickSort(asio::io_context &ctx,
+                          std::vector<int>::iterator begin,
+                          std::vector<int>::iterator end) {
   if (std::distance(begin, end) <= 32) {
     // Use std::sort for small inputs
     std::sort(begin, end);
   } else {
-    asio::steady_timer timer{ctx};
 
     auto pivot = begin + std::distance(begin, end) - 1;
     auto i = begin;
@@ -25,16 +29,14 @@ void quickSort(asio::io_context &ctx, std::vector<int>::iterator begin,
     }
     std::swap(*i, *pivot);
 
-    // Create a strand to wrap the async calls to quickSort
-    asio::io_context::strand strand{ctx};
     auto quickSortWrapper = [&](auto &&begin, auto &&end) {
       quickSort(ctx, begin, end);
     };
 
-    // Use the strand to post the async calls to quickSort
-    strand.post(std::bind(quickSortWrapper, begin, i));
-    strand.post(std::bind(quickSortWrapper, i + 1, end));
+    co_await quickSort(ctx, begin, i);
+    co_await quickSort(ctx, i + 1, end);
   }
+  co_return;
 }
 
 void shuffle(std::vector<int> &arr) {
@@ -52,10 +54,17 @@ int main() {
   shuffle(arr);
 
   std::cout << "running" << std::endl;
+
   const int num_threads = std::thread::hardware_concurrency();
   asio::io_context ctx{num_threads};
   const auto start = high_resolution_clock::now();
-  quickSort(ctx, std::begin(arr), std::end(arr));
+
+  co_spawn(
+      ctx,
+      [&]() -> awaitable<void> {
+        co_await quickSort(ctx, std::begin(arr), std::end(arr));
+      },
+      detached);
 
   // Run the io_context to process the posted tasks
   ctx.run();

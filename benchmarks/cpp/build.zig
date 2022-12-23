@@ -11,13 +11,13 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const coro = b.option(bool, "coro", "build coroutines (C++20) qsort.") orelse false;
+    const op = b.option([]const u8, "Example", "choice qsort examples (coro, parallel, strand [default]) to build.") orelse "strand";
 
     const exe = b.addExecutable("asio-qsort", null);
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addIncludePath("vendor/asio/asio/include");
-    if (coro) {
+    if (std.mem.eql(u8, op, "coro")) {
         exe.addCSourceFile("src/coro-qsort.cpp", &.{
             "-Oz",
             "-Wall",
@@ -25,6 +25,14 @@ pub fn build(b: *std.build.Builder) void {
             "-std=c++20",
             "-fno-sanitize=all",
             "-fcoroutines-ts",
+        });
+    } else if (std.mem.eql(u8, op, "parallel")) {
+        exe.addCSourceFile("src/parallel-qsort.cpp", &.{
+            "-Oz",
+            "-Wall",
+            "-Wextra",
+            "-std=c++14",
+            "-fno-sanitize=all",
         });
     } else {
         exe.addCSourceFile("src/qsort.cpp", &.{

@@ -451,7 +451,7 @@ const Event = struct {
             // Acquiring to WAITING will make the next notify() or shutdown() wake a sleeping futex thread
             // who will either exit on SHUTDOWN or acquire with WAITING again, ensuring all threads are awoken.
             // This unfortunately results in the last notify() or shutdown() doing an extra futex wake but that's fine. 
-            std.Thread.Futex.wait(&self.state, WAITING, null) catch unreachable;
+            std.Thread.Futex.wait(&self.state, WAITING);
             state = self.state.load(.Monotonic);
             acquire_with = WAITING;
         }

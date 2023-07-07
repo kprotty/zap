@@ -104,13 +104,13 @@ fn SpawnHandle(comptime T: type) type {
             suspend {
                 // Acquire barrier to ensuer we see the join()'s *Waiter writes if present.
                 // Release barrier to ensure join() and detach() see our *Waiter writes.
-                const state = self.state.swap(@ptrToInt(&waiter), .AcqRel);
+                const state = self.state.swap(@intFromPtr(&waiter), .AcqRel);
 
                 // If join() or detach() were called before us.
                 if (state != 0) {
                     // Then fill the result value for join() & wake it up.
                     if (state != DETACHED) {
-                        const joiner = @intToPtr(*Waiter, state);
+                        const joiner = @ptrFromInt(*Waiter, state);
                         joiner.value = waiter.value;
                         joiner.task.schedule();
                     }
@@ -130,7 +130,7 @@ fn SpawnHandle(comptime T: type) type {
             suspend {
                 // Acquire barrier to ensuer we see the complete()'s *Waiter writes if present.
                 // Release barrier to ensure complete() sees our *Waiter writes.
-                if (@intToPtr(?*Waiter, self.state.swap(@ptrToInt(&waiter), .AcqRel))) |completer| {
+                if (@ptrFromInt(?*Waiter, self.state.swap(@intFromPtr(&waiter), .AcqRel))) |completer| {
                     // complete() was waiting for us to consume its value.
                     // Do so and reschedule both of us.
                     waiter.value = completer.value;
@@ -149,7 +149,7 @@ fn SpawnHandle(comptime T: type) type {
             // Mark the state as detached, making a subsequent complete() no-op
             // Wake up the waiting complete() if it was there before us.
             // Acquire barrier in order to see the complete()'s *Waiter writes.
-            if (@intToPtr(?*Waiter, self.state.swap(DETACHED, .Acquire))) |completer| {
+            if (@ptrFromInt(?*Waiter, self.state.swap(DETACHED, .Acquire))) |completer| {
                 completer.task.schedule();
             }
         }

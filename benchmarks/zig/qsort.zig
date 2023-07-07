@@ -12,7 +12,7 @@ fn asyncMain() void {
     defer Async.allocator.free(arr);
 
     std.debug.print("filling\n", .{});
-    for (arr) |*item, i| {
+    for (arr, 0..) |*item, i| {
         item.* = @intCast(i32, i);
     }
 
@@ -52,7 +52,7 @@ fn verify(arr: []const i32) bool {
 
 fn shuffle(arr: []i32) void {
     var xs: u32 = 0xdeadbeef;
-    for (arr) |_, i| {
+    for (arr, 0..) |_, i| {
         xs ^= xs << 13;
         xs ^= xs >> 17;
         xs ^= xs << 5;
@@ -78,7 +78,7 @@ fn quickSort(arr: []i32) void {
 fn partition(arr: []i32) usize {
     const pivot = arr.len - 1;
     var i: usize = 0;
-    for (arr[0..pivot]) |_, j| {
+    for (arr[0..pivot], 0..) |_, j| {
         if (arr[j] <= arr[pivot]) {
             std.mem.swap(i32, &arr[j], &arr[i]);
             i += 1;
@@ -89,7 +89,7 @@ fn partition(arr: []i32) usize {
 }
 
 fn insertionSort(arr: []i32) void {
-    for (arr[1..]) |_, i| {
+    for (arr[1..], 0..) |_, i| {
         var n = i + 1;
         while (n > 0 and arr[n] < arr[n - 1]) {
             std.mem.swap(i32, &arr[n], &arr[n - 1]);

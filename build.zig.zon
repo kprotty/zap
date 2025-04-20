@@ -1,5 +1,6 @@
 .{
-    .name = "zap",
+    .name = .zap,
     .version = "0.2.0",
+    .fingerprint = 0x8ac41f4e8bb7b240,
     .paths = .{"."},
 }

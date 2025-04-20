@@ -4,7 +4,7 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("zig-datetime", .{ .root_source_file = b.path("v2.zig") });
+    _ = b.addModule("zap", .{ .root_source_file = b.path("v2.zig") });
 
     const exe = b.addExecutable(.{
         .name = "bench",
